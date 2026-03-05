@@ -4,6 +4,10 @@ Self-hosted [wllama](https://github.com/nicebyte/wllama) (v2.1.1) for browser-ba
 
 Part of [Idle Intelligence](https://idleintelligence.org/).
 
+## Demo
+
+[idle-intelligence.github.io/llm-web/web/](https://idle-intelligence.github.io/llm-web/web/)
+
 ## Structure
 
 ```
@@ -23,10 +27,6 @@ const wllama = new Wllama({
   'multi-thread/wllama.wasm': 'https://idle-intelligence.github.io/llm-web/pkg/wllama/multi-thread/wllama.wasm',
 });
 ```
-
-## Demo
-
-[idle-intelligence.github.io/llm-web/web/](https://idle-intelligence.github.io/llm-web/web/)
 
 ## Local development
 
