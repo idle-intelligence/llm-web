@@ -1,0 +1,482 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>llm-web — idle intelligence</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg: #fdfdfd;
+            --text: #1a1a1a;
+            --muted: #555;
+            --faint: #999;
+            --border: #ddd;
+            --green: #2d7d46;
+            --yellow: #b58900;
+            --red: #c0392b;
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'IBM Plex Sans', -apple-system, sans-serif;
+            max-width: 640px;
+            margin: 0 auto;
+            padding: 48px 24px 96px;
+            color: var(--text);
+            background: var(--bg);
+            line-height: 1.5;
+            font-size: 15px;
+        }
+        a { color: var(--text); }
+        a:hover { color: var(--muted); }
+
+        header { margin-bottom: 48px; }
+        .org {
+            font-family: 'IBM Plex Mono', monospace;
+            font-size: 13px;
+            color: var(--muted);
+            letter-spacing: 0.02em;
+            margin-bottom: 2px;
+        }
+        h1 {
+            font-family: 'IBM Plex Mono', monospace;
+            font-size: 24px;
+            font-weight: 600;
+            margin-bottom: 8px;
+        }
+        .tagline {
+            color: var(--muted);
+            font-size: 14px;
+            line-height: 1.6;
+        }
+        .tagline a { text-decoration: underline; color: var(--muted); }
+        .tagline a:hover { color: var(--text); }
+        .repo {
+            font-family: 'IBM Plex Mono', monospace;
+            font-size: 13px;
+            margin-top: 4px;
+        }
+        .repo a { color: var(--faint); text-decoration: none; }
+        .repo a:hover { color: var(--muted); }
+
+        section {
+            border-top: 1px solid var(--border);
+            padding: 24px 0;
+        }
+        section h2 {
+            font-family: 'IBM Plex Mono', monospace;
+            font-size: 12px;
+            font-weight: 500;
+            letter-spacing: 0.04em;
+            color: var(--faint);
+            margin-bottom: 12px;
+        }
+        section h2 .sub {
+            font-weight: 400;
+        }
+
+        .status {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 14px;
+        }
+        .status-dot {
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            background: var(--faint);
+            flex-shrink: 0;
+        }
+        .status-dot.loading { background: var(--yellow); }
+        .status-dot.ready { background: var(--green); }
+        .status-dot.error { background: var(--red); }
+        .status-dot.generating {
+            background: var(--text);
+            animation: pulse 1s infinite;
+        }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.4; }
+        }
+        .progress {
+            height: 2px;
+            background: var(--border);
+            border-radius: 1px;
+            overflow: hidden;
+            margin-top: 12px;
+            display: none;
+        }
+        .progress.visible { display: block; }
+        .progress-bar {
+            height: 100%;
+            background: var(--text);
+            width: 0%;
+            transition: width 0.3s;
+        }
+        #progressInfo {
+            font-family: 'IBM Plex Mono', monospace;
+            font-size: 12px;
+            color: var(--faint);
+            margin-top: 4px;
+        }
+
+        textarea {
+            font-family: 'IBM Plex Sans', -apple-system, sans-serif;
+            font-size: 15px;
+            width: 100%;
+            min-height: 80px;
+            padding: 12px;
+            border: 1px solid var(--border);
+            background: transparent;
+            resize: vertical;
+            color: var(--text);
+            margin-bottom: 12px;
+            line-height: 1.5;
+        }
+        textarea:focus {
+            outline: none;
+            border-color: var(--text);
+        }
+        .controls {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        button {
+            font-family: 'IBM Plex Mono', monospace;
+            font-size: 13px;
+            font-weight: 500;
+            padding: 8px 16px;
+            cursor: pointer;
+            border: 1px solid var(--border);
+            background: transparent;
+            color: var(--text);
+            border-radius: 0;
+            transition: border-color 0.15s;
+        }
+        button:hover:not(:disabled) {
+            border-color: var(--text);
+        }
+        button:disabled {
+            opacity: 0.3;
+            cursor: not-allowed;
+        }
+        button.primary {
+            background: var(--text);
+            color: var(--bg);
+            border-color: var(--text);
+        }
+        button.primary:hover:not(:disabled) {
+            background: var(--muted);
+            border-color: var(--muted);
+        }
+        .info {
+            font-size: 13px;
+            color: var(--faint);
+            margin-top: 12px;
+        }
+
+        #output {
+            padding: 16px;
+            min-height: 120px;
+            border: 1px solid var(--border);
+            white-space: pre-wrap;
+            line-height: 1.6;
+            font-size: 15px;
+            color: var(--text);
+        }
+        #output.empty {
+            color: var(--faint);
+            font-style: italic;
+        }
+        .streaming-cursor {
+            display: inline-block;
+            width: 2px;
+            height: 1em;
+            background: var(--text);
+            margin-left: 2px;
+            vertical-align: text-bottom;
+            animation: blink 0.7s infinite;
+        }
+        @keyframes blink {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0; }
+        }
+
+        #metricsCard { display: none; }
+        .metrics-grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 12px;
+        }
+        .metric { text-align: center; }
+        .metric-value {
+            font-family: 'IBM Plex Mono', monospace;
+            font-size: 16px;
+            font-weight: 600;
+        }
+        .metric-label {
+            font-family: 'IBM Plex Mono', monospace;
+            font-size: 11px;
+            color: var(--faint);
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+            margin-top: 2px;
+        }
+
+        footer {
+            border-top: 1px solid var(--border);
+            padding-top: 24px;
+            margin-top: 24px;
+        }
+        footer a {
+            font-family: 'IBM Plex Mono', monospace;
+            font-size: 13px;
+            color: var(--faint);
+            text-decoration: none;
+        }
+        footer a:hover { color: var(--muted); }
+    </style>
+</head>
+<body>
+    <header>
+        <p class="org">idle intelligence</p>
+        <h1>llm-web</h1>
+        <p class="tagline">
+            <a href="https://huggingface.co/HuggingFaceTB/SmolLM2-360M-Instruct">SmolLM2-360M-Instruct</a>
+            (Q4_K_M, ~271 MB) running client-side via WebAssembly using
+            <a href="https://github.com/nicebyte/wllama">wllama</a>
+        </p>
+        <p class="repo">
+            <a href="https://github.com/idle-intelligence/llm-web">github.com/idle-intelligence/llm-web</a>
+        </p>
+    </header>
+
+    <section>
+        <h2>STATUS</h2>
+        <div class="status">
+            <span class="status-dot" id="statusDot"></span>
+            <span id="statusText">Initializing...</span>
+        </div>
+        <div class="progress" id="progressBar">
+            <div class="progress-bar" id="progressFill"></div>
+        </div>
+        <p id="progressInfo"></p>
+        <div style="margin-top:12px">
+            <button id="downloadBtn" class="primary" style="display:none">Download Model (~271 MB)</button>
+        </div>
+    </section>
+
+    <section>
+        <h2>INPUT <span class="sub">· message</span></h2>
+        <textarea id="textInput" placeholder="Ask me anything..."></textarea>
+        <div class="controls">
+            <button id="sendBtn" class="primary" disabled>Send</button>
+            <button id="stopBtn" style="display:none">Stop</button>
+        </div>
+        <p class="info">Everything runs on this device.</p>
+    </section>
+
+    <section>
+        <h2>OUTPUT <span class="sub">· response</span></h2>
+        <div id="output" class="empty"><span id="outputText">Response will appear here...</span><span id="streamingCursor" class="streaming-cursor" style="display:none"></span></div>
+    </section>
+
+    <section id="metricsCard">
+        <h2>PERFORMANCE</h2>
+        <div class="metrics-grid">
+            <div class="metric">
+                <div class="metric-value" id="metricTokens">—</div>
+                <div class="metric-label">TOKENS</div>
+            </div>
+            <div class="metric">
+                <div class="metric-value" id="metricElapsed">—</div>
+                <div class="metric-label">ELAPSED (s)</div>
+            </div>
+            <div class="metric">
+                <div class="metric-value" id="metricSpeed">—</div>
+                <div class="metric-label">TOK/S</div>
+            </div>
+        </div>
+    </section>
+
+    <footer>
+        <a href="https://idleintelligence.org">idleintelligence.org</a>
+    </footer>
+
+    <script type="module">
+        import { Wllama } from '../pkg/wllama/index.js';
+
+        const MODEL_REPO = 'bartowski/SmolLM2-360M-Instruct-GGUF';
+        const MODEL_FILE = 'SmolLM2-360M-Instruct-Q4_K_M.gguf';
+        const MODEL_CACHE = 'wllama-model-v1';
+
+        const statusDot = document.getElementById('statusDot');
+        const statusText = document.getElementById('statusText');
+        const progressBar = document.getElementById('progressBar');
+        const progressFill = document.getElementById('progressFill');
+        const progressInfo = document.getElementById('progressInfo');
+        const downloadBtn = document.getElementById('downloadBtn');
+        const sendBtn = document.getElementById('sendBtn');
+        const stopBtn = document.getElementById('stopBtn');
+        const textInput = document.getElementById('textInput');
+        const outputEl = document.getElementById('output');
+        const outputText = document.getElementById('outputText');
+        const streamingCursor = document.getElementById('streamingCursor');
+        const metricsCard = document.getElementById('metricsCard');
+        const metricTokens = document.getElementById('metricTokens');
+        const metricElapsed = document.getElementById('metricElapsed');
+        const metricSpeed = document.getElementById('metricSpeed');
+
+        let wllama = null;
+        let generating = false;
+        let abortGeneration = false;
+
+        function updateStatus(state, text) {
+            statusDot.className = 'status-dot ' + state;
+            statusText.textContent = text;
+        }
+
+        function formatBytes(bytes) {
+            const mb = bytes / (1024 * 1024);
+            return mb >= 1 ? `${mb.toFixed(1)} MB` : `${(bytes / 1024).toFixed(0)} KB`;
+        }
+
+        async function isModelCached() {
+            try {
+                const cache = await caches.open(MODEL_CACHE);
+                const keys = await cache.keys();
+                return keys.length > 0;
+            } catch { return false; }
+        }
+
+        async function initWllama() {
+            const wasmPaths = {
+                'single-thread/wllama.wasm': '../pkg/wllama/single-thread/wllama.wasm',
+                'multi-thread/wllama.wasm': '../pkg/wllama/multi-thread/wllama.wasm',
+            };
+
+            wllama = new Wllama(wasmPaths);
+
+            const cached = await isModelCached();
+
+            updateStatus('loading', cached ? 'Loading model from cache...' : 'Downloading model...');
+            progressBar.classList.add('visible');
+
+            await wllama.loadModelFromHF(MODEL_REPO, MODEL_FILE, {
+                progressCallback: ({ loaded, total }) => {
+                    if (total > 0) {
+                        const pct = ((loaded / total) * 100).toFixed(0);
+                        progressFill.style.width = pct + '%';
+                        const verb = cached ? 'Loading' : 'Downloading';
+                        progressInfo.textContent = `${verb}: ${formatBytes(loaded)} / ${formatBytes(total)} (${pct}%)`;
+                    }
+                },
+            });
+
+            progressBar.classList.remove('visible');
+            progressInfo.textContent = '';
+            downloadBtn.style.display = 'none';
+            updateStatus('ready', 'Ready');
+            sendBtn.disabled = false;
+        }
+
+        async function generate() {
+            const userText = textInput.value.trim();
+            if (!userText || generating) return;
+
+            generating = true;
+            abortGeneration = false;
+            sendBtn.disabled = true;
+            stopBtn.style.display = '';
+            outputEl.classList.remove('empty');
+            outputText.textContent = '';
+            streamingCursor.style.display = 'inline-block';
+            updateStatus('generating', 'Generating...');
+
+            const prompt = `<|im_start|>user\n${userText}<|im_end|>\n<|im_start|>assistant\n`;
+
+            let tokenCount = 0;
+            const startTime = performance.now();
+
+            try {
+                await wllama.createCompletion(prompt, {
+                    nPredict: 512,
+                    sampling: { temp: 0.7, top_k: 40, top_p: 0.9 },
+                    onNewToken: (token, piece, currentText, { abortSignal }) => {
+                        if (abortGeneration) {
+                            abortSignal();
+                            return;
+                        }
+                        tokenCount++;
+                        outputText.textContent = currentText;
+
+                        // Update metrics live
+                        const elapsed = (performance.now() - startTime) / 1000;
+                        metricsCard.style.display = 'block';
+                        metricTokens.textContent = tokenCount;
+                        metricElapsed.textContent = elapsed.toFixed(1);
+                        metricSpeed.textContent = (tokenCount / elapsed).toFixed(1);
+                    },
+                });
+            } catch (err) {
+                if (!abortGeneration) {
+                    updateStatus('error', 'Error: ' + err.message);
+                    console.error(err);
+                }
+            }
+
+            streamingCursor.style.display = 'none';
+            generating = false;
+            sendBtn.disabled = false;
+            stopBtn.style.display = 'none';
+            if (!abortGeneration) {
+                updateStatus('ready', 'Ready');
+            } else {
+                updateStatus('ready', 'Stopped');
+            }
+        }
+
+        // Event listeners
+        sendBtn.addEventListener('click', generate);
+
+        stopBtn.addEventListener('click', () => {
+            abortGeneration = true;
+        });
+
+        textInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                generate();
+            }
+        });
+
+        // Init flow
+        const cached = await isModelCached();
+        if (cached) {
+            try {
+                await initWllama();
+            } catch (err) {
+                updateStatus('error', 'Failed: ' + err.message);
+                console.error(err);
+            }
+        } else {
+            updateStatus('', 'Model not downloaded (~271 MB)');
+            downloadBtn.style.display = '';
+            downloadBtn.addEventListener('click', async () => {
+                downloadBtn.disabled = true;
+                try {
+                    await initWllama();
+                } catch (err) {
+                    updateStatus('error', 'Failed: ' + err.message);
+                    downloadBtn.disabled = false;
+                    console.error(err);
+                }
+            });
+        }
+    </script>
+</body>
+</html>
