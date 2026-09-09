@@ -1,0 +1,262 @@
+{
+  "messages": [
+    {
+      "role": "system",
+      "content": "You are a helpful home assistant with access to Sonos speaker controls."
+    },
+    {
+      "role": "user",
+      "content": "pause the kitchen"
+    }
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "get_households_and_groups_and_players",
+        "description": "List all Sonos households, the groups (rooms) within each household, and the players belonging to each group.",
+        "parameters": {
+          "type": "object",
+          "properties": {},
+          "required": []
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "pause",
+        "description": "Pause playback for a group.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "group_id": {
+              "type": "string",
+              "description": "The id of the group to pause."
+            }
+          },
+          "required": [
+            "group_id"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "resume",
+        "description": "Resume (play) playback for a group.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "group_id": {
+              "type": "string",
+              "description": "The id of the group to resume."
+            }
+          },
+          "required": [
+            "group_id"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "set_group_volume",
+        "description": "Set the absolute volume for a group.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "group_id": {
+              "type": "string",
+              "description": "The id of the group."
+            },
+            "volume": {
+              "type": "integer",
+              "description": "Volume level from 0 to 100.",
+              "minimum": 0,
+              "maximum": 100
+            }
+          },
+          "required": [
+            "group_id",
+            "volume"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "get_now_playing",
+        "description": "Get the currently playing track and playback state for a group.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "group_id": {
+              "type": "string",
+              "description": "The id of the group."
+            }
+          },
+          "required": [
+            "group_id"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "skip_to_next_track",
+        "description": "Skip to the next track for a group.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "group_id": {
+              "type": "string",
+              "description": "The id of the group."
+            }
+          },
+          "required": [
+            "group_id"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "play_sonos_favorite",
+        "description": "Play a saved Sonos favorite on a group.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "group_id": {
+              "type": "string",
+              "description": "The id of the group."
+            },
+            "favorite_id": {
+              "type": "string",
+              "description": "The id of the favorite to play."
+            }
+          },
+          "required": [
+            "group_id",
+            "favorite_id"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "get_sonos_favorites",
+        "description": "List the Sonos favorites available for a household.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "household_id": {
+              "type": "string",
+              "description": "The id of the household."
+            }
+          },
+          "required": [
+            "household_id"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "set_group_mute",
+        "description": "Mute or unmute a group.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "group_id": {
+              "type": "string",
+              "description": "The id of the group."
+            },
+            "muted": {
+              "type": "boolean",
+              "description": "True to mute, false to unmute."
+            }
+          },
+          "required": [
+            "group_id",
+            "muted"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "adjust_group_volume",
+        "description": "Adjust a group's volume by a relative delta.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "group_id": {
+              "type": "string",
+              "description": "The id of the group."
+            },
+            "delta": {
+              "type": "integer",
+              "description": "Relative change in volume, e.g. 5 or -10."
+            }
+          },
+          "required": [
+            "group_id",
+            "delta"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "get_group_volume",
+        "description": "Get the current volume level for a group.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "group_id": {
+              "type": "string",
+              "description": "The id of the group."
+            }
+          },
+          "required": [
+            "group_id"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "play_radio",
+        "description": "Play a radio station by name on a group.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "group_id": {
+              "type": "string",
+              "description": "The id of the group."
+            },
+            "station_name": {
+              "type": "string",
+              "description": "Name of the radio station to search for and play."
+            }
+          },
+          "required": [
+            "group_id",
+            "station_name"
+          ]
+        }
+      }
+    }
+  ]
+}

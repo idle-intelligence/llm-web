@@ -1,0 +1,7 @@
+{
+  "messages": [
+    {"role": "system", "content": "You are a helpful home assistant with access to Sonos speaker controls."},
+    {"role": "user", "content": "Which speakers do I have?"}
+  ],
+  "tools": []
+}
