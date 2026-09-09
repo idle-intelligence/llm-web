@@ -1,10 +1,16 @@
 //! Native CLI for llm-wasm. `required-features = ["native"]` in Cargo.toml
 //! keeps this out of the wasm32-unknown-unknown / wasm-pack build.
 
+use std::fs::File;
+use std::io::BufReader;
+use std::path::PathBuf;
+
+use burn::backend::wgpu::WgpuDevice;
 use clap::{Parser, Subcommand};
+use llm_wasm::gguf::Q4ModelLoader;
 
 #[derive(Parser)]
-#[command(name = "llm-agent", about = "xLAM-2-3b-fc-r native CLI (skeleton)")]
+#[command(name = "llm-agent", about = "xLAM-2-3b-fc-r native CLI")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -12,19 +18,140 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Run the agent loop against a prompt.
-    Run,
+    /// Run greedy generation over a token-id prompt (or plain text, with `--tokenizer`).
+    Run {
+        #[arg(long)]
+        gguf: PathBuf,
+        /// JSON file containing a flat array of token ids (see
+        /// `fixtures/reference/rendered/*.tokens.json`).
+        #[arg(long)]
+        tokens: PathBuf,
+        #[arg(long, default_value_t = 32)]
+        max_new: usize,
+        /// Optional tokenizer.json for decoding generated ids to text.
+        #[arg(long)]
+        tokenizer: Option<PathBuf>,
+        #[arg(long, default_value_t = 12288)]
+        max_ctx: usize,
+    },
     /// Evaluate the model against reference logits/outputs.
     Eval,
     /// Print GGUF header/tensor info for a model file.
-    GgufInfo,
+    GgufInfo {
+        gguf: PathBuf,
+    },
 }
 
-fn main() {
+fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Run => println!("run: not implemented"),
-        Commands::Eval => println!("eval: not implemented"),
-        Commands::GgufInfo => println!("gguf-info: not implemented"),
+        Commands::Run {
+            gguf,
+            tokens,
+            max_new,
+            tokenizer,
+            max_ctx,
+        } => run(&gguf, &tokens, max_new, tokenizer.as_deref(), max_ctx),
+        Commands::Eval => {
+            println!("eval: not implemented (fixture wiring is a later phase)");
+            Ok(())
+        }
+        Commands::GgufInfo { gguf } => gguf_info(&gguf),
     }
+}
+
+fn gguf_info(path: &std::path::Path) -> anyhow::Result<()> {
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+    let loader = Q4ModelLoader::new(reader)?;
+    let r = loader.reader();
+
+    println!("GGUF version: {}", r.version());
+    println!("Tensor count: {}", r.tensor_count());
+    println!();
+    println!("-- metadata --");
+    let mut keys: Vec<&String> = r.metadata().keys().collect();
+    keys.sort();
+    for k in keys {
+        match r.metadata().get(k).unwrap() {
+            llm_wasm::gguf::GgufValue::Array { elem_type, len } => {
+                println!("{k} = Array(elem_type={elem_type}, len={len})");
+            }
+            other => println!("{k} = {other:?}"),
+        }
+    }
+
+    println!();
+    match llm_wasm::gguf::config_from_gguf(r) {
+        Ok(cfg) => {
+            println!("-- LlmConfig (derived) --");
+            println!("{cfg:#?}");
+        }
+        Err(e) => println!("-- LlmConfig derivation failed: {e} --"),
+    }
+
+    println!();
+    println!("-- tensors ({}) --", r.tensor_names().len());
+    println!("{:<32} {:>20} {:>8}", "name", "shape", "dtype");
+    for name in r.tensor_names() {
+        let info = r.tensor_info(name).unwrap();
+        println!(
+            "{:<32} {:>20?} {:>8}",
+            name,
+            info.shape(),
+            info.dtype().name()
+        );
+    }
+
+    Ok(())
+}
+
+fn run(
+    gguf_path: &std::path::Path,
+    tokens_path: &std::path::Path,
+    max_new: usize,
+    tokenizer_path: Option<&std::path::Path>,
+    max_ctx: usize,
+) -> anyhow::Result<()> {
+    let device = WgpuDevice::default();
+
+    let t0 = std::time::Instant::now();
+    let file = File::open(gguf_path)?;
+    let reader = BufReader::new(file);
+    let mut loader = Q4ModelLoader::new(reader)?;
+    let parts = loader.load_deferred(&device)?;
+    drop(loader);
+    let model = parts.finalize(&device)?;
+    eprintln!("model load: {:.2}s", t0.elapsed().as_secs_f32());
+
+    let tokens_json = std::fs::read_to_string(tokens_path)?;
+    let prompt_ids: Vec<u32> = serde_json::from_str(&tokens_json)?;
+    println!("prompt: {} tokens", prompt_ids.len());
+
+    let mut cache = model.new_cache(max_ctx);
+    let stop_ids = model.config().eos_token_ids.clone();
+
+    let t1 = std::time::Instant::now();
+    let generated = model.generate(&prompt_ids, max_new, &stop_ids, &mut cache);
+    let dt = t1.elapsed().as_secs_f32();
+    eprintln!(
+        "generated {} tokens in {:.2}s ({:.1} ms/token overall, includes prefill)",
+        generated.len(),
+        dt,
+        1000.0 * dt / generated.len().max(1) as f32
+    );
+
+    println!("generated ids: {generated:?}");
+
+    if let Some(tok_path) = tokenizer_path {
+        let bytes = std::fs::read(tok_path)?;
+        let tok = llm_wasm::tokenizer::Tokenizer::from_json(&bytes)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let text = tok
+            .decode(&generated, false)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        println!("generated text: {text}");
+    }
+
+    Ok(())
 }
