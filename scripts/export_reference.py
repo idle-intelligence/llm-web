@@ -12,6 +12,7 @@ Tensor/output naming:
 - fixtures/reference/logits/<name>.json           seq_len, dtype/device, argmax per position, top-5 @ last position, greedy 32-token continuation
 - models/reference/xlam-2-3b-fc-r/<name>.logits.npy  float32 [seq_len, vocab_size] full forward-pass logits (outside repo, large)
 """
+import argparse
 import json
 import os
 
@@ -27,6 +28,9 @@ LOGITS_JSON_DIR = os.path.join(REPO_ROOT, "fixtures/reference/logits")
 LOGITS_NPY_DIR = "/Users/tc/Code/idle-intelligence/models/reference/xlam-2-3b-fc-r"
 
 INPUT_NAMES = ["01_no_tools", "02_tools_single", "03_tools_multiturn"]
+# Rendered/token ids only, no forward pass -- 34-tool prefill would produce a
+# multi-GB logits.npy ([seq_len, 151936] float32) for no benefit here.
+RENDER_ONLY_NAMES = ["04_tools_all"]
 
 MAX_NEW_TOKENS = 32
 TOP_K = 5
@@ -42,10 +46,55 @@ def pick_device_dtype():
     return "cpu", torch.bfloat16
 
 
+def render_only(name, tokenizer):
+    """Render + tokenize only -- no model, no forward pass. For inputs whose
+    full-sequence logits.npy would be multi-GB (e.g. 34-tool prefill)."""
+    with open(os.path.join(INPUTS_DIR, f"{name}.json")) as f:
+        spec = json.load(f)
+    messages = spec["messages"]
+    tools = spec["tools"] if spec["tools"] else None
+
+    rendered = tokenizer.apply_chat_template(
+        messages, tools=tools, add_generation_prompt=True, tokenize=False
+    )
+    with open(os.path.join(RENDERED_DIR, f"{name}.txt"), "w") as f:
+        f.write(rendered)
+
+    token_ids = tokenizer(rendered, add_special_tokens=False)["input_ids"]
+    with open(os.path.join(RENDERED_DIR, f"{name}.tokens.json"), "w") as f:
+        json.dump(token_ids, f)
+
+    print(f"{name}: seq_len={len(token_ids)} (render-only, no forward pass)")
+
+
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--render-only",
+        metavar="NAME",
+        help="render + tokenize this input name only (no model load, no "
+        "forward pass, no logits.npy); defaults to names in "
+        "RENDER_ONLY_NAMES if passed with no value",
+        nargs="?",
+        const="__ALL_RENDER_ONLY__",
+        default=None,
+    )
+    args = parser.parse_args()
+
     os.makedirs(RENDERED_DIR, exist_ok=True)
     os.makedirs(LOGITS_JSON_DIR, exist_ok=True)
     os.makedirs(LOGITS_NPY_DIR, exist_ok=True)
+
+    if args.render_only:
+        tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR)
+        names = (
+            RENDER_ONLY_NAMES
+            if args.render_only == "__ALL_RENDER_ONLY__"
+            else [args.render_only]
+        )
+        for name in names:
+            render_only(name, tokenizer)
+        return
 
     device, dtype = pick_device_dtype()
     print(f"device={device} dtype={dtype}")
