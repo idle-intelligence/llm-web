@@ -422,3 +422,147 @@ need new WGSL, not a sibling-repo copy, to move from ~150 ms/step (naive) to the
 bound (§10); treating the fast kernel as a stretch goal rather than budgeting it is the main
 schedule risk here. Secondary risk unchanged: the 175 MB single-buffer tied head is unverified
 against real WebGPU `maxStorageBufferBindingSize` on M2/Chrome.
+
+## 13. Browser (wasm-bindgen bindings, `crates/llm-wasm/src/web.rs`)
+
+### Bindings surface
+
+- `initWgpuDevice(): Promise<void>` — module-level async fn, mirrors stt-web's `initWgpuDevice`
+  (`stt-wasm/src/web/bindings.rs`): requests a `BROWSER_WEBGPU` adapter with
+  `PowerPreference::HighPerformance`, then a device with the **adapter's full limits** (not spec
+  defaults) — required because the tied lm_head is a single ~175MB Q4_0 buffer
+  (`maxStorageBufferBindingSize` needs to clear that; unverified on real hardware, same open risk
+  docs/ENGINE.md §12 already flagged for the native path). Must be awaited exactly once before
+  constructing any `LlmEngine`.
+- `new LlmEngine()` — cheap constructor; grabs the device `initWgpuDevice` stashed in a
+  `static OnceLock<WgpuDevice>`.
+- `engine.appendModelShard(bytes: Uint8Array)` — call once per GGUF shard (see "shard decision"
+  below) before `load()`.
+- `await engine.load(tokenizerJson: string, tokenizerConfigJson: string, onProgress?: (stage, step, total) => void): Promise<void>` —
+  parses the GGUF via `Q4ModelLoader::from_shards` (two-phase: parse+load tensors, drop the
+  reader, then `finalize()` onto GPU — same pattern as native and as stt-web), builds the
+  `Tokenizer` and `ChatTemplate`, and allocates a `KvCache` sized `DEFAULT_MAX_CTX = 12288` (same
+  sizing rationale as `kv.rs`'s doc comment: the 34-tool Sonos prompt plus conversation headroom).
+  `onProgress` fires three times (`"parsing-gguf"`, `"finalizing-gpu"`, `"ready"`) — coarse,
+  because `gguf.rs`'s `load_deferred` loads all 36 transformer layers in one call with no
+  per-layer hook. Byte-level shard *fetch* progress is `worker.js`'s job, before ever calling
+  `appendModelShard`.
+- `engine.setSystemPrompt(text: string)`.
+- `await engine.start(utterance: string, toolsJson: string, optsJson: string): Promise<string>` —
+  begins a turn; `toolsJson` is a JSON array of MCP `tools/list` entries
+  (`{"name","description","inputSchema"}`), `optsJson` is `{"maxNewTokens"?, "maxSteps"?,
+  "systemPrompt"?}` (all optional). Returns a JSON **string** (not `serde-wasm-bindgen`, to avoid
+  adding that dependency for a shape this simple):
+  `{"outcome":"needTools","calls":[{"call_id","name","arguments"}...],"step":{"promptTokens","text","prefillMs","decodeMs","tokens"}}`,
+  `{"outcome":"final","text":...,"step":{...}}`, or `{"outcome":"error","message":...}`.
+- `await engine.provideToolResults(resultsJson: string): Promise<string>` — `resultsJson` is
+  `[{"call_id","result"}...]`, keyed by the `call_id`s from the prior `needTools` outcome; same
+  return shape as `start`.
+- `engine.reset()` — drops the in-progress conversation and the KV cache's resident length
+  (`cache.restore(0)`), keeps the loaded model.
+- `engine.info(): string` — JSON with `numLayers`/`hiddenSize`/`vocabSize`/`maxCtx`/`cacheLen`
+  (or `{"loaded": false}` before `load()`).
+- No `on_token` streaming callback: `model.rs`'s `generate()` has no per-token hook at HEAD, and
+  adding one would mean editing `model.rs` (out of scope — it's phase 1b's file, being edited
+  concurrently). A step's full text arrives in one `start`/`provideToolResults` resolution when
+  the step completes.
+
+### Load path: bytes -> GPU
+
+The actual `xLAM-2-3b-fc-r-q4_0.gguf` on disk is a **single 1.74GB file**, not pre-sharded.
+`gguf.rs`'s `GgufReader`/`Q4ModelLoader` need `Read + Seek` over the whole logical byte range up
+front (header + all tensor offsets are read before any tensor's bytes), so there's no streamed/
+incremental parse available to consume bytes as they arrive off the wire — `ShardedCursor` reads
+`Vec<Vec<u8>>` in memory, `Read+Seek`-compatible, purely to avoid ever forcing one contiguous
+>2GB `Vec<u8>` allocation (wasm32 pointer/length fields and some allocators choke well before the
+4GB address-space ceiling). **Decision: `worker.js`'s `load` handler fetches the (single, in this
+model's case) shard URL fully into memory with progress reporting, then calls
+`appendModelShard`/`load` once** — no attempt to stream tensor-by-tensor GPU upload during the
+fetch. 1.74GB resident in wasm linear memory, plus the GPU-side buffers `finalize()` allocates
+(dropped from CPU memory once GPU upload completes, per the existing two-phase `Q4ModelLoader`
+design), comfortably clears wasm32's 4GB ceiling with room for the KV cache (~906MB f32 at
+12288 ctx, `kv.rs`'s own arithmetic) and working buffers. If disk-side sharding is ever added
+(e.g. to parallelize the HTTP fetch), `appendModelShard` already accepts it — `worker.js`'s
+`model.shards` is a URL array for exactly this reason — with no Rust-side change needed.
+
+### The step-wise loop, or: why `web.rs` doesn't call into `Agent`
+
+`agent.rs`'s `Agent::start`/`provide_tool_results` are synchronous — correct for native, where
+Burn's wgpu backend can block on `Tensor::into_data()` for logits readback. In the browser that
+readback is a WebGPU buffer map, asynchronous only (`Tensor::into_data_async().await` — see
+`model.rs`'s `logits_to_vec` doc comment). A synchronous `Generator::generate` can't wrap that, so
+there's no GPU-backed `Generator` impl for wasm to plug into `Agent`. `LlmEngine::run_step`
+(private, in `web.rs`) therefore runs its own async render -> encode -> restore-prefix -> prefill
+-> decode -> parse loop directly against `model.rs`'s public `forward_hidden`/`lm_head`,
+`kv.rs`'s `KvCache::restore`, and `sample::greedy`/`tools::parse_output` — the same functions
+`Agent::step_inner` calls natively, just awaited per-token instead of called synchronously. This
+duplicates *orchestration* (message/tools bookkeeping, prefix-length bookkeeping) between
+`agent.rs` and `web.rs`, not any model/tokenizer/template/tool-parsing logic. If Burn ever exposes
+a sync-over-async escape hatch for wasm32, this duplication could be collapsed by implementing
+`Generator` for a wasm-backed type instead.
+
+### Prefix cache
+
+Same idea as `agent.rs`'s (see its module docs): `LlmEngine` renders the actual utterance plus a
+throwaway probe utterance under the same `tools` set, finds their common leading token run, and
+caches that length keyed by the `tools` list (`Tool` derives `PartialEq`, so a 12-34-entry
+`Vec<Tool>` comparison is cheap). Before prefilling, it checks the cached length against
+`resident_tokens` (the exact token sequence currently written into the `KvCache`, tracked
+position-for-position in `web.rs`) — only trusting the cache when the resident prefix's tokens
+actually match the new prompt's leading tokens, falling back to a full prefill
+(`effective_prefix = 0`) otherwise. Measured on the real tokenizer/template with the 12-tool
+Sonos fixture (`fixtures/sonos/tools-12.json`) and system prompt `"You are a helpful home
+assistant with access to Sonos speaker controls."` (see
+`crates/llm-wasm/tests/agent.rs::prefix_is_stable_across_utterances_for_same_tools`):
+
+```
+utterance A ("pause the kitchen"):                2225 tokens
+utterance B ("what's playing in the living room"): 2229 tokens
+common prefix:                                     2218 tokens
+```
+
+i.e. ~99.7% of the rendered prompt for two different utterances under the same tools is the
+constant system+tools preamble — prefilling that once per tools-set change instead of per turn is
+the entire point of this cache.
+
+### The three local dev servers
+
+1. `scripts/serve_models.py --dir ~/Code/idle-intelligence/models` (port 8001) — GGUF + tokenizer
+   files, Range-request + CORS aware (pre-existing, not owned by this work). Exposes
+   `/gguf/xlam-2-3b-fc-r/xLAM-2-3b-fc-r-q4_0.gguf` and
+   `/hf/xLAM-2-3b-fc-r/{tokenizer.json,tokenizer_config.json}`.
+2. (reserved for a real MCP tool server in a later phase — this demo's two tools are canned
+   in-page, no server needed.)
+3. `python3 web/agent/serve.py` (port 8002) — serves `web/agent/` (the demo page, `worker.js`,
+   `llm-client.js`, `pkg/`) with `Cross-Origin-Opener-Policy: same-origin` /
+   `Cross-Origin-Embedder-Policy: credentialless` (WebGPU/cross-origin-Worker requirements) and
+   permissive CORS, stdlib-only (mirrors `scripts/serve_models.py`'s style).
+
+Open `http://127.0.0.1:8002/` once both are running.
+
+### Build
+
+```bash
+CARGO_BUILD_JOBS=4 wasm-pack build --target web --out-dir web/agent/pkg crates/llm-wasm \
+  --no-default-features --features web
+```
+
+Note: `--out-dir` is resolved relative to the crate directory being built
+(`crates/llm-wasm/`), not the invocation cwd — after the build, move (or symlink) the emitted
+`crates/llm-wasm/web/agent/pkg` to `web/agent/pkg` at the repo root if it doesn't land there
+directly. `pkg/` is committed (same convention as stt-web) — remove `pkg/.gitignore` (wasm-pack
+always emits one with a bare `*`) before staging, or nothing under `pkg/` will be tracked.
+
+### What is untested
+
+No headless browser is available in this environment (Playwright/Chrome are explicitly
+off-limits per this task's constraints) — everything above is verified by: `cargo check`/`cargo
+clippy --target wasm32-unknown-unknown --no-default-features --features web` (clean), `wasm-pack
+build` succeeding, and native `cargo test -p llm-wasm` for the render/encode/parse/prefix-cache
+logic `web.rs` shares with `agent.rs`. **Never exercised**: `initWgpuDevice()` actually acquiring
+a WebGPU adapter/device in a real browser; `maxStorageBufferBindingSize` actually covering the
+175MB tied-head buffer; the full `load()` -> `start()` -> tool-call round trip -> `Final` path
+end-to-end; `into_data_async()`'s actual behavior/latency under real WebGPU buffer mapping; Worker
++ module-script + COOP/COEP interaction in a real browser (`type: 'module'` Workers plus
+cross-origin isolation headers have historically had browser-specific rough edges). The user's
+first click-through in a real browser is the first real signal on all of these.
