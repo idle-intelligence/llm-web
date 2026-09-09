@@ -1,0 +1,14 @@
+{
+  "playlists": [
+    {
+      "id": "PL:1",
+      "name": "Sunday Cooking",
+      "trackCount": 42
+    },
+    {
+      "id": "PL:2",
+      "name": "Road Trip",
+      "trackCount": 87
+    }
+  ]
+}

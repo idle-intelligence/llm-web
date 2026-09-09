@@ -1,0 +1,20 @@
+{
+  "favorites": [
+    {
+      "id": "FV:1",
+      "name": "Jazz Vibes",
+      "description": "Playlist · Spotify"
+    },
+    {
+      "id": "FV:2",
+      "name": "Morning News",
+      "description": "Station · Sonos Radio"
+    },
+    {
+      "id": "FV:3",
+      "name": "Deep Focus",
+      "description": "Playlist · Apple Music",
+      "unavailable": true
+    }
+  ]
+}
