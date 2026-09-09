@@ -199,10 +199,17 @@ impl Q4Attention {
 /// `02_tools_single` fixture — `SimpleCyclicCmma` doesn't fall back
 /// gracefully on an `InvalidConfig` error, only on `Unavailable`). Chunking
 /// the query dimension keeps each individual `matmul` call's shape inside
-/// the region the fixed strategy handles, at the cost of `ceil(T/512)`
-/// separate score/softmax/PV passes per layer during prefill (decode, T=1,
-/// never chunks).
-const ATTN_QUERY_CHUNK: usize = 128;
+/// the region the fixed strategy handles, at the cost of
+/// `ceil(T/ATTN_QUERY_CHUNK)` separate score/softmax/PV passes per layer
+/// during prefill (decode, T=1, never chunks).
+///
+/// K3 (docs/BENCHMARKS.md): 256 doesn't panic on this M2/Metal adapter and
+/// is bit-identical to 128 (full_forward's greedy-match tests still pass);
+/// prefill tok/s is unchanged within noise (26.3 vs 26.5 tok/s on
+/// `02_tools_single`) since attention chunking overhead isn't prefill's
+/// bottleneck — the naive Q4_0 matmul kernel (K2) is. 512 still panics
+/// (unverified after this change, carried over from C3's finding).
+const ATTN_QUERY_CHUNK: usize = 256;
 
 /// QK^T -> causal mask -> softmax -> PV, chunked over the query (T)
 /// dimension — see `ATTN_QUERY_CHUNK`'s doc comment. `q`: `[1, H, T, Dh]`,
