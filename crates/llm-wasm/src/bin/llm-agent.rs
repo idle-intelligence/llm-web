@@ -40,6 +40,19 @@ enum Commands {
     GgufInfo {
         gguf: PathBuf,
     },
+    /// Load once, time prefill of `tokens` then `decode_steps` greedy decode
+    /// steps from the resulting KV cache; reports prefill tok/s and median
+    /// decode ms/token (kernel benchmarking — see docs/BENCHMARKS.md).
+    Bench {
+        #[arg(long)]
+        gguf: PathBuf,
+        #[arg(long)]
+        tokens: PathBuf,
+        #[arg(long, default_value_t = 32)]
+        decode_steps: usize,
+        #[arg(long, default_value_t = 12288)]
+        max_ctx: usize,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -57,6 +70,12 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Commands::GgufInfo { gguf } => gguf_info(&gguf),
+        Commands::Bench {
+            gguf,
+            tokens,
+            decode_steps,
+            max_ctx,
+        } => bench(&gguf, &tokens, decode_steps, max_ctx),
     }
 }
 
@@ -152,6 +171,70 @@ fn run(
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         println!("generated text: {text}");
     }
+
+    Ok(())
+}
+
+fn bench(
+    gguf_path: &std::path::Path,
+    tokens_path: &std::path::Path,
+    decode_steps: usize,
+    max_ctx: usize,
+) -> anyhow::Result<()> {
+    let device = WgpuDevice::default();
+
+    let t0 = std::time::Instant::now();
+    let file = File::open(gguf_path)?;
+    let reader = BufReader::new(file);
+    let mut loader = Q4ModelLoader::new(reader)?;
+    let parts = loader.load_deferred(&device)?;
+    drop(loader);
+    let model = parts.finalize(&device)?;
+    eprintln!("model load: {:.2}s", t0.elapsed().as_secs_f32());
+
+    let tokens_json = std::fs::read_to_string(tokens_path)?;
+    let prompt_ids: Vec<u32> = serde_json::from_str(&tokens_json)?;
+    println!("prompt: {} tokens", prompt_ids.len());
+
+    let mut cache = model.new_cache(max_ctx);
+
+    let t_prefill = std::time::Instant::now();
+    let hidden = model.forward_hidden(&prompt_ids, &mut cache);
+    let last = hidden.narrow(1, prompt_ids.len() - 1, 1);
+    let logits = model.lm_head(last);
+    // burn's wgpu backend dispatches asynchronously — force a sync readback
+    // here (native-only `into_data()`, never do this in WASM) so
+    // `prefill_dt` measures actual GPU completion, not just queue time.
+    let mut logits_vec = llm_wasm::model::logits_to_vec(logits);
+    let prefill_dt = t_prefill.elapsed().as_secs_f32();
+    let prefill_tok_s = prompt_ids.len() as f32 / prefill_dt;
+    println!(
+        "prefill: {} tok in {:.2}s ({:.1} tok/s)",
+        prompt_ids.len(),
+        prefill_dt,
+        prefill_tok_s
+    );
+
+    let mut decode_ms: Vec<f32> = Vec::with_capacity(decode_steps);
+    for _ in 0..decode_steps {
+        let next = llm_wasm::sample::greedy(&logits_vec);
+        let t_step = std::time::Instant::now();
+        let hidden = model.forward_hidden(&[next], &mut cache);
+        let logits = model.lm_head(hidden);
+        // Force sync so this step's GPU work is actually complete before
+        // the next timer starts (native-only sync readback — see
+        // model.rs's `logits_to_vec` doc comment; not a WASM code path).
+        logits_vec = llm_wasm::model::logits_to_vec(logits);
+        decode_ms.push(t_step.elapsed().as_secs_f32() * 1000.0);
+    }
+
+    decode_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let median = decode_ms[decode_ms.len() / 2];
+    let mean: f32 = decode_ms.iter().sum::<f32>() / decode_ms.len() as f32;
+    println!(
+        "decode: {} steps, median {:.1} ms/token, mean {:.1} ms/token",
+        decode_steps, median, mean
+    );
 
     Ok(())
 }

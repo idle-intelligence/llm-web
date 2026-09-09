@@ -40,6 +40,7 @@ use cubecl::server::{Bindings, CubeCount, Handle};
 use cubecl::{CubeTask, Runtime};
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::model::{
     LlmModel, Q4Attention, Q4FeedForward, Q4TransformerBlock, RmsNormLayer, RoPE,
@@ -56,6 +57,10 @@ const ALIGNMENT: u64 = 32;
 // Naive kernel workgroup sizes (16×16 = 256, the WebGPU limit)
 const NAIVE_WG_X: u32 = 16;
 const NAIVE_WG_Y: u32 = 16;
+
+// Q4_0 matvec (M=1 decode) cooperative kernel: WG_SIZE=256, ROWS_PER_WG=8 —
+// see wgsl/shader_q4_matvec.wgsl's header comment.
+const MATVEC_ROWS_PER_WG: usize = 8;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -730,6 +735,48 @@ impl Q4Linear {
 // Q4 matmul kernel dispatch
 // ---------------------------------------------------------------------------
 
+/// Set (from device-init code, e.g. after probing `wgpu::Features::SUBGROUP`)
+/// to route the M=1 decode matvec through `shader_q4_matvec_subgroup.wgsl`
+/// instead of the portable shared-memory-reduction variant — mirrors
+/// sts-web's `gguf.rs:33-46` / `web/bindings.rs:162-163` pattern. Nothing in
+/// this crate currently calls `set_subgroup_support(true)` (that wiring
+/// lives in web.rs, outside this crate's owned files for this task), so this
+/// defaults to `false` — every measured number in docs/BENCHMARKS.md uses
+/// the shared-memory variant.
+static HAS_SUBGROUPS: AtomicBool = AtomicBool::new(false);
+
+pub fn set_subgroup_support(supported: bool) {
+    HAS_SUBGROUPS.store(supported, Ordering::Relaxed);
+}
+
+pub fn has_subgroup_support() -> bool {
+    HAS_SUBGROUPS.load(Ordering::Relaxed)
+}
+
+struct Q4MatvecKernel;
+
+impl KernelSource for Q4MatvecKernel {
+    fn source(&self) -> SourceTemplate {
+        SourceTemplate::new(include_str!("wgsl/shader_q4_matvec.wgsl"))
+    }
+
+    fn id(&self) -> KernelId {
+        KernelId::new::<Self>()
+    }
+}
+
+struct Q4MatvecSubgroupKernel;
+
+impl KernelSource for Q4MatvecSubgroupKernel {
+    fn source(&self) -> SourceTemplate {
+        SourceTemplate::new(include_str!("wgsl/shader_q4_matvec_subgroup.wgsl"))
+    }
+
+    fn id(&self) -> KernelId {
+        KernelId::new::<Self>()
+    }
+}
+
 struct Q4MatmulNaiveKernel {
     workgroup_size_x: u32,
     workgroup_size_y: u32,
@@ -788,22 +835,38 @@ pub fn q4_matmul(input: Tensor<Wgpu, 3>, weights: &Q4Tensor) -> Tensor<Wgpu, 3> 
         .with_buffer(output_handle.clone().binding())
         .with_buffer(info_handle.binding());
 
-    let kernel = SourceKernel::new(
-        Q4MatmulNaiveKernel {
-            workgroup_size_x: NAIVE_WG_X,
-            workgroup_size_y: NAIVE_WG_Y,
-        },
-        CubeDim::new_2d(NAIVE_WG_X, NAIVE_WG_Y),
-    );
-    let wg_x = n.div_ceil(NAIVE_WG_X as usize) as u32;
-    let wg_y = (b * m).div_ceil(NAIVE_WG_Y as usize) as u32;
-    client
-        .launch(
-            Box::new(kernel) as Box<dyn CubeTask<AutoCompiler>>,
-            CubeCount::new_2d(wg_x, wg_y),
-            bindings,
-        )
-        .expect("Q4 naive matmul kernel launch failed");
+    // M==1 (decode): dispatch the cooperative matvec kernel (K1 —
+    // wgsl/shader_q4_matvec{,_subgroup}.wgsl) instead of the naive
+    // one-thread-per-output kernel. M>1 (prefill) keeps the naive kernel.
+    if b * m == 1 {
+        let kernel: Box<dyn CubeTask<AutoCompiler>> = if has_subgroup_support() {
+            Box::new(SourceKernel::new(Q4MatvecSubgroupKernel, CubeDim::new_1d(256)))
+        } else {
+            Box::new(SourceKernel::new(Q4MatvecKernel, CubeDim::new_1d(256)))
+        };
+        let wg_x = n.div_ceil(MATVEC_ROWS_PER_WG) as u32;
+        let wg_y = b as u32;
+        client
+            .launch(kernel, CubeCount::new_2d(wg_x, wg_y), bindings)
+            .expect("Q4 matvec kernel launch failed");
+    } else {
+        let kernel = SourceKernel::new(
+            Q4MatmulNaiveKernel {
+                workgroup_size_x: NAIVE_WG_X,
+                workgroup_size_y: NAIVE_WG_Y,
+            },
+            CubeDim::new_2d(NAIVE_WG_X, NAIVE_WG_Y),
+        );
+        let wg_x = n.div_ceil(NAIVE_WG_X as usize) as u32;
+        let wg_y = (b * m).div_ceil(NAIVE_WG_Y as usize) as u32;
+        client
+            .launch(
+                Box::new(kernel) as Box<dyn CubeTask<AutoCompiler>>,
+                CubeCount::new_2d(wg_x, wg_y),
+                bindings,
+            )
+            .expect("Q4 naive matmul kernel launch failed");
+    }
 
     let output_tensor = CubeTensor::new_contiguous(
         client,

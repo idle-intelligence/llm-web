@@ -152,6 +152,36 @@ fn test_q4_matmul_synthetic_shapes() {
     }
 }
 
+/// K1: decode matvec (M=1) at N=151936 (lm_head/embedding width), both K
+/// values the model actually uses. `q4_matmul` dispatches the cooperative
+/// `shader_q4_matvec.wgsl` kernel whenever `B*M==1` (gguf.rs), so this
+/// exercises that kernel at the largest N in the model — the real
+/// `token_embd.weight` test below covers K=2048/N=151936 against real
+/// weights; this covers the synthetic K=11008/N=151936 combination too, for
+/// full N x K coverage at M=1 per the task brief.
+#[test]
+fn test_q4_matvec_m1_large_n() {
+    let shapes = [(2048usize, 151936usize), (11008, 151936)];
+    for &(k, n) in &shapes {
+        let (q4_bytes, cpu_weights) = random_q4(n, k, 0xFEED ^ (k as u64) ^ ((n as u64) << 20));
+        let input = random_input(1, k, 0xC0DE + k as u64);
+        let cpu_out = cpu_matmul(&input, &cpu_weights, 1, k, n);
+        let gpu_out = run_gpu_matmul(&input, &q4_bytes, 1, k, n);
+        assert_eq!(cpu_out.len(), gpu_out.len());
+
+        let mut max_err = 0f32;
+        for (c, g) in cpu_out.iter().zip(gpu_out.iter()) {
+            max_err = max_err.max((c - g).abs());
+        }
+        let tol = 0.05 * (k as f32).sqrt();
+        assert!(
+            max_err < tol,
+            "K1 matvec K={k} N={n} M=1: max_err={max_err} exceeds tol={tol}"
+        );
+        println!("K1 matvec K={k} N={n} M=1: max_err={max_err} (tol {tol})");
+    }
+}
+
 /// Real `token_embd.weight` (Q4_0, [151936, 2048], tied lm_head shape) from
 /// the xLAM-2-3b-fc-r GGUF. Exercises the full 151936-wide dispatch and the
 /// ~174MB single-buffer upload (docs/ENGINE.md §2's untested-limit concern).
