@@ -1,0 +1,49 @@
+{
+  "households": [
+    {
+      "householdId": "Sonos_ABC123XYZ",
+      "groups": [
+        {
+          "groupId": "RINCON_KITCHEN01:1",
+          "name": "Kitchen",
+          "playbackState": "PAUSED",
+          "playerIds": ["RINCON_KITCHEN01"]
+        },
+        {
+          "groupId": "RINCON_LIVING01:2",
+          "name": "Living Room",
+          "playbackState": "PLAYING",
+          "playerIds": ["RINCON_LIVING01", "RINCON_LIVING02"]
+        },
+        {
+          "groupId": "RINCON_BEDROOM01:3",
+          "name": "Bedroom",
+          "playbackState": "IDLE",
+          "playerIds": ["RINCON_BEDROOM01"]
+        }
+      ],
+      "players": [
+        {
+          "playerId": "RINCON_KITCHEN01",
+          "name": "Kitchen",
+          "capabilities": ["PLAYBACK", "AUDIO_CLIP", "VOICE"]
+        },
+        {
+          "playerId": "RINCON_LIVING01",
+          "name": "Living Room",
+          "capabilities": ["PLAYBACK", "AUDIO_CLIP"]
+        },
+        {
+          "playerId": "RINCON_LIVING02",
+          "name": "Living Room Surround",
+          "capabilities": ["PLAYBACK"]
+        },
+        {
+          "playerId": "RINCON_BEDROOM01",
+          "name": "Bedroom",
+          "capabilities": ["PLAYBACK", "AUDIO_CLIP"]
+        }
+      ]
+    }
+  ]
+}

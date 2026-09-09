@@ -1,0 +1,12 @@
+{
+  "groupId": "RINCON_KITCHEN01:1",
+  "playbackState": "PLAYING",
+  "currentItem": {
+    "track": {
+      "name": "Everything In Its Right Place",
+      "artist": "Radiohead",
+      "album": "Kid A",
+      "durationMillis": 249000
+    }
+  }
+}
