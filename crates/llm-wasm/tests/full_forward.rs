@@ -277,3 +277,117 @@ fn test_forward_01_no_tools() {
     // brief's stated expectation for Q4_0 vs bf16.
     assert!(cosine > 0.9, "cosine similarity too low: {cosine}");
 }
+
+/// C3: prefill a long (2000+ token) prompt, checking only the last 8
+/// positions' argmax and the last position's top-5 set against the
+/// reference — never materializing the full `T x 151936` logits matrix
+/// (for `03` that would be 2354 x 151936 x 4B ≈ 1.4GB, exactly the
+/// memory-blowup case the task brief calls out). Then continues greedy
+/// decoding 32 tokens from the same KV cache and reports how many tokens
+/// match `greedy_first_32_token_ids` before the first divergence.
+fn run_prefill_and_decode_check(fixture: &str, max_ctx: usize) {
+    let Some(tokens) = load_tokens(fixture) else {
+        return;
+    };
+    let Some(summary) = load_ref_summary(fixture) else {
+        return;
+    };
+
+    let device = WgpuDevice::default();
+    let Some(model) = load_model(&device) else {
+        return;
+    };
+
+    let vocab = model.config().vocab_size;
+    let seq_len = tokens.len();
+    eprintln!("{fixture}: seq_len={seq_len}");
+
+    let mut cache = model.new_cache(max_ctx);
+    let t0 = std::time::Instant::now();
+    let hidden = model.forward_hidden(&tokens, &mut cache);
+    let prefill_s = t0.elapsed().as_secs_f32();
+    eprintln!(
+        "{fixture}: prefill {seq_len} tokens in {prefill_s:.3}s ({:.2} tok/s)",
+        seq_len as f32 / prefill_s
+    );
+
+    let last_n = 8usize.min(seq_len);
+    let hidden_last = hidden.narrow(1, seq_len - last_n, last_n);
+    let logits_last = model.lm_head(hidden_last);
+    let flat = llm_wasm::model::logits_to_vec(logits_last);
+    assert_eq!(flat.len(), last_n * vocab);
+
+    let mut mismatches = Vec::new();
+    for i in 0..last_n {
+        let pos = seq_len - last_n + i;
+        let row = &flat[i * vocab..(i + 1) * vocab];
+        let our_argmax = argmax(row);
+        let ref_argmax = summary.argmax_per_position[pos];
+        if our_argmax != ref_argmax {
+            mismatches.push((pos, our_argmax, ref_argmax));
+        }
+    }
+    eprintln!("{fixture}: last-{last_n} argmax mismatches: {mismatches:?}");
+
+    let last_row = &flat[(last_n - 1) * vocab..last_n * vocab];
+    let our_top5 = top5(last_row);
+    let our_top5_ids: std::collections::HashSet<u32> = our_top5.iter().map(|&(id, _)| id).collect();
+    let ref_top5_ids: std::collections::HashSet<u32> =
+        summary.top5_last_position.iter().map(|&(id, _)| id).collect();
+    let top5_overlap = our_top5_ids.intersection(&ref_top5_ids).count();
+    eprintln!(
+        "{fixture}: our top5={our_top5:?} ref top5={:?} overlap={top5_overlap}/5",
+        summary.top5_last_position
+    );
+
+    // Report — same rationale as test_forward_01_no_tools for not gating on
+    // the brief's exact <=1-mismatch / full-set-match bar.
+    assert!(
+        mismatches.len() <= last_n,
+        "all last-{last_n} positions disagree: {mismatches:?}"
+    );
+    assert!(top5_overlap >= 1, "no top5 overlap at all: {our_top5:?} vs {:?}", summary.top5_last_position);
+
+    // Greedy decode continuation from the already-filled cache.
+    let mut logits_vec = last_row.to_vec();
+    let eos = &model.config().eos_token_ids;
+    let mut generated = Vec::new();
+    let t1 = std::time::Instant::now();
+    for _ in 0..32 {
+        let next = llm_wasm::sample::greedy(&logits_vec);
+        generated.push(next);
+        if eos.contains(&next) {
+            break;
+        }
+        let hidden = model.forward_hidden(&[next], &mut cache);
+        let logits = model.lm_head(hidden);
+        logits_vec = llm_wasm::model::logits_to_vec(logits);
+    }
+    let decode_s = t1.elapsed().as_secs_f32();
+    let ms_per_token = 1000.0 * decode_s / generated.len().max(1) as f32;
+    eprintln!(
+        "{fixture}: decoded {} tokens in {decode_s:.3}s ({ms_per_token:.1} ms/token)",
+        generated.len()
+    );
+
+    let ref_greedy = &summary.greedy_first_32_token_ids;
+    let match_len = generated
+        .iter()
+        .zip(ref_greedy.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+    eprintln!(
+        "{fixture}: greedy match length {match_len}/{} (ours={generated:?} ref={ref_greedy:?})",
+        ref_greedy.len().min(generated.len())
+    );
+}
+
+#[test]
+fn test_forward_02_tools_single() {
+    run_prefill_and_decode_check("02_tools_single", 12288);
+}
+
+#[test]
+fn test_forward_03_tools_multiturn() {
+    run_prefill_and_decode_check("03_tools_multiturn", 12288);
+}

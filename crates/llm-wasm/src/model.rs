@@ -180,13 +180,7 @@ impl Q4Attention {
         let k_all = repeat_kv(k_all, n_rep);
         let v_all = repeat_kv(v_all, n_rep);
 
-        // [1, H, T, Dh] x [1, H, Dh, kv_len] -> [1, H, T, kv_len]
-        let scores = q.matmul(k_all.swap_dims(2, 3)) * self.scale;
-        let scores = apply_causal_mask(scores, t, kv_len, offset);
-        let probs = softmax(scores, 3);
-
-        // [1, H, T, kv_len] x [1, H, kv_len, Dh] -> [1, H, T, Dh]
-        let out = probs.matmul(v_all);
+        let out = attention_scores_and_values(q, k_all, v_all, t, kv_len, offset, self.scale);
         let out = out.permute([0, 2, 1, 3]).reshape([b, t, self.n_heads * self.head_dim]);
 
         self.o_proj.forward(out)
@@ -196,6 +190,59 @@ impl Q4Attention {
 /// Repeat each of `n_kv_heads` KV heads `n_rep` times along the head axis
 /// (axis 1) so shapes line up with `n_heads = n_kv_heads * n_rep` query
 /// heads — HF `repeat_kv`.
+/// Largest query-chunk size for QK^T/softmax/PV. Burn 0.20's wgpu backend
+/// (built here without the `autotune` cubecl feature, see workspace
+/// Cargo.toml) falls back to a fixed `Strategy::Auto` matmul kernel
+/// (`cubek-matmul`'s `SimpleCyclicCmma`) that panics with "shared memory ...
+/// hardware limit" on this M2/Metal adapter once the query dimension of
+/// QK^T gets into the low thousands (hit at T=2225 while prefilling C3's
+/// `02_tools_single` fixture — `SimpleCyclicCmma` doesn't fall back
+/// gracefully on an `InvalidConfig` error, only on `Unavailable`). Chunking
+/// the query dimension keeps each individual `matmul` call's shape inside
+/// the region the fixed strategy handles, at the cost of `ceil(T/512)`
+/// separate score/softmax/PV passes per layer during prefill (decode, T=1,
+/// never chunks).
+const ATTN_QUERY_CHUNK: usize = 128;
+
+/// QK^T -> causal mask -> softmax -> PV, chunked over the query (T)
+/// dimension — see `ATTN_QUERY_CHUNK`'s doc comment. `q`: `[1, H, T, Dh]`,
+/// `k_all`/`v_all`: `[1, H, kv_len, Dh]`. Returns `[1, H, T, Dh]`.
+fn attention_scores_and_values(
+    q: Tensor<Wgpu, 4>,
+    k_all: Tensor<Wgpu, 4>,
+    v_all: Tensor<Wgpu, 4>,
+    t: usize,
+    kv_len: usize,
+    offset: usize,
+    scale: f32,
+) -> Tensor<Wgpu, 4> {
+    if t <= ATTN_QUERY_CHUNK {
+        let scores = q.matmul(k_all.swap_dims(2, 3)) * scale;
+        let scores = apply_causal_mask(scores, t, kv_len, offset);
+        let probs = softmax(scores, 3);
+        return probs.matmul(v_all);
+    }
+
+    let mut chunks = Vec::with_capacity(t.div_ceil(ATTN_QUERY_CHUNK));
+    let mut start = 0usize;
+    while start < t {
+        let len = ATTN_QUERY_CHUNK.min(t - start);
+        let q_chunk = q.clone().narrow(2, start, len);
+        // This chunk's queries are at absolute positions
+        // [offset+start, offset+start+len); they may attend to keys
+        // [0, offset+start+len).
+        let chunk_kv_len = offset + start + len;
+        let k_chunk = k_all.clone().narrow(2, 0, chunk_kv_len);
+        let v_chunk = v_all.clone().narrow(2, 0, chunk_kv_len);
+        let scores = q_chunk.matmul(k_chunk.swap_dims(2, 3)) * scale;
+        let scores = apply_causal_mask(scores, len, chunk_kv_len, offset + start);
+        let probs = softmax(scores, 3);
+        chunks.push(probs.matmul(v_chunk));
+        start += len;
+    }
+    Tensor::cat(chunks, 2)
+}
+
 fn repeat_kv(x: Tensor<Wgpu, 4>, n_rep: usize) -> Tensor<Wgpu, 4> {
     if n_rep == 1 {
         return x;
@@ -404,12 +451,14 @@ impl LlmModel {
         self.lm_head(hidden)
     }
 
-    /// Greedy-decode `max_new` tokens after prefilling `prompt_ids` into
-    /// `cache` (which may already hold a restored prefix — see
-    /// `KvCache::snapshot`/`restore`). Stops early (without including the
-    /// stop token) if a generated id is in `stop_ids`. Only the last
-    /// prefill position's logits are computed (never the full `T x vocab`
-    /// matrix) — see module doc comment on `forward_hidden`.
+    /// Greedy-decode up to `max_new` tokens after prefilling `prompt_ids`
+    /// into `cache` (which may already hold a restored prefix — see
+    /// `KvCache::snapshot`/`restore`). Stops after appending a generated id
+    /// that's in `stop_ids` (the stop token IS included in the returned
+    /// vec — matches `fixtures/reference/logits/*.json`'s
+    /// `greedy_first_32_token_ids` convention). Only the last prefill
+    /// position's logits are computed (never the full `T x vocab` matrix)
+    /// — see module doc comment on `forward_hidden`.
     pub fn generate(
         &self,
         prompt_ids: &[u32],
@@ -426,10 +475,10 @@ impl LlmModel {
         for _ in 0..max_new {
             let logits_vec = logits_to_vec(logits);
             let next = crate::sample::greedy(&logits_vec);
+            out.push(next);
             if stop_ids.contains(&next) {
                 break;
             }
-            out.push(next);
             let hidden = self.forward_hidden(&[next], cache);
             logits = self.lm_head(hidden);
         }
