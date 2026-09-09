@@ -32,3 +32,17 @@ types, and the exact parameter set are invented.
 **These must be replaced with the real recorded `tools/list` output** once
 one is captured from the actual Sonos MCP server, and the reference
 rendering/logits in `../rendered/` and `../logits/` regenerated from it.
+
+**Update 2026-09-10**: the real schemas for all 34 Sonos MCP tools have now
+been captured (from the claude.ai Sonos MCP connector's tool schemas — see
+`../../sonos/README.md`) into `../../sonos/tools.json` and, for this
+12-tool subset, `../../sonos/tools-12.json`. Parameter naming is confirmed:
+`group_id`/`household_id`/`player_id`, snake_case throughout — the
+placeholders' naming was correct. Descriptions and exact optional-parameter
+sets differ from the hand-written placeholders (e.g. real descriptions are
+longer and include cross-references between tools, "IMPORTANT" usage notes,
+and enum lists for `music_service`). The 12 placeholder schemas embedded in
+`02_tools_single.json` and `03_tools_multiturn.json` must be regenerated
+from `../../sonos/tools-12.json` verbatim (not by hand) — this is left to
+the Rust worker owning `scripts/`, along with regenerating the reference
+rendering/logits afterward.

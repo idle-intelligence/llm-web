@@ -1,0 +1,228 @@
+[
+  {
+    "name": "get_households_and_groups_and_players",
+    "description": "Get the household, group, and player IDs every other Sonos tool needs — a discovery of the user's whole Sonos system(s): every household, its groups (each with current playback state), and their players (speakers) with capabilities. Call it the first time you need any ID, and again after any grouping change (add_players_to_group, remove_players_from_group, move_audio_to_players), since group IDs and memberships go stale. Otherwise reuse that result for the rest of the conversation — no need to call it again before every operation. Only a call made in the current conversation is authoritative — never rely on names or IDs from any other source (your memory, past conversations, or general knowledge of the setup), because the system can change anytime (players renamed, groups reorganized, added, or removed).",
+    "inputSchema": {
+      "properties": {},
+      "required": [],
+      "type": "object"
+    }
+  },
+  {
+    "name": "get_now_playing",
+    "description": "Return what's currently playing on a Sonos group: the source (playlist, station, album, or radio, with its name and type); the current song or track's name, artist, album, and duration — or, for radio and other streams, the station or stream info; and the next track when available. Playback advances continuously — call this every time the user asks what's playing, even if you called it earlier in the conversation.",
+    "inputSchema": {
+      "properties": {
+        "group_id": {
+          "description": "The Sonos group ID",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "group_id"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "pause",
+    "description": "Pause playback on a Sonos group — stop the music where it is (it can be resumed). This is the plain 'pause'/'stop' action. IMPORTANT: Stateless command — always execute when asked, without first checking or assuming whether music is playing or paused.",
+    "inputSchema": {
+      "properties": {
+        "group_id": {
+          "description": "The Sonos group ID",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "group_id"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "resume",
+    "description": "Resume playback on a Sonos group — unpause and continue playing. This is the plain 'play'/'resume'/'unpause' action; to start new content, use one of the play_* tools. IMPORTANT: Stateless command — always execute when asked, without first checking or assuming whether music is playing or paused.",
+    "inputSchema": {
+      "properties": {
+        "group_id": {
+          "description": "The Sonos group ID",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "group_id"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "skip_to_next_track",
+    "description": "Skip to the next track on a Sonos group. Use this when the user asks to skip or play the next track.",
+    "inputSchema": {
+      "properties": {
+        "group_id": {
+          "description": "The Sonos group ID",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "group_id"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "skip_to_previous_track",
+    "description": "Skip to the previous track on a Sonos group. Use this when the user asks to go back or play the previous track.",
+    "inputSchema": {
+      "properties": {
+        "group_id": {
+          "description": "The Sonos group ID",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "group_id"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "set_group_volume",
+    "description": "Set the volume of a Sonos group to a specific level. Scales all players in the group proportionally, preserving their relative balance — it does not set every player to the same level. If the group is muted (all its players muted), setting the group volume also unmutes it. Group volume and player volume are linked — changing one affects the other. To set the volume of a single player, use set_player_volume; to set every player to an identical level, call it on each player individually instead.",
+    "inputSchema": {
+      "properties": {
+        "group_id": {
+          "description": "The Sonos group ID",
+          "minLength": 1,
+          "type": "string"
+        },
+        "volume": {
+          "description": "Volume level",
+          "maximum": 100,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "group_id",
+        "volume"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "adjust_group_volume",
+    "description": "Turn a Sonos group's volume up or down by the specified amount. Adjusts all players in the group proportionally, preserving their relative balance — it does not apply the same delta to every player. If the group is muted (all its players muted), adjusting the group volume also unmutes it. Group volume and player volume are linked — changing one affects the other. To turn a single player up or down, use adjust_player_volume; to apply an identical delta to every player, call it on each player individually instead.",
+    "inputSchema": {
+      "properties": {
+        "group_id": {
+          "description": "The Sonos group ID",
+          "minLength": 1,
+          "type": "string"
+        },
+        "volume_delta": {
+          "description": "Amount to adjust volume",
+          "maximum": 100,
+          "minimum": -100,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "group_id",
+        "volume_delta"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "get_group_volume",
+    "description": "Get the volume and mute state of a Sonos group. Group volume is the average level across the group's players. Group volume and player volume are linked — changing one affects the other. To get the volume of a single player, use get_player_volume instead.",
+    "inputSchema": {
+      "properties": {
+        "group_id": {
+          "description": "The Sonos group ID",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "group_id"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "set_group_mute",
+    "description": "Mute or unmute all players in a Sonos group. Group volume and player volume are linked — changing one affects the other. To mute a single player, use set_player_mute instead.",
+    "inputSchema": {
+      "properties": {
+        "group_id": {
+          "description": "The Sonos group ID",
+          "minLength": 1,
+          "type": "string"
+        },
+        "muted": {
+          "description": "true to mute, false to unmute",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "group_id",
+        "muted"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "get_sonos_favorites",
+    "description": "Get all Sonos favorites saved to a Sonos household. These are items saved within the Sonos app and are distinct from favorites or saved content on any music service. Returns each favorite's name and ID. Use this when the user asks what Sonos favorites are available, or to look up a favorite ID before playing one. Favorites marked `unavailable: true` can't be played — likely the associated music service account is missing.",
+    "inputSchema": {
+      "properties": {
+        "household_id": {
+          "description": "The Sonos household ID",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "household_id"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "play_sonos_favorite",
+    "description": "Play a Sonos favorite on a group. Use get_sonos_favorites first to find the favorite ID.",
+    "inputSchema": {
+      "properties": {
+        "favorite_id": {
+          "description": "The favorite ID (from get_sonos_favorites)",
+          "minLength": 1,
+          "type": "string"
+        },
+        "group_id": {
+          "description": "The Sonos group ID",
+          "minLength": 1,
+          "type": "string"
+        },
+        "shuffle": {
+          "description": "Set true only when the user clearly asks to shuffle; otherwise false (play in order). Sets the same state as set_shuffle_repeat_crossfade — no separate call needed.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "group_id",
+        "favorite_id",
+        "shuffle"
+      ],
+      "type": "object"
+    }
+  }
+]
