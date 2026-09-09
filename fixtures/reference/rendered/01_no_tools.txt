@@ -1,0 +1,4 @@
+<|im_start|>system
+You are a helpful home assistant with access to Sonos speaker controls.
+<|im_end|><|im_start|>user
+Which speakers do I have?<|im_end|><|im_start|>assistant
