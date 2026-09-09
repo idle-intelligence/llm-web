@@ -443,3 +443,40 @@ impl LlmModel {
 pub fn logits_to_vec(logits: Tensor<Wgpu, 3>) -> Vec<f32> {
     logits.into_data().into_vec::<f32>().expect("f32 logits")
 }
+
+#[cfg(test)]
+mod debug_tests {
+    use super::*;
+
+    #[test]
+    fn causal_mask_pattern() {
+        let device = WgpuDevice::default();
+        let scores = Tensor::<Wgpu, 4>::zeros([1, 1, 3, 3], &device);
+        let masked = apply_causal_mask(scores, 3, 3, 0);
+        let data = masked.into_data().into_vec::<f32>().unwrap();
+        println!("mask pattern: {data:?}");
+        // Expect row i can see cols 0..=i: masked (-inf) where col>row.
+        assert_eq!(data[0], 0.0); // (0,0)
+        assert!(data[1].is_infinite() && data[1] < 0.0); // (0,1) masked
+        assert!(data[2].is_infinite() && data[2] < 0.0); // (0,2) masked
+        assert_eq!(data[3], 0.0); // (1,0)
+        assert_eq!(data[4], 0.0); // (1,1)
+        assert!(data[5].is_infinite() && data[5] < 0.0); // (1,2) masked
+        assert_eq!(data[6], 0.0); // (2,0)
+        assert_eq!(data[7], 0.0); // (2,1)
+        assert_eq!(data[8], 0.0); // (2,2)
+    }
+
+    #[test]
+    fn causal_mask_with_offset() {
+        let device = WgpuDevice::default();
+        // offset=2 (2 cached tokens), T=1 new query at absolute pos 2, kv_len=3.
+        let scores = Tensor::<Wgpu, 4>::zeros([1, 1, 1, 3], &device);
+        let masked = apply_causal_mask(scores, 1, 3, 2);
+        let data = masked.into_data().into_vec::<f32>().unwrap();
+        println!("offset mask pattern: {data:?}");
+        assert_eq!(data[0], 0.0);
+        assert_eq!(data[1], 0.0);
+        assert_eq!(data[2], 0.0);
+    }
+}
