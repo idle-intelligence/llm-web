@@ -318,7 +318,78 @@ matmul kernel's cost scales roughly linearly with total weight bytes touched per
 for the wider MLP/attention shapes, i.e. plausibly bandwidth-bound *slower* than 20 tok/s once
 ported, before any prefill/tiling optimization work.
 
-## 9. Gap list for Qwen2.5-3B (xLAM-2-3b-fc-r)
+## 9. Facts settled after the audit
+
+- **The GGUF actually in use** is `~/Code/idle-intelligence/models/gguf/xlam-2-3b-fc-r/
+  xLAM-2-3b-fc-r-q4_0.gguf` (lowercase filename; a **Mungert** requant, not the Salesforce-
+  official file `MODELS.md` §2 audited). Confirmed on disk: 1,742,628,672 bytes ≈ **1.74 GB**,
+  **pure F32 + Q4_0** throughout including `token_embd.weight` (the Salesforce Q4_0 file instead
+  keeps `token_embd.weight` at Q6_K and is 1.82 GB — a different, unused file). No `output.weight`
+  tensor, consistent with `tie_word_embeddings: true`: LM head reuses `token_embd.weight`
+  transposed. Since Mungert is what's on disk, the loader only needs Q4_0 support, not Q6_K —
+  simpler than `MODELS.md` §2's checklist implied.
+- **Tool-call output is a bare JSON array**, no `<tool_call>` wrapper tags (`MODELS.md` §3) — the
+  engine's tool-call detector is "does decoded, stripped output start with `[`", then
+  `JSON.parse` the whole thing as `[{name, arguments}, ...]`.
+- **Chat template needs only minijinja's `json` feature** (for `tojson`, incl. `indent` kwarg) on
+  top of default `builtins` — no `loop_controls`, `custom_syntax`, `adjacent_loop_items`,
+  `macros`, or `multi_template` (`MODELS.md` §3, "Jinja features used").
+
+## 10. Bandwidth bound
+
+Q4 decode (M=1) is memory-bandwidth-bound, not compute-bound: every output element reads its full
+weight row once and does O(1) arithmetic per byte. The measured baseline (§8) gives an effective
+achieved bandwidth for the *existing naive kernel*:
+
+- stt-wasm's 1B model: ~0.6 GB of Q4 weights touched per decode step, measured **54.5 ms/step**
+  (`stt-web/BENCHMARKS.md`, 120s clip steady state) → **0.6 GB / 0.0545 s ≈ 11 GB/s effective**,
+  against an M2's unified-memory peak of roughly **~100 GB/s** — the naive kernel runs at ~11% of
+  peak bandwidth.
+- xLAM-2-3b-fc-r (Mungert Q4_0, §9) reads **~1.8 GB per decode step**: all 36 layers' Q4_0
+  weights plus norms/biases, plus the **tied 151936×2048 Q4_0 head** (151936 × 2048 × 0.5625
+  bytes/elem ≈ **175 MB**) reused as the LM-head matmul.
+  - **Bandwidth bound at ~near-peak (~90-100 GB/s)**: 1.8 GB / 100 GB/s ≈ **18-20 ms/step**
+    (~**50 tok/s**) — achievable only with a kernel that reuses shared memory / cooperative
+    reduction close to peak, i.e. not the naive kernel.
+  - **On the naive kernel** (extrapolating stt-wasm's measured ~11 GB/s effective rate): 1.8 GB /
+    11 GB/s ≈ **150 ms/step** (~**6 tok/s**) — this is the realistic number if the naive kernel is
+    ported as-is without a tiled/cooperative replacement.
+- **Prefill is compute-bound**, not bandwidth-bound (M>1 reuses each weight row across all N
+  prompt tokens): roughly `2 × 3e9 × N` FLOPs for the 34-tool MCP system prompt, where N is the
+  rendered token count. `MODELS.md` does not report the rendered length of the 34-tool prompt —
+  **N is not yet known; measure it in Phase 1c** (tokenizer is built there) before this can be
+  turned into a wall-clock estimate.
+
+## 11. Kernels and pieces to take from siblings
+
+- **sts-web's fast matvec kernels are Q4_K-only, not Q4_0**, all three hardcoded to `M=1`
+  (decode only): `sts-web/crates/sts-wasm/src/wgsl/shader_q4k_matvec.wgsl` (shared-memory input
+  caching), `shader_q4k_matvec_coop.wgsl` (K-cooperative), `shader_q4k_matvec_subgroup.wgsl`
+  (`subgroupAdd()` reduction, 8 subgroups × 32 threads/workgroup on Apple Silicon). All three
+  operate on Q4_K's 144-byte/256-element block, not Q4_0's 18-byte/32-element block — **porting
+  any of them to our Mungert-Q4_0 file needs a genuine block-decode-math rewrite**, not a flag.
+  `sts-web/crates/sts-wasm/src/gguf.rs:141-157`'s `GgmlDtype` loader accepts both Q4_0 and Q4_K,
+  but the fast WGSL kernels themselves never branch on dtype — Q4_K only. No benchmark numbers
+  exist for these three kernels specifically (`BENCHMARKS.md` lives in `stt-web`, not `sts-web`;
+  the 54.5 ms/step figure in §10 is from stt-web's naive Q4_0 kernel). **No Q4_0 variant of the
+  cooperative/subgroup kernel exists anywhere across `sts-web`, `stt-web`, or `tts-web`** — the
+  only Q4_0 matvec/matmul shader in any of the three repos is stt-web's `shader_naive.wgsl` (§2),
+  general over M but bandwidth-inefficient (§10).
+- **tts-web's tied-head path** (`tts-web/crates/tada-wasm/src/gguf.rs`): `to_gpu_f32()`
+  (~L663-680) dequantizes the entire Q4_0 embedding table to F32 on CPU, row by row, and uploads
+  it as one `[vocab_size, dim]` GPU tensor — "for tied lm_head where we need the full table
+  resident on GPU for matmul." A **load-time, CPU-side, one-shot dequant**, not a per-step GPU
+  cost (~1.16 GB F32 upload once, same magnitude as stt-wasm's `dequant_embedding_to_gpu`, §1).
+  `load_f32_weight_any()` (~L782-812) is the general form for any F32/F16/Q4_0/Q8_0 weight.
+- **Recommended starting kernel: stt-wasm's `shader_naive.wgsl`, not any sts-web Q4_K kernel.**
+  It's the only Q4_0 kernel in any of the three repos, already general over M, and covered by
+  `stt-wasm/tests/q4_matmul.rs`. It's bandwidth-inefficient (§10: ~11 GB/s vs. ~100 GB/s peak), so
+  the real work is not porting a sibling kernel wholesale but **writing a Q4_0 cooperative/
+  subgroup kernel modeled on sts-web's `shader_q4k_matvec_subgroup.wgsl` reduction strategy**
+  (shared-memory row caching + `subgroupAdd()`) with Q4_0 block-decode math. tts-web's
+  `to_gpu_f32()` is directly reusable as-is for the tied-head load-time dequant either way.
+
+## 12. Gap list for Qwen2.5-3B (xLAM-2-3b-fc-r), revised
 
 | Gap | Size | Notes |
 |---|---|---|
@@ -326,30 +397,28 @@ ported, before any prefill/tiling optimization work.
 | Qwen2 GGUF tensor-name table (new loader, §1) | small–medium | Mechanical rewrite of `load_transformer_layer`/`load_q4_linear` name strings |
 | q/k/v bias loading (struct support exists, loader doesn't populate, §1/§4) | small | Add a `*.bias` tensor read alongside each Q4 linear load |
 | RoPE convention mismatch: interleaved-pair vs. Llama/Qwen2 rotate-half (§3) | medium | Silent-wrong-output risk if not fixed; either permute weight rows on load or rewrite `apply_rotation` |
-| KV cache: single-token-only → multi-token prefill (§3) | large | New `KVCache::update` path for M>1 writes; new batched embedding path in `model.rs`; kernel itself (§2) already supports M>1 |
-| KV cache size/growth: 751-step fixed ring buffer → thousands-of-tokens context for MCP conversations (§3) | medium–large | Either a much bigger fixed buffer (~600 MB budget estimate in §3) or a paged/growable design; current wraparound silently corrupts state past capacity |
+| Tokenisation: byte-level BPE, 151k vocab, ~7 MB tokenizer.json, encode+decode (§6, MODELS.md §5) | large | Nothing in stt-wasm transfers — current tokenizer is decode-only, 8001-vocab SentencePiece; likely lands in JS per this repo's own native-vs-WASM precedent |
+| Prefill + KV cache: single-token-only → multi-token prefill, plus context large enough for MCP conversations (§3, §10) | large | Kernel itself already supports M>1 (naive kernel, §2); KV cache rewrite (batched write path, growable/bigger-than-751-step buffer) is the real work; prefill is compute-bound (§10) and N (34-tool prompt length) is unmeasured until Phase 1c |
+| Q4_0 decode kernel port/rewrite: naive kernel works but is bandwidth-inefficient; no ready-made fast Q4_0 kernel exists in any sibling repo (§10, §11) | medium–large | Recommended path: start from stt-wasm's `shader_naive.wgsl` for correctness, then write a Q4_0 cooperative/subgroup kernel modeled on sts-web's `shader_q4k_matvec_subgroup.wgsl` reduction strategy (Q4_K→Q4_0 block-math rewrite, not a port) — needed to hit the ~18-20 ms/step bound instead of ~150 ms/step |
 | Sliding-window mask always-on → make optional/full-causal (§3) | small | `Q4Attention::new(..., sliding_window: None)` for Qwen2's full-context attention |
-| lm_head at 151936×2048: single 174 MB Q4 buffer, untested against actual `maxStorageBufferBindingSize` (§2) | medium | Requesting adapter's full limits (already done, §2) likely covers it on M2/Metal, but unverified; may need to shard the head matmul across dispatches if not |
-| Tied embeddings/lm_head (currently two independent tensors, §4) | small–medium | Simplification opportunity (share one buffer) but needs new plumbing since `EmbeddingStore` (CPU row-dequant) and `Q4Tensor`(GPU matmul weight) are different representations today |
-| Byte-level BPE tokenizer, 151k vocab, ~7 MB tokenizer.json, encode+decode (§6) | large | Nothing here transfers — current tokenizer is decode-only, 8001-vocab SentencePiece; likely lands in JS per this repo's own native-vs-WASM precedent |
-| Worker/wasm-bindgen protocol: audio-frame-in/text-out → prompt-in/token-stream-out (§5) | small–medium | Message shapes and `SttEngine` surface both need new methods; `&mut self` single-flight queuing pattern (worker.js) carries over directly |
-| MCP tool-call sampling/formatting (grammar-constrained or JSON-mode decoding for tool calls) | large | No sampling logic beyond argmax exists in this crate (`stream.rs` only ever reads GPU argmax) — greedy-only; tool-call-structured decoding is new work entirely |
+| Tied embeddings/lm_head (currently two independent tensors in stt-wasm, §4) | small | tts-web's `to_gpu_f32()` (§11) is a directly reusable load-time pattern: one CPU-side dequant pass, one GPU buffer shared between embedding lookup and LM-head matmul |
+| MCP tool-call sampling/formatting: detect bare-JSON-array output (MODELS.md §3), greedy or constrained decode | large | No sampling logic beyond argmax exists in stt-wasm (`stream.rs` only reads GPU argmax) — greedy-only; tool-call-structured decoding is new work entirely |
 | PyTorch-logits reference/comparison harness (§7) | medium | No numeric-tolerance-vs-PyTorch test exists to copy; would follow `e2e_pytorch_mimi.rs`'s "dump JSON offline, compare in Rust test" pattern but needs building from scratch |
-| Prefill matmul performance (naive kernel is bandwidth-bound, no M-dimension weight reuse, §2) | medium | Works correctness-wise at M>1 today; a multi-hundred-token MCP prompt prefill would be slow without a tiled/cooperative kernel (exists in `refs/voxtral-mini-realtime-rs` but not ported into this crate) |
+| lm_head at 151936×2048: single 175 MB Q4_0 buffer, untested against actual `maxStorageBufferBindingSize` (§2, §10) | medium | Requesting adapter's full limits (already done in stt-wasm, §2) likely covers it on M2/Metal, but unverified; may need to shard the head matmul across dispatches if not |
 
 **Effort estimate (Phase 1b — decoder + kernels + KV + sampling on this engine): roughly
-15-25 worker-days**, dominated by three items: (1) multi-token KV cache/prefill plumbing (KV
-cache rewrite + batched embedding path + wiring the already-general Q4 kernel through it — this
-touches the most files and needs careful correctness verification against a fresh PyTorch
-reference, since there's no existing numeric-tolerance harness to build on, §7); (2) the RoPE
-convention mismatch, which is cheap to *fix* but expensive to *catch* if missed (wrong numbers,
-not a crash — needs the PyTorch reference harness from day one, not bolted on after); and (3) BPE
-tokenization for 151k vocab, which is a real subproject (encode+decode, likely JS-side, plus a new
-worker protocol) rather than a config change. Secondary risks worth calling out explicitly: the
-174 MB single-buffer lm_head is unverified against real WebGPU `maxStorageBufferBindingSize` on
-M2/Chrome (§2 — could force a head-matmul sharding fallback, a few extra days if so); and prefill
-throughput on the naive (untiled) kernel is unmeasured and could make MCP tool-schema prompts
-(hundreds to low-thousands of tokens) slow to first-token even after correctness is achieved,
-since only a matvec-shaped (M=1) workload has ever actually been benchmarked in this codebase
-(§8) — porting the tiled kernel referenced in `refs/voxtral-mini-realtime-rs` is the natural
-mitigation and should be budgeted in rather than treated as a stretch goal.
+18-28 worker-days**, revised up from the pre-audit 15-25 range now that the kernel question is
+settled: sts-web's fast kernels don't shortcut the work (§11 — Q4_K-only, M=1, need a real
+block-math rewrite to serve Q4_0), so hitting the ~50 tok/s bandwidth bound (§10) instead of the
+~6 tok/s naive-kernel floor is now budgeted as its own line item. Four items dominate: (1)
+**tokenisation** — 151k-vocab BPE encode+decode, a real subproject (likely JS-side per this
+repo's precedent), plus a new prompt-in/token-stream-out worker protocol on the critical path;
+(2) **prefill/KV cache** — the naive kernel already supports M>1 mathematically, but the
+KV-cache rewrite (batched writes, MCP-length-context buffer) is untouched code, and prefill cost
+is unmeasured until N (the 34-tool prompt's token count) is known in Phase 1c; (3) **RoPE
+rotate-half** — cheap to fix, expensive to catch if missed, so the from-scratch PyTorch-logits
+reference harness (§7) must exist from day one; and (4) **the Q4_0 kernel port** — confirmed to
+need new WGSL, not a sibling-repo copy, to move from ~150 ms/step (naive) to the ~18-20 ms/step
+bound (§10); treating the fast kernel as a stretch goal rather than budgeting it is the main
+schedule risk here. Secondary risk unchanged: the 175 MB single-buffer tied head is unverified
+against real WebGPU `maxStorageBufferBindingSize` on M2/Chrome.
