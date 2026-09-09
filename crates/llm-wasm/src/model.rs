@@ -1,40 +1,35 @@
-//! Qwen2 transformer model: embeddings, attention, RoPE, KV cache. Owned by phase 1b.
-//!
-//! This is a *type skeleton*, not a one-line stub: `crate::gguf` was copied
-//! working from stt-wasm (see gguf.rs's header comment) and constructs these
-//! types directly (`Q4Attention::new`, `SttModel::new`, ...), so their fields
-//! and constructors are mirrored here **verbatim from stt-web's `model.rs`**
-//! (only `SttConfig`/`SttModel` renamed to `LlmConfig`/`LlmModel`) purely to
-//! keep `gguf.rs` compiling as copied. This is deliberately *not* yet
-//! Qwen2-shaped: stt-web's `Q4Attention` has one combined `in_proj` (no q/k/v
-//! bias) and a sliding window; `Q4FeedForward` is the 2-matrix STT variant, not
-//! Qwen2/Llama's 3-matrix gate/up/down; `LlmModel` still carries a leftover
-//! `audio_emb` field from STT's per-codebook embeddings. All of that — plus
-//! `forward`/`forward_with_cache`/KV cache wiring, entirely absent here — is
-//! real phase-1b work: rewrite `gguf.rs`'s tensor-name table AND these structs
-//! together for Qwen2's `blk.N.attn_{q,k,v,output}` naming, q/k/v bias, 3-matrix
-//! SwiGLU, tied lm_head, and no sliding window. See docs/ENGINE.md §1/§3/§4 and
-//! docs/MODELS.md §1-2 for the target shapes.
+//! Qwen2 decoder-only transformer: RMSNorm, GQA attention with q/k/v bias,
+//! RoPE (rotate-half convention), SwiGLU MLP, tied lm_head. Ported from
+//! HF's `Qwen2Model`/`Qwen2Attention` semantics (transformers
+//! `modeling_qwen2.py`), matched numerically against `fixtures/reference`
+//! (see tests/full_forward.rs), not from stt-web's structurally-similar but
+//! differently-shaped `SttModel` (docs/ENGINE.md §3-4 catalogued the deltas:
+//! separate q/k/v/bias instead of one `in_proj`, 3-matrix SwiGLU instead of
+//! 2-matrix gating, rotate-half RoPE instead of interleaved-pair, no sliding
+//! window, tied lm_head instead of an independent `text_linear`).
 
 use burn::backend::wgpu::{Wgpu, WgpuDevice};
-use burn::tensor::Tensor;
+use burn::tensor::activation::{silu, softmax};
+use burn::tensor::{Int, Tensor};
 
 use crate::gguf::{EmbeddingStore, Q4Linear};
+use crate::kv::KvCache;
 use crate::LlmConfig;
 
 // ---------------------------------------------------------------------------
-// RoPE — Rotary Position Embeddings
+// RoPE — Rotary Position Embeddings (rotate-half / HF Llama-Qwen2 convention)
 // ---------------------------------------------------------------------------
 
-/// Rotary Position Embeddings with precomputed cos/sin tables.
-///
-/// NOTE: stt-wasm's (unported) `apply()` used the interleaved/GPT-NeoX-pair
-/// convention. Qwen2 (HF `rotate_half`) needs the contiguous-half-split
-/// convention instead — see docs/ENGINE.md §3.
+/// Rotary Position Embeddings with precomputed cos/sin tables, HF
+/// `rotate_half` convention: `head_dim` splits into two contiguous halves
+/// `[x0..x_{d/2})` / `[x_{d/2}..x_d)`, rotated against each other — **not**
+/// stt-wasm's interleaved-pair convention (docs/ENGINE.md §3). `cos`/`sin`
+/// are `[max_seq_len, head_dim]` (the per-half-dim frequency table
+/// concatenated with itself, matching HF's `emb = cat([freqs, freqs],
+/// dim=-1)`) so they can be sliced and broadcast-multiplied directly against
+/// `[.., head_dim]`-shaped q/k tensors.
 pub struct RoPE {
-    #[allow(dead_code)]
     cos: Tensor<Wgpu, 2>,
-    #[allow(dead_code)]
     sin: Tensor<Wgpu, 2>,
 }
 
@@ -47,23 +42,47 @@ impl RoPE {
             .map(|i| 1.0 / (theta as f32).powf((2 * i) as f32 / head_dim as f32))
             .collect();
 
-        let positions: Vec<f32> = (0..max_seq_len).map(|i| i as f32).collect();
-
-        let mut freqs = vec![0.0f32; max_seq_len * half_dim];
-        for i in 0..max_seq_len {
+        // freqs[pos, j] = pos * inv_freq[j], then duplicated across the
+        // second half: emb = [freqs, freqs] (HF `Qwen2RotaryEmbedding`).
+        let mut emb = vec![0.0f32; max_seq_len * head_dim];
+        for pos in 0..max_seq_len {
             for j in 0..half_dim {
-                freqs[i * half_dim + j] = positions[i] * inv_freq[j];
+                let v = pos as f32 * inv_freq[j];
+                emb[pos * head_dim + j] = v;
+                emb[pos * head_dim + half_dim + j] = v;
             }
         }
 
-        let freqs = Tensor::<Wgpu, 1>::from_floats(freqs.as_slice(), device)
-            .reshape([max_seq_len, half_dim]);
+        let emb = Tensor::<Wgpu, 1>::from_floats(emb.as_slice(), device)
+            .reshape([max_seq_len, head_dim]);
 
-        let cos = freqs.clone().cos();
-        let sin = freqs.sin();
+        let cos = emb.clone().cos();
+        let sin = emb.sin();
 
         RoPE { cos, sin }
     }
+
+    /// cos/sin slices for absolute positions `[offset, offset+len)`, shaped
+    /// `[1, 1, len, head_dim]` for broadcast against `[B, H, len, head_dim]`.
+    fn slice(&self, offset: usize, len: usize) -> (Tensor<Wgpu, 4>, Tensor<Wgpu, 4>) {
+        let cos = self.cos.clone().narrow(0, offset, len).unsqueeze::<4>();
+        let sin = self.sin.clone().narrow(0, offset, len).unsqueeze::<4>();
+        (cos, sin)
+    }
+}
+
+/// `rotate_half(x) = cat(-x[..., d/2:], x[..., :d/2])`.
+fn rotate_half(x: Tensor<Wgpu, 4>) -> Tensor<Wgpu, 4> {
+    let d = x.dims()[3];
+    let half = d / 2;
+    let x1 = x.clone().narrow(3, 0, half);
+    let x2 = x.narrow(3, half, half);
+    Tensor::cat(vec![x2.mul_scalar(-1.0), x1], 3)
+}
+
+/// `x_rope = x * cos + rotate_half(x) * sin`.
+fn apply_rope(x: Tensor<Wgpu, 4>, cos: Tensor<Wgpu, 4>, sin: Tensor<Wgpu, 4>) -> Tensor<Wgpu, 4> {
+    x.clone() * cos + rotate_half(x) * sin
 }
 
 // ---------------------------------------------------------------------------
@@ -82,72 +101,159 @@ impl RmsNormLayer {
 }
 
 // ---------------------------------------------------------------------------
-// Q4Attention
+// Q4Attention — GQA with q/k/v bias
 // ---------------------------------------------------------------------------
 
-/// Multi-head attention with combined QKV projection (stt-web shape, see the
-/// module doc comment above — needs reworking to separate q/k/v + bias).
+/// Grouped-query attention: `n_heads` query heads, `n_kv_heads` key/value
+/// heads (`n_heads / n_kv_heads` query heads share each KV head). Qwen2's
+/// q/k/v projections carry bias; `attn_output` doesn't (docs/MODELS.md §2).
 pub struct Q4Attention {
-    #[allow(dead_code)]
-    in_proj: Q4Linear,
-    #[allow(dead_code)]
-    out_proj: Q4Linear,
-    #[allow(dead_code)]
+    q_proj: Q4Linear,
+    k_proj: Q4Linear,
+    v_proj: Q4Linear,
+    o_proj: Q4Linear,
     n_heads: usize,
-    #[allow(dead_code)]
     n_kv_heads: usize,
-    #[allow(dead_code)]
     head_dim: usize,
-    #[allow(dead_code)]
-    dim: usize,
-    #[allow(dead_code)]
     scale: f32,
-    #[allow(dead_code)]
-    sliding_window: Option<usize>,
 }
 
 impl Q4Attention {
     pub fn new(
-        in_proj: Q4Linear,
-        out_proj: Q4Linear,
+        q_proj: Q4Linear,
+        k_proj: Q4Linear,
+        v_proj: Q4Linear,
+        o_proj: Q4Linear,
         n_heads: usize,
         n_kv_heads: usize,
         head_dim: usize,
-        sliding_window: Option<usize>,
     ) -> Self {
-        let dim = n_heads * head_dim;
         Self {
-            in_proj,
-            out_proj,
+            q_proj,
+            k_proj,
+            v_proj,
+            o_proj,
             n_heads,
             n_kv_heads,
             head_dim,
-            dim,
             scale: (head_dim as f32).powf(-0.5),
-            sliding_window,
         }
+    }
+
+    /// `x`: `[1, T, hidden]`. `cache`/`layer_idx`/`offset` give the absolute
+    /// position (for RoPE) and prior KV length (for the causal mask) — see
+    /// `kv.rs` for cache layout. Returns `[1, T, hidden]`.
+    fn forward(
+        &self,
+        x: Tensor<Wgpu, 3>,
+        rope: &RoPE,
+        cache: &mut KvCache,
+        layer_idx: usize,
+        offset: usize,
+    ) -> Tensor<Wgpu, 3> {
+        let [b, t, _] = x.dims();
+        assert_eq!(b, 1, "batch size 1 only (single-session MCP agent)");
+
+        let q = self.q_proj.forward(x.clone());
+        let k = self.k_proj.forward(x.clone());
+        let v = self.v_proj.forward(x);
+
+        // [1, T, H, Dh] -> [1, H, T, Dh]
+        let q = q
+            .reshape([b, t, self.n_heads, self.head_dim])
+            .permute([0, 2, 1, 3]);
+        let k = k
+            .reshape([b, t, self.n_kv_heads, self.head_dim])
+            .permute([0, 2, 1, 3]);
+        let v = v
+            .reshape([b, t, self.n_kv_heads, self.head_dim])
+            .permute([0, 2, 1, 3]);
+
+        let (cos, sin) = rope.slice(offset, t);
+        let q = apply_rope(q, cos.clone(), sin.clone());
+        let k = apply_rope(k, cos, sin);
+
+        let (k_all, v_all) = cache.append(layer_idx, k, v);
+        let kv_len = offset + t;
+
+        let n_rep = self.n_heads / self.n_kv_heads;
+        let k_all = repeat_kv(k_all, n_rep);
+        let v_all = repeat_kv(v_all, n_rep);
+
+        // [1, H, T, Dh] x [1, H, Dh, kv_len] -> [1, H, T, kv_len]
+        let scores = q.matmul(k_all.swap_dims(2, 3)) * self.scale;
+        let scores = apply_causal_mask(scores, t, kv_len, offset);
+        let probs = softmax(scores, 3);
+
+        // [1, H, T, kv_len] x [1, H, kv_len, Dh] -> [1, H, T, Dh]
+        let out = probs.matmul(v_all);
+        let out = out.permute([0, 2, 1, 3]).reshape([b, t, self.n_heads * self.head_dim]);
+
+        self.o_proj.forward(out)
     }
 }
 
+/// Repeat each of `n_kv_heads` KV heads `n_rep` times along the head axis
+/// (axis 1) so shapes line up with `n_heads = n_kv_heads * n_rep` query
+/// heads — HF `repeat_kv`.
+fn repeat_kv(x: Tensor<Wgpu, 4>, n_rep: usize) -> Tensor<Wgpu, 4> {
+    if n_rep == 1 {
+        return x;
+    }
+    let n_kv_heads = x.dims()[1];
+    let mut heads = Vec::with_capacity(n_kv_heads * n_rep);
+    for h in 0..n_kv_heads {
+        let slice = x.clone().narrow(1, h, 1);
+        for _ in 0..n_rep {
+            heads.push(slice.clone());
+        }
+    }
+    Tensor::cat(heads, 1)
+}
+
+/// Additive-mask-free causal mask via `mask_fill`: position `i` (absolute
+/// `offset + i`) may attend to key `j` iff `j <= offset + i`. `scores`:
+/// `[1, H, T, kv_len]`.
+fn apply_causal_mask(
+    scores: Tensor<Wgpu, 4>,
+    t: usize,
+    kv_len: usize,
+    offset: usize,
+) -> Tensor<Wgpu, 4> {
+    let device = scores.device();
+    let q_pos = Tensor::<Wgpu, 1, Int>::arange(0..t as i64, &device)
+        .reshape([t, 1])
+        .add_scalar(offset as i64);
+    let k_pos = Tensor::<Wgpu, 1, Int>::arange(0..kv_len as i64, &device).reshape([1, kv_len]);
+    // true where key position is in the future (masked out)
+    let mask = k_pos.greater(q_pos).unsqueeze::<4>();
+    scores.mask_fill(mask, f32::NEG_INFINITY)
+}
+
 // ---------------------------------------------------------------------------
-// Q4FeedForward
+// Q4FeedForward — 3-matrix SwiGLU
 // ---------------------------------------------------------------------------
 
-/// Gated MLP, 2-matrix STT form (see module doc comment — Qwen2/Llama need the
-/// 3-matrix gate_proj/up_proj/down_proj form instead).
+/// SwiGLU MLP: `down_proj(silu(gate_proj(x)) * up_proj(x))`.
 pub struct Q4FeedForward {
-    #[allow(dead_code)]
-    linear_in: Q4Linear,
-    #[allow(dead_code)]
-    linear_out: Q4Linear,
+    gate_proj: Q4Linear,
+    up_proj: Q4Linear,
+    down_proj: Q4Linear,
 }
 
 impl Q4FeedForward {
-    pub fn new(linear_in: Q4Linear, linear_out: Q4Linear) -> Self {
+    pub fn new(gate_proj: Q4Linear, up_proj: Q4Linear, down_proj: Q4Linear) -> Self {
         Self {
-            linear_in,
-            linear_out,
+            gate_proj,
+            up_proj,
+            down_proj,
         }
+    }
+
+    fn forward(&self, x: Tensor<Wgpu, 3>) -> Tensor<Wgpu, 3> {
+        let gate = silu(self.gate_proj.forward(x.clone()));
+        let up = self.up_proj.forward(x);
+        self.down_proj.forward(gate * up)
     }
 }
 
@@ -155,15 +261,11 @@ impl Q4FeedForward {
 // Q4TransformerBlock
 // ---------------------------------------------------------------------------
 
-/// Pre-LN transformer block with Q4 weights.
+/// Pre-LN (RMSNorm) transformer block: `x += attn(norm(x)); x += ffn(norm(x))`.
 pub struct Q4TransformerBlock {
-    #[allow(dead_code)]
     attention_norm: RmsNormLayer,
-    #[allow(dead_code)]
     attention: Q4Attention,
-    #[allow(dead_code)]
     ffn_norm: RmsNormLayer,
-    #[allow(dead_code)]
     ffn: Q4FeedForward,
 }
 
@@ -181,60 +283,163 @@ impl Q4TransformerBlock {
             ffn,
         }
     }
+
+    fn forward(
+        &self,
+        x: Tensor<Wgpu, 3>,
+        rope: &RoPE,
+        cache: &mut KvCache,
+        layer_idx: usize,
+        offset: usize,
+    ) -> Tensor<Wgpu, 3> {
+        let attn_out = self
+            .attention
+            .forward(self.attention_norm.forward(x.clone()), rope, cache, layer_idx, offset);
+        let x = x + attn_out;
+        let ffn_out = self.ffn.forward(self.ffn_norm.forward(x.clone()));
+        x + ffn_out
+    }
 }
 
 // ---------------------------------------------------------------------------
 // LlmModel
 // ---------------------------------------------------------------------------
 
-/// The complete transformer model (still carrying stt-web's `audio_emb` field
-/// — see module doc comment; xLAM-2-3b-fc-r has no audio embeddings, and its
-/// `text_emb`/`text_emb_gpu` double as the tied lm_head instead of a separate
-/// `text_linear`).
+/// The complete Qwen2 decoder. `lm_head` is tied to `embed`'s Q4 buffer (same
+/// GPU handle, shared via `Q4Tensor::clone` at load time — docs/MODELS.md §2:
+/// no independent `output.weight` tensor exists in this GGUF).
 pub struct LlmModel {
-    #[allow(dead_code)]
-    audio_emb: Vec<EmbeddingStore>,
-    #[allow(dead_code)]
-    text_emb: EmbeddingStore,
-    #[allow(dead_code)]
-    text_emb_gpu: Tensor<Wgpu, 2>,
-    #[allow(dead_code)]
+    embed: EmbeddingStore,
     layers: Vec<Q4TransformerBlock>,
-    #[allow(dead_code)]
     rope: RoPE,
-    #[allow(dead_code)]
     out_norm: RmsNormLayer,
-    #[allow(dead_code)]
-    text_linear: Q4Linear,
-    #[allow(dead_code)]
+    lm_head: Q4Linear,
     config: LlmConfig,
-    #[allow(dead_code)]
     device: WgpuDevice,
 }
 
 impl LlmModel {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        audio_emb: Vec<EmbeddingStore>,
-        text_emb: EmbeddingStore,
-        text_emb_gpu: Tensor<Wgpu, 2>,
+        embed: EmbeddingStore,
         layers: Vec<Q4TransformerBlock>,
         rope: RoPE,
         out_norm: RmsNormLayer,
-        text_linear: Q4Linear,
+        lm_head: Q4Linear,
         config: LlmConfig,
         device: WgpuDevice,
     ) -> Self {
         Self {
-            audio_emb,
-            text_emb,
-            text_emb_gpu,
+            embed,
             layers,
             rope,
             out_norm,
-            text_linear,
+            lm_head,
             config,
             device,
         }
     }
+
+    pub fn config(&self) -> &LlmConfig {
+        &self.config
+    }
+
+    pub fn device(&self) -> &WgpuDevice {
+        &self.device
+    }
+
+    /// New KV cache sized for this model, `max_ctx` timesteps.
+    pub fn new_cache(&self, max_ctx: usize) -> KvCache {
+        KvCache::new(
+            self.config.num_layers,
+            self.config.num_kv_heads,
+            self.config.hidden_size / self.config.num_heads,
+            max_ctx,
+            &self.device,
+        )
+    }
+
+    /// Embed `token_ids` on CPU (per-row Q4 dequant) and upload as `[1, T, hidden]`.
+    fn embed_tokens(&self, token_ids: &[u32]) -> Tensor<Wgpu, 3> {
+        let hidden = self.config.hidden_size;
+        let mut data = vec![0.0f32; token_ids.len() * hidden];
+        for (i, &id) in token_ids.iter().enumerate() {
+            self.embed
+                .embed_id_add_cpu(id, &mut data[i * hidden..(i + 1) * hidden]);
+        }
+        Tensor::<Wgpu, 1>::from_floats(data.as_slice(), &self.device).reshape([
+            1,
+            token_ids.len(),
+            hidden,
+        ])
+    }
+
+    /// Run all transformer layers + final norm over `token_ids`, appending to
+    /// `cache` at its current length. Returns hidden states `[1, T, hidden]`
+    /// (post `output_norm`, pre lm_head — callers slice before calling
+    /// `lm_head` to avoid materializing `T x 151936` logits when only a few
+    /// positions are needed, e.g. prefill's last-token generation step).
+    pub fn forward_hidden(&self, token_ids: &[u32], cache: &mut KvCache) -> Tensor<Wgpu, 3> {
+        let offset = cache.len();
+        let mut x = self.embed_tokens(token_ids);
+        for (i, layer) in self.layers.iter().enumerate() {
+            x = layer.forward(x, &self.rope, cache, i, offset);
+        }
+        cache.advance(token_ids.len());
+        self.out_norm.forward(x)
+    }
+
+    /// lm_head over hidden states `[1, T, hidden]` -> logits `[1, T, vocab]`.
+    /// Callers should narrow `hidden` to only the positions they need first
+    /// (the 151936-wide head is 0.6MB/row of f32 output).
+    pub fn lm_head(&self, hidden: Tensor<Wgpu, 3>) -> Tensor<Wgpu, 3> {
+        self.lm_head.forward(hidden)
+    }
+
+    /// Convenience: full forward + full-width logits for every position.
+    /// Only use for small T (tests); for real prefill, slice `forward_hidden`'s
+    /// output to the positions you need before calling `lm_head`.
+    pub fn forward_logits(&self, token_ids: &[u32], cache: &mut KvCache) -> Tensor<Wgpu, 3> {
+        let hidden = self.forward_hidden(token_ids, cache);
+        self.lm_head(hidden)
+    }
+
+    /// Greedy-decode `max_new` tokens after prefilling `prompt_ids` into
+    /// `cache` (which may already hold a restored prefix — see
+    /// `KvCache::snapshot`/`restore`). Stops early (without including the
+    /// stop token) if a generated id is in `stop_ids`. Only the last
+    /// prefill position's logits are computed (never the full `T x vocab`
+    /// matrix) — see module doc comment on `forward_hidden`.
+    pub fn generate(
+        &self,
+        prompt_ids: &[u32],
+        max_new: usize,
+        stop_ids: &[u32],
+        cache: &mut KvCache,
+    ) -> Vec<u32> {
+        assert!(!prompt_ids.is_empty());
+        let hidden = self.forward_hidden(prompt_ids, cache);
+        let last = hidden.narrow(1, prompt_ids.len() - 1, 1);
+        let mut logits = self.lm_head(last);
+
+        let mut out = Vec::with_capacity(max_new);
+        for _ in 0..max_new {
+            let logits_vec = logits_to_vec(logits);
+            let next = crate::sample::greedy(&logits_vec);
+            if stop_ids.contains(&next) {
+                break;
+            }
+            out.push(next);
+            let hidden = self.forward_hidden(&[next], cache);
+            logits = self.lm_head(hidden);
+        }
+        out
+    }
+}
+
+/// Extract a `[1, 1, vocab]` (or `[1, T=1, vocab]`) logits tensor to a flat
+/// `Vec<f32>`. Native-only sync readback (`into_data()`); WASM callers must
+/// use `into_data_async().await` instead (see crate-level WASM constraints).
+pub fn logits_to_vec(logits: Tensor<Wgpu, 3>) -> Vec<f32> {
+    logits.into_data().into_vec::<f32>().expect("f32 logits")
 }

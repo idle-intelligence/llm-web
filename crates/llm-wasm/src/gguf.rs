@@ -1,20 +1,30 @@
-// Copied from stt-web crates/stt-wasm/src/gguf.rs at commit 16940c99218303747c13bbe905f538628415ce64.
-// Imports adjusted for this crate: crate::model::SttModel -> crate::model::LlmModel,
-// crate::SttConfig -> crate::LlmConfig (and all in-file uses of those two type names
-// renamed to match). No other logic changes. Tensor-name assumptions (emb.{i}.weight,
-// text_emb.weight, transformer.layers.{i}...) are stt-web/Kyutai-specific and do NOT
-// match Qwen2/GGUF-convention names (blk.N.attn_q.weight, ...) -- see docs/ENGINE.md §1
-// and docs/MODELS.md §2. Rewriting this naming table for Qwen2 is phase-1b work.
+// Rewritten from the stt-web copy (see git history) for Qwen2/xLAM-2-3b-fc-r's
+// GGUF layout. GGUF metadata KV pairs are now parsed generically (not
+// skipped) so `qwen2.*` hyperparameters can be read from the file instead of
+// hand-copied; tensor names follow llama.cpp's `blk.N.attn_{q,k,v,output}`
+// convention (docs/MODELS.md §2). See docs/ENGINE.md §1 for the audit this
+// replaces.
 
 //! Q4 GGUF weight loader and WGSL dequantization shaders.
 //!
-//! Pipeline: GGUF file → parse header/tensors → store Q4 blocks as raw bytes
-//! on GPU → dequantize via WGSL compute shader → matmul.
+//! Pipeline: GGUF file → parse header/metadata/tensors → store Q4 blocks as
+//! raw bytes on GPU → dequantize via WGSL compute shader → matmul.
 //!
-//! Key patterns from voxtral-mini-realtime-rs:
 //! - `ShardedCursor`: Read+Seek over Vec<Vec<u8>> for multi-shard GGUF (stays under 2GB allocation limit)
 //! - Two-phase loading: parse GGUF, drop reader, finalize tensors (stays under 4GB address space)
-//! - Naive WGSL kernel for WASM (tiled kernel is native-only)
+//! - Naive WGSL kernel for WASM (tiled kernel is native-only, not yet written)
+//!
+//! Embedding-lookup strategy (see docs/ENGINE.md §1's 1.16GB-dequant warning):
+//! `token_embd.weight` ([151936, 2048], Q4_0, tied to the lm_head — no
+//! `output.weight` tensor exists) is kept as raw Q4_0 bytes on **both** the
+//! CPU (`EmbeddingStore`, for cheap per-token row dequant at input time —
+//! 2048 values, ~64 blocks, negligible cost even at M=8000+ prefill) and the
+//! GPU (`Q4Tensor`, reused directly as the lm_head's matmul weight through
+//! the same kernel that serves every other linear layer). This avoids ever
+//! materializing the full 151936×2048 table as F32 (which would cost 1.2GB),
+//! unlike stt-wasm's `dequant_embedding_to_gpu` (appropriate there only
+//! because its vocab was 8001, ~62MB) — deliberately *not* reusing that
+//! pattern here.
 
 use anyhow::{bail, ensure, Context, Result};
 use burn::backend::wgpu::{
@@ -31,7 +41,9 @@ use cubecl::{CubeTask, Runtime};
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
 
-use crate::model::{Q4TransformerBlock, Q4Attention, Q4FeedForward, RmsNormLayer, RoPE, LlmModel};
+use crate::model::{
+    LlmModel, Q4Attention, Q4FeedForward, Q4TransformerBlock, RmsNormLayer, RoPE,
+};
 use crate::LlmConfig;
 
 // ---------------------------------------------------------------------------
@@ -86,8 +98,8 @@ fn align_up(offset: u64, alignment: u64) -> u64 {
 
 /// Reverse GGUF dimension order to get PyTorch convention.
 ///
-/// GGUF stores dimensions in reversed order (row-major innermost first),
-/// while PyTorch uses `[out_features, in_features]` convention.
+/// GGUF stores dimensions `ne[]` with `ne[0]` fastest-varying (innermost),
+/// while PyTorch/`Q4Tensor` use `[out_features, in_features]` convention.
 fn reverse_gguf_dims(gguf_dims: &[u64]) -> Vec<usize> {
     gguf_dims.iter().rev().map(|&d| d as usize).collect()
 }
@@ -103,17 +115,61 @@ fn read_gguf_string<R: Read>(reader: &mut R) -> Result<String> {
     String::from_utf8(buf).context("Invalid UTF-8 in GGUF string")
 }
 
+/// A parsed GGUF metadata value. Arrays are not materialized (we never need
+/// array *contents* for config extraction — vocab size is instead read off
+/// `token_embd.weight`'s tensor shape) but their length/element-type are kept
+/// so `llm-agent gguf-info` can report them.
+#[derive(Debug, Clone)]
+pub enum GgufValue {
+    U8(u8),
+    I8(i8),
+    U16(u16),
+    I16(i16),
+    U32(u32),
+    I32(i32),
+    F32(f32),
+    Bool(bool),
+    String(String),
+    U64(u64),
+    I64(i64),
+    F64(f64),
+    Array { elem_type: u32, len: u64 },
+}
+
+fn read_gguf_scalar<R: Read>(reader: &mut R, value_type: u32) -> Result<GgufValue> {
+    Ok(match value_type {
+        0 => GgufValue::U8(reader.read_u8()?),
+        1 => GgufValue::I8(reader.read_i8()?),
+        2 => GgufValue::U16(reader.read_u16::<LittleEndian>()?),
+        3 => GgufValue::I16(reader.read_i16::<LittleEndian>()?),
+        4 => GgufValue::U32(reader.read_u32::<LittleEndian>()?),
+        5 => GgufValue::I32(reader.read_i32::<LittleEndian>()?),
+        6 => GgufValue::F32(reader.read_f32::<LittleEndian>()?),
+        7 => GgufValue::Bool(reader.read_u8()? != 0),
+        8 => GgufValue::String(read_gguf_string(reader)?),
+        10 => GgufValue::U64(reader.read_u64::<LittleEndian>()?),
+        11 => GgufValue::I64(reader.read_i64::<LittleEndian>()?),
+        12 => GgufValue::F64(reader.read_f64::<LittleEndian>()?),
+        other => bail!("Unexpected scalar GGUF value type: {other}"),
+    })
+}
+
+/// Skip (without allocating) the contents of a GGUF value; used for array
+/// elements, whose contents we don't need (tokenizer.ggml.tokens etc.).
 fn skip_gguf_value<R: Read + Seek>(reader: &mut R, value_type: u32) -> Result<()> {
     match value_type {
-        0 => { reader.read_u8()?; }
-        1 => { reader.read_i8()?; }
-        2 => { reader.seek(SeekFrom::Current(2))?; }
-        3 => { reader.seek(SeekFrom::Current(2))?; }
-        4 => { reader.seek(SeekFrom::Current(4))?; }
-        5 => { reader.seek(SeekFrom::Current(4))?; }
-        6 => { reader.seek(SeekFrom::Current(4))?; }
-        7 => { reader.read_u8()?; }
-        8 => { let _ = read_gguf_string(reader)?; }
+        0 | 1 | 7 => {
+            reader.seek(SeekFrom::Current(1))?;
+        }
+        2 | 3 => {
+            reader.seek(SeekFrom::Current(2))?;
+        }
+        4..=6 => {
+            reader.seek(SeekFrom::Current(4))?;
+        }
+        8 => {
+            let _ = read_gguf_string(reader)?;
+        }
         9 => {
             let elem_type = reader.read_u32::<LittleEndian>()?;
             let count = reader.read_u64::<LittleEndian>()?;
@@ -121,12 +177,29 @@ fn skip_gguf_value<R: Read + Seek>(reader: &mut R, value_type: u32) -> Result<()
                 skip_gguf_value(reader, elem_type)?;
             }
         }
-        10 => { reader.seek(SeekFrom::Current(8))?; }
-        11 => { reader.seek(SeekFrom::Current(8))?; }
-        12 => { reader.seek(SeekFrom::Current(8))?; }
+        10..=12 => {
+            reader.seek(SeekFrom::Current(8))?;
+        }
         other => bail!("Unknown GGUF metadata value type: {other}"),
     }
     Ok(())
+}
+
+/// Read a top-level GGUF metadata value (scalar or array).
+fn read_gguf_value<R: Read + Seek>(reader: &mut R, value_type: u32) -> Result<GgufValue> {
+    if value_type == 9 {
+        let elem_type = reader.read_u32::<LittleEndian>()?;
+        let count = reader.read_u64::<LittleEndian>()?;
+        for _ in 0..count {
+            skip_gguf_value(reader, elem_type)?;
+        }
+        Ok(GgufValue::Array {
+            elem_type,
+            len: count,
+        })
+    } else {
+        read_gguf_scalar(reader, value_type)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -159,6 +232,14 @@ impl GgmlDtype {
                 let num_blocks = num_elements / 32;
                 num_blocks * 18
             }
+        }
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::F32 => "F32",
+            Self::F16 => "F16",
+            Self::Q4_0 => "Q4_0",
         }
     }
 }
@@ -204,6 +285,9 @@ pub struct GgufReader<R: Read + Seek> {
     version: u32,
     tensor_count: u64,
     tensors: HashMap<String, GgufTensorInfo>,
+    /// Ordered tensor names, in on-disk order (for `gguf-info` printing).
+    tensor_order: Vec<String>,
+    metadata: HashMap<String, GgufValue>,
     data_section_offset: u64,
 }
 
@@ -231,19 +315,23 @@ impl<R: Read + Seek> GgufReader<R> {
             .read_u64::<LittleEndian>()
             .context("Failed to read metadata KV count")?;
 
-        // Skip metadata key-value pairs
+        // Parse metadata key-value pairs generically (not skipped — Qwen2
+        // hyperparameters come from here rather than being hand-copied).
+        let mut metadata = HashMap::with_capacity(metadata_kv_count as usize);
         for i in 0..metadata_kv_count {
-            let _key = read_gguf_string(&mut reader)
+            let key = read_gguf_string(&mut reader)
                 .with_context(|| format!("Failed to read metadata key {i}"))?;
             let value_type = reader
                 .read_u32::<LittleEndian>()
                 .with_context(|| format!("Failed to read metadata value type {i}"))?;
-            skip_gguf_value(&mut reader, value_type)
-                .with_context(|| format!("Failed to skip metadata value {i}"))?;
+            let value = read_gguf_value(&mut reader, value_type)
+                .with_context(|| format!("Failed to read metadata value {i} ('{key}')"))?;
+            metadata.insert(key, value);
         }
 
         // Parse tensor index
         let mut tensors = HashMap::with_capacity(tensor_count as usize);
+        let mut tensor_order = Vec::with_capacity(tensor_count as usize);
         for i in 0..tensor_count {
             let name = read_gguf_string(&mut reader)
                 .with_context(|| format!("Failed to read tensor name {i}"))?;
@@ -267,6 +355,7 @@ impl<R: Read + Seek> GgufReader<R> {
                 .read_u64::<LittleEndian>()
                 .with_context(|| format!("Failed to read offset for tensor {i}"))?;
 
+            tensor_order.push(name.clone());
             tensors.insert(
                 name.clone(),
                 GgufTensorInfo {
@@ -286,6 +375,8 @@ impl<R: Read + Seek> GgufReader<R> {
             version,
             tensor_count,
             tensors,
+            tensor_order,
+            metadata,
             data_section_offset,
         })
     }
@@ -302,6 +393,45 @@ impl<R: Read + Seek> GgufReader<R> {
         self.tensors.get(name)
     }
 
+    pub fn tensor_names(&self) -> &[String] {
+        &self.tensor_order
+    }
+
+    pub fn metadata(&self) -> &HashMap<String, GgufValue> {
+        &self.metadata
+    }
+
+    /// Read a metadata value as u32, widening from any integer variant.
+    pub fn meta_u32(&self, key: &str) -> Option<u32> {
+        match self.metadata.get(key)? {
+            GgufValue::U8(v) => Some(*v as u32),
+            GgufValue::U16(v) => Some(*v as u32),
+            GgufValue::U32(v) => Some(*v),
+            GgufValue::U64(v) => Some(*v as u32),
+            GgufValue::I8(v) => Some(*v as u32),
+            GgufValue::I16(v) => Some(*v as u32),
+            GgufValue::I32(v) => Some(*v as u32),
+            GgufValue::I64(v) => Some(*v as u32),
+            _ => None,
+        }
+    }
+
+    /// Read a metadata value as f32, widening from f32/f64.
+    pub fn meta_f32(&self, key: &str) -> Option<f32> {
+        match self.metadata.get(key)? {
+            GgufValue::F32(v) => Some(*v),
+            GgufValue::F64(v) => Some(*v as f32),
+            _ => None,
+        }
+    }
+
+    pub fn meta_string(&self, key: &str) -> Option<&str> {
+        match self.metadata.get(key)? {
+            GgufValue::String(s) => Some(s.as_str()),
+            _ => None,
+        }
+    }
+
     /// Read raw tensor data bytes from the file.
     pub fn tensor_data(&mut self, name: &str) -> Result<Vec<u8>> {
         let info = self
@@ -316,6 +446,90 @@ impl<R: Read + Seek> GgufReader<R> {
         self.reader.read_exact(&mut buf)?;
         Ok(buf)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Config extraction — qwen2.* metadata -> LlmConfig
+// ---------------------------------------------------------------------------
+
+/// Build an [`LlmConfig`] from a GGUF's `qwen2.*` metadata (docs/MODELS.md §2).
+///
+/// Vocab size is read from `token_embd.weight`'s tensor shape rather than any
+/// metadata array length, since the tokenizer's own vocab (151665) is smaller
+/// than the padded embedding matrix (151936) — see docs/MODELS.md §1.
+pub fn config_from_gguf<R: Read + Seek>(reader: &GgufReader<R>) -> Result<LlmConfig> {
+    let arch = reader.meta_string("general.architecture").unwrap_or("");
+    ensure!(
+        arch == "qwen2",
+        "Expected general.architecture = 'qwen2', got '{arch}'"
+    );
+
+    let num_layers = reader
+        .meta_u32("qwen2.block_count")
+        .context("Missing qwen2.block_count")? as usize;
+    let hidden_size = reader
+        .meta_u32("qwen2.embedding_length")
+        .context("Missing qwen2.embedding_length")? as usize;
+    let intermediate_size = reader
+        .meta_u32("qwen2.feed_forward_length")
+        .context("Missing qwen2.feed_forward_length")? as usize;
+    let num_heads = reader
+        .meta_u32("qwen2.attention.head_count")
+        .context("Missing qwen2.attention.head_count")? as usize;
+    let num_kv_heads = reader
+        .meta_u32("qwen2.attention.head_count_kv")
+        .context("Missing qwen2.attention.head_count_kv")? as usize;
+    let rms_norm_eps = reader
+        .meta_f32("qwen2.attention.layer_norm_rms_epsilon")
+        .context("Missing qwen2.attention.layer_norm_rms_epsilon")? as f64;
+    let rope_theta = reader
+        .meta_f32("qwen2.rope.freq_base")
+        .context("Missing qwen2.rope.freq_base")? as f64;
+    let max_seq_len = reader
+        .meta_u32("qwen2.context_length")
+        .context("Missing qwen2.context_length")? as usize;
+
+    let bos_token_id = reader.meta_u32("tokenizer.ggml.bos_token_id").unwrap_or(151643);
+    let eos_token_id = reader.meta_u32("tokenizer.ggml.eos_token_id").unwrap_or(151645);
+    let pad_token_id = reader
+        .meta_u32("tokenizer.ggml.padding_token_id")
+        .unwrap_or(151643);
+    // generation_config.json's eos list is [151645, 151643] (im_end, then
+    // endoftext/pad as fallback) — see docs/MODELS.md §1. Dedup in case the
+    // GGUF's own eos/pad happen to coincide.
+    let mut eos_token_ids = vec![eos_token_id];
+    if pad_token_id != eos_token_id {
+        eos_token_ids.push(pad_token_id);
+    }
+
+    let embd_info = reader
+        .tensor_info("token_embd.weight")
+        .context("Missing tensor 'token_embd.weight'")?;
+    let embd_shape = reverse_gguf_dims(embd_info.shape());
+    ensure!(
+        embd_shape.len() == 2,
+        "Expected 2D token_embd.weight, got {embd_shape:?}"
+    );
+    let vocab_size = embd_shape[0];
+    ensure!(
+        embd_shape[1] == hidden_size,
+        "token_embd.weight hidden dim {} != qwen2.embedding_length {hidden_size}",
+        embd_shape[1]
+    );
+
+    Ok(LlmConfig {
+        num_layers,
+        hidden_size,
+        num_heads,
+        num_kv_heads,
+        intermediate_size,
+        vocab_size,
+        rope_theta,
+        max_seq_len,
+        rms_norm_eps,
+        bos_token_id,
+        eos_token_ids,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -411,7 +625,11 @@ impl Seek for ShardedCursor {
 /// A Q4_0 quantized weight tensor living on GPU.
 ///
 /// The buffer contains raw Q4_0 blocks (18 bytes per block of 32 elements).
-/// The WGSL shader interprets the buffer as `array<u32>`.
+/// The WGSL shader interprets the buffer as `array<u32>`. `Clone` is a cheap
+/// handle clone (ref-counted GPU buffer, not a copy) — used to share
+/// `token_embd.weight`'s buffer between the embedding table and the tied
+/// lm_head matmul.
+#[derive(Clone)]
 pub struct Q4Tensor {
     pub(crate) handle: Handle,
     shape: [usize; 2],
@@ -474,7 +692,9 @@ impl Q4Tensor {
 /// A linear layer with Q4_0 quantized weights.
 ///
 /// Stores weights as `[out_features, in_features]` in Q4_0 format and an
-/// optional f32 bias. Forward: `x @ weights^T + bias` via fused dequant+matmul.
+/// optional f32 bias (Qwen2's q/k/v projections carry bias; attn_output and
+/// all ffn_* projections don't — docs/MODELS.md §2). Forward: `x @ weights^T
+/// + bias` via fused dequant+matmul.
 pub struct Q4Linear {
     weights: Q4Tensor,
     bias: Option<Tensor<Wgpu, 1>>,
@@ -483,6 +703,14 @@ pub struct Q4Linear {
 impl Q4Linear {
     pub fn new(weights: Q4Tensor, bias: Option<Tensor<Wgpu, 1>>) -> Self {
         Self { weights, bias }
+    }
+
+    pub fn out_features(&self) -> usize {
+        self.weights.shape()[0]
+    }
+
+    pub fn in_features(&self) -> usize {
+        self.weights.shape()[1]
     }
 
     /// Forward pass: `x @ weights^T + bias`.
@@ -521,7 +749,9 @@ impl KernelSource for Q4MatmulNaiveKernel {
 
 /// Fused Q4_0 dequant+matmul on GPU.
 ///
-/// Computes `output[B, M, N] = input[B, M, K] × weights[N, K]^T`.
+/// Computes `output[B, M, N] = input[B, M, K] × weights[N, K]^T`. General
+/// over M — serves both prefill (M = prompt length) and decode (M = 1)
+/// through the same naive kernel (docs/ENGINE.md §2).
 pub fn q4_matmul(input: Tensor<Wgpu, 3>, weights: &Q4Tensor) -> Tensor<Wgpu, 3> {
     let cube_input: CubeTensor<WgpuRuntime> = input.into_primitive().tensor();
     let cube_input = into_contiguous(cube_input);
@@ -592,7 +822,8 @@ pub fn q4_matmul(input: Tensor<Wgpu, 3>, weights: &Q4Tensor) -> Tensor<Wgpu, 3> 
 /// Q4 embedding table stored as CPU bytes for efficient row lookups.
 ///
 /// Dequantizes individual rows on-the-fly (avoids materializing the full
-/// embedding table as f32, which could be hundreds of MB).
+/// embedding table as f32, which would cost 1.2GB at this model's 151936-row
+/// vocab — see module doc comment).
 pub struct EmbeddingStore {
     cpu_bytes: Vec<u8>,
     vocab_size: usize,
@@ -617,10 +848,16 @@ impl EmbeddingStore {
         self.dim
     }
 
+    /// Dequantize a single row, returning `dim` f32s.
+    pub fn embed_id(&self, id: u32) -> Vec<f32> {
+        let mut out = vec![0.0f32; self.dim];
+        self.embed_id_add_cpu(id, &mut out);
+        out
+    }
+
     /// Dequantize a single row into an existing CPU buffer (for accumulation).
     ///
     /// Adds the dequantized embedding to `out_buf` (which must be `dim` f32s).
-    /// This avoids creating a GPU tensor per embedding lookup.
     pub fn embed_id_add_cpu(&self, id: u32, out_buf: &mut [f32]) {
         assert_eq!(out_buf.len(), self.dim);
         let blocks_per_row = self.dim / 32;
@@ -645,104 +882,46 @@ impl EmbeddingStore {
 // Q4ModelParts — deferred loading intermediate
 // ---------------------------------------------------------------------------
 
-/// All Q4 model components with embeddings still in raw Q4 form.
+/// All Q4 model components with `token_embd.weight` still in raw Q4 form.
 ///
 /// Used by [`Q4ModelLoader::load_deferred`] to allow freeing the GGUF
-/// reader's memory before creating embedding stores.
+/// reader's memory before creating the GPU embedding/lm_head buffer.
 pub struct Q4ModelParts {
     pub layers: Vec<Q4TransformerBlock>,
     pub rope: RoPE,
     pub out_norm: RmsNormLayer,
-    pub text_linear: Q4Linear,
-    pub audio_emb_bytes: Vec<Vec<u8>>,
-    pub audio_emb_shapes: Vec<[usize; 2]>,
-    pub text_emb_bytes: Vec<u8>,
-    pub text_emb_shape: [usize; 2],
+    pub token_embd_bytes: Vec<u8>,
+    pub vocab_size: usize,
+    pub hidden_size: usize,
     pub config: LlmConfig,
 }
 
 impl Q4ModelParts {
     /// Assemble the final model from deferred parts.
+    ///
+    /// Uploads `token_embd.weight`'s Q4_0 bytes to GPU once (~174MB at this
+    /// model's 151936×2048 shape) and reuses that same buffer as both the
+    /// embedding table (via CPU-side `EmbeddingStore`, for input lookups)
+    /// and the lm_head weight (via `Q4Linear`, tied — no separate
+    /// `output.weight` tensor exists in this GGUF, docs/MODELS.md §2).
     pub fn finalize(self, device: &WgpuDevice) -> Result<LlmModel> {
-        let audio_emb: Vec<EmbeddingStore> = self
-            .audio_emb_bytes
-            .into_iter()
-            .zip(self.audio_emb_shapes.iter())
-            .map(|(bytes, &[vocab, dim])| EmbeddingStore::new(bytes, vocab, dim))
-            .collect();
-
-        let [text_vocab, text_dim] = self.text_emb_shape;
-
-        // Dequantize text embedding from Q4 to f32 and upload to GPU.
-        // This enables GPU-resident token lookups via Tensor::select(),
-        // eliminating the 236ms WebGPU buffer readback per frame.
-        // Memory cost: 8001 × 2048 × 4 bytes ≈ 62 MB.
-        let text_emb_gpu = Self::dequant_embedding_to_gpu(
-            &self.text_emb_bytes,
-            text_vocab,
-            text_dim,
+        let embed_gpu = Q4Tensor::from_q4_bytes(
+            &self.token_embd_bytes,
+            [self.vocab_size, self.hidden_size],
             device,
-        );
-
-        let text_emb = EmbeddingStore::new(self.text_emb_bytes, text_vocab, text_dim);
+        )?;
+        let lm_head = Q4Linear::new(embed_gpu, None);
+        let embed_store = EmbeddingStore::new(self.token_embd_bytes, self.vocab_size, self.hidden_size);
 
         Ok(LlmModel::new(
-            audio_emb,
-            text_emb,
-            text_emb_gpu,
+            embed_store,
             self.layers,
             self.rope,
             self.out_norm,
-            self.text_linear,
+            lm_head,
             self.config,
             device.clone(),
         ))
-    }
-
-    /// Dequantize a Q4_0 embedding table to f32 and upload to GPU.
-    ///
-    /// Returns a [vocab_size, dim] f32 tensor on GPU.
-    fn dequant_embedding_to_gpu(
-        q4_bytes: &[u8],
-        vocab_size: usize,
-        dim: usize,
-        device: &WgpuDevice,
-    ) -> Tensor<Wgpu, 2> {
-        assert!(
-            dim.is_multiple_of(32),
-            "Q4_0 requires dim divisible by 32, got {dim}"
-        );
-        let blocks_per_row = dim / 32;
-        let bytes_per_row = blocks_per_row * 18;
-        let expected = vocab_size * bytes_per_row;
-        assert!(
-            q4_bytes.len() >= expected,
-            "Q4 embedding bytes too short: got {}, need {expected}",
-            q4_bytes.len()
-        );
-        let mut data = vec![0.0f32; vocab_size * dim];
-
-        for row in 0..vocab_size {
-            let row_offset = row * bytes_per_row;
-            let row_bytes = &q4_bytes[row_offset..row_offset + bytes_per_row];
-            let out_offset = row * dim;
-
-            for block in 0..blocks_per_row {
-                let bo = block * 18;
-                let d = f16_to_f32(u16::from_le_bytes([row_bytes[bo], row_bytes[bo + 1]]));
-                let base = out_offset + block * 32;
-                for j in 0..16 {
-                    let byte = row_bytes[bo + 2 + j];
-                    data[base + j] = ((byte & 0x0F) as f32 - 8.0) * d;
-                    data[base + j + 16] = (((byte >> 4) & 0x0F) as f32 - 8.0) * d;
-                }
-            }
-        }
-
-        Tensor::<Wgpu, 2>::from_data(
-            TensorData::new(data, [vocab_size, dim]),
-            device,
-        )
     }
 }
 
@@ -750,7 +929,7 @@ impl Q4ModelParts {
 // Q4ModelLoader — GGUF → LlmModel
 // ---------------------------------------------------------------------------
 
-/// Loads a Q4-quantized STT model from a GGUF file.
+/// Loads a Q4-quantized Qwen2 model from a GGUF file.
 pub struct Q4ModelLoader<R: Read + Seek> {
     reader: GgufReader<R>,
 }
@@ -764,107 +943,126 @@ impl Q4ModelLoader<ShardedCursor> {
 }
 
 impl<R: Read + Seek> Q4ModelLoader<R> {
-    /// Load model components without creating embedding stores.
+    /// Open a GGUF from a single reader (native: a `BufReader<File>`).
+    pub fn new(reader: R) -> Result<Self> {
+        let reader = GgufReader::open(reader)?;
+        Ok(Self { reader })
+    }
+
+    pub fn reader(&self) -> &GgufReader<R> {
+        &self.reader
+    }
+
+    /// Read a tensor's raw bytes directly (for tests / `gguf-info`; real
+    /// model loading goes through `load_deferred`).
+    pub fn tensor_bytes(&mut self, name: &str) -> Result<Vec<u8>> {
+        self.reader.tensor_data(name)
+    }
+
+    /// Load model components without materializing `token_embd.weight` on GPU.
     ///
-    /// Returns [`Q4ModelParts`] — the caller should drop the loader to
-    /// free GGUF memory, then call [`Q4ModelParts::finalize`].
-    pub fn load_deferred(&mut self, device: &WgpuDevice, config: &LlmConfig) -> Result<Q4ModelParts> {
+    /// Returns [`Q4ModelParts`] — the caller should drop the loader to free
+    /// GGUF memory (the underlying file / shard buffers), then call
+    /// [`Q4ModelParts::finalize`].
+    pub fn load_deferred(&mut self, device: &WgpuDevice) -> Result<Q4ModelParts> {
+        let config = config_from_gguf(&self.reader)?;
         tracing::info!(
             version = self.reader.version(),
             tensors = self.reader.tensor_count(),
-            "Loading Q4 STT model from GGUF (deferred)"
+            layers = config.num_layers,
+            hidden = config.hidden_size,
+            vocab = config.vocab_size,
+            "Loading Qwen2 Q4 model from GGUF (deferred)"
         );
 
-        // Load audio codebook embeddings as raw Q4 bytes
-        let mut audio_emb_bytes = Vec::with_capacity(config.num_codebooks);
-        let mut audio_emb_shapes = Vec::with_capacity(config.num_codebooks);
-        for i in 0..config.num_codebooks {
-            let name = format!("emb.{i}.weight");
-            let info = self
-                .reader
-                .tensor_info(&name)
-                .with_context(|| format!("Tensor '{name}' not found"))?
-                .clone();
-            let shape = reverse_gguf_dims(info.shape());
-            let bytes = self.reader.tensor_data(&name)?;
-            audio_emb_bytes.push(bytes);
-            audio_emb_shapes.push([shape[0], shape[1]]);
-        }
-
-        // Load text embedding as raw Q4 bytes
-        let text_info = self
-            .reader
-            .tensor_info("text_emb.weight")
-            .context("Tensor 'text_emb.weight' not found")?
-            .clone();
-        let text_emb_shape = reverse_gguf_dims(text_info.shape());
-        let text_emb_bytes = self.reader.tensor_data("text_emb.weight")?;
-
-        // Load transformer layers
         let head_dim = config.hidden_size / config.num_heads;
         let rope = RoPE::new(head_dim, config.max_seq_len, config.rope_theta, device);
 
         let mut layers = Vec::with_capacity(config.num_layers);
         for i in 0..config.num_layers {
             let layer = self
-                .load_transformer_layer(i, config, device)
+                .load_transformer_layer(i, &config, device)
                 .with_context(|| format!("Failed to load transformer layer {i}"))?;
             layers.push(layer);
         }
 
-        // Output norm
-        let out_norm = self.load_rms_norm("out_norm.alpha", 1e-8, device)?;
+        let out_norm = self.load_rms_norm("output_norm.weight", config.rms_norm_eps, device)?;
 
-        // Text output linear
-        let text_linear = self.load_q4_linear("text_linear.weight", device)?;
+        let embd_info = self
+            .reader
+            .tensor_info("token_embd.weight")
+            .context("Tensor 'token_embd.weight' not found")?
+            .clone();
+        ensure!(
+            embd_info.dtype() == GgmlDtype::Q4_0,
+            "Expected Q4_0 for 'token_embd.weight', got {:?}",
+            embd_info.dtype()
+        );
+        let embd_shape = reverse_gguf_dims(embd_info.shape());
+        let token_embd_bytes = self.reader.tensor_data("token_embd.weight")?;
 
-        tracing::info!("Q4 model loaded (embeddings deferred)");
+        tracing::info!("Qwen2 Q4 model loaded (token_embd deferred)");
 
         Ok(Q4ModelParts {
             layers,
             rope,
             out_norm,
-            text_linear,
-            audio_emb_bytes,
-            audio_emb_shapes,
-            text_emb_bytes,
-            text_emb_shape: [text_emb_shape[0], text_emb_shape[1]],
-            config: config.clone(),
+            token_embd_bytes,
+            vocab_size: embd_shape[0],
+            hidden_size: embd_shape[1],
+            config,
         })
     }
 
-    /// Load a single transformer layer from GGUF.
+    /// Load a single transformer layer from GGUF (llama.cpp `blk.N.*` naming,
+    /// docs/MODELS.md §2).
     fn load_transformer_layer(
         &mut self,
         layer_idx: usize,
         config: &LlmConfig,
         device: &WgpuDevice,
     ) -> Result<Q4TransformerBlock> {
-        let prefix = format!("transformer.layers.{layer_idx}");
+        let p = format!("blk.{layer_idx}");
 
         let attention_norm =
-            self.load_rms_norm(&format!("{prefix}.norm1.alpha"), 1e-8, device)?;
+            self.load_rms_norm(&format!("{p}.attn_norm.weight"), config.rms_norm_eps, device)?;
 
-        let in_proj = self.load_q4_linear(&format!("{prefix}.self_attn.in_proj_weight"), device)?;
-        let out_proj = self.load_q4_linear(&format!("{prefix}.self_attn.out_proj.weight"), device)?;
+        let q_proj = self.load_q4_linear_with_bias(
+            &format!("{p}.attn_q.weight"),
+            &format!("{p}.attn_q.bias"),
+            device,
+        )?;
+        let k_proj = self.load_q4_linear_with_bias(
+            &format!("{p}.attn_k.weight"),
+            &format!("{p}.attn_k.bias"),
+            device,
+        )?;
+        let v_proj = self.load_q4_linear_with_bias(
+            &format!("{p}.attn_v.weight"),
+            &format!("{p}.attn_v.bias"),
+            device,
+        )?;
+        let o_proj = self.load_q4_linear(&format!("{p}.attn_output.weight"), device)?;
 
         let head_dim = config.hidden_size / config.num_heads;
         let attention = Q4Attention::new(
-            in_proj,
-            out_proj,
+            q_proj,
+            k_proj,
+            v_proj,
+            o_proj,
             config.num_heads,
             config.num_kv_heads,
             head_dim,
-            Some(config.sliding_window),
         );
 
         let ffn_norm =
-            self.load_rms_norm(&format!("{prefix}.norm2.alpha"), 1e-8, device)?;
+            self.load_rms_norm(&format!("{p}.ffn_norm.weight"), config.rms_norm_eps, device)?;
 
-        let linear_in = self.load_q4_linear(&format!("{prefix}.gating.linear_in.weight"), device)?;
-        let linear_out = self.load_q4_linear(&format!("{prefix}.gating.linear_out.weight"), device)?;
+        let gate_proj = self.load_q4_linear(&format!("{p}.ffn_gate.weight"), device)?;
+        let up_proj = self.load_q4_linear(&format!("{p}.ffn_up.weight"), device)?;
+        let down_proj = self.load_q4_linear(&format!("{p}.ffn_down.weight"), device)?;
 
-        let ffn = Q4FeedForward::new(linear_in, linear_out);
+        let ffn = Q4FeedForward::new(gate_proj, up_proj, down_proj);
 
         Ok(Q4TransformerBlock::new(
             attention_norm,
@@ -895,21 +1093,39 @@ impl<R: Read + Seek> Q4ModelLoader<R> {
         Ok(Q4Linear::new(q4, None))
     }
 
-    fn load_rms_norm(
+    fn load_q4_linear_with_bias(
         &mut self,
-        name: &str,
-        eps: f64,
+        weight_name: &str,
+        bias_name: &str,
         device: &WgpuDevice,
-    ) -> Result<RmsNormLayer> {
-        // Load as generic f32 data, then reshape to 1D.
-        // The actual safetensors store alpha as [1, 1, 2048] (3D)
-        // but RmsNorm expects a 1D [hidden_size] tensor.
+    ) -> Result<Q4Linear> {
+        let info = self
+            .reader
+            .tensor_info(weight_name)
+            .with_context(|| format!("Tensor '{weight_name}' not found"))?
+            .clone();
+        if info.dtype() != GgmlDtype::Q4_0 {
+            bail!("Expected Q4_0 for '{weight_name}', got {:?}", info.dtype());
+        }
+        let shape = reverse_gguf_dims(info.shape());
+        let bytes = self.reader.tensor_data(weight_name)?;
+        let q4 = Q4Tensor::from_q4_bytes(&bytes, [shape[0], shape[1]], device)?;
+        let bias = self.load_f32_vector(bias_name, device)?;
+        Ok(Q4Linear::new(q4, Some(bias)))
+    }
+
+    fn load_f32_vector(&mut self, name: &str, device: &WgpuDevice) -> Result<Tensor<Wgpu, 1>> {
+        let data = self.read_f32_data(name)?;
+        let n = data.len();
+        Ok(Tensor::from_data(TensorData::new(data, [n]), device))
+    }
+
+    fn read_f32_data(&mut self, name: &str) -> Result<Vec<f32>> {
         let info = self
             .reader
             .tensor_info(name)
             .with_context(|| format!("Tensor '{name}' not found"))?
             .clone();
-        let num_elements: u64 = info.num_elements();
         let bytes = self.reader.tensor_data(name)?;
         let data: Vec<f32> = match info.dtype() {
             GgmlDtype::F32 => bytes
@@ -920,10 +1136,20 @@ impl<R: Read + Seek> Q4ModelLoader<R> {
                 .chunks_exact(2)
                 .map(|b| f16_to_f32(u16::from_le_bytes([b[0], b[1]])))
                 .collect(),
-            GgmlDtype::Q4_0 => bail!("Cannot load Q4_0 tensor '{name}' as norm weight"),
+            GgmlDtype::Q4_0 => bail!("Cannot load Q4_0 tensor '{name}' as a dense f32 vector"),
         };
-        let weight: Tensor<Wgpu, 1> =
-            Tensor::from_data(TensorData::new(data, [num_elements as usize]), device);
+        Ok(data)
+    }
+
+    fn load_rms_norm(
+        &mut self,
+        name: &str,
+        eps: f64,
+        device: &WgpuDevice,
+    ) -> Result<RmsNormLayer> {
+        let data = self.read_f32_data(name)?;
+        let n = data.len();
+        let weight: Tensor<Wgpu, 1> = Tensor::from_data(TensorData::new(data, [n]), device);
         Ok(RmsNormLayer {
             inner: burn::nn::RmsNorm {
                 gamma: Param::initialized(ParamId::new(), weight),

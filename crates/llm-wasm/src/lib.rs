@@ -52,17 +52,6 @@ pub struct LlmConfig {
     pub bos_token_id: u32,
     /// EOS token id(s) — generation stops on any of these.
     pub eos_token_ids: Vec<u32>,
-
-    // --- Fields below are leftovers from the copied stt-wasm GGUF loader
-    // (`gguf.rs`), which is STT-shaped, not Qwen2-shaped — see that file's
-    // header comment and docs/ENGINE.md §1. They exist only so `gguf.rs`
-    // compiles against this config today; phase 1b removes them once the
-    // loader is rewritten for Qwen2's tensor naming (xLAM-2-3b-fc-r has no
-    // audio codebooks and no sliding-window attention, docs/MODELS.md §1). ---
-    /// Unused by xLAM-2-3b-fc-r (no audio codebooks). See note above.
-    pub num_codebooks: usize,
-    /// Unused by xLAM-2-3b-fc-r (no sliding-window attention). See note above.
-    pub sliding_window: usize,
 }
 
 impl Default for LlmConfig {
@@ -81,8 +70,6 @@ impl Default for LlmConfig {
             rms_norm_eps: 1e-6,
             bos_token_id: 151643,
             eos_token_ids: vec![151645, 151643],
-            num_codebooks: 0,
-            sliding_window: 0,
         }
     }
 }
