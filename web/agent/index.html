@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>llm-wasm agent demo</title>
+<style>
+  body { font-family: -apple-system, system-ui, sans-serif; max-width: 860px; margin: 2rem auto; padding: 0 1rem; color: #1a1a1a; }
+  h1 { font-size: 1.3rem; }
+  fieldset { margin-bottom: 1rem; border: 1px solid #ccc; border-radius: 6px; }
+  label { display: block; font-size: 0.85rem; color: #555; margin-top: 0.5rem; }
+  input[type=text] { width: 100%; box-sizing: border-box; padding: 0.4rem; font-size: 0.95rem; }
+  button { padding: 0.5rem 1rem; font-size: 0.95rem; cursor: pointer; }
+  progress { width: 100%; }
+  #log { font-family: ui-monospace, Menlo, monospace; font-size: 0.8rem; white-space: pre-wrap; background: #f6f6f6; border: 1px solid #ddd; border-radius: 6px; padding: 0.75rem; max-height: 40vh; overflow-y: auto; }
+  .step { border-left: 3px solid #888; padding-left: 0.6rem; margin-bottom: 0.6rem; }
+  .step.tool { border-left-color: #b58900; }
+  .step.final { border-left-color: #2aa198; }
+  #status { font-size: 0.85rem; color: #555; }
+</style>
+</head>
+<body>
+<h1>llm-wasm agent demo (xLAM-2-3b-fc-r, Burn+wgpu, WebGPU)</h1>
+<p id="status">Not loaded.</p>
+
+<fieldset>
+  <legend>1. Load model</legend>
+  <label>GGUF shard URL(s), comma-separated (single file is fine)</label>
+  <input id="gguf-url" type="text" value="http://127.0.0.1:8001/gguf/xlam-2-3b-fc-r/xLAM-2-3b-fc-r-q4_0.gguf" />
+  <label>tokenizer.json URL</label>
+  <input id="tokenizer-url" type="text" value="http://127.0.0.1:8001/hf/xLAM-2-3b-fc-r/tokenizer.json" />
+  <label>tokenizer_config.json URL</label>
+  <input id="template-url" type="text" value="http://127.0.0.1:8001/hf/xLAM-2-3b-fc-r/tokenizer_config.json" />
+  <p><button id="load-btn">Load model</button></p>
+  <progress id="load-progress" value="0" max="1"></progress>
+  <div id="load-detail" style="font-size:0.8rem;color:#777;"></div>
+</fieldset>
+
+<fieldset>
+  <legend>2. Ask</legend>
+  <input id="utterance" type="text" placeholder="what's the weather in Paris, and set the thermostat there to 21?" />
+  <p><button id="run-btn" disabled>Run</button> <button id="reset-btn" disabled>Reset conversation</button></p>
+</fieldset>
+
+<fieldset>
+  <legend>Steps / log</legend>
+  <div id="log"></div>
+</fieldset>
+
+<script type="module">
+import { LlmClient } from './llm-client.js';
+
+// Two fake tools, served in-page with canned answers — no real MCP server
+// needed for this demo. Shapes match the MCP `tools/list` entries the
+// worker/engine expect: {name, description, inputSchema}.
+const TOOLS = [
+  {
+    name: 'get_weather',
+    description: 'Get the current weather for a city.',
+    inputSchema: {
+      type: 'object',
+      properties: { city: { type: 'string', description: 'City name' } },
+      required: ['city'],
+    },
+  },
+  {
+    name: 'set_thermostat',
+    description: 'Set the target temperature for a room.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        room: { type: 'string', description: 'Room name' },
+        temperature: { type: 'number', description: 'Target temperature in Celsius' },
+      },
+      required: ['room', 'temperature'],
+    },
+  },
+];
+
+const CANNED = {
+  get_weather: (args) => ({ city: args.city, condition: 'partly cloudy', temperature_c: 18 }),
+  set_thermostat: (args) => ({ room: args.room, temperature: args.temperature, ok: true }),
+};
+
+async function toolCaller(name, args) {
+  await new Promise((r) => setTimeout(r, 150)); // pretend it's a real round trip
+  const fn = CANNED[name];
+  if (!fn) throw new Error(`no canned tool: ${name}`);
+  return fn(args);
+}
+
+const logEl = document.getElementById('log');
+function logLine(text) {
+  const div = document.createElement('div');
+  div.textContent = text;
+  logEl.appendChild(div);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+function logStep(step) {
+  const div = document.createElement('div');
+  div.className = 'step ' + (step.calls ? 'tool' : 'final');
+  const callsText = step.calls ? step.calls.map((c) => `${c.name}(${JSON.stringify(c.args)})`).join(', ') : '(final answer)';
+  div.textContent =
+    `step ${step.index}: ${callsText} — prompt=${step.promptTokens} tok, ` +
+    `prefill=${step.prefillMs.toFixed(1)}ms, decode=${step.decodeMs.toFixed(1)}ms, generated=${step.tokens} tok\n` +
+    `  raw: ${step.text}`;
+  logEl.appendChild(div);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+const client = new LlmClient({
+  toolCaller,
+  onEvent: (msg) => {
+    if (msg.type === 'progress') {
+      const pct = msg.total ? msg.loaded / msg.total : 0;
+      document.getElementById('load-progress').value = pct;
+      document.getElementById('load-detail').textContent = `${msg.shard}: ${msg.loaded}${msg.total ? ' / ' + msg.total : ''}`;
+    }
+  },
+});
+
+document.getElementById('load-btn').addEventListener('click', async () => {
+  const shards = document.getElementById('gguf-url').value.split(',').map((s) => s.trim()).filter(Boolean);
+  const tokenizerUrl = document.getElementById('tokenizer-url').value;
+  const templateUrl = document.getElementById('template-url').value;
+  document.getElementById('status').textContent = 'Loading model (this fetches ~1.7GB, then uploads to GPU)...';
+  document.getElementById('load-btn').disabled = true;
+  try {
+    const info = await client.load({ id: 'xlam-2-3b-fc-r', shards, tokenizerUrl, templateUrl });
+    document.getElementById('status').textContent = `Ready: ${JSON.stringify(info)}`;
+    document.getElementById('run-btn').disabled = false;
+    document.getElementById('reset-btn').disabled = false;
+  } catch (err) {
+    document.getElementById('status').textContent = `Load failed: ${err.message || err}`;
+    document.getElementById('load-btn').disabled = false;
+  }
+});
+
+document.getElementById('run-btn').addEventListener('click', async () => {
+  const utterance = document.getElementById('utterance').value.trim();
+  if (!utterance) return;
+  logLine(`> ${utterance}`);
+  document.getElementById('run-btn').disabled = true;
+  try {
+    const transcript = await client.run(utterance, TOOLS, { maxSteps: 6, maxNewTokens: 256 }, logStep);
+    logLine(`= ${transcript.finalText}  (${transcript.totalMs.toFixed(0)}ms total)`);
+  } catch (err) {
+    logLine(`! error: ${err.message || err}`);
+  } finally {
+    document.getElementById('run-btn').disabled = false;
+  }
+});
+
+document.getElementById('reset-btn').addEventListener('click', () => {
+  client.reset();
+  logLine('--- conversation reset ---');
+});
+</script>
+</body>
+</html>
