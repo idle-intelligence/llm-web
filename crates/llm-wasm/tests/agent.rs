@@ -1,6 +1,6 @@
 //! Agent loop tests (phase 1a).
 
-use llm_wasm::agent::{Agent, FixtureCaller, FixtureGenerator};
+use llm_wasm::agent::{Agent, FixtureCaller, FixtureGenerator, StepOutcome};
 use llm_wasm::template::{ChatTemplate, Tool};
 use llm_wasm::tokenizer::Tokenizer;
 use llm_wasm::tools::ParsedOutput;
@@ -152,4 +152,118 @@ fn max_steps_guard_errors_instead_of_looping_forever() {
 
     let result = agent.run("pause the kitchen", &tools_12(), 2);
     assert!(result.is_err(), "expected max_steps guard to error");
+}
+
+/// Same "pause the kitchen" transcript as `pause_the_kitchen_end_to_end`,
+/// but driven through the step-wise `start`/`provide_tool_results` API the
+/// browser uses (tool results supplied out-of-band, not via a synchronous
+/// `ToolCaller`).
+#[test]
+fn step_wise_pause_the_kitchen() {
+    let Some((template, tokenizer)) = load_agent_parts() else {
+        return;
+    };
+
+    let discover_turn = script_tokens(
+        &tokenizer,
+        r#"[{"name": "get_households_and_groups_and_players", "arguments": {}}]<|im_end|>"#,
+    );
+    let pause_turn = script_tokens(
+        &tokenizer,
+        r#"[{"name": "pause", "arguments": {"group_id": "RINCON_KITCHEN01:1"}}]<|im_end|>"#,
+    );
+    let answer_turn = script_tokens(&tokenizer, "Paused the Kitchen.<|im_end|>");
+
+    let generator = FixtureGenerator::new(vec![discover_turn, pause_turn, answer_turn]);
+    // No calls will actually be routed through this synchronous caller in
+    // the step-wise path — the fixture results are read directly below —
+    // but `Agent` still requires a `ToolCaller` type parameter.
+    let caller = FixtureCaller::new(results_dir());
+    let mut agent = Agent::new(
+        template,
+        tokenizer,
+        generator,
+        caller,
+        "You are a helpful home assistant with access to Sonos speaker controls.",
+        64,
+    );
+
+    let load_fixture = |name: &str| -> Value {
+        let path = results_dir().join(format!("{name}.json"));
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    };
+
+    let outcome = agent.start("pause the kitchen", &tools_12());
+    let calls = match outcome {
+        StepOutcome::NeedTools { calls, step } => {
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].name, "get_households_and_groups_and_players");
+            assert!(matches!(step.parsed, ParsedOutput::ToolCalls(_)));
+            calls
+        }
+        _ => panic!("expected NeedTools for step 1"),
+    };
+    let results = vec![(calls[0].call_id.clone(), load_fixture(&calls[0].name))];
+
+    let outcome = agent.provide_tool_results(results);
+    let calls = match outcome {
+        StepOutcome::NeedTools { calls, step } => {
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].name, "pause");
+            assert_eq!(calls[0].arguments, serde_json::json!({"group_id": "RINCON_KITCHEN01:1"}));
+            assert!(
+                step.prompt_tokens.len()
+                    > agent
+                        .tokenizer()
+                        .encode("pause the kitchen", false)
+                        .unwrap()
+                        .len(),
+                "step 2's prompt should include step 1's tool result"
+            );
+            calls
+        }
+        _ => panic!("expected NeedTools for step 2"),
+    };
+    let results = vec![(calls[0].call_id.clone(), load_fixture(&calls[0].name))];
+
+    let outcome = agent.provide_tool_results(results);
+    match outcome {
+        StepOutcome::Final { text, .. } => assert_eq!(text, "Paused the Kitchen."),
+        StepOutcome::NeedTools { .. } => panic!("expected Final for step 3"),
+        StepOutcome::Error { message, .. } => panic!("unexpected error: {message}"),
+    }
+}
+
+/// The rendered prompt's prefix (system + all 12 tool schemas) is identical
+/// across two different utterances under the same tools set — the
+/// assumption prefix caching relies on. Also reports the prefix's token
+/// count for the 12-tool Sonos prompt.
+#[test]
+fn prefix_is_stable_across_utterances_for_same_tools() {
+    let Some((template, tokenizer)) = load_agent_parts() else {
+        return;
+    };
+    let tools = tools_12();
+    let system = "You are a helpful home assistant with access to Sonos speaker controls.";
+
+    let render = |utterance: &str| -> Vec<u32> {
+        let messages = vec![
+            llm_wasm::template::Message::system(system),
+            llm_wasm::template::Message::user(utterance),
+        ];
+        let prompt = template.render_prompt(&messages, &tools, true).unwrap();
+        tokenizer.encode(&prompt, false).unwrap()
+    };
+
+    let a = render("pause the kitchen");
+    let b = render("what's playing in the living room");
+
+    let common = a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count();
+    println!("12-tool prefix common token length: {common} (a={}, b={})", a.len(), b.len());
+
+    // The two utterances diverge immediately after the constant
+    // system+tools preamble, so the common prefix should cover the large
+    // majority of both prompts, not just a handful of tokens.
+    assert!(common > 100, "expected a substantial shared prefix, got {common} tokens");
+    assert!(common < a.len() && common < b.len());
 }
