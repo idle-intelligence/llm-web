@@ -108,21 +108,33 @@ pub fn load_all_tools(fixtures_dir: impl AsRef<Path>) -> Result<Vec<Tool>> {
 }
 
 /// Select the [`Tool`]s for a given [`ToolSet`]: `all` unchanged for
-/// [`ToolSet::All`], or `all` filtered down to the names in
-/// `fixtures/sonos/tools-12.json` for [`ToolSet::Twelve`] (so the returned
-/// tools always carry whatever schema `all` was built from).
+/// [`ToolSet::All`], or `all`'s schema entries for the names in
+/// `fixtures/sonos/tools-12.json`, **in `tools-12.json`'s own order**, for
+/// [`ToolSet::Twelve`] (so the returned tools carry whatever schema `all`
+/// was built from, but the model sees the curated 12-tool ordering — e.g.
+/// the listing tool first — not `tools.json`'s alphabetical order. Getting
+/// this wrong silently reorders the tool preamble the model sees, which
+/// changes its greedy output independently of any KV-cache/prefill
+/// behavior — see docs/ENGINE.md "Known issues / fixed").
 pub fn select_tools(all: &[Tool], subset: ToolSet, fixtures_dir: impl AsRef<Path>) -> Result<Vec<Tool>> {
     match subset {
         ToolSet::All => Ok(all.to_vec()),
         ToolSet::Twelve => {
             let twelve = load_mcp_tools(fixtures_dir.as_ref().join("tools-12.json"))?;
-            let names: std::collections::HashSet<&str> =
-                twelve.iter().map(|t| t.function.name.as_str()).collect();
-            Ok(all
+            twelve
                 .iter()
-                .filter(|t| names.contains(t.function.name.as_str()))
-                .cloned()
-                .collect())
+                .map(|t| {
+                    all.iter()
+                        .find(|a| a.function.name == t.function.name)
+                        .cloned()
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "tools-12.json tool `{}` not found in the full tool set",
+                                t.function.name
+                            )
+                        })
+                })
+                .collect()
         }
     }
 }

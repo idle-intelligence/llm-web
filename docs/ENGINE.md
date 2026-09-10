@@ -584,3 +584,44 @@ end-to-end; `into_data_async()`'s actual behavior/latency under real WebGPU buff
 + module-script + COOP/COEP interaction in a real browser (`type: 'module'` Workers plus
 cross-origin isolation headers have historically had browser-specific rough edges). The user's
 first click-through in a real browser is the first real signal on all of these.
+
+## Known issues / fixed
+
+### 2026-09-10: `eval --tools 12` tool preamble silently reordered (not a KV-cache bug)
+
+Symptom: `llm-agent eval --tools 12` on `m01`/`s09` ("Pause the kitchen." / "Resume
+playback.") invented a group id directly instead of calling the listing tool
+first, while `llm-agent run` on the identical HF-rendered prompt (and HF bf16
+itself) called the listing tool first. Initial hypothesis was a split-prefill
+bug: the eval harness prefills the constant system+tools prefix once,
+`KvCache::snapshot`/`restore`s it, and prefills only the per-turn suffix at a
+nonzero `offset` — suspects were RoPE position, the causal mask at `offset >
+0`, or `KvCache::append`/`restore` writing/reading the wrong range.
+
+That hypothesis was wrong. `crates/llm-wasm/tests/full_forward.rs`'s
+`split_prefill_matches_single_prefill` test (added for this investigation)
+prefills a 2225-token prompt whole, then again split at token 2218/1000/2224
+with `restore()` in between, and again with `restore()` followed by a
+*different* suffix (simulating a second turn) — all three variants match a
+fresh single-shot prefill to <1e-4 max-abs-diff in logits and bit-for-bit in
+an 8-token greedy continuation. The KV cache / RoPE-offset / causal-mask
+machinery in `model.rs`/`kv.rs` is correct at nonzero offset.
+
+The real bug: `s09` is the *first* case run in that eval (no cache reuse
+involved at all — a single fresh 2225-token prefill, same code path as
+`llm-agent run`) and still produced the wrong tool call, which ruled out
+prefix-caching entirely and pointed at prompt construction instead.
+`eval::select_tools` (`crates/llm-wasm/src/eval.rs`) built the 12-tool subset
+by filtering the full 34-tool list (`tools.json`, alphabetically ordered) down
+to the names present in `tools-12.json`, **discarding `tools-12.json`'s own
+curated order** (which lists `get_households_and_groups_and_players` — the
+listing tool — first) and replacing it with alphabetical order. The model
+sees a completely different tool preamble token sequence than the
+HF/`llm-agent run` reference (which used `tools-12.json`'s order verbatim),
+so it picks a different first action — nothing to do with KV cache offsets.
+
+Fix: `select_tools` now iterates `tools-12.json` in its own order and looks
+up each tool's schema in the full 34-tool list, instead of filtering the
+34-tool list's order. `llm-agent eval --tools 12 --only s09,m01 --label
+split-fix` after the fix: both call `get_households_and_groups_and_players({})`
+first (`correct=true`).

@@ -439,6 +439,128 @@ fn test_rmsnorm_fused_matches_reference() {
     assert!(max_rel_err < 1e-5, "max relative error {max_rel_err:.2e} exceeds 1e-5");
 }
 
+/// Regression test for the split-prefill divergence found in eval (m01/s09:
+/// prefill-prefix + `snapshot`/`restore` + prefill-suffix at nonzero offset
+/// picked a different first token than a single whole-prompt prefill).
+/// Compares (a) one prefill of the full 2225-token `02_tools_single`
+/// sequence against (b)/(c)/(d) `restore(0)` + split prefill at various
+/// split points + `restore(split)` + prefill-suffix, at the last position's
+/// logits and 8 greedy-decoded continuation tokens.
+#[test]
+fn split_prefill_matches_single_prefill() {
+    let Some(tokens) = load_tokens("02_tools_single") else {
+        return;
+    };
+
+    let device = WgpuDevice::default();
+    let Some(model) = load_model(&device) else {
+        return;
+    };
+    let max_ctx = 12288;
+    let vocab = model.config().vocab_size;
+    let seq_len = tokens.len();
+
+    // (a) single whole-prompt prefill.
+    let mut cache_a = model.new_cache(max_ctx);
+    let hidden_a = model.forward_hidden(&tokens, &mut cache_a);
+    let last_a = hidden_a.narrow(1, seq_len - 1, 1);
+    let logits_a = llm_wasm::model::logits_to_vec(model.lm_head(last_a));
+
+    let mut decoded_a = Vec::new();
+    let mut logits_vec = logits_a.clone();
+    for _ in 0..8 {
+        let next = llm_wasm::sample::greedy(&logits_vec);
+        decoded_a.push(next);
+        let hidden = model.forward_hidden(&[next], &mut cache_a);
+        logits_vec = llm_wasm::model::logits_to_vec(model.lm_head(hidden));
+    }
+
+    let mut max_diff_report = Vec::new();
+
+    for &split in &[2218usize, 1000, seq_len - 1] {
+        let mut cache = model.new_cache(max_ctx);
+        cache.restore(0);
+        let _ = model.forward_hidden(&tokens[..split], &mut cache);
+        let snap = cache.snapshot();
+        assert_eq!(snap, split, "snapshot() should equal tokens prefilled so far");
+
+        let hidden_b = model.forward_hidden(&tokens[split..], &mut cache);
+        let last_b = hidden_b.narrow(1, seq_len - split - 1, 1);
+        let logits_b = llm_wasm::model::logits_to_vec(model.lm_head(last_b));
+
+        assert_eq!(logits_a.len(), logits_b.len());
+        let mut max_abs_diff = 0f32;
+        for (x, y) in logits_a.iter().zip(logits_b.iter()) {
+            max_abs_diff = max_abs_diff.max((x - y).abs());
+        }
+        let argmax_a = argmax(&logits_a);
+        let argmax_b = argmax(&logits_b);
+        max_diff_report.push((split, max_abs_diff, argmax_a, argmax_b));
+        eprintln!(
+            "split={split}: max_abs_diff={max_abs_diff:.6} argmax_a={argmax_a} argmax_b={argmax_b}"
+        );
+        assert_eq!(
+            argmax_a, argmax_b,
+            "split={split}: argmax diverged (a={argmax_a} b={argmax_b}, max_abs_diff={max_abs_diff})"
+        );
+        assert!(
+            max_abs_diff < 1e-4,
+            "split={split}: max_abs_diff {max_abs_diff} exceeds 1e-4"
+        );
+
+        // greedy continuation from this split-prefill cache
+        let mut decoded_b = Vec::new();
+        let mut logits_vec = logits_b.clone();
+        for _ in 0..8 {
+            let next = llm_wasm::sample::greedy(&logits_vec);
+            decoded_b.push(next);
+            let hidden = model.forward_hidden(&[next], &mut cache);
+            logits_vec = llm_wasm::model::logits_to_vec(model.lm_head(hidden));
+        }
+        eprintln!("split={split}: decoded_a={decoded_a:?} decoded_b={decoded_b:?}");
+        assert_eq!(decoded_a, decoded_b, "split={split}: greedy continuation diverged");
+    }
+
+    eprintln!("split-prefill report: {max_diff_report:?}");
+    let vocab_check = vocab; // silence unused warning if vocab used only above
+    let _ = vocab_check;
+
+    // Second-utterance simulation: restore(split) then prefill a *different*
+    // suffix, compare against a fresh single prefill of that full sequence.
+    let split = 2218usize;
+    let alt_suffix: Vec<u32> = tokens[split..].iter().rev().cloned().collect(); // deliberately different tail
+    let mut alt_full = tokens[..split].to_vec();
+    alt_full.extend_from_slice(&alt_suffix);
+
+    let mut cache_fresh = model.new_cache(max_ctx);
+    let hidden_fresh = model.forward_hidden(&alt_full, &mut cache_fresh);
+    let last_fresh = hidden_fresh.narrow(1, alt_full.len() - 1, 1);
+    let logits_fresh = llm_wasm::model::logits_to_vec(model.lm_head(last_fresh));
+
+    let mut cache_reuse = model.new_cache(max_ctx);
+    cache_reuse.restore(0);
+    let _ = model.forward_hidden(&tokens[..split], &mut cache_reuse);
+    cache_reuse.restore(split);
+    let hidden_reuse = model.forward_hidden(&alt_suffix, &mut cache_reuse);
+    let last_reuse = hidden_reuse.narrow(1, alt_suffix.len() - 1, 1);
+    let logits_reuse = llm_wasm::model::logits_to_vec(model.lm_head(last_reuse));
+
+    let mut max_abs_diff = 0f32;
+    for (x, y) in logits_fresh.iter().zip(logits_reuse.iter()) {
+        max_abs_diff = max_abs_diff.max((x - y).abs());
+    }
+    let argmax_fresh = argmax(&logits_fresh);
+    let argmax_reuse = argmax(&logits_reuse);
+    eprintln!(
+        "second-utterance sim: max_abs_diff={max_abs_diff:.6} argmax_fresh={argmax_fresh} argmax_reuse={argmax_reuse}"
+    );
+    assert_eq!(
+        argmax_fresh, argmax_reuse,
+        "restore+reprefill-different-suffix diverged from fresh full prefill"
+    );
+    assert!(max_abs_diff < 1e-4, "second-utterance sim max_abs_diff {max_abs_diff} exceeds 1e-4");
+}
+
 /// Deterministic xorshift PRNG (mirrors tests/q4_matmul.rs's copy — no
 /// `rand` dependency needed for test data).
 struct Xorshift(u64);
