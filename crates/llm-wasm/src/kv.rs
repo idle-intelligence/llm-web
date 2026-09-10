@@ -100,8 +100,28 @@ impl KvCache {
             self.len..self.len + t,
             0..self.head_dim,
         ];
-        self.k[layer] = self.k[layer].clone().slice_assign(ranges.clone(), k);
-        self.v[layer] = self.v[layer].clone().slice_assign(ranges, v);
+        // D1 (docs/BENCHMARKS.md Session 2 "next most valuable"): the old
+        // code did `self.k[layer].clone().slice_assign(...)`, which left
+        // `self.k[layer]` itself holding a second reference to the same
+        // buffer at the moment `slice_assign` ran, guaranteeing refcount
+        // >= 2 and forcing cubecl's wgpu backend to copy the *entire*
+        // `[1, n_kv_heads, max_ctx, head_dim]` cache tensor (12.58MB/layer
+        // at max_ctx=12288) instead of writing only the new `t` rows in
+        // place. `mem::replace`-ing the slot with a tiny placeholder first
+        // drops that second reference before `slice_assign` runs, so the
+        // taken-out tensor is uniquely owned and cubecl can mutate its
+        // buffer in place.
+        let placeholder_shape = [1, self.n_kv_heads, 1, self.head_dim];
+        let old_k = std::mem::replace(
+            &mut self.k[layer],
+            Tensor::<Wgpu, 4>::empty(placeholder_shape, &k.device()),
+        );
+        let old_v = std::mem::replace(
+            &mut self.v[layer],
+            Tensor::<Wgpu, 4>::empty(placeholder_shape, &v.device()),
+        );
+        self.k[layer] = old_k.slice_assign(ranges.clone(), k);
+        self.v[layer] = old_v.slice_assign(ranges, v);
 
         let k_all = self.k[layer].clone().narrow(2, 0, self.len + t);
         let v_all = self.v[layer].clone().narrow(2, 0, self.len + t);
@@ -126,5 +146,52 @@ impl KvCache {
     pub fn restore(&mut self, snapshot: usize) {
         assert!(snapshot <= self.max_ctx);
         self.len = snapshot;
+    }
+}
+
+#[cfg(all(test, feature = "wgpu"))]
+mod bench {
+    use super::*;
+
+    /// D1 isolation bench (docs/BENCHMARKS.md Session 3): times `append`
+    /// alone, one layer, T=1 (decode shape), at the model's real
+    /// `n_kv_heads=2, head_dim=128, max_ctx=12288` cache shape. Run with:
+    /// `cargo test --release --features wgpu --lib kv::bench::bench_append
+    /// -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn bench_append() {
+        let device = WgpuDevice::default();
+        let n_kv_heads = 2;
+        let head_dim = 128;
+        let max_ctx = 12288;
+        let iters = 200;
+
+        let mut cache = KvCache::new(1, n_kv_heads, head_dim, max_ctx, &device);
+        let kv_shape = [1, n_kv_heads, 1, head_dim];
+
+        // Warm up + advance past a synthetic prefill so append is measured
+        // at a realistic mid-cache offset, not len=0.
+        let prefill_len = 2225;
+        cache.len = prefill_len;
+
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            let k = Tensor::<Wgpu, 4>::zeros(kv_shape, &device);
+            let v = Tensor::<Wgpu, 4>::zeros(kv_shape, &device);
+            let (k_all, _v_all) = cache.append(0, k, v);
+            cache.advance(1);
+            // Force sync every iter so each append's GPU work is actually
+            // retired before starting the next — otherwise wgpu queues
+            // work asynchronously and the wall clock only measures
+            // submission overhead, not execution time.
+            let _ = k_all.into_data().into_vec::<f32>().unwrap();
+        }
+        let elapsed = t0.elapsed();
+        println!(
+            "append (T=1, n_kv_heads={n_kv_heads}, head_dim={head_dim}, max_ctx={max_ctx}): \
+             {:.4} ms/call over {iters} iters",
+            elapsed.as_secs_f64() * 1000.0 / iters as f64
+        );
     }
 }
