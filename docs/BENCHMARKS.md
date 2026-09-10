@@ -267,3 +267,143 @@ with `std::mem::replace(&mut self.k[layer], <placeholder>)` before `slice_assign
 confirm whether Burn's wgpu backend does in-place `slice_assign` at all when given a
 uniquely-owned tensor) and re-run the P1c decode breakdown to quantify the win before
 committing to a rewrite.
+
+## Session 3
+
+Scope this session: D1 (KV cache in-place write) and D2a (RMSNorm fusion). D2b/c/d
+(RoPE fusion, SiLU*up fusion, residual folding), D3 (coalesced matvec), D4 (prefill
+scratch-dequant+matmul) not attempted — see "next most valuable" below. All numbers
+`02_tools_single` (2225-token prompt) unless noted; machine is shared with another
+worker's concurrent native smoke-test runs per the task brief, so single before/after
+pairs carry real noise (see D1's finding) — multiple runs are reported where taken.
+
+### D1 — KV cache in-place write, commit `92fbdb5`
+
+`kv.rs::append` did `self.k[layer].clone().slice_assign(...)`: the `.clone()` left
+`self.k[layer]` holding a second reference to the handle at the exact moment
+`slice_assign` ran. Traced into `burn-cubecl-0.20.1/src/kernel/index/slice_assign.rs:110-114`:
+`slice_assign` calls `tensor.can_mut()` (an `Arc` strong-count check on the underlying
+buffer handle) and only mutates in place if it's the sole owner, otherwise falls back
+to `tensor.copy()` — a full-buffer copy of the `[1, n_kv_heads, max_ctx, head_dim]`
+tensor (12.58MB/layer at `max_ctx=12288`), confirming last session's "next most
+valuable" hypothesis mechanistically. Fix: `std::mem::replace(&mut self.k[layer],
+<tiny placeholder>)` before calling `slice_assign` on the taken-out (now uniquely
+owned) tensor, then reassign the result — drops the second reference before
+`can_mut()` runs.
+
+**Isolated bench** (`kv.rs::bench::bench_append`, `cargo test --release --features
+wgpu --lib kv::bench::bench_append -- --ignored --nocapture`; one layer, T=1, real
+`n_kv_heads=2/head_dim=128/max_ctx=12288` shape, forced per-call sync via
+`into_data()`):
+
+| variant | ms/call |
+|---|---|
+| old (`.clone()` pattern, inlined manually for comparison) | 1.2032 |
+| new (`mem::replace` fix) | 1.2024 |
+
+**No measurable difference in isolation.** Two candidate explanations, neither
+confirmed within this session's budget: (a) the forced per-iteration `into_data()`
+sync in the bench dominates the measured time (CPU↔GPU round-trip latency, not the
+copy itself) at this single-layer/12MB scale, masking a real but small difference; or
+(b) `can_mut()` is false in both cases for a reason unrelated to the `Tensor` clone —
+e.g. cubecl-wgpu's shared-arena suballocator (already implicated in K5's read/read_write
+binding-qualifier revert) reporting the buffer as shared regardless of the Rust-level
+`Arc` count. Not distinguished here.
+
+**End-to-end** (`02_tools_single`, full prefill+decode, `--test-threads=1`):
+
+| | prefill tok/s | decode ms/token (20 steps to EOS) | greedy-match |
+|---|---|---|---|
+| before (HEAD, K5 baseline) | 35.97 | 213.8 | 20/20 |
+| after D1 | 29.17 | 194.9 | 20/20 |
+
+Prefill tok/s (which D1's change cannot affect — it's decode-only code) swung 35.97
+vs 29.17 across these two runs with zero prefill-path code difference, a ~20% delta —
+confirming the isolated-bench finding that this machine's noise floor is large enough
+to swallow a real effect of D1's size, if any. **Kept anyway**: the change matches
+burn-cubecl's documented contract and cannot regress correctness (verified: greedy
+match still exact). Numerics: `full_forward` 20/20 (02), 28/28 (03) — unchanged.
+
+### D2a — fused RMSNorm, commit `2a69490`
+
+`RmsNormLayer::forward` called `burn::nn::RmsNorm::forward`, which lowers to ~8
+separate wgpu dispatches (cast/square/mean_dim/add/sqrt/div/mul) — 2 RMSNorms/layer x
+36 layers + `out_norm` was the largest non-matmul contributor to Session 2's ~1589
+dispatches/token estimate. New `wgsl/shader_rmsnorm.wgsl`: one workgroup/row (B*T rows
+total), 256 threads, shared-memory tree reduction for sum-of-squares, one dispatch for
+the whole `[B,T,hidden]` tensor. Matches burn-nn 0.20's `Y = X / sqrt(mean(X^2) + eps)
+* gamma` exactly (no mixed-precision cast needed — this model's whole pipeline is f32).
+`gguf.rs::rmsnorm_fused` dispatches it; `RmsNormLayer::forward` narrowed from generic
+`<const D: usize>` to concrete `Tensor<Wgpu, 3>` (every call site was already 3D).
+
+**Correctness**: new `tests/full_forward.rs::test_rmsnorm_fused_matches_reference`
+(hidden=2048, 5 rows — exercises the prefill-shaped multi-row path — non-trivial
+random gamma so a weight-indexing bug wouldn't hide behind all-ones) — max relative
+error **2.97e-7** vs burn-nn's reference, two orders of magnitude under the 1e-5 bar.
+Full greedy-match suite: 01 unchanged (pre-existing small-model quantization-noise
+divergence, not a regression — see C2/C3 history), 02 20/20, 03 28/28, both exact.
+
+**Dispatch count**: not re-measured with the analytical estimator (`bin/llm-agent.rs`'s
+`print_dispatch_estimate` is owned by the other worker this session, not touched) —
+by inspection, RMSNorm goes from ~8 dispatches x 73 calls (36 layers x 2 + out_norm) =
+~584 to 1 x 73 = 73, a ~511-dispatch reduction, taking the ~1589/token estimate to
+roughly **~1078/token** (estimated, not measured).
+
+**End-to-end** (`02_tools_single`, with D1 also applied — not isolated from D1's
+noise):
+
+| | prefill tok/s | decode ms/token | greedy-match |
+|---|---|---|---|
+| D1 only | 29.17 | 194.9 | 20/20 |
+| D1 + D2a (run 1) | 29.6* | 188.3 | 20/20 |
+| D1 + D2a (`03_tools_multiturn`, run 1) | 26.95 | 181.6 | 28/28 |
+
+(*from the combined 3-fixture suite run; 02's own line reports "37.20 tok/s" in the
+raw log — two different runs in this session disagreed by ~8 tok/s on the identical
+D1+D2a code, same noise-floor caveat as D1's table.)
+
+Directionally consistent with a real (if partially noise-masked) improvement — every
+D1+D2a decode number this session (188.3, 181.6) came in below every D1-only or
+pre-D1 number (194.9, 213.8) — but not a clean isolated measurement given the shared
+machine. No regression in any run.
+
+### Not attempted this session
+
+- **D2b/c (RoPE rotate-half fusion, SiLU*up fusion)**: same pattern as D2a, next
+  highest dispatch-count wins per Session 2's per-op breakdown (RoPE ~10/layer, mostly
+  `rotate_half`'s `cat`). Straightforward given D2a's kernel skeleton (one workgroup
+  per row, elementwise) — highest-ROI remaining work.
+- **D2d (residual add folded into matvec)**: requires adding an optional `+residual`
+  binding + info-buffer flag to `shader_q4_matvec.wgsl`/`shader_naive.wgsl` and
+  `gguf.rs::q4_matmul`'s signature — more invasive than D2a-c, not started.
+- **D3 (coalesced matvec)**: not attempted. Isolated matvec GB/s was last measured at
+  16-27 GB/s (Session 2, unaffected by this session's changes); the reviewer's
+  word-index-interleaved-across-lanes target (≥60 GB/s) still open.
+- **D4 (prefill scratch-dequant + matmul)**: not attempted. Prefill's >90% matmul-time
+  bottleneck (Session 2 finding) is unchanged by D1/D2a (neither touches the M>1 naive
+  kernel).
+
+### Summary
+
+| change | status | prefill tok/s (02, noisy) | decode ms/token (02) | greedy-match | numerics verified |
+|---|---|---|---|---|---|
+| K5 baseline (session 2 end) | — | 29.6 | ~190 | y | y |
+| D1 (KV cache in-place) | shipped, no isolated measured win | 29-36 (noise) | 195-214 (noise) | y | y (bit-identical logic path when it does write in place; argmax-identical either way) |
+| D2a (fused RMSNorm) | shipped | 27-37 (noise) | 181-188 | y | y (2.97e-7 rel. err. vs reference) |
+
+Neither this session's changes nor Session 2's moved decode ms/token or prefill tok/s
+outside this machine's run-to-run noise band in a way a single before/after pair can
+prove — the directional evidence (every post-D2a decode number beat every pre-D2a
+number) is suggestive, not conclusive. **Single most valuable next change**: D2b
+(RoPE fusion) — same low-risk elementwise-kernel pattern as D2a, next-largest
+dispatch-count item, and (unlike D1) has a plausible mechanism to show up in wall time
+regardless of GPU-copy-vs-view uncertainty, since it removes real dispatch-submission
+overhead rather than a memory-bandwidth cost that may already be masked by unified
+memory. After D2b/c/d close out D2, D3's coalesced-matvec rewrite is the largest
+remaining lever (16-27 GB/s measured vs ≥60 GB/s target, decode's matvec bucket is
+still ~half of total step time per Session 2's P1c breakdown) — but it's also the
+highest-risk item (K2's tiled-matmul attempt shows this GPU/driver combination doesn't
+respond to naive tiling/vectorization the way the reviewer's model predicted; treat
+D3's target as aspirational, not guaranteed, and budget time to fall back to "ship the
+best measured variant" rather than chasing 60GB/s if early attempts plateau like K2
+did).
