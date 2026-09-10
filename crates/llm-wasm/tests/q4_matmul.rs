@@ -18,8 +18,8 @@ use burn::backend::wgpu::WgpuDevice;
 use burn::backend::Wgpu;
 use burn::tensor::Tensor;
 use llm_wasm::gguf::{
-    q4_dequant_scratch_to_vec, q4_matmul, q4_matmul_naive_forced, q4_matmul_scratch_forced,
-    q4_matmul_tiled_forced, Q4ModelLoader, Q4Tensor,
+    pad_m_bucket_for_test, q4_dequant_scratch_to_vec, q4_matmul, q4_matmul_naive_forced,
+    q4_matmul_scratch_forced, q4_matmul_tiled_forced, Q4ModelLoader, Q4Tensor,
 };
 
 fn device() -> WgpuDevice {
@@ -608,4 +608,54 @@ fn test_dequant_scratch_matches_cpu_real_gguf() {
         worst.0, worst.1
     );
     assert!(max_abs < 1e-3, "dequant max_abs={max_abs} exceeds 1e-3 at {worst:?}");
+}
+
+// ---------------------------------------------------------------------------
+// Session 10: autotune-bucket padding (docs/BENCHMARKS.md Session 10). The
+// scratch-dequant+matmul path now pads M up to `pad_m_bucket`'s fixed
+// buckets before calling `Tensor::matmul`, so distinct prefill lengths
+// don't each pay a fresh autotune pass in the browser (no persistent
+// autotune cache there). This asserts padding is numerically inert: calling
+// the public API at M gives the same first-M rows as calling it at the
+// bucket boundary `pad_m_bucket(M)` (manually zero-padded here) and slicing
+// — i.e. zero rows appended by the internal padding don't perturb the real
+// rows' matmul output.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_scratch_matmul_padding_is_numerically_inert() {
+    let k = 2048usize;
+    let n = 96usize;
+    let (bytes, _cpu_weights) = random_q4(n, k, 0x9EC0DE);
+
+    for &m in &[40usize, 100, 531, 1225] {
+        let input = random_input(m, k, 0xBADD1E + m as u64);
+        let out_m = run_gpu_matmul_scratch(&input, &bytes, m, k, n);
+
+        let padded_m = pad_m_bucket_for_test(m);
+        assert!(padded_m >= m, "M={m}: padded_m={padded_m} must be >= m");
+        assert_eq!(
+            padded_m % if m < 128 { 32 } else { 128 },
+            0,
+            "M={m}: padded_m={padded_m} not aligned to expected bucket"
+        );
+
+        let mut padded_input = input.clone();
+        padded_input.resize(padded_m * k, 0.0);
+        let out_padded = run_gpu_matmul_scratch(&padded_input, &bytes, padded_m, k, n);
+
+        let mut max_diff = 0f32;
+        for row in 0..m {
+            for col in 0..n {
+                let a = out_m[row * n + col];
+                let b = out_padded[row * n + col];
+                max_diff = max_diff.max((a - b).abs());
+            }
+        }
+        assert!(
+            max_diff < 1e-6,
+            "M={m} (padded to {padded_m}): first-M-rows max_diff={max_diff} exceeds 1e-6"
+        );
+        println!("M={m:5} padded_to={padded_m:5}: max_diff={max_diff:.3e}");
+    }
 }

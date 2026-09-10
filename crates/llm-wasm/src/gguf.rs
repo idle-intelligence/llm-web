@@ -1008,6 +1008,13 @@ pub fn q4_matmul_scratch_forced(input: Tensor<Wgpu, 3>, weights: &Q4Tensor) -> T
     q4_matmul_dispatch(input, weights, ForceKernel::Scratch)
 }
 
+/// Test-only: exposes `pad_m_bucket` so `tests/q4_matmul.rs` can assert
+/// zero-padding's first-M-rows-identical property directly against the
+/// bucket boundary it pads to.
+pub fn pad_m_bucket_for_test(m: usize) -> usize {
+    pad_m_bucket(m)
+}
+
 /// Forces K1's superseded matvec kernel (requires M==1) — test/bench-only,
 /// see `ForceKernel::MatvecK1`.
 pub fn q4_matmul_matvec_k1_forced(input: Tensor<Wgpu, 3>, weights: &Q4Tensor) -> Tensor<Wgpu, 3> {
@@ -1150,7 +1157,15 @@ pub fn q4_dequant_scratch_to_vec(weights: &Q4Tensor, device: &WgpuDevice) -> Vec
 /// length's shape — if a much longer prefill panics again, the fix is to
 /// lower this back down (chunking still works correctly for M > this value,
 /// it's purely a throughput/safety-margin tradeoff, not a correctness one).
-const SCRATCH_MATMUL_CHUNK_M: usize = 2225;
+///
+/// Session 10: lowered from 2225 to 2048 (a multiple of 128) so that
+/// `pad_m_bucket`'s 128-row buckets never produce a ragged last chunk —
+/// since callers of `scratch_matmul_chunked` now always pass an `m` that's
+/// already a multiple of 128 (or, for M<128, a multiple of 32 which never
+/// chunks since it's under this threshold), and 2048 % 128 == 0, the
+/// remainder chunk is automatically 128-aligned too. No extra last-chunk
+/// padding logic is needed.
+const SCRATCH_MATMUL_CHUNK_M: usize = 2048;
 
 /// Chunks `x[B,M,K] . w[1,K,N]` over the M dimension — see
 /// `SCRATCH_MATMUL_CHUNK_M`'s doc comment for why.
@@ -1167,6 +1182,28 @@ fn scratch_matmul_chunked(x: Tensor<Wgpu, 3>, w: Tensor<Wgpu, 3>, m: usize) -> T
         start += len;
     }
     Tensor::cat(chunks, 1)
+}
+
+/// Rounds `m` up to a fixed bucket so that Burn's `autotune` (no persistent
+/// cache in the browser — see docs/BENCHMARKS.md Session 10) only ever
+/// tunes a small, reused set of prefill shapes instead of a fresh one for
+/// every distinct prompt/tool-result length. Two bucket granularities:
+///
+/// - `m < 128`: round up to the next multiple of 32. At small M the next
+///   128-bucket is a disproportionate multiplier (M=40 padded to 128 is
+///   3.2x fake rows; padded to 64 it's 1.6x), and small-M calls are cheap
+///   enough in absolute terms that the extra distinct buckets (32/64/96)
+///   don't reintroduce meaningful re-tuning cost — measured net win at
+///   M=40 and M=100 (docs/BENCHMARKS.md Session 10).
+/// - `m >= 128`: round up to the next multiple of 128, matching
+///   `SCRATCH_MATMUL_CHUNK_M`'s alignment so chunked prefills never see a
+///   ragged last chunk.
+fn pad_m_bucket(m: usize) -> usize {
+    if m < 128 {
+        m.next_multiple_of(32)
+    } else {
+        m.next_multiple_of(128)
+    }
 }
 
 fn q4_matmul_dispatch(input: Tensor<Wgpu, 3>, weights: &Q4Tensor, force: ForceKernel) -> Tensor<Wgpu, 3> {
@@ -1228,7 +1265,26 @@ fn q4_matmul_dispatch(input: Tensor<Wgpu, 3>, weights: &Q4Tensor, force: ForceKe
         );
         let x = Tensor::from_primitive(TensorPrimitive::Float(cube_input.clone()));
         let w = Tensor::<Wgpu, 3>::from_primitive(TensorPrimitive::Float(w_tensor));
-        return scratch_matmul_chunked(x, w, m);
+
+        // Pad M up to a fixed bucket (see `pad_m_bucket`'s doc comment) so
+        // `Tensor::matmul`'s autotune only ever sees a small, reused set of
+        // shapes instead of one per distinct prefill length. Padded rows
+        // are zeros, which don't affect the real rows' matmul output
+        // (each output row is an independent dot product over K), and are
+        // sliced off below before any downstream op sees them.
+        let padded_m = pad_m_bucket(m);
+        let x_padded = if padded_m == m {
+            x
+        } else {
+            let pad_rows = Tensor::<Wgpu, 3>::zeros([b, padded_m - m, k], &device);
+            Tensor::cat(vec![x, pad_rows], 1)
+        };
+        let out = scratch_matmul_chunked(x_padded, w, padded_m);
+        return if padded_m == m {
+            out
+        } else {
+            out.narrow(1, 0, m)
+        };
     }
 
     let output_handle = client.empty(b * m * n * 4);
