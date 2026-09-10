@@ -391,3 +391,67 @@ fn test_forward_02_tools_single() {
 fn test_forward_03_tools_multiturn() {
     run_prefill_and_decode_check("03_tools_multiturn", 12288);
 }
+
+/// D2 (docs/BENCHMARKS.md Session 3): the fused RMSNorm kernel
+/// (`gguf.rs::rmsnorm_fused`, `wgsl/shader_rmsnorm.wgsl`) must match
+/// `burn::nn::RmsNorm::forward`'s unfused reference to 1e-5 relative,
+/// at the model's real `hidden_size=2048` shape and a multi-row (T>1,
+/// exercises prefill-shaped input) case, with non-trivial gamma (not all
+/// ones, so a gamma bug wouldn't hide behind a no-op weight).
+#[test]
+fn test_rmsnorm_fused_matches_reference() {
+    use burn::backend::wgpu::WgpuDevice;
+    use burn::backend::Wgpu;
+    use burn::nn::RmsNormConfig;
+    use burn::tensor::Tensor;
+
+    let device = WgpuDevice::default();
+    let hidden = 2048usize;
+    let rows = 5usize; // B*T, exercises the multi-row (prefill-shaped) path
+
+    let mut rng = Xorshift::new(42);
+    let mut next_f32 = || (rng.next_u32() as i32 as f32) / (u32::MAX as f32 / 2.0);
+
+    let x_data: Vec<f32> = (0..rows * hidden).map(|_| next_f32()).collect();
+    let gamma_data: Vec<f32> = (0..hidden).map(|_| 0.5 + next_f32().abs()).collect();
+
+    let x = Tensor::<Wgpu, 1>::from_floats(x_data.as_slice(), &device).reshape([1, rows, hidden]);
+    let gamma = Tensor::<Wgpu, 1>::from_floats(gamma_data.as_slice(), &device);
+
+    let mut reference = RmsNormConfig::new(hidden)
+        .with_epsilon(1e-5)
+        .init::<Wgpu>(&device);
+    // Overwrite the default (all-ones) gamma with our non-trivial weight.
+    reference.gamma = burn::module::Param::from_tensor(gamma.clone());
+    let ref_out = reference.forward(x.clone());
+    let ref_data = ref_out.into_data().into_vec::<f32>().unwrap();
+
+    let fused_out = llm_wasm::gguf::rmsnorm_fused(x, gamma, 1e-5);
+    let fused_data = fused_out.into_data().into_vec::<f32>().unwrap();
+
+    assert_eq!(ref_data.len(), fused_data.len());
+    let mut max_rel_err = 0.0f32;
+    for (r, f) in ref_data.iter().zip(fused_data.iter()) {
+        let rel = (r - f).abs() / r.abs().max(1e-6);
+        max_rel_err = max_rel_err.max(rel);
+    }
+    eprintln!("rmsnorm_fused vs reference: max relative error = {max_rel_err:.2e}");
+    assert!(max_rel_err < 1e-5, "max relative error {max_rel_err:.2e} exceeds 1e-5");
+}
+
+/// Deterministic xorshift PRNG (mirrors tests/q4_matmul.rs's copy — no
+/// `rand` dependency needed for test data).
+struct Xorshift(u64);
+impl Xorshift {
+    fn new(seed: u64) -> Self {
+        Self(seed | 1)
+    }
+    fn next_u32(&mut self) -> u32 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        (x >> 32) as u32
+    }
+}

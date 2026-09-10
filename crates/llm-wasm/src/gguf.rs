@@ -997,6 +997,70 @@ fn q4_matmul_dispatch(input: Tensor<Wgpu, 3>, weights: &Q4Tensor, force_tiled: b
 }
 
 // ---------------------------------------------------------------------------
+// D2 — fused RMSNorm kernel
+// ---------------------------------------------------------------------------
+
+struct RmsNormKernel;
+
+impl KernelSource for RmsNormKernel {
+    fn source(&self) -> SourceTemplate {
+        SourceTemplate::new(include_str!("wgsl/shader_rmsnorm.wgsl"))
+    }
+
+    fn id(&self) -> KernelId {
+        KernelId::new::<Self>()
+    }
+}
+
+/// Fused RMSNorm: `Y = X / sqrt(mean(X^2) + eps) * gamma`, one dispatch for
+/// the whole `[B, T, hidden]` input instead of burn-nn's unfused
+/// cast/square/mean_dim/add/sqrt/div/mul chain. See
+/// `wgsl/shader_rmsnorm.wgsl` for the kernel and `RmsNormLayer::forward`
+/// (model.rs) for the call site.
+pub fn rmsnorm_fused(x: Tensor<Wgpu, 3>, weight: Tensor<Wgpu, 1>, eps: f32) -> Tensor<Wgpu, 3> {
+    let cube_x: CubeTensor<WgpuRuntime> = x.into_primitive().tensor();
+    let cube_x = into_contiguous(cube_x);
+    let cube_w: CubeTensor<WgpuRuntime> = weight.into_primitive().tensor();
+    let cube_w = into_contiguous(cube_w);
+
+    let [b, t, hidden] = [cube_x.shape.dims[0], cube_x.shape.dims[1], cube_x.shape.dims[2]];
+    let rows = b * t;
+    assert_eq!(cube_w.shape.dims[0], hidden, "RMSNorm weight/hidden size mismatch");
+
+    let client = cube_x.client.clone();
+    let device = cube_x.device.clone();
+    let output_handle = client.empty(rows * hidden * 4);
+
+    let info: [f32; 3] = [rows as f32, hidden as f32, eps];
+    let info_bytes: Vec<u8> = info.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let info_handle = client.create_from_slice(&info_bytes);
+
+    let bindings = Bindings::new()
+        .with_buffer(cube_x.handle.clone().binding())
+        .with_buffer(cube_w.handle.clone().binding())
+        .with_buffer(output_handle.clone().binding())
+        .with_buffer(info_handle.binding());
+
+    let kernel = SourceKernel::new(RmsNormKernel, CubeDim::new_1d(256));
+    client
+        .launch(
+            Box::new(kernel) as Box<dyn CubeTask<AutoCompiler>>,
+            CubeCount::new_1d(rows as u32),
+            bindings,
+        )
+        .expect("RMSNorm kernel launch failed");
+
+    let output_tensor = CubeTensor::new_contiguous(
+        client,
+        device,
+        burn::prelude::Shape::from(vec![b, t, hidden]),
+        output_handle,
+        DType::F32,
+    );
+    Tensor::from_primitive(TensorPrimitive::Float(output_tensor))
+}
+
+// ---------------------------------------------------------------------------
 // EmbeddingStore — Q4 embeddings for token lookups
 // ---------------------------------------------------------------------------
 

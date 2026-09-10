@@ -95,8 +95,14 @@ pub struct RmsNormLayer {
 }
 
 impl RmsNormLayer {
-    pub fn forward<const D: usize>(&self, x: Tensor<Wgpu, D>) -> Tensor<Wgpu, D> {
-        self.inner.forward(x)
+    /// D2 (docs/BENCHMARKS.md Session 3): dispatches the fused WGSL kernel
+    /// (`gguf.rs::rmsnorm_fused`) instead of burn-nn's unfused
+    /// cast/square/mean_dim/add/sqrt/div/mul chain (~8 dispatches). Matches
+    /// `burn::nn::RmsNorm::forward`'s math exactly — see
+    /// `wgsl/shader_rmsnorm.wgsl`'s doc comment and
+    /// `tests/full_forward.rs`'s unit test comparing the two.
+    pub fn forward(&self, x: Tensor<Wgpu, 3>) -> Tensor<Wgpu, 3> {
+        crate::gguf::rmsnorm_fused(x, self.inner.gamma.val(), self.inner.epsilon as f32)
     }
 }
 
