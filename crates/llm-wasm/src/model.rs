@@ -8,6 +8,7 @@
 //! 2-matrix gating, rotate-half RoPE instead of interleaved-pair, no sliding
 //! window, tied lm_head instead of an independent `text_linear`).
 
+use anyhow::Result;
 use burn::backend::wgpu::{Wgpu, WgpuDevice};
 use burn::tensor::activation::{silu, softmax};
 use burn::tensor::{Int, Tensor};
@@ -422,18 +423,20 @@ impl LlmModel {
     /// Embed `token_ids` on CPU (per-row Q4 dequant) and upload as `[1, T, hidden]`.
     /// `pub` (not just used internally) so `llm-agent bench` can time the
     /// CPU dequant + upload step in isolation (docs/BENCHMARKS.md P1c).
-    pub fn embed_tokens(&self, token_ids: &[u32]) -> Tensor<Wgpu, 3> {
+    pub fn embed_tokens(&self, token_ids: &[u32]) -> Result<Tensor<Wgpu, 3>> {
         let hidden = self.config.hidden_size;
         let mut data = vec![0.0f32; token_ids.len() * hidden];
         for (i, &id) in token_ids.iter().enumerate() {
             self.embed
-                .embed_id_add_cpu(id, &mut data[i * hidden..(i + 1) * hidden]);
+                .embed_id_add_cpu(id, &mut data[i * hidden..(i + 1) * hidden])?;
         }
-        Tensor::<Wgpu, 1>::from_floats(data.as_slice(), &self.device).reshape([
-            1,
-            token_ids.len(),
-            hidden,
-        ])
+        Ok(
+            Tensor::<Wgpu, 1>::from_floats(data.as_slice(), &self.device).reshape([
+                1,
+                token_ids.len(),
+                hidden,
+            ]),
+        )
     }
 
     /// Run all transformer layers + final norm over `token_ids`, appending to
@@ -441,14 +444,14 @@ impl LlmModel {
     /// (post `output_norm`, pre lm_head — callers slice before calling
     /// `lm_head` to avoid materializing `T x 151936` logits when only a few
     /// positions are needed, e.g. prefill's last-token generation step).
-    pub fn forward_hidden(&self, token_ids: &[u32], cache: &mut KvCache) -> Tensor<Wgpu, 3> {
+    pub fn forward_hidden(&self, token_ids: &[u32], cache: &mut KvCache) -> Result<Tensor<Wgpu, 3>> {
         let offset = cache.len();
-        let mut x = self.embed_tokens(token_ids);
+        let mut x = self.embed_tokens(token_ids)?;
         for (i, layer) in self.layers.iter().enumerate() {
             x = layer.forward(x, &self.rope, cache, i, offset);
         }
         cache.advance(token_ids.len());
-        self.out_norm.forward(x)
+        Ok(self.out_norm.forward(x))
     }
 
     /// lm_head over hidden states `[1, T, hidden]` -> logits `[1, T, vocab]`.
@@ -461,9 +464,9 @@ impl LlmModel {
     /// Convenience: full forward + full-width logits for every position.
     /// Only use for small T (tests); for real prefill, slice `forward_hidden`'s
     /// output to the positions you need before calling `lm_head`.
-    pub fn forward_logits(&self, token_ids: &[u32], cache: &mut KvCache) -> Tensor<Wgpu, 3> {
-        let hidden = self.forward_hidden(token_ids, cache);
-        self.lm_head(hidden)
+    pub fn forward_logits(&self, token_ids: &[u32], cache: &mut KvCache) -> Result<Tensor<Wgpu, 3>> {
+        let hidden = self.forward_hidden(token_ids, cache)?;
+        Ok(self.lm_head(hidden))
     }
 
     /// Greedy-decode up to `max_new` tokens after prefilling `prompt_ids`
@@ -480,32 +483,35 @@ impl LlmModel {
         max_new: usize,
         stop_ids: &[u32],
         cache: &mut KvCache,
-    ) -> Vec<u32> {
+    ) -> Result<Vec<u32>> {
         assert!(!prompt_ids.is_empty());
-        let hidden = self.forward_hidden(prompt_ids, cache);
+        let hidden = self.forward_hidden(prompt_ids, cache)?;
         let last = hidden.narrow(1, prompt_ids.len() - 1, 1);
         let mut logits = self.lm_head(last);
 
         let mut out = Vec::with_capacity(max_new);
         for _ in 0..max_new {
-            let logits_vec = logits_to_vec(logits);
+            let logits_vec = logits_to_vec(logits)?;
             let next = crate::sample::greedy(&logits_vec);
             out.push(next);
             if stop_ids.contains(&next) {
                 break;
             }
-            let hidden = self.forward_hidden(&[next], cache);
+            let hidden = self.forward_hidden(&[next], cache)?;
             logits = self.lm_head(hidden);
         }
-        out
+        Ok(out)
     }
 }
 
 /// Extract a `[1, 1, vocab]` (or `[1, T=1, vocab]`) logits tensor to a flat
 /// `Vec<f32>`. Native-only sync readback (`into_data()`); WASM callers must
 /// use `into_data_async().await` instead (see crate-level WASM constraints).
-pub fn logits_to_vec(logits: Tensor<Wgpu, 3>) -> Vec<f32> {
-    logits.into_data().into_vec::<f32>().expect("f32 logits")
+pub fn logits_to_vec(logits: Tensor<Wgpu, 3>) -> Result<Vec<f32>> {
+    logits
+        .into_data()
+        .into_vec::<f32>()
+        .map_err(|e| anyhow::anyhow!("failed to read back f32 logits: {e:?}"))
 }
 
 #[cfg(test)]

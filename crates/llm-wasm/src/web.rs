@@ -519,7 +519,9 @@ impl LlmEngine {
         self.resident_tokens.truncate(effective_prefix);
 
         let prefill_start = now_ms();
-        let hidden = model.forward_hidden(suffix, cache);
+        let hidden = model
+            .forward_hidden(suffix, cache)
+            .map_err(|e| JsError::new(&format!("forward pass failed: {e}")))?;
         self.resident_tokens.extend_from_slice(suffix);
         let last = hidden.narrow(1, suffix.len() - 1, 1);
         let mut logits = model.lm_head(last);
@@ -533,13 +535,17 @@ impl LlmEngine {
                 .into_data_async()
                 .await
                 .map_err(|e| JsError::new(&format!("GPU readback failed: {e}")))?;
-            let logits_vec: Vec<f32> = data.into_vec().expect("f32 logits");
+            let logits_vec: Vec<f32> = data
+                .into_vec()
+                .map_err(|e| JsError::new(&format!("failed to read back f32 logits: {e:?}")))?;
             let next = greedy(&logits_vec);
             out_ids.push(next);
             if stop_ids.contains(&next) {
                 break;
             }
-            let hidden = model.forward_hidden(&[next], cache);
+            let hidden = model
+                .forward_hidden(&[next], cache)
+                .map_err(|e| JsError::new(&format!("forward pass failed: {e}")))?;
             self.resident_tokens.push(next);
             logits = model.lm_head(hidden);
         }

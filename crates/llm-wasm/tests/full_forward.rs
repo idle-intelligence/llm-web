@@ -189,13 +189,13 @@ fn test_forward_01_no_tools() {
 
     let mut cache = model.new_cache(64);
     let t0 = std::time::Instant::now();
-    let logits = model.forward_logits(&tokens, &mut cache);
+    let logits = model.forward_logits(&tokens, &mut cache).unwrap();
     let prefill_s = t0.elapsed().as_secs_f32();
     eprintln!("prefill (31 tokens): {prefill_s:.3}s");
 
     let vocab = model.config().vocab_size;
     let seq_len = tokens.len();
-    let flat = llm_wasm::model::logits_to_vec(logits);
+    let flat = llm_wasm::model::logits_to_vec(logits).unwrap();
     assert_eq!(flat.len(), seq_len * vocab);
 
     let mut npy = NpyF32::open(&ref_npy_path);
@@ -304,7 +304,7 @@ fn run_prefill_and_decode_check(fixture: &str, max_ctx: usize) {
 
     let mut cache = model.new_cache(max_ctx);
     let t0 = std::time::Instant::now();
-    let hidden = model.forward_hidden(&tokens, &mut cache);
+    let hidden = model.forward_hidden(&tokens, &mut cache).unwrap();
     let prefill_s = t0.elapsed().as_secs_f32();
     eprintln!(
         "{fixture}: prefill {seq_len} tokens in {prefill_s:.3}s ({:.2} tok/s)",
@@ -314,7 +314,7 @@ fn run_prefill_and_decode_check(fixture: &str, max_ctx: usize) {
     let last_n = 8usize.min(seq_len);
     let hidden_last = hidden.narrow(1, seq_len - last_n, last_n);
     let logits_last = model.lm_head(hidden_last);
-    let flat = llm_wasm::model::logits_to_vec(logits_last);
+    let flat = llm_wasm::model::logits_to_vec(logits_last).unwrap();
     assert_eq!(flat.len(), last_n * vocab);
 
     let mut mismatches = Vec::new();
@@ -359,9 +359,9 @@ fn run_prefill_and_decode_check(fixture: &str, max_ctx: usize) {
         if eos.contains(&next) {
             break;
         }
-        let hidden = model.forward_hidden(&[next], &mut cache);
+        let hidden = model.forward_hidden(&[next], &mut cache).unwrap();
         let logits = model.lm_head(hidden);
-        logits_vec = llm_wasm::model::logits_to_vec(logits);
+        logits_vec = llm_wasm::model::logits_to_vec(logits).unwrap();
     }
     let decode_s = t1.elapsed().as_secs_f32();
     let ms_per_token = 1000.0 * decode_s / generated.len().max(1) as f32;
@@ -462,17 +462,17 @@ fn split_prefill_matches_single_prefill() {
 
     // (a) single whole-prompt prefill.
     let mut cache_a = model.new_cache(max_ctx);
-    let hidden_a = model.forward_hidden(&tokens, &mut cache_a);
+    let hidden_a = model.forward_hidden(&tokens, &mut cache_a).unwrap();
     let last_a = hidden_a.narrow(1, seq_len - 1, 1);
-    let logits_a = llm_wasm::model::logits_to_vec(model.lm_head(last_a));
+    let logits_a = llm_wasm::model::logits_to_vec(model.lm_head(last_a)).unwrap();
 
     let mut decoded_a = Vec::new();
     let mut logits_vec = logits_a.clone();
     for _ in 0..8 {
         let next = llm_wasm::sample::greedy(&logits_vec);
         decoded_a.push(next);
-        let hidden = model.forward_hidden(&[next], &mut cache_a);
-        logits_vec = llm_wasm::model::logits_to_vec(model.lm_head(hidden));
+        let hidden = model.forward_hidden(&[next], &mut cache_a).unwrap();
+        logits_vec = llm_wasm::model::logits_to_vec(model.lm_head(hidden)).unwrap();
     }
 
     let mut max_diff_report = Vec::new();
@@ -480,13 +480,13 @@ fn split_prefill_matches_single_prefill() {
     for &split in &[2218usize, 1000, seq_len - 1] {
         let mut cache = model.new_cache(max_ctx);
         cache.restore(0);
-        let _ = model.forward_hidden(&tokens[..split], &mut cache);
+        let _ = model.forward_hidden(&tokens[..split], &mut cache).unwrap();
         let snap = cache.snapshot();
         assert_eq!(snap, split, "snapshot() should equal tokens prefilled so far");
 
-        let hidden_b = model.forward_hidden(&tokens[split..], &mut cache);
+        let hidden_b = model.forward_hidden(&tokens[split..], &mut cache).unwrap();
         let last_b = hidden_b.narrow(1, seq_len - split - 1, 1);
-        let logits_b = llm_wasm::model::logits_to_vec(model.lm_head(last_b));
+        let logits_b = llm_wasm::model::logits_to_vec(model.lm_head(last_b)).unwrap();
 
         assert_eq!(logits_a.len(), logits_b.len());
         let mut max_abs_diff = 0f32;
@@ -514,8 +514,8 @@ fn split_prefill_matches_single_prefill() {
         for _ in 0..8 {
             let next = llm_wasm::sample::greedy(&logits_vec);
             decoded_b.push(next);
-            let hidden = model.forward_hidden(&[next], &mut cache);
-            logits_vec = llm_wasm::model::logits_to_vec(model.lm_head(hidden));
+            let hidden = model.forward_hidden(&[next], &mut cache).unwrap();
+            logits_vec = llm_wasm::model::logits_to_vec(model.lm_head(hidden)).unwrap();
         }
         eprintln!("split={split}: decoded_a={decoded_a:?} decoded_b={decoded_b:?}");
         assert_eq!(decoded_a, decoded_b, "split={split}: greedy continuation diverged");
@@ -533,17 +533,17 @@ fn split_prefill_matches_single_prefill() {
     alt_full.extend_from_slice(&alt_suffix);
 
     let mut cache_fresh = model.new_cache(max_ctx);
-    let hidden_fresh = model.forward_hidden(&alt_full, &mut cache_fresh);
+    let hidden_fresh = model.forward_hidden(&alt_full, &mut cache_fresh).unwrap();
     let last_fresh = hidden_fresh.narrow(1, alt_full.len() - 1, 1);
-    let logits_fresh = llm_wasm::model::logits_to_vec(model.lm_head(last_fresh));
+    let logits_fresh = llm_wasm::model::logits_to_vec(model.lm_head(last_fresh)).unwrap();
 
     let mut cache_reuse = model.new_cache(max_ctx);
     cache_reuse.restore(0);
-    let _ = model.forward_hidden(&tokens[..split], &mut cache_reuse);
+    let _ = model.forward_hidden(&tokens[..split], &mut cache_reuse).unwrap();
     cache_reuse.restore(split);
-    let hidden_reuse = model.forward_hidden(&alt_suffix, &mut cache_reuse);
+    let hidden_reuse = model.forward_hidden(&alt_suffix, &mut cache_reuse).unwrap();
     let last_reuse = hidden_reuse.narrow(1, alt_suffix.len() - 1, 1);
-    let logits_reuse = llm_wasm::model::logits_to_vec(model.lm_head(last_reuse));
+    let logits_reuse = llm_wasm::model::logits_to_vec(model.lm_head(last_reuse)).unwrap();
 
     let mut max_abs_diff = 0f32;
     for (x, y) in logits_fresh.iter().zip(logits_reuse.iter()) {

@@ -232,7 +232,7 @@ fn run(
     let stop_ids = model.config().eos_token_ids.clone();
 
     let t1 = std::time::Instant::now();
-    let generated = model.generate(&prompt_ids, max_new, &stop_ids, &mut cache);
+    let generated = model.generate(&prompt_ids, max_new, &stop_ids, &mut cache)?;
     let dt = t1.elapsed().as_secs_f32();
     eprintln!(
         "generated {} tokens in {:.2}s ({:.1} ms/token overall, includes prefill)",
@@ -393,13 +393,13 @@ fn bench(
     let mut cache = model.new_cache(max_ctx);
 
     let t_prefill = std::time::Instant::now();
-    let hidden = model.forward_hidden(&prompt_ids, &mut cache);
+    let hidden = model.forward_hidden(&prompt_ids, &mut cache)?;
     let last = hidden.narrow(1, prompt_ids.len() - 1, 1);
     let logits = model.lm_head(last);
     // burn's wgpu backend dispatches asynchronously — force a sync readback
     // here (native-only `into_data()`, never do this in WASM) so
     // `prefill_dt` measures actual GPU completion, not just queue time.
-    let mut logits_vec = llm_wasm::model::logits_to_vec(logits);
+    let mut logits_vec = llm_wasm::model::logits_to_vec(logits)?;
     let prefill_dt = t_prefill.elapsed().as_secs_f32();
     let prefill_tok_s = prompt_ids.len() as f32 / prefill_dt;
     println!(
@@ -419,10 +419,10 @@ fn bench(
     set_skip_matvec_for_bench(true);
     let mut prefill_bench_cache = model.new_cache(max_ctx);
     let t_pf_skip = std::time::Instant::now();
-    let hidden2 = model.forward_hidden(&prompt_ids, &mut prefill_bench_cache);
+    let hidden2 = model.forward_hidden(&prompt_ids, &mut prefill_bench_cache)?;
     let last2 = hidden2.narrow(1, prompt_ids.len() - 1, 1);
     let logits2 = model.lm_head(last2);
-    let _ = llm_wasm::model::logits_to_vec(logits2);
+    let _ = llm_wasm::model::logits_to_vec(logits2)?;
     let prefill_skip_dt = t_pf_skip.elapsed().as_secs_f32();
     set_skip_matvec_for_bench(false);
     let prefill_matmul_dt = prefill_dt - prefill_skip_dt;
@@ -434,22 +434,22 @@ fn bench(
     // P1c: decode per-token wall-time breakdown.
     println!("-- P1c: decode per-token wall-time breakdown --");
     let t_embed = std::time::Instant::now();
-    let embed_tensor = model.embed_tokens(&[prompt_ids[0]]);
+    let embed_tensor = model.embed_tokens(&[prompt_ids[0]])?;
     let _ = embed_tensor.into_data().into_vec::<f32>().unwrap();
     let embed_ms = t_embed.elapsed().as_secs_f64() * 1000.0;
 
     set_skip_matvec_for_bench(true);
     let mut rest_cache = model.new_cache(max_ctx);
     // warm-up
-    let _ = model.forward_hidden(&prompt_ids[..1], &mut rest_cache);
+    let _ = model.forward_hidden(&prompt_ids[..1], &mut rest_cache)?;
     let rest_iters = 8;
     let t_rest = std::time::Instant::now();
     let mut last_rest = None;
     for _ in 0..rest_iters {
-        let h = model.forward_hidden(&prompt_ids[..1], &mut rest_cache);
+        let h = model.forward_hidden(&prompt_ids[..1], &mut rest_cache)?;
         last_rest = Some(model.lm_head(h));
     }
-    let _ = llm_wasm::model::logits_to_vec(last_rest.unwrap());
+    let _ = llm_wasm::model::logits_to_vec(last_rest.unwrap())?;
     let rest_ms = t_rest.elapsed().as_secs_f64() * 1000.0 / rest_iters as f64;
     set_skip_matvec_for_bench(false);
 
@@ -482,12 +482,12 @@ fn bench(
     for _ in 0..decode_steps {
         let next = llm_wasm::sample::greedy(&logits_vec);
         let t_step = std::time::Instant::now();
-        let hidden = model.forward_hidden(&[next], &mut cache);
+        let hidden = model.forward_hidden(&[next], &mut cache)?;
         let logits = model.lm_head(hidden);
         // Force sync so this step's GPU work is actually complete before
         // the next timer starts (native-only sync readback — see
         // model.rs's `logits_to_vec` doc comment; not a WASM code path).
-        logits_vec = llm_wasm::model::logits_to_vec(logits);
+        logits_vec = llm_wasm::model::logits_to_vec(logits)?;
         decode_ms.push(t_step.elapsed().as_secs_f32() * 1000.0);
     }
 
@@ -584,10 +584,10 @@ impl Generator for NativeGenerator {
             0
         };
         let suffix = &prompt_ids[suffix_start..];
-        let hidden = self.model.forward_hidden(suffix, &mut self.cache);
+        let hidden = self.model.forward_hidden(suffix, &mut self.cache)?;
         let last = hidden.narrow(1, suffix.len() - 1, 1);
         let logits = self.model.lm_head(last);
-        let mut logits_vec = llm_wasm::model::logits_to_vec(logits);
+        let mut logits_vec = llm_wasm::model::logits_to_vec(logits)?;
         self.last_prefill = t_prefill.elapsed();
 
         if !reuse {
@@ -602,9 +602,9 @@ impl Generator for NativeGenerator {
             if stop_ids.contains(&next) {
                 break;
             }
-            let hidden = self.model.forward_hidden(&[next], &mut self.cache);
+            let hidden = self.model.forward_hidden(&[next], &mut self.cache)?;
             let logits = self.model.lm_head(hidden);
-            logits_vec = llm_wasm::model::logits_to_vec(logits);
+            logits_vec = llm_wasm::model::logits_to_vec(logits)?;
         }
         self.last_decode = t_decode.elapsed();
 
