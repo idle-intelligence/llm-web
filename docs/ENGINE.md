@@ -553,6 +553,24 @@ Note: `--out-dir` is resolved relative to the crate directory being built
 directly. `pkg/` is committed (same convention as stt-web) — remove `pkg/.gitignore` (wasm-pack
 always emits one with a bare `*`) before staging, or nothing under `pkg/` will be tracked.
 
+### Rebuild after the Q4 repack / cooperative-matvec / fused-RMSNorm changes
+
+`web.rs` was checked against the post-repack `model.rs`/`gguf.rs`/`kv.rs`/`agent.rs` APIs
+(repacked Q4 tensors, cooperative M=1 matvec + subgroup variant, fused RMSNorm, in-place KV
+writes, `preserve_order` JSON, step timing fields) — no source changes were needed beyond the
+subgroup wiring below; `forward_hidden`/`lm_head`/`KvCache::restore`/`into_data_async` all kept
+their signatures. `cargo clippy --target wasm32-unknown-unknown --no-default-features --features
+web -p llm-wasm` is clean and `wasm-pack build` (command above) succeeds; `pkg/` was rebuilt and
+recommitted.
+
+`initWgpuDevice()` now probes `adapter.features().contains(wgpu::Features::SUBGROUP)` and calls
+`gguf::set_subgroup_support(...)` before requesting the device, mirroring
+`sts-wasm/src/web/bindings.rs`'s `initWgpuDevice` exactly (same feature-diff-then-probe shape
+already present in `web.rs` for `MAPPABLE_PRIMARY_BUFFERS`) — the browser now uses the subgroup
+matvec kernel when the adapter reports it, falling back to the portable kernel otherwise.
+Unverified in a real browser (no headless browser available in this environment) whether any
+adapter actually reports `SUBGROUP` support.
+
 ### What is untested
 
 No headless browser is available in this environment (Playwright/Chrome are explicitly

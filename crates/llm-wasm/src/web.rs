@@ -103,6 +103,14 @@ pub async fn init_wgpu_device() -> Result<(), JsError> {
     ));
 
     let features = adapter.features() - wgpu::Features::MAPPABLE_PRIMARY_BUFFERS;
+
+    // Detect subgroup support for the cooperative matvec kernel's subgroup
+    // variant (`gguf.rs::has_subgroup_support()`); falls back to the
+    // portable kernel otherwise.
+    let subgroups_available = features.contains(wgpu::Features::SUBGROUP);
+    crate::gguf::set_subgroup_support(subgroups_available);
+    wasm_log(&format!("[llm] Subgroup support: {subgroups_available}"));
+
     let (device, queue) = adapter
         .request_device(&wgpu::DeviceDescriptor {
             label: Some("llm-wgpu"),
