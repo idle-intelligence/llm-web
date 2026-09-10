@@ -229,15 +229,16 @@ impl GgmlDtype {
         }
     }
 
-    pub fn byte_size(&self, num_elements: u64) -> u64 {
+    pub fn byte_size(&self, num_elements: u64) -> Result<u64> {
         match self {
-            Self::F32 => num_elements * 4,
-            Self::F16 => num_elements * 2,
+            Self::F32 => num_elements.checked_mul(4),
+            Self::F16 => num_elements.checked_mul(2),
             Self::Q4_0 => {
                 let num_blocks = num_elements / 32;
-                num_blocks * 18
+                num_blocks.checked_mul(18)
             }
         }
+        .context("tensor size overflow")
     }
 
     pub fn name(&self) -> &'static str {
@@ -271,12 +272,15 @@ impl GgufTensorInfo {
         self.dtype
     }
 
-    pub fn num_elements(&self) -> u64 {
-        self.dimensions.iter().product()
+    pub fn num_elements(&self) -> Result<u64> {
+        self.dimensions.iter().try_fold(1u64, |acc, &d| {
+            acc.checked_mul(d)
+                .with_context(|| format!("Tensor '{}': element count overflow", self.name))
+        })
     }
 
-    pub fn byte_size(&self) -> u64 {
-        self.dtype.byte_size(self.num_elements())
+    pub fn byte_size(&self) -> Result<u64> {
+        self.dtype.byte_size(self.num_elements()?)
     }
 }
 
@@ -296,9 +300,22 @@ pub struct GgufReader<R: Read + Seek> {
     data_section_offset: u64,
 }
 
+/// Cap on `with_capacity` hints derived from untrusted GGUF header counts
+/// (`metadata_kv_count`, `tensor_count`, per-tensor `ndims`) — a malformed
+/// or adversarial file must not be able to force a huge up-front
+/// allocation before any of the counted items are actually read.
+const MAX_CAPACITY_HINT: usize = 1 << 16;
+
 impl<R: Read + Seek> GgufReader<R> {
     /// Parse a GGUF file from the given reader.
     pub fn open(mut reader: R) -> Result<Self> {
+        let file_len = reader
+            .seek(SeekFrom::End(0))
+            .context("Failed to seek to end of GGUF")?;
+        reader
+            .seek(SeekFrom::Start(0))
+            .context("Failed to seek to start of GGUF")?;
+
         let magic = reader
             .read_u32::<LittleEndian>()
             .context("Failed to read GGUF magic")?;
@@ -322,7 +339,8 @@ impl<R: Read + Seek> GgufReader<R> {
 
         // Parse metadata key-value pairs generically (not skipped — Qwen2
         // hyperparameters come from here rather than being hand-copied).
-        let mut metadata = HashMap::with_capacity(metadata_kv_count as usize);
+        let mut metadata =
+            HashMap::with_capacity((metadata_kv_count as usize).min(MAX_CAPACITY_HINT));
         for i in 0..metadata_kv_count {
             let key = read_gguf_string(&mut reader)
                 .with_context(|| format!("Failed to read metadata key {i}"))?;
@@ -335,14 +353,19 @@ impl<R: Read + Seek> GgufReader<R> {
         }
 
         // Parse tensor index
-        let mut tensors = HashMap::with_capacity(tensor_count as usize);
-        let mut tensor_order = Vec::with_capacity(tensor_count as usize);
+        let mut tensors =
+            HashMap::with_capacity((tensor_count as usize).min(MAX_CAPACITY_HINT));
+        let mut tensor_order = Vec::with_capacity((tensor_count as usize).min(MAX_CAPACITY_HINT));
         for i in 0..tensor_count {
             let name = read_gguf_string(&mut reader)
                 .with_context(|| format!("Failed to read tensor name {i}"))?;
             let ndims = reader
                 .read_u32::<LittleEndian>()
                 .with_context(|| format!("Failed to read ndims for tensor {i}"))?;
+            ensure!(
+                ndims <= 4,
+                "Tensor {i} ('{name}'): ndims={ndims} exceeds supported maximum of 4"
+            );
             let mut dimensions = Vec::with_capacity(ndims as usize);
             for d in 0..ndims {
                 dimensions.push(
@@ -359,6 +382,10 @@ impl<R: Read + Seek> GgufReader<R> {
             let offset = reader
                 .read_u64::<LittleEndian>()
                 .with_context(|| format!("Failed to read offset for tensor {i}"))?;
+            ensure!(
+                offset <= file_len,
+                "Tensor {i} ('{name}'): offset {offset} exceeds file length {file_len}"
+            );
 
             tensor_order.push(name.clone());
             tensors.insert(
@@ -374,6 +401,23 @@ impl<R: Read + Seek> GgufReader<R> {
 
         let current_pos = reader.stream_position()?;
         let data_section_offset = align_up(current_pos, ALIGNMENT);
+
+        // Validate every tensor's data range lies within the file before any
+        // caller can slice it (`tensor_data`/`load_q4_linear` etc.).
+        for info in tensors.values() {
+            let byte_size = info.byte_size()?;
+            let abs_offset = data_section_offset
+                .checked_add(info.offset)
+                .with_context(|| format!("Tensor '{}': offset overflow", info.name))?;
+            let end = abs_offset
+                .checked_add(byte_size)
+                .with_context(|| format!("Tensor '{}': data range overflow", info.name))?;
+            ensure!(
+                end <= file_len,
+                "Tensor '{}': data range [{abs_offset}, {end}) exceeds file length {file_len}",
+                info.name
+            );
+        }
 
         Ok(Self {
             reader,
@@ -444,7 +488,8 @@ impl<R: Read + Seek> GgufReader<R> {
             .get(name)
             .with_context(|| format!("Tensor '{name}' not found in GGUF"))?
             .clone();
-        let byte_size = info.byte_size() as usize;
+        let byte_size = usize::try_from(info.byte_size()?)
+            .with_context(|| format!("Tensor '{name}': byte size does not fit in usize"))?;
         let abs_offset = self.data_section_offset + info.offset;
         self.reader.seek(SeekFrom::Start(abs_offset))?;
         let mut buf = vec![0u8; byte_size];
@@ -1094,16 +1139,24 @@ impl EmbeddingStore {
     }
 
     /// Dequantize a single row, returning `dim` f32s.
-    pub fn embed_id(&self, id: u32) -> Vec<f32> {
+    pub fn embed_id(&self, id: u32) -> Result<Vec<f32>> {
         let mut out = vec![0.0f32; self.dim];
-        self.embed_id_add_cpu(id, &mut out);
-        out
+        self.embed_id_add_cpu(id, &mut out)?;
+        Ok(out)
     }
 
     /// Dequantize a single row into an existing CPU buffer (for accumulation).
     ///
     /// Adds the dequantized embedding to `out_buf` (which must be `dim` f32s).
-    pub fn embed_id_add_cpu(&self, id: u32, out_buf: &mut [f32]) {
+    /// Errors (rather than panics/indexes out of bounds) when `id` is not a
+    /// valid row in this table — `id` can come from tokenizer output on
+    /// untrusted input.
+    pub fn embed_id_add_cpu(&self, id: u32, out_buf: &mut [f32]) -> Result<()> {
+        ensure!(
+            (id as usize) < self.vocab_size,
+            "embed_id_add_cpu: id {id} out of range (vocab_size={})",
+            self.vocab_size
+        );
         assert_eq!(out_buf.len(), self.dim);
         let blocks_per_row = self.dim / 32;
         let bytes_per_row = blocks_per_row * 18;
@@ -1120,6 +1173,7 @@ impl EmbeddingStore {
                 out_buf[base + j + 16] += (((byte >> 4) & 0x0F) as f32 - 8.0) * d;
             }
         }
+        Ok(())
     }
 }
 
@@ -1333,6 +1387,10 @@ impl<R: Read + Seek> Q4ModelLoader<R> {
         }
 
         let shape = reverse_gguf_dims(info.shape());
+        ensure!(
+            shape.len() == 2,
+            "Tensor '{name}': expected 2D shape for Q4 linear, got {shape:?}"
+        );
         let bytes = self.reader.tensor_data(name)?;
         let q4 = Q4Tensor::from_q4_bytes(&bytes, [shape[0], shape[1]], device)?;
         Ok(Q4Linear::new(q4, None))
@@ -1353,6 +1411,10 @@ impl<R: Read + Seek> Q4ModelLoader<R> {
             bail!("Expected Q4_0 for '{weight_name}', got {:?}", info.dtype());
         }
         let shape = reverse_gguf_dims(info.shape());
+        ensure!(
+            shape.len() == 2,
+            "Tensor '{weight_name}': expected 2D shape for Q4 linear, got {shape:?}"
+        );
         let bytes = self.reader.tensor_data(weight_name)?;
         let q4 = Q4Tensor::from_q4_bytes(&bytes, [shape[0], shape[1]], device)?;
         let bias = self.load_f32_vector(bias_name, device)?;
