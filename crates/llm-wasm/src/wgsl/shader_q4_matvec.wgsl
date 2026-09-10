@@ -27,6 +27,16 @@
 //
 // Dispatch: ceil(N / ROWS_PER_WG) workgroups in X, B in Y. Requires M==1
 // (caller in gguf.rs only dispatches this kernel for decode's M=1 step).
+//
+// Tint uniformity fix (docs/ENGINE.md "Known issues / fixed"): this kernel
+// used to `return` early when `b >= B`, before the workgroupBarrier() calls
+// in the tile loop below. `b` (== wg_id.y) is uniform per workgroup, but
+// `B` is loaded from a storage buffer and Tint conservatively taints every
+// storage-buffer load as non-uniform, so a branch that skips a later
+// barrier is rejected. Fix: never branch around a barrier — guard only the
+// loads/accumulation/store with `b_valid`/`row_has_output`, keep every
+// workgroupBarrier() at the top level of the tile loop so it is always
+// reached by the whole workgroup regardless of B or N.
 
 // K5 (docs/BENCHMARKS.md): `weights` holds only the 16-byte nibble portion
 // of each Q4_0 block (4 u32/block, always aligned) — `gguf.rs::Q4Tensor`
@@ -59,14 +69,12 @@ fn main(
 
     let tid = local_id.x;
     let b = wg_id.y;
-    if (b >= B) {
-        return;
-    }
+    let b_valid = b < B;
 
     let row_in_wg = tid / THREADS_PER_ROW;
     let k_lane = tid % THREADS_PER_ROW;
     let n = wg_id.x * ROWS_PER_WG + row_in_wg;
-    let row_has_output = n < N;
+    let row_has_output = n < N && b_valid;
 
     let input_base = b * K;
     var acc: f32 = 0.0;
@@ -85,7 +93,11 @@ fn main(
             if (i >= tile_len) {
                 break;
             }
-            x_shared[i] = input[input_base + tile_start + i];
+            if (b_valid) {
+                x_shared[i] = input[input_base + tile_start + i];
+            } else {
+                x_shared[i] = 0.0;
+            }
             i = i + WG_SIZE;
         }
         workgroupBarrier();

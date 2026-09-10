@@ -12,6 +12,19 @@
 //
 // info: [rows, hidden, eps] packed as f32 (rows/hidden are exact integers
 // well within f32's 24-bit mantissa, cast back with u32()).
+//
+// Tint uniformity fix (docs/ENGINE.md "Known issues / fixed"): this kernel
+// used to `return` early when `row >= rows`, before the workgroupBarrier()
+// calls below. `row` is uniform per workgroup (== wg_id.x), but `rows` is
+// loaded from a storage buffer, and Tint's WGSL uniformity analysis taints
+// every storage-buffer load as non-uniform regardless of whether the
+// address is invocation-independent — so a branch on `row >= rows` that
+// skips a later barrier is rejected even though it is safe in practice.
+// Fix: never branch around a barrier. Compute `valid = row < rows` once,
+// guard only the loads/accumulation/store with `if (valid)`, and leave
+// every workgroupBarrier() at the top level of `main` so it is always
+// reached by the whole workgroup. Invalid rows contribute 0 to the shared
+// reduction, which does not change the result for valid rows.
 @group(0) @binding(0) var<storage, read_write> input: array<f32>;
 @group(0) @binding(1) var<storage, read_write> weight: array<f32>;
 @group(0) @binding(2) var<storage, read_write> output: array<f32>;
@@ -31,21 +44,21 @@ fn main(
     let eps = info[2];
 
     let row = wg_id.x;
-    if (row >= rows) {
-        return;
-    }
+    let valid = row < rows;
     let tid = local_id.x;
     let row_base = row * hidden;
 
     var acc: f32 = 0.0;
-    var i: u32 = tid;
-    loop {
-        if (i >= hidden) {
-            break;
+    if (valid) {
+        var i: u32 = tid;
+        loop {
+            if (i >= hidden) {
+                break;
+            }
+            let v = input[row_base + i];
+            acc += v * v;
+            i = i + WG_SIZE;
         }
-        let v = input[row_base + i];
-        acc += v * v;
-        i = i + WG_SIZE;
     }
 
     partial_sums[tid] = acc;
@@ -62,14 +75,15 @@ fn main(
         stride = stride / 2u;
     }
 
-    let rms = sqrt(partial_sums[0] / f32(hidden) + eps);
-
-    var j: u32 = tid;
-    loop {
-        if (j >= hidden) {
-            break;
+    if (valid) {
+        let rms = sqrt(partial_sums[0] / f32(hidden) + eps);
+        var j: u32 = tid;
+        loop {
+            if (j >= hidden) {
+                break;
+            }
+            output[row_base + j] = (input[row_base + j] / rms) * weight[j];
+            j = j + WG_SIZE;
         }
-        output[row_base + j] = (input[row_base + j] / rms) * weight[j];
-        j = j + WG_SIZE;
     }
 }

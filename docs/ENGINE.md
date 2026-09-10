@@ -605,6 +605,54 @@ blocking `engine.start`/`provideToolResults` calls so `index.html` can drive a p
 
 ## Known issues / fixed
 
+### 2026-09-10: Tint WGSL uniformity rejects `workgroupBarrier`/`subgroupAdd` after a storage-buffer-gated early return
+
+Symptom, real Chrome (Dawn/Tint), first compute dispatch of a run:
+`createShaderModule failed: Error while parsing WGSL: :61:9 error:
+'workgroupBarrier' must only be called from uniform control flow` /
+`control flow depends on possibly non-uniform value` / `reading from
+read_write storage buffer 'info' may result in a non-uniform value`.
+Native wgpu/Naga does not run this analysis, so the bug was invisible to
+`cargo test --features wgpu` and only surfaced in the browser.
+
+Root cause: three fused kernels each had an early `return` guarding
+per-workgroup bounds (`row >= rows` in `shader_rmsnorm.wgsl`, `b >= B` in
+`shader_q4_matvec.wgsl` and `shader_q4_matvec_subgroup.wgsl`) that executed
+*before* the kernel's `workgroupBarrier()`/`subgroupAdd()` calls. The guard
+condition (`row`/`b` == a builtin id) is uniform per workgroup, but the
+bound it's compared against (`rows`/`B`) is loaded from a `storage` buffer
+(`info`), and Tint's WGSL uniformity analysis conservatively taints *every*
+storage-buffer load as non-uniform — it cannot prove the load reads the
+same address for every invocation, so any branch on that value that can
+skip a later barrier is rejected, even when (as here) the skip is
+workgroup-uniform in practice.
+
+Fix, same pattern in all three shaders: never branch around a barrier or
+subgroup op. Compute a `valid`/`b_valid` flag once, guard only the
+loads/accumulation/store with `if (valid)`, and leave every
+`workgroupBarrier()`/`subgroupAdd()` call at the top level of `main` (or of
+an unconditional loop) so it is always reached by the whole workgroup
+regardless of the storage-buffer-derived bound. Invalid lanes contribute 0
+to shared-memory reductions, which doesn't change results for valid lanes.
+Changed: `crates/llm-wasm/src/wgsl/shader_rmsnorm.wgsl`,
+`shader_q4_matvec.wgsl`, `shader_q4_matvec_subgroup.wgsl`. No dispatch-shape
+or binding changes, so `gguf.rs` was untouched.
+
+Audited and left as-is: `shader_naive.wgsl` has an early return but no
+barriers/subgroup ops at all, so the rule doesn't apply (this is why it was
+already known to pass Chrome). `shader_q4_tiled.wgsl` (native-only,
+`#[cfg(not(target_arch = "wasm32"))]` in `gguf.rs`, never compiled for
+Tint) already followed the correct pattern — its per-element bounds checks
+(`n_global < N`, `m_global < M`) gate `if/else` value selection, not a
+`return`/`break` that skips a barrier, and its K-loop barriers are
+unconditional at loop-body top level.
+
+Rule for future kernels: **guard work, not barriers.** A `workgroupBarrier`
+or `subgroupAdd` call must never sit inside an `if`/`for`/`while` whose
+condition was computed from a storage-buffer load, and no `return`/`break`/
+`continue` derived from such a load may skip a barrier call for only some
+invocations. Push the bounds check down into the loads/stores instead.
+
 ### 2026-09-10: `eval --tools 12` tool preamble silently reordered (not a KV-cache bug)
 
 Symptom: `llm-agent eval --tools 12` on `m01`/`s09` ("Pause the kitchen." / "Resume

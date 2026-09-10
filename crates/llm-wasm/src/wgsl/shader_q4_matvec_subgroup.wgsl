@@ -14,6 +14,14 @@
 //
 // Dispatch: identical grid to shader_q4_matvec.wgsl — ceil(N / ROWS_PER_WG)
 // workgroups in X, B in Y, ROWS_PER_WG=8 (WG_SIZE=256 / SUBGROUP_SIZE=32).
+//
+// Tint uniformity fix (docs/ENGINE.md "Known issues / fixed"): same bug and
+// same fix as shader_q4_matvec.wgsl — an early `return` on `b >= B` (b ==
+// wg_id.y, uniform per workgroup, but B is a storage-buffer load Tint
+// taints as non-uniform) used to precede both workgroupBarrier() and
+// subgroupAdd() calls below, both of which require uniform control flow.
+// Guard loads/accumulation/store with `b_valid`/`row_has_output` instead;
+// keep every barrier and subgroupAdd() at the top level of `main`.
 
 enable subgroups;
 
@@ -45,13 +53,11 @@ fn main(
 
     let tid = local_id.x;
     let b = wg_id.y;
-    if (b >= B) {
-        return;
-    }
+    let b_valid = b < B;
 
     let sg_idx = tid / SUBGROUP_SIZE;
     let n = wg_id.x * ROWS_PER_WG + sg_idx;
-    let row_has_output = n < N;
+    let row_has_output = n < N && b_valid;
 
     let input_base = b * K;
     var acc: f32 = 0.0;
@@ -68,7 +74,11 @@ fn main(
             if (i >= tile_len) {
                 break;
             }
-            x_shared[i] = input[input_base + tile_start + i];
+            if (b_valid) {
+                x_shared[i] = input[input_base + tile_start + i];
+            } else {
+                x_shared[i] = 0.0;
+            }
             i = i + WG_SIZE;
         }
         workgroupBarrier();
