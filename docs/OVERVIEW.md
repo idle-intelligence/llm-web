@@ -1,5 +1,12 @@
 # OVERVIEW — llm-wasm crate layout
 
+`llm-web` is about running LLMs in the browser on Burn + wgpu (WebGPU, GGUF
+models) — the engine and its WASM bindings are the point. The MCP agent
+loop demo (`web/agent/`) and `eval/` are applications built on top of that
+engine, not the project itself; Sonos-specific fixtures/prompts live only
+under `fixtures/sonos` and `eval/` and are not a dependency of the core
+engine or the headless harness.
+
 Skeleton for xLAM-2-3b-fc-r (Qwen2 architecture) in Burn+wgpu, mirroring stt-web's
 stt-wasm engine (see docs/ENGINE.md, docs/MODELS.md). `Cargo.toml` (workspace root
 and crate) and `src/lib.rs` are frozen for the two phases below — don't touch them;
@@ -8,6 +15,8 @@ everything else is fair game.
 ```
 Cargo.toml                    workspace: Burn 0.20, cubecl 0.9 wgpu, wgpu 26, tokenizers 0.22
 patches/cubecl-wgpu-0.9.0/    workgroup-size patch, copied from stt-web
+scripts/headless/             general headless-Chromium harness: load+run any page/model
+                               via window.__llm, verify + benchmark decode tok/s
 crates/llm-wasm/
   Cargo.toml                  features: wgpu, native, web
   src/

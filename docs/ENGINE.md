@@ -501,6 +501,20 @@ duplicates *orchestration* (message/tools bookkeeping, prefix-length bookkeeping
 a sync-over-async escape hatch for wasm32, this duplication could be collapsed by implementing
 `Generator` for a wasm-backed type instead.
 
+**TODO — `prefillMs`/`decodeMs` are wall-clock around a blocking call, not phase-accurate.**
+Each `step.prefillMs`/`step.decodeMs` the page reports (via `worker.js`'s `status` brackets and
+`step.tokens`/`promptTokens`) is measured as elapsed wall-clock time around the single blocking
+`await engine.start(...)`/`await engine.provideToolResults(...)` call, split by whatever
+`web.rs` internally timestamps between its prefill and decode phases. Because WebGPU submission
+is async and the browser can pipeline/queue work, `prefillMs` currently measures how long it took
+to *submit* the prefill dispatch, not how long it took the GPU to *complete* it — decode's timer
+start can therefore begin before prefill's GPU work has actually finished, skewing the split
+between the two numbers. **The `totalMs`/end-to-end number is trustworthy; the prefill/decode
+split is not**, until `web.rs` inserts an explicit GPU sync (e.g. an `into_data_async()` readback
+or an explicit queue-submitted-work-done fence) between the two phases. Not fixed here — this is
+a Rust-side change (`crates/llm-wasm/src/web.rs`), out of scope for the JS-side owner of this
+file's Browser section.
+
 ### Prefix cache
 
 Same idea as `agent.rs`'s (see its module docs): `LlmEngine` renders the actual utterance plus a

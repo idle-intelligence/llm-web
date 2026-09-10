@@ -38,6 +38,11 @@
 <fieldset>
   <legend>2. Ask</legend>
   <input id="utterance" type="text" placeholder="what's the weather in Paris, and set the thermostat there to 21?" />
+  <label>tools</label>
+  <select id="tools-select">
+    <option value="demo" selected>demo (get_weather, set_thermostat)</option>
+    <option value="none">none (plain chat)</option>
+  </select>
   <p><button id="run-btn" disabled>Run</button> <button id="reset-btn" disabled>Reset conversation</button></p>
 </fieldset>
 
@@ -165,10 +170,11 @@ document.getElementById('load-btn').addEventListener('click', async () => {
 document.getElementById('run-btn').addEventListener('click', async () => {
   const utterance = document.getElementById('utterance').value.trim();
   if (!utterance) return;
+  const toolsMode = document.getElementById('tools-select').value;
   logLine(`> ${utterance}`);
   document.getElementById('run-btn').disabled = true;
   try {
-    const transcript = await client.run(utterance, TOOLS, { maxSteps: 6, maxNewTokens: 256 }, logStep);
+    const transcript = await client.run(utterance, toolsMode === 'none' ? [] : TOOLS, { maxSteps: 6, maxNewTokens: 256 }, logStep);
     logLine(`= ${transcript.finalText}  (${transcript.totalMs.toFixed(0)}ms total)`);
   } catch (err) {
     logLine(`! error: ${err.message || err}`);
@@ -181,6 +187,32 @@ document.getElementById('reset-btn').addEventListener('click', () => {
   client.reset();
   logLine('--- conversation reset ---');
 });
+
+// ---------------------------------------------------------------------------
+// window.__llm: page automation surface for scripts/headless/run.mjs (and
+// any other external driver). Thin wrapper over the same `client` the human
+// UI uses — no separate code path, so headless runs exercise exactly what a
+// person clicking through the page exercises.
+// ---------------------------------------------------------------------------
+window.__llm = {
+  state: { loaded: false, info: null },
+  async load(modelSpec) {
+    const info = await client.load(modelSpec);
+    window.__llm.state.loaded = true;
+    window.__llm.state.info = info;
+    document.getElementById('run-btn').disabled = false;
+    document.getElementById('reset-btn').disabled = false;
+    return info;
+  },
+  async run(prompt, opts = {}) {
+    const { tools = 'demo', maxNewTokens = 256, maxSteps = 6 } = opts;
+    const toolList = tools === 'none' ? [] : TOOLS;
+    return client.run(prompt, toolList, { maxNewTokens, maxSteps }, logStep);
+  },
+  reset() {
+    client.reset();
+  },
+};
 </script>
 </body>
 </html>
