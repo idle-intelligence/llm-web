@@ -17,7 +17,10 @@
 use burn::backend::wgpu::WgpuDevice;
 use burn::backend::Wgpu;
 use burn::tensor::Tensor;
-use llm_wasm::gguf::{q4_matmul, q4_matmul_tiled_forced, Q4Tensor};
+use llm_wasm::gguf::{
+    q4_dequant_scratch_to_vec, q4_matmul, q4_matmul_naive_forced, q4_matmul_scratch_forced,
+    q4_matmul_tiled_forced, Q4ModelLoader, Q4Tensor,
+};
 
 fn device() -> WgpuDevice {
     WgpuDevice::default()
@@ -338,4 +341,222 @@ fn test_q4_matmul_real_gguf_token_embd() {
         );
         println!("real token_embd.weight N={n} K={k} M={m}: max_err={max_err} (tol {tol})");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Session 6 bug hunt: scratch-dequant+matmul vs naive kernel vs CPU
+// reference, per-M, on the REAL GGUF's blk.0.attn_q.weight (K=2048) and
+// blk.0.ffn_down.weight (K=11008) — isolating whether the split-prefill
+// logit divergence (11.14 max-abs at split=1000) traces to the
+// scratch-dequant/matmul path at ragged M.
+// ---------------------------------------------------------------------------
+
+fn model_dir() -> String {
+    std::env::var("LLM_MODEL_DIR")
+        .unwrap_or_else(|_| "/Users/tc/Code/idle-intelligence/models/gguf/xlam-2-3b-fc-r".to_string())
+}
+
+/// Full CPU dequant of a raw Q4_0 `[n, k]` tensor's on-disk bytes into a
+/// row-major `[n, k]` `Vec<f32>` (same 18-bytes/block layout as
+/// `random_q4`'s output, but from real weights instead of synthetic ones).
+fn cpu_dequant_full(bytes: &[u8], n: usize, k: usize) -> Vec<f32> {
+    let blocks_per_row = k / 32;
+    let bytes_per_row = blocks_per_row * 18;
+    assert_eq!(bytes.len(), n * bytes_per_row);
+    let mut out = vec![0f32; n * k];
+    for row in 0..n {
+        for block in 0..blocks_per_row {
+            let bo = row * bytes_per_row + block * 18;
+            let scale = llm_wasm::gguf::f16_to_f32(u16::from_le_bytes([bytes[bo], bytes[bo + 1]]));
+            let base = row * k + block * 32;
+            for j in 0..16 {
+                let byte = bytes[bo + 2 + j];
+                out[base + j] = ((byte & 0x0F) as f32 - 8.0) * scale;
+                out[base + j + 16] = (((byte >> 4) & 0x0F) as f32 - 8.0) * scale;
+            }
+        }
+    }
+    out
+}
+
+fn run_gpu_matmul_naive(input: &[f32], q4_bytes: &[u8], m: usize, k: usize, n: usize) -> Vec<f32> {
+    let device = device();
+    let weights = Q4Tensor::from_q4_bytes(q4_bytes, [n, k], &device).expect("upload Q4 weights");
+    let input_t: Tensor<Wgpu, 3> =
+        Tensor::<Wgpu, 1>::from_floats(input, &device).reshape([1, m, k]);
+    let out = q4_matmul_naive_forced(input_t, &weights);
+    out.into_data().into_vec::<f32>().expect("f32 output")
+}
+
+fn run_gpu_matmul_scratch(input: &[f32], q4_bytes: &[u8], m: usize, k: usize, n: usize) -> Vec<f32> {
+    let device = device();
+    let weights = Q4Tensor::from_q4_bytes(q4_bytes, [n, k], &device).expect("upload Q4 weights");
+    let input_t: Tensor<Wgpu, 3> =
+        Tensor::<Wgpu, 1>::from_floats(input, &device).reshape([1, m, k]);
+    let out = q4_matmul_scratch_forced(input_t, &weights);
+    out.into_data().into_vec::<f32>().expect("f32 output")
+}
+
+/// Like `cpu_matmul` but only computes a sampled subset of output columns
+/// `cols` (still over all `m` rows / full `k` dot product) — full N would
+/// be prohibitively slow on CPU at ffn_down's K=11008 and M up to 2225
+/// (M*N*K ~ 5e10 MACs). Returns `[m, cols.len()]`.
+fn cpu_matmul_cols(input: &[f32], weights: &[f32], m: usize, k: usize, cols: &[usize]) -> Vec<f32> {
+    let mut out = vec![0f32; m * cols.len()];
+    for mi in 0..m {
+        let x = &input[mi * k..(mi + 1) * k];
+        for (ci, &ni) in cols.iter().enumerate() {
+            let w = &weights[ni * k..(ni + 1) * k];
+            out[mi * cols.len() + ci] = x.iter().zip(w).map(|(a, b)| a * b).sum();
+        }
+    }
+    out
+}
+
+fn max_abs_rel(cpu: &[f32], gpu: &[f32]) -> (f32, f32) {
+    assert_eq!(cpu.len(), gpu.len());
+    let mut max_abs = 0f32;
+    let mut max_rel = 0f32;
+    for (c, g) in cpu.iter().zip(gpu.iter()) {
+        let abs = (c - g).abs();
+        max_abs = max_abs.max(abs);
+        let rel = abs / c.abs().max(1e-6);
+        max_rel = max_rel.max(rel);
+    }
+    (max_abs, max_rel)
+}
+
+/// Per-M comparison of the naive kernel and the scratch-dequant+Burn-matmul
+/// path against a CPU f32 reference, on real GGUF weights, at ragged M
+/// values spanning the `SCRATCH_MATMUL_MIN_M=32` boundary and the actual
+/// chunk boundaries this bug report is about (1000, 1225, 2225) plus the
+/// real tool-result size (531).
+#[test]
+fn test_scratch_vs_naive_vs_cpu_per_m_real_gguf() {
+    let path = format!("{}/xLAM-2-3b-fc-r-q4_0.gguf", model_dir());
+    if !std::path::Path::new(&path).exists() {
+        eprintln!("skipping: {path} not found");
+        return;
+    }
+    let file = std::fs::File::open(&path).expect("open gguf");
+    let reader = std::io::BufReader::new(file);
+    let mut loader = Q4ModelLoader::new(reader).expect("parse gguf");
+
+    let tensors = [
+        ("blk.0.attn_q.weight", 2048usize),
+        ("blk.0.ffn_down.weight", 11008usize),
+        ("blk.0.ffn_gate.weight", 2048usize),
+    ];
+    let ms = [31usize, 32, 33, 100, 255, 256, 257, 531, 1000, 1225, 2225];
+
+    for (name, expected_k) in tensors {
+        let info = loader.reader().tensor_info(name).expect("tensor present").clone();
+        let shape: Vec<usize> = info.shape().iter().rev().map(|&d| d as usize).collect();
+        let (n, k) = (shape[0], shape[1]);
+        assert_eq!(k, expected_k, "{name}: unexpected K");
+        let bytes = loader.tensor_bytes(name).expect("read tensor bytes");
+        let cpu_weights = cpu_dequant_full(&bytes, n, k);
+
+        // Sample output columns rather than all N: full M*N*K on CPU is
+        // prohibitively slow at ffn_down's K=11008, M up to 2225 (~5e10
+        // MACs/M). 40 columns spread across N, including first/last.
+        let num_cols = 40usize.min(n);
+        let cols: Vec<usize> = (0..num_cols)
+            .map(|i| (i * (n - 1)) / (num_cols - 1).max(1))
+            .collect();
+
+        println!("--- {name} [N={n}, K={k}] ---");
+        for &m in &ms {
+            let input = random_input(m, k, 0x51DE + (m as u64) * 7 + k as u64);
+            let cpu_out = cpu_matmul_cols(&input, &cpu_weights, m, k, &cols);
+            let naive_full = run_gpu_matmul_naive(&input, &bytes, m, k, n);
+            let scratch_full = run_gpu_matmul_scratch(&input, &bytes, m, k, n);
+
+            let gather = |full: &[f32]| -> Vec<f32> {
+                let mut out = vec![0f32; m * cols.len()];
+                for mi in 0..m {
+                    for (ci, &ni) in cols.iter().enumerate() {
+                        out[mi * cols.len() + ci] = full[mi * n + ni];
+                    }
+                }
+                out
+            };
+            let naive_out = gather(&naive_full);
+            let scratch_out = gather(&scratch_full);
+
+            let (naive_abs, naive_rel) = max_abs_rel(&cpu_out, &naive_out);
+            let (scratch_abs, scratch_rel) = max_abs_rel(&cpu_out, &scratch_out);
+            println!(
+                "M={m:5}: naive  max_abs={naive_abs:.6} max_rel={naive_rel:.6} | scratch max_abs={scratch_abs:.6} max_rel={scratch_rel:.6}"
+            );
+
+            // Relative error alone spuriously blows up near cpu_out ~= 0
+            // (a dot product crossing zero), so gate on `rel <= 1e-3 OR abs`
+            // small in absolute terms (K-length f32 dot products of O(1)
+            // values — same convention as this file's other tests' `tol =
+            // 0.05 * sqrt(K)`).
+            let abs_tol = 0.05 * (k as f32).sqrt();
+            assert!(
+                naive_rel <= 1e-3 || naive_abs < abs_tol,
+                "{name} M={m}: naive max_rel={naive_rel} max_abs={naive_abs} exceeds both 1e-3 rel and {abs_tol} abs"
+            );
+            assert!(
+                scratch_rel <= 1e-3 || scratch_abs < abs_tol,
+                "{name} M={m}: scratch max_rel={scratch_rel} max_abs={scratch_abs} exceeds both 1e-3 rel and {abs_tol} abs"
+            );
+        }
+    }
+}
+
+/// Isolates the dequant kernel (`shader_q4_dequant.wgsl` via
+/// `q4_dequant_scratch_to_vec`) from the matmul that consumes it: dequant
+/// `blk.0.ffn_down.weight` and compare every element against the CPU
+/// dequant reference. Output layout is transposed `[K, N]`
+/// (`out[k*N+n]`) vs the CPU reference's row-major `[N, K]`
+/// (`cpu[n*K+k]`).
+#[test]
+fn test_dequant_scratch_matches_cpu_real_gguf() {
+    let path = format!("{}/xLAM-2-3b-fc-r-q4_0.gguf", model_dir());
+    if !std::path::Path::new(&path).exists() {
+        eprintln!("skipping: {path} not found");
+        return;
+    }
+    let file = std::fs::File::open(&path).expect("open gguf");
+    let reader = std::io::BufReader::new(file);
+    let mut loader = Q4ModelLoader::new(reader).expect("parse gguf");
+
+    let name = "blk.0.ffn_down.weight";
+    let info = loader.reader().tensor_info(name).expect("tensor present").clone();
+    let shape: Vec<usize> = info.shape().iter().rev().map(|&d| d as usize).collect();
+    let (n, k) = (shape[0], shape[1]);
+    let bytes = loader.tensor_bytes(name).expect("read tensor bytes");
+    let cpu_weights = cpu_dequant_full(&bytes, n, k); // [N, K] row-major
+
+    let device = device();
+    let weights = Q4Tensor::from_q4_bytes(&bytes, [n, k], &device).expect("upload Q4 weights");
+    let gpu_kt_n = q4_dequant_scratch_to_vec(&weights, &device); // [K, N] row-major
+
+    assert_eq!(gpu_kt_n.len(), n * k);
+
+    let mut max_abs = 0f32;
+    let mut max_rel = 0f32;
+    let mut worst = (0usize, 0usize);
+    for row in 0..n {
+        for col in 0..k {
+            let cpu_v = cpu_weights[row * k + col];
+            let gpu_v = gpu_kt_n[col * n + row];
+            let abs = (cpu_v - gpu_v).abs();
+            let rel = abs / cpu_v.abs().max(1e-6);
+            if abs > max_abs {
+                max_abs = abs;
+                worst = (row, col);
+            }
+            max_rel = max_rel.max(rel);
+        }
+    }
+    println!(
+        "dequant {name} [N={n},K={k}]: max_abs={max_abs} max_rel={max_rel} worst=(row={},col={})",
+        worst.0, worst.1
+    );
+    assert!(max_abs < 1e-3, "dequant max_abs={max_abs} exceeds 1e-3 at {worst:?}");
 }

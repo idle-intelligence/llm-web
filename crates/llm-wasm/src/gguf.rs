@@ -916,7 +916,27 @@ impl KernelSource for Q4MatmulNaiveKernel {
 /// session's budget. Left as tested-but-unused for future work rather than
 /// shipped as a regression — see that doc's K2 section.
 pub fn q4_matmul(input: Tensor<Wgpu, 3>, weights: &Q4Tensor) -> Tensor<Wgpu, 3> {
-    q4_matmul_dispatch(input, weights, false)
+    q4_matmul_dispatch(input, weights, ForceKernel::Auto)
+}
+
+/// Test-only routing override for `q4_matmul_dispatch`, isolating a
+/// specific kernel path regardless of the M/N thresholds `q4_matmul` would
+/// otherwise apply — see tests/q4_matmul.rs's per-M scratch-vs-naive
+/// comparison (Session 6 bug hunt for the split-prefill logit divergence).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ForceKernel {
+    /// Production routing: M==1 -> matvec, M>=32 && N<100000 -> scratch
+    /// dequant + Burn matmul, else naive.
+    Auto,
+    /// K2's tiled kernel (native only, B==1) — see `q4_matmul`'s doc
+    /// comment for why it's not the default.
+    Tiled,
+    /// Force the naive one-thread-per-output kernel even when M/N would
+    /// otherwise route through scratch-dequant+matmul.
+    Naive,
+    /// Force the scratch-dequant + Burn `Tensor::matmul` path even when M
+    /// is below `SCRATCH_MATMUL_MIN_M`.
+    Scratch,
 }
 
 /// Forces K2's tiled kernel regardless of M (native only, requires B==1) —
@@ -925,7 +945,19 @@ pub fn q4_matmul(input: Tensor<Wgpu, 3>, weights: &Q4Tensor) -> Tensor<Wgpu, 3> 
 /// comment for why it's not the default.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn q4_matmul_tiled_forced(input: Tensor<Wgpu, 3>, weights: &Q4Tensor) -> Tensor<Wgpu, 3> {
-    q4_matmul_dispatch(input, weights, true)
+    q4_matmul_dispatch(input, weights, ForceKernel::Tiled)
+}
+
+/// Forces the naive per-element kernel regardless of M — test-only, see
+/// `ForceKernel::Naive`.
+pub fn q4_matmul_naive_forced(input: Tensor<Wgpu, 3>, weights: &Q4Tensor) -> Tensor<Wgpu, 3> {
+    q4_matmul_dispatch(input, weights, ForceKernel::Naive)
+}
+
+/// Forces the scratch-dequant + Burn matmul path regardless of M —
+/// test-only, see `ForceKernel::Scratch`.
+pub fn q4_matmul_scratch_forced(input: Tensor<Wgpu, 3>, weights: &Q4Tensor) -> Tensor<Wgpu, 3> {
+    q4_matmul_dispatch(input, weights, ForceKernel::Scratch)
 }
 
 struct Q4DequantKernel;
@@ -1023,6 +1055,26 @@ fn q4_dequant_scratch(
     handle
 }
 
+/// Test-only: run `shader_q4_dequant.wgsl` on `weights` and read back the
+/// full `[K, N]` transposed scratch buffer as a flat row-major `Vec<f32>`
+/// (`out[k * n + n_idx]`) — isolates the dequant kernel itself from
+/// `scratch_matmul_chunked`/Burn's `Tensor::matmul`. See
+/// tests/q4_matmul.rs's dequant-only coverage (Session 6 bug hunt).
+pub fn q4_dequant_scratch_to_vec(weights: &Q4Tensor, device: &WgpuDevice) -> Vec<f32> {
+    let [n, k] = weights.shape();
+    let client = WgpuRuntime::client(device);
+    let handle = q4_dequant_scratch(&client, weights);
+    let tensor = CubeTensor::new_contiguous(
+        client,
+        device.clone(),
+        burn::prelude::Shape::from(vec![k, n]),
+        handle,
+        DType::F32,
+    );
+    let out = Tensor::<Wgpu, 2>::from_primitive(TensorPrimitive::Float(tensor));
+    out.into_data().into_vec::<f32>().expect("f32 readback")
+}
+
 /// Largest M chunk for `scratch_matmul_chunked`'s calls into Burn's
 /// `Tensor::matmul`. Session 4: this build had no `autotune` cubecl feature,
 /// so `Tensor::matmul` fell back to a fixed `Strategy::Auto` matmul kernel
@@ -1063,7 +1115,7 @@ fn scratch_matmul_chunked(x: Tensor<Wgpu, 3>, w: Tensor<Wgpu, 3>, m: usize) -> T
     Tensor::cat(chunks, 1)
 }
 
-fn q4_matmul_dispatch(input: Tensor<Wgpu, 3>, weights: &Q4Tensor, force_tiled: bool) -> Tensor<Wgpu, 3> {
+fn q4_matmul_dispatch(input: Tensor<Wgpu, 3>, weights: &Q4Tensor, force: ForceKernel) -> Tensor<Wgpu, 3> {
     let cube_input: CubeTensor<WgpuRuntime> = input.into_primitive().tensor();
     let cube_input = into_contiguous(cube_input);
 
@@ -1102,9 +1154,16 @@ fn q4_matmul_dispatch(input: Tensor<Wgpu, 3>, weights: &Q4Tensor, force_tiled: b
     // buffer (excludes the 151936-wide lm_head), dequant once via
     // `shader_q4_dequant.wgsl` and run the actual matmul through Burn's
     // `Tensor::matmul` (cubecl's tiled/cmma kernels) instead of the naive
-    // per-element-redundant-dequant kernel. `force_tiled` (test-only, K2)
-    // bypasses this to keep exercising the tiled kernel directly.
-    if !force_tiled && m >= SCRATCH_MATMUL_MIN_M && n < SCRATCH_MATMUL_MAX_N {
+    // per-element-redundant-dequant kernel. `ForceKernel::Tiled`/`Naive`
+    // (test-only, K2/naive-vs-scratch comparison) bypass this to keep
+    // exercising those kernels directly; `ForceKernel::Scratch` forces this
+    // path even below `SCRATCH_MATMUL_MIN_M`.
+    let take_scratch = match force {
+        ForceKernel::Auto => m >= SCRATCH_MATMUL_MIN_M && n < SCRATCH_MATMUL_MAX_N,
+        ForceKernel::Scratch => true,
+        ForceKernel::Tiled | ForceKernel::Naive => false,
+    };
+    if take_scratch {
         let w_handle = q4_dequant_scratch(&client, weights);
         let w_tensor = CubeTensor::new_contiguous(
             client.clone(),
@@ -1142,7 +1201,7 @@ fn q4_matmul_dispatch(input: Tensor<Wgpu, 3>, weights: &Q4Tensor, force_tiled: b
     // one-thread-per-output kernel. M>1 (prefill) keeps the naive kernel
     // unless a test forces K2's tiled kernel (see `q4_matmul`'s doc comment
     // — not the production default).
-    if b * m == 1 {
+    if force == ForceKernel::Auto && b * m == 1 {
         let kernel: Box<dyn CubeTask<AutoCompiler>> = if has_subgroup_support() {
             Box::new(SourceKernel::new(Q4MatvecSubgroupKernel, CubeDim::new_1d(256)))
         } else {
@@ -1153,7 +1212,7 @@ fn q4_matmul_dispatch(input: Tensor<Wgpu, 3>, weights: &Q4Tensor, force_tiled: b
         client
             .launch(kernel, CubeCount::new_2d(wg_x, wg_y), bindings)
             .expect("Q4 matvec kernel launch failed");
-    } else if cfg!(not(target_arch = "wasm32")) && b == 1 && force_tiled {
+    } else if cfg!(not(target_arch = "wasm32")) && b == 1 && force == ForceKernel::Tiled {
         // K2 (native only, B==1, test-forced only): tiled matmul with
         // workgroup-shared dequant/weight reuse — see
         // wgsl/shader_q4_tiled.wgsl.
