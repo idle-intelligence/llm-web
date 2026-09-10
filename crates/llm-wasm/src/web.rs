@@ -189,10 +189,22 @@ pub struct LlmEngine {
 
 #[wasm_bindgen]
 impl LlmEngine {
+    /// `#[wasm_bindgen(constructor)]` cannot return `Result` (no fallible
+    /// JS constructor), so if `initWgpuDevice()` wasn't awaited first this
+    /// silently falls back to `WgpuDevice::default()` rather than erroring
+    /// — logged as a `console.warn` since a fallback device here almost
+    /// certainly means every subsequent GPU call fails or targets the
+    /// wrong adapter.
     #[wasm_bindgen(constructor)]
     pub fn new() -> Self {
         console_error_panic_hook::set_once();
-        let device = WGPU_DEVICE.get().cloned().unwrap_or_else(WgpuDevice::default);
+        let device = WGPU_DEVICE.get().cloned().unwrap_or_else(|| {
+            web_sys::console::warn_1(&JsValue::from_str(
+                "[llm] LlmEngine::new() called before initWgpuDevice() completed — \
+                 falling back to WgpuDevice::default(), which will likely fail on GPU calls",
+            ));
+            WgpuDevice::default()
+        });
         Self {
             device,
             shard_bufs: Vec::new(),
