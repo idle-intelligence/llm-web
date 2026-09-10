@@ -927,13 +927,13 @@ pub struct TokenMask {
 impl TokenMask {
     fn new(len: usize) -> Self {
         Self {
-            bits: vec![0u64; (len + 63) / 64],
+            bits: vec![0u64; len.div_ceil(64)],
             len,
         }
     }
 
     fn all_ones(len: usize) -> Self {
-        let mut bits = vec![u64::MAX; (len + 63) / 64];
+        let mut bits = vec![u64::MAX; len.div_ceil(64)];
         let rem = len % 64;
         if rem != 0 {
             if let Some(last) = bits.last_mut() {
