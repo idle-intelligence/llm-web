@@ -224,5 +224,46 @@
       ],
       "type": "object"
     }
+  },
+  {
+    "name": "play_artist",
+    "description": "Play a mix of music from an artist on a Sonos group.",
+    "inputSchema": {
+      "properties": {
+        "artist": {
+          "description": "The canonical artist name",
+          "minLength": 1,
+          "type": "string"
+        },
+        "group_id": {
+          "description": "The Sonos group ID",
+          "minLength": 1,
+          "type": "string"
+        },
+        "music_service": {
+          "description": "The music service to play from, when the user explicitly names one; omit otherwise.",
+          "enum": [
+            "Amazon Music",
+            "Apple Music",
+            "Deezer",
+            "Pandora",
+            "Radio France",
+            "Sonos Radio",
+            "Spotify"
+          ],
+          "type": "string"
+        },
+        "shuffle": {
+          "description": "Set true only when the user clearly asks to shuffle; otherwise false (play in order). Sets the same state as set_shuffle_repeat_crossfade — no separate call needed.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "group_id",
+        "artist",
+        "shuffle"
+      ],
+      "type": "object"
+    }
   }
 ]
