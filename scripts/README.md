@@ -68,3 +68,73 @@ forward pass would produce a `[8140, 151936]` float32 logits.npy
 (multi-GB) purely to check how prefill size scales with tool count — not
 worth generating. `--render-only` with no name defaults to
 `RENDER_ONLY_NAMES` in the script (currently just `04_tools_all`).
+
+## Generate the Q4_0-dequant-matched reference
+
+```
+scripts/.venv/bin/python scripts/export_reference_dequant.py
+```
+
+Purpose: the Rust (Burn/wgpu) port loads the Q4_0 GGUF and dequantises to
+f32 at load time, then computes in f32 — it is not comparable byte-for-byte
+to `export_reference.py`'s bf16-on-MPS reference, which uses the original
+unquantised weights. This script builds a *third* reference that isolates
+quantisation noise from port bugs: it loads
+`Salesforce/xLAM-2-3b-fc-r` in plain float32 on CPU, then overwrites every
+parameter in place with the exact Q4_0-dequantised (Q6_K for
+`token_embd.weight`) values read straight out of
+`/Users/tc/Code/idle-intelligence/models/gguf/xlam-2-3b-fc-r/xLAM-2-3b-fc-r-q4_0.gguf`
+via the `gguf` package's `GGUFReader` + `gguf.quants.dequantize`. The
+resulting model's forward pass should track the Rust port far more closely
+than the bf16 reference does — any remaining discrepancy vs. the Rust port
+is then attributable to the port itself, not quantisation.
+
+**Memory: run this alone.** It holds a full float32 copy of the 3B model on
+CPU (~12 GB) for the duration of the run — no MPS/bf16 headroom trick
+available here since the whole point is exact f32 compute. Loading uses
+`low_cpu_mem_usage=True` and each GGUF tensor is dequantised, copied into
+the already-allocated model parameter in place, and freed before moving to
+the next tensor, so the transient overhead beyond the base ~12 GB is at
+most one tensor at a time (largest: the ~1.2 GB embedding table). Do not
+run this alongside another GPU/CPU-heavy job (e.g. a GPU worker sharing
+this machine's unified memory) — pick a quiet moment.
+
+Default run (fixture `01_no_tools` only, no hidden states, ~1-2 min once
+the model is loaded):
+
+```
+scripts/.venv/bin/python scripts/export_reference_dequant.py
+```
+
+Also run 02/03 and dump per-layer hidden states (02/03 add a much longer
+f32-on-CPU prefill — `03_tools_multiturn` is 2225 tokens, expect 5-10
+minutes for that one fixture alone; `--hidden` adds negligible time):
+
+```
+scripts/.venv/bin/python scripts/export_reference_dequant.py \
+    --inputs 01_no_tools 02_tools_single 03_tools_multiturn --hidden
+```
+
+Writes, per fixture `<name>`:
+
+- `fixtures/reference/logits/<name>.dequant.json` — same shape as
+  `export_reference.py`'s `<name>.json` (seq_len, argmax per position,
+  top-5 at the last position, greedy 32-token continuation), plus a
+  `"weights"` field noting this is the dequant-matched run.
+- `models/reference/xlam-2-3b-fc-r/<name>.dequant.logits.npy` — full
+  `[seq_len, vocab_size]` float32 logits. Outside the repo, not committed.
+- `models/reference/xlam-2-3b-fc-r/<name>.dequant.hidden.npz` (`--hidden`
+  only) — last-position hidden states at layers {0, 9, 18, 27} (raw,
+  pre-next-layer-norm), `layer_35_raw` (raw output of the final
+  transformer layer, captured via a forward hook since
+  `output_hidden_states`'s last tuple entry is post-final-norm, not raw),
+  and `final_normed` (after `model.norm`). For the Rust side to compare
+  per-layer later.
+
+After each fixture's forward pass, the script also prints a comparison
+against the existing bf16 reference (`fixtures/reference/logits/<name>.json`
+and, if present outside the repo, `<name>.logits.npy`): per-position argmax
+agreement (`n/seq_len`) and cosine similarity at the last position. This
+number is the load-bearing one — it tells us how much of the Rust port's
+argmax mismatch against the bf16 reference is explainable by Q4_0
+quantisation alone, versus a port bug.
