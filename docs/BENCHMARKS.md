@@ -1196,3 +1196,46 @@ Headless (Playwright's bundled Chromium, GPU otherwise idle):
   shape (orthogonal to autotune — not investigated further this session,
   flagged for a follow-up). The multi-minute (6.5 min) autotune-driven
   spike from the original bug report is gone.
+
+## Session 12 — schema-constrained decoding (jump-forward)
+
+`grammar.rs`'s `Constraint`/`GrammarConstraint` wired into
+`model.rs::generate_with_constraint` and `Agent`/`NativeGenerator` — see
+`docs/ENGINE.md` "Schema-constrained decoding" for the design (byte-level
+`forced_bytes`, not token-level mask-count, and why).
+
+### `tests/constrained.rs` — fixtures 02/03, steps vs tokens
+
+| fixture | total tokens | model steps | forced tokens | forced share | greedy match |
+|---|---|---|---|---|---|
+| 02_tools_single (no ids known, listing tool only callable) | 20 | 11 | 13 | 65.0% | exact (20/20) |
+| 03_tools_multiturn (kitchen group id known, `pause`) | 28 | 14 | 19 | 67.9% | exact (28/28) |
+
+Both match the unconstrained reference greedy output token-for-token.
+Wall time isn't reported here as a before/after (see the eval run below —
+this session's own runs were GPU-contended); the meaningful number is
+model-forward-pass reduction: 02 needed 11 forward passes to produce 20
+tokens (45% fewer than one-decode-step-per-token), 03 needed 14 for 28
+(50% fewer).
+
+### `llm-agent eval --tools 12 --tool-order listing-first --constrained --label constrained`
+
+**Timing contaminated**: this run shared the GPU with another worker's
+headless Chromium job for part or all of its duration (flagged mid-run by
+the coordinator). All per-case and mean `prefill_s`/`decode_tok_s`/
+`total_s` in `eval/results/2026-09-11-12-constrained-listing-first-native.md`
+are **not** representative of steady-state performance — see that file's
+own contamination note. `correct`/`steps`/`reason` are unaffected by GPU
+contention.
+
+Result: **43.3% correct (30 scored, 13 skipped)** on the current 43-case
+Sonos eval set. This is **not a like-for-like comparison** against the
+56.2% baseline in `eval/results/2026-09-10-summary.md` — that baseline
+predates two concurrent-worker changes that landed on this branch between
+the two measurements: the case set grew from 22 to 43 utterances
+(`c4f6e71`), and scoring gained `no_mutation`/`any_play` accept modes plus
+a `lang` field (`dbcb431`). A fair before/after would need a fresh
+*unconstrained* run on the identical 43-case set, which this session did
+not have GPU budget for alongside the concurrent Chromium job — flagged as
+a follow-up rather than reported as a number that isn't actually
+comparable.
