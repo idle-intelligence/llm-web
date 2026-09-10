@@ -107,9 +107,31 @@ pub async fn init_wgpu_device() -> Result<(), JsError> {
     // Detect subgroup support for the cooperative matvec kernel's subgroup
     // variant (`gguf.rs::has_subgroup_support()`); falls back to the
     // portable kernel otherwise.
-    let subgroups_available = features.contains(wgpu::Features::SUBGROUP);
+    //
+    // The subgroup kernel (`shader_q4_matvec_subgroup.wgsl`) hard-codes
+    // SUBGROUP_SIZE=32 — enabling it on a device whose actual subgroup size
+    // is 8/16/64 (e.g. some Intel/AMD/mobile GPUs) silently produces wrong
+    // sums, not an error. `wgpu::Features::SUBGROUP` alone only says the
+    // *feature* is available, not what size it runs at, so gate on
+    // `min_subgroup_size == max_subgroup_size == 32` as well. As of wgpu
+    // 26's `BROWSER_WEBGPU` backend, `adapter.limits()` doesn't surface a
+    // real subgroup size from the browser (`min_subgroup_size`/
+    // `max_subgroup_size` come back `Limits::default()`, i.e. 0/0 — see
+    // `wgpu-26.0.1/src/backend/webgpu.rs`), so this gate keeps the subgroup
+    // kernel disabled on WebGPU today; it only activates once wgpu (or the
+    // WebGPU spec's `adapter-info` subgroup extension) actually reports a
+    // real size.
+    let subgroup_size_confirmed_32 =
+        adapter_limits.min_subgroup_size == 32 && adapter_limits.max_subgroup_size == 32;
+    let subgroups_available =
+        features.contains(wgpu::Features::SUBGROUP) && subgroup_size_confirmed_32;
     crate::gguf::set_subgroup_support(subgroups_available);
-    wasm_log(&format!("[llm] Subgroup support: {subgroups_available}"));
+    wasm_log(&format!(
+        "[llm] Subgroup support: {subgroups_available} (feature={}, min_subgroup_size={}, max_subgroup_size={})",
+        features.contains(wgpu::Features::SUBGROUP),
+        adapter_limits.min_subgroup_size,
+        adapter_limits.max_subgroup_size,
+    ));
 
     let (device, queue) = adapter
         .request_device(&wgpu::DeviceDescriptor {
