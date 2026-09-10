@@ -59,6 +59,7 @@ export class LlmClient {
     this.onEvent(msg);
     switch (msg.type) {
       case 'progress':
+      case 'status':
         break; // surfaced via onEvent only
       case 'ready':
         if (this.readyResolve) {

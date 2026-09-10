@@ -585,6 +585,24 @@ end-to-end; `into_data_async()`'s actual behavior/latency under real WebGPU buff
 cross-origin isolation headers have historically had browser-specific rough edges). The user's
 first click-through in a real browser is the first real signal on all of these.
 
+### `worker.js` hardening (ported from trucs.ai's sonos stub)
+
+`web/agent/worker.js` was hardened to match the error-handling/observability bar set by
+trucs.ai's `sonos/llm-worker.js` (same protocol, drop-in-compatible): shard/tokenizer/template
+fetches use `cache: 'no-store'` so a stale cached GGUF or tokenizer never masks a real reload;
+`load` guards against an empty `model.shards` array and a missing `tokenizerUrl`/`templateUrl`
+before fetching anything, and checks `res.ok` on the tokenizer/template responses (not just the
+shard); thrown errors carry their stack trace in the `error` message's text; the whole `run` loop
+is wrapped in try/catch so an engine-side throw reaches the page as an `error` message instead of
+an unhandled rejection; top-level `self.addEventListener('error'|'unhandledrejection')` relay
+anything that would otherwise vanish silently (e.g. a throw during the top-level `import` of
+`pkg/llm_wasm.js`); shard fetch progress is throttled to report at most every 8MB instead of on
+every chunk; and new `{type:'status', phase:'prefill'|'decode'|'idle'}` messages bracket the
+blocking `engine.start`/`provideToolResults` calls so `index.html` can drive a page-side
+"thinking... (N.Ns)" timer instead of the UI looking hung while the model runs. The
+`?stub=1` dry-run path and sonos-specific bits were not ported — this demo's two canned tools
+(`get_weather`, `set_thermostat`) already exercise the same UI without needing a fake model path.
+
 ## Known issues / fixed
 
 ### 2026-09-10: `eval --tools 12` tool preamble silently reordered (not a KV-cache bug)

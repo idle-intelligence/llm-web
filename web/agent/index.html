@@ -107,6 +107,23 @@ function logStep(step) {
   logEl.scrollTop = logEl.scrollHeight;
 }
 
+let thinkingTimer = null;
+let thinkingStart = 0;
+function stopThinkingTimer() {
+  if (thinkingTimer) clearInterval(thinkingTimer);
+  thinkingTimer = null;
+  document.getElementById('status').textContent = 'Ready.';
+}
+function startThinkingTimer(phase) {
+  thinkingStart = performance.now();
+  if (thinkingTimer) clearInterval(thinkingTimer);
+  const tick = () => {
+    document.getElementById('status').textContent = `${phase}... (${((performance.now() - thinkingStart) / 1000).toFixed(1)}s)`;
+  };
+  tick();
+  thinkingTimer = setInterval(tick, 200);
+}
+
 const client = new LlmClient({
   toolCaller,
   onEvent: (msg) => {
@@ -114,6 +131,9 @@ const client = new LlmClient({
       const pct = msg.total ? msg.loaded / msg.total : 0;
       document.getElementById('load-progress').value = pct;
       document.getElementById('load-detail').textContent = `${msg.shard}: ${msg.loaded}${msg.total ? ' / ' + msg.total : ''}`;
+    } else if (msg.type === 'status') {
+      if (msg.phase === 'idle') stopThinkingTimer();
+      else startThinkingTimer(msg.phase);
     }
   },
 });
