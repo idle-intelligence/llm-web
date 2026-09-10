@@ -976,3 +976,75 @@ elements this schema set actually uses, but a real generic-JSON-string
 validator would be stricter. `advance()` on a token the mask didn't allow
 is a documented no-op (state unchanged) rather than a panic, since it's the
 sampler's job to respect the mask, not this module's job to trust it did.
+
+## Prefix KV images
+
+Build-time-produced files that let any engine instance load a prefix's KV cache in one shot
+instead of running prefill token-by-token, per the idea in
+`trucs.ai/.claude/worktrees/sonos-mcp/docs/kv-cache-images.md` (read-only reference). Step 1 of
+that plan, f32 only — int8 packing (§"KV quantisation" in that doc) is a later step.
+
+### Format v1
+
+`crates/llm-wasm/src/kvimg.rs`, little-endian: magic `KVIMG\0` (6 bytes), `u32` version=1, `u32`
+header length, then that many bytes of UTF-8 JSON header, then zero-padding out to the next
+16-byte boundary from the start of the file, then tensor data: for `layer in 0..n_layers`, K then
+V, each flat `[n_kv_heads, n_tokens, head_dim]` f32 row-major (the cache's batch=1 axis is
+dropped — redundant with the flattened layout). `KvImage::layer_slices_at` returns zero-copy `&[f32]`
+views when the data region lands 4-byte aligned in memory, and falls back to an owned copy
+otherwise (`Cow<[f32]>`).
+
+Header fields: `model_hash` (sha256 of the GGUF file, or — for files too large to hash cheaply on
+every load — `content_fingerprint`'s `sha256(file_size || first 1MiB || last 1MiB)`, either is
+just an opaque string to this format), `prefix_key` (`sha256(model_hash || rendered_prefix_text)`
+— hashing the *rendered* prompt, not the system prompt and tool list separately, means the key is
+sensitive to chat-template version, system-prompt wording, and tool ordering all at once, matching
+how `web.rs`'s `compute_prefix_len`/`resident_tokens` already treat the rendered prompt as the
+unit of comparison), `tokens` (the prefix's token ids, for a resident-tokens equality check before
+trusting an import — same check `web.rs`'s `run_step` already does for its in-session prefix
+cache), `n_layers`/`n_kv_heads`/`head_dim`/`dtype`/`engine`/`created`.
+
+No `sha2` crate: `cargo tree -i sha2` printed nothing, so `kvimg.rs` implements SHA-256 itself
+(~80 lines, FIPS 180-4, tested against the standard empty/`"abc"`/pangram vectors) rather than add
+a dependency this worker doesn't own `Cargo.toml` to add anyway.
+
+### `KvCache` API (`kv.rs`)
+
+`export_prefix(&self, n_tokens) -> Vec<(Vec<f32>, Vec<f32>)>`: one `into_data()` readback per
+layer per tensor (not per token), narrowed to `[0, n_tokens)`. **Native/build-time only** — this
+is a synchronous GPU readback; a WASM caller must not use it directly (deadlocks the browser) and
+should add an `into_data_async` variant before calling it from `web.rs`.
+
+`import_prefix(&mut self, layers, n_tokens)`: one `slice_assign` per layer per tensor (bulk write
+for all `n_tokens` rows at once), using the same placeholder-swap discipline `append` uses (see
+its doc comment / D1 in `docs/BENCHMARKS.md`) so cubecl mutates the existing buffer in place
+instead of copying the whole `max_ctx`-sized tensor. Sets `len = n_tokens` directly, so
+`snapshot()` reflects the imported prefix with no further calls needed.
+
+### Where this plugs in (next worker's wiring step)
+
+- `bin/`: a `kv-export` subcommand (native only — this is a build step, not a runtime path) that
+  loads a model, renders the prefix (system prompt + tools, per `template.rs`), computes
+  `model_hash` + `prefix_key`, runs one prefill via `model.rs`'s existing `forward_hidden`, calls
+  `KvCache::export_prefix`, and writes a `.kvimg` with `KvImage::write`.
+- `web.rs`: on `load()`/`start()`, before falling back to full prefill, compute `prefix_key` for
+  the current tools+system-prompt and check for a matching resident/cached image; on a hit, fetch
+  `<model base>/kv/<prefix_key>.kvimg`, `KvImage::read_header` + `layer_slices`, verify
+  `header.model_hash` matches the loaded GGUF's hash and `header.tokens` matches the *literal*
+  leading tokens of the newly rendered prompt (same match discipline `run_step`'s
+  `effective_prefix` check already applies to `resident_tokens`), then `KvCache::import_prefix`
+  and set `resident_tokens = header.tokens.clone()`. Needs an async GPU-upload path (`import_prefix`
+  as given is fine — `from_data`/`slice_assign` don't require a sync readback — but the readback
+  path for a *miss* that then wants to write its own image back still needs `into_data_async`).
+- `worker.js`: a `fetch(kvUrl, {cache: 'no-store'})` guarded the same way shard/tokenizer fetches
+  already are (`res.ok` check, thrown-error-carries-stack convention per the "worker.js hardening"
+  section above), gated on a 404 being a normal "no prebuilt image for this prefix" case rather
+  than a load failure.
+
+### Sizes (f32; int8 next)
+
+See `kv-cache-images.md`'s table: xLAM-2-3b-fc-r (36 layers, 2 kv heads, head_dim 128) — 13-tool
+prefix (~2300 tok) is ~170MB f32; 34-tool prefix (8140 tok) is ~600MB f32. Both are plausible only
+as a one-time download; int8 (packed 4/u32 + per-32-block f32 scale, per that doc's "KV
+quantisation" section) brings the 34-tool case to ~150MB and is the natural next step once this f32
+format is wired end-to-end.

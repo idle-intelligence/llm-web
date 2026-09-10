@@ -13,6 +13,8 @@ pub mod model;
 #[cfg(feature = "wgpu")]
 pub mod kv;
 
+pub mod kvimg;
+
 #[cfg(feature = "wgpu")]
 pub mod sample;
 

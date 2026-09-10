@@ -147,6 +147,76 @@ impl KvCache {
         assert!(snapshot <= self.max_ctx);
         self.len = snapshot;
     }
+
+    /// Read back positions `[0, n_tokens)` of every layer's K/V from the
+    /// GPU as flat `Vec<f32>` in `[n_kv_heads, n_tokens, head_dim]`
+    /// row-major order (the batch=1 axis is dropped — it's redundant with
+    /// the flattened layout) — the layout `kvimg::KvImage::write` expects
+    /// per layer. One `into_data()` readback per layer per tensor (not per
+    /// token). **Native-only usage**: this is the build-time `kv-export`
+    /// CLI path (see `docs/ENGINE.md` "Prefix KV images"); a caller
+    /// running inside WASM must not use this synchronous readback (it
+    /// deadlocks the browser) and should add an `into_data_async` variant
+    /// before calling this from `web.rs`.
+    pub fn export_prefix(&self, n_tokens: usize) -> Vec<(Vec<f32>, Vec<f32>)> {
+        assert!(n_tokens <= self.max_ctx);
+        self.k
+            .iter()
+            .zip(self.v.iter())
+            .map(|(k, v)| {
+                let k_data = k.clone().narrow(2, 0, n_tokens).into_data();
+                let v_data = v.clone().narrow(2, 0, n_tokens).into_data();
+                (
+                    k_data.into_vec::<f32>().expect("K tensor is f32"),
+                    v_data.into_vec::<f32>().expect("V tensor is f32"),
+                )
+            })
+            .collect()
+    }
+
+    /// Upload `layers` (per-layer `(k, v)` flat `[n_kv_heads, n_tokens,
+    /// head_dim]` row-major, as produced by [`Self::export_prefix`] or
+    /// `kvimg::KvImage::layer_slices`) into positions `[0, n_tokens)` of
+    /// this cache's tensors, one `slice_assign` per layer per tensor (not
+    /// per token — matches `append`'s bulk-write shape), and set `len =
+    /// n_tokens` so `snapshot()` reflects the imported prefix immediately.
+    pub fn import_prefix(&mut self, layers: &[(Vec<f32>, Vec<f32>)], n_tokens: usize) {
+        assert!(n_tokens <= self.max_ctx);
+        assert_eq!(
+            layers.len(),
+            self.k.len(),
+            "layers.len()={} does not match cache's num_layers={}",
+            layers.len(),
+            self.k.len()
+        );
+        let ranges = [0..1usize, 0..self.n_kv_heads, 0..n_tokens, 0..self.head_dim];
+        for (layer, (k_flat, v_flat)) in layers.iter().enumerate() {
+            let expect_len = self.n_kv_heads * n_tokens * self.head_dim;
+            assert_eq!(k_flat.len(), expect_len, "layer {layer} k length mismatch");
+            assert_eq!(v_flat.len(), expect_len, "layer {layer} v length mismatch");
+
+            let device = self.k[layer].device();
+            let k_new = Tensor::<Wgpu, 4>::from_data(
+                burn::tensor::TensorData::new(k_flat.clone(), [1, self.n_kv_heads, n_tokens, self.head_dim]),
+                &device,
+            );
+            let v_new = Tensor::<Wgpu, 4>::from_data(
+                burn::tensor::TensorData::new(v_flat.clone(), [1, self.n_kv_heads, n_tokens, self.head_dim]),
+                &device,
+            );
+
+            // Same placeholder-swap discipline as `append` (see its D1
+            // comment): drop the second reference to the cache slot before
+            // `slice_assign` so cubecl mutates the existing buffer in
+            // place instead of copying the whole `max_ctx`-sized tensor.
+            let placeholder_shape = [1, self.n_kv_heads, 1, self.head_dim];
+            let old_k = std::mem::replace(&mut self.k[layer], Tensor::<Wgpu, 4>::empty(placeholder_shape, &device));
+            let old_v = std::mem::replace(&mut self.v[layer], Tensor::<Wgpu, 4>::empty(placeholder_shape, &device));
+            self.k[layer] = old_k.slice_assign(ranges.clone(), k_new);
+            self.v[layer] = old_v.slice_assign(ranges.clone(), v_new);
+        }
+        self.len = n_tokens;
+    }
 }
 
 #[cfg(all(test, feature = "wgpu"))]
