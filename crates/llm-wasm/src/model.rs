@@ -218,6 +218,46 @@ impl Q4Attention {
 /// (unverified after this change, carried over from C3's finding).
 const ATTN_QUERY_CHUNK: usize = 256;
 
+/// Largest single contraction (K) block for the P@V matmul (`probs`:
+/// `[.., Tq, kv_len]`, `v`: `[.., kv_len, Dh]`). Session 7 root-caused a
+/// Burn/cubecl wgpu matmul correctness bug (not a shape *panic* like
+/// `ATTN_QUERY_CHUNK`'s, a silently wrong result) that appears once the
+/// contraction dimension `kv_len` is in the low thousands while the output
+/// width `Dh` (head_dim) is comparatively small — confirmed with a plain
+/// random-data `matmul([1,H,256,1256],[1,H,1256,16])` outside any
+/// attention/softmax code (worst_abs_diff ~34 against a CPU f64 reference;
+/// QK^T and softmax on the same inputs matched the CPU reference to
+/// ~1e-6/~1e-8). Splitting the contraction into `PV_KV_CHUNK`-sized blocks
+/// and summing partial products (`pv_matmul` below) keeps every individual
+/// `matmul` call's K dimension small and avoids the bad kernel selection;
+/// verified against a CPU reference at K=1256 with block=128 (bit-close,
+/// max-abs ~1e-6) where the single-call matmul was off by ~0.1.
+const PV_KV_CHUNK: usize = 256;
+
+/// `probs`: `[1, H, Tq, kv_len]`, `v`: `[1, H, kv_len, Dh]`. Returns
+/// `[1, H, Tq, Dh]`. See `PV_KV_CHUNK`'s doc comment for why this chunks the
+/// contraction dimension instead of calling `probs.matmul(v)` directly.
+fn pv_matmul(probs: Tensor<Wgpu, 4>, v: Tensor<Wgpu, 4>) -> Tensor<Wgpu, 4> {
+    let kv_len = probs.dims()[3];
+    if kv_len <= PV_KV_CHUNK {
+        return probs.matmul(v);
+    }
+    let mut acc: Option<Tensor<Wgpu, 4>> = None;
+    let mut start = 0usize;
+    while start < kv_len {
+        let len = PV_KV_CHUNK.min(kv_len - start);
+        let p_chunk = probs.clone().narrow(3, start, len);
+        let v_chunk = v.clone().narrow(2, start, len);
+        let part = p_chunk.matmul(v_chunk);
+        acc = Some(match acc {
+            Some(prev) => prev + part,
+            None => part,
+        });
+        start += len;
+    }
+    acc.unwrap()
+}
+
 /// QK^T -> causal mask -> softmax -> PV, chunked over the query (T)
 /// dimension — see `ATTN_QUERY_CHUNK`'s doc comment. `q`: `[1, H, T, Dh]`,
 /// `k_all`/`v_all`: `[1, H, kv_len, Dh]`. Returns `[1, H, T, Dh]`.
@@ -234,7 +274,7 @@ fn attention_scores_and_values(
         let scores = q.matmul(k_all.swap_dims(2, 3)) * scale;
         let scores = apply_causal_mask(scores, t, kv_len, offset);
         let probs = softmax(scores, 3);
-        return probs.matmul(v_all);
+        return pv_matmul(probs, v_all);
     }
 
     let mut chunks = Vec::with_capacity(t.div_ceil(ATTN_QUERY_CHUNK));
@@ -251,7 +291,7 @@ fn attention_scores_and_values(
         let scores = q_chunk.matmul(k_chunk.swap_dims(2, 3)) * scale;
         let scores = apply_causal_mask(scores, len, chunk_kv_len, offset + start);
         let probs = softmax(scores, 3);
-        chunks.push(probs.matmul(v_chunk));
+        chunks.push(pv_matmul(probs, v_chunk));
         start += len;
     }
     Tensor::cat(chunks, 2)
@@ -548,5 +588,86 @@ mod debug_tests {
         assert_eq!(data[0], 0.0);
         assert_eq!(data[1], 0.0);
         assert_eq!(data[2], 0.0);
+    }
+
+    /// Session 7 regression test for the chunked-attention divergence
+    /// (docs/BENCHMARKS.md Session 5/6 addenda, `split_prefill_matches_single_prefill`):
+    /// synthetic q/k/v at offset=1000, T=1225 (mirrors the real 1000/1225
+    /// split). Compares `attention_scores_and_values`'s chunked branch
+    /// (T=1225 > ATTN_QUERY_CHUNK=256) against the same math computed in one
+    /// unchunked shot (the T<=256 branch's formula, called directly) on
+    /// *identical* q/k/v tensors — isolated from gguf.rs/RoPE/KV-cache
+    /// entirely. Root cause (proven by bisecting QK^T / softmax / PV matmul
+    /// independently against a CPU f64 reference, and reproducing with
+    /// plain random-data matmul calls with no attention involved at all):
+    /// Burn/cubecl's wgpu matmul kernel silently mis-computes
+    /// `probs.matmul(v)` once the contraction dim (`kv_len`, here 1256) is
+    /// in the low thousands while the output width (`Dh`, head_dim) is
+    /// comparatively small — QK^T and softmax on the same inputs matched a
+    /// CPU reference to ~1e-6/~1e-8, only the PV matmul was wrong (~0.1
+    /// abs, matching this test's failure before the fix). Fixed by
+    /// `pv_matmul` chunking the contraction dimension into `PV_KV_CHUNK`
+    /// blocks and summing partial products.
+    #[test]
+    fn chunked_attention_matches_unchunked_synthetic() {
+        let device = WgpuDevice::default();
+        let h = 4usize;
+        let dh = 16usize;
+        let offset = 1000usize;
+        let t = 1225usize;
+        let kv_len = offset + t;
+
+        let mut rng = 12345u64;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            ((rng as i64 % 2000) as f32) / 1000.0 - 1.0
+        };
+
+        let q_data: Vec<f32> = (0..h * t * dh).map(|_| next()).collect();
+        let k_data: Vec<f32> = (0..h * kv_len * dh).map(|_| next()).collect();
+        let v_data: Vec<f32> = (0..h * kv_len * dh).map(|_| next()).collect();
+
+        let q = Tensor::<Wgpu, 1>::from_floats(q_data.as_slice(), &device).reshape([1, h, t, dh]);
+        let k_all =
+            Tensor::<Wgpu, 1>::from_floats(k_data.as_slice(), &device).reshape([1, h, kv_len, dh]);
+        let v_all =
+            Tensor::<Wgpu, 1>::from_floats(v_data.as_slice(), &device).reshape([1, h, kv_len, dh]);
+
+        let scale = 1.0 / (dh as f32).sqrt();
+
+        // Chunked path (real code path: T=1225 > ATTN_QUERY_CHUNK).
+        let chunked = attention_scores_and_values(
+            q.clone(),
+            k_all.clone(),
+            v_all.clone(),
+            t,
+            kv_len,
+            offset,
+            scale,
+        );
+
+        // Unchunked reference: identical formula to the T<=ATTN_QUERY_CHUNK
+        // branch, called directly on the same (whole, unsliced) tensors.
+        let scores = q.matmul(k_all.swap_dims(2, 3)) * scale;
+        let scores = apply_causal_mask(scores, t, kv_len, offset);
+        let probs = softmax(scores, 3);
+        let unchunked = pv_matmul(probs, v_all);
+
+        let chunked_data = chunked.into_data().into_vec::<f32>().unwrap();
+        let unchunked_data = unchunked.into_data().into_vec::<f32>().unwrap();
+        assert_eq!(chunked_data.len(), unchunked_data.len());
+
+        let mut max_abs_diff = 0f32;
+        for (a, b) in chunked_data.iter().zip(unchunked_data.iter()) {
+            max_abs_diff = max_abs_diff.max((a - b).abs());
+        }
+        println!("chunked vs unchunked synthetic attention: max_abs_diff={max_abs_diff}");
+        assert!(
+            max_abs_diff < 3e-4,
+            "chunked attention diverges from unchunked reference by {max_abs_diff} \
+             (offset={offset}, t={t}, kv_len={kv_len})"
+        );
     }
 }

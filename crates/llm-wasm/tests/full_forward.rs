@@ -442,13 +442,24 @@ fn test_rmsnorm_fused_matches_reference() {
 /// Regression test for the split-prefill divergence found in eval (m01/s09:
 /// prefill-prefix + `snapshot`/`restore` + prefill-suffix at nonzero offset
 /// picked a different first token than a single whole-prompt prefill).
-/// Compares (a) one prefill of the full 2225-token `02_tools_single`
-/// sequence against (b)/(c)/(d) `restore(0)` + split prefill at various
-/// split points + `restore(split)` + prefill-suffix, at the last position's
-/// logits and 8 greedy-decoded continuation tokens.
-#[test]
-fn split_prefill_matches_single_prefill() {
-    let Some(tokens) = load_tokens("02_tools_single") else {
+///
+/// Session 7 (docs/BENCHMARKS.md addendum) root-caused the `split=1000`
+/// (~11 max-abs) divergence to a Burn/cubecl wgpu matmul correctness bug:
+/// `attention_scores_and_values`'s P@V matmul (`probs.matmul(v)`) silently
+/// mis-computes once its contraction dimension (`kv_len`, in the low
+/// thousands here) is large relative to the output width (`head_dim`) —
+/// confirmed independent of gguf.rs/RoPE/KV-cache with a synthetic-tensor
+/// unit test (`model.rs::debug_tests::chunked_attention_matches_unchunked_synthetic`)
+/// and with plain random-data `matmul` calls with no attention involved.
+/// Fixed by `model.rs::pv_matmul` chunking the contraction dimension.
+/// Compares (a) one whole-prompt prefill against (b) `restore(0)` + split
+/// prefill at various split points + `restore(split)` + prefill-suffix, at
+/// the last position's logits and 8 greedy-decoded continuation tokens.
+/// All splits now hold the tight P1 bound (previously `split=1000` — where
+/// the suffix is T=1225 > `ATTN_QUERY_CHUNK`=256 at nonzero offset — was
+/// left ungated as a KNOWN BUG).
+fn check_split_prefill(fixture: &str, splits: &[usize], max_ctx: usize) {
+    let Some(tokens) = load_tokens(fixture) else {
         return;
     };
 
@@ -456,8 +467,6 @@ fn split_prefill_matches_single_prefill() {
     let Some(model) = load_model(&device) else {
         return;
     };
-    let max_ctx = 12288;
-    let vocab = model.config().vocab_size;
     let seq_len = tokens.len();
 
     // (a) single whole-prompt prefill.
@@ -477,7 +486,7 @@ fn split_prefill_matches_single_prefill() {
 
     let mut max_diff_report = Vec::new();
 
-    for &split in &[2218usize, 1000, seq_len - 1] {
+    for &split in splits {
         let mut cache = model.new_cache(max_ctx);
         cache.restore(0);
         let _ = model.forward_hidden(&tokens[..split], &mut cache).unwrap();
@@ -497,59 +506,15 @@ fn split_prefill_matches_single_prefill() {
         let argmax_b = argmax(&logits_b);
         max_diff_report.push((split, max_abs_diff, argmax_a, argmax_b));
         eprintln!(
-            "split={split}: max_abs_diff={max_abs_diff:.6} argmax_a={argmax_a} argmax_b={argmax_b}"
+            "{fixture} split={split}: max_abs_diff={max_abs_diff:.6} argmax_a={argmax_a} argmax_b={argmax_b}"
         );
         assert_eq!(
             argmax_a, argmax_b,
-            "split={split}: argmax diverged (a={argmax_a} b={argmax_b}, max_abs_diff={max_abs_diff})"
+            "{fixture} split={split}: argmax diverged (a={argmax_a} b={argmax_b}, max_abs_diff={max_abs_diff})"
         );
-        // Session 6 bug hunt (docs/BENCHMARKS.md addendum): the P1 comment
-        // this replaced attributed all split-prefill divergence to
-        // fp32-reduction-order noise from the scratch-dequant path
-        // (gguf.rs::q4_matmul_dispatch). That's the correct explanation for
-        // split=2218/seq_len-1 (both < ~1e-4 here), but NOT for split=1000,
-        // which shows max_abs_diff ~11 — three orders of magnitude larger,
-        // clearly a real divergence, not rounding noise.
-        //
-        // tests/q4_matmul.rs::test_scratch_vs_naive_vs_cpu_per_m_real_gguf
-        // exonerates gguf.rs: on the real GGUF's attn_q [2048,2048],
-        // ffn_down [2048,11008] AND ffn_gate [11008,2048] weights — every
-        // linear-layer shape this model uses — both the naive and
-        // scratch-dequant matmul kernels agree with a CPU f32 reference to
-        // ~1e-5/~3e-5 max-abs at M in {1000, 1225, 2225} (this split's exact
-        // M values), for both the naive and scratch-dequant kernels. The
-        // dequant kernel itself (test_dequant_scratch_matches_cpu_real_gguf)
-        // is bit-exact (max_abs=0) against a CPU dequant of the real
-        // ffn_down.weight tensor. So gguf.rs/wgsl are not the source.
-        //
-        // What's different about split=1000 vs the other two splits: its
-        // second `forward_hidden` call has T=1225 (2225-1000), which is
-        // > `model.rs::ATTN_QUERY_CHUNK` (256) and so takes
-        // `attention_scores_and_values`'s chunked branch (5 sub-chunks) at
-        // a nonzero `offset` (1000) — plain Burn `Tensor::matmul` calls on
-        // `q.narrow(2, start, len)` of an already-permuted (non-contiguous)
-        // `[1,H,T,Dh]` tensor (model.rs ~240-256). split=2218's second call
-        // has T=7 (<=256, no chunking) and split=(seq_len-1)'s has T=1
-        // (decode/matvec path) — both clean. This correlation (chunked
-        // attention + nonzero offset -> ~11 max-abs divergence; either
-        // alone -> clean) points at `attention_scores_and_values`'s chunked
-        // path in model.rs, not at anything in this crate's gguf.rs/wgsl
-        // (owned by this session) — model.rs/kv.rs are owned elsewhere, so
-        // the fix belongs there. Left failing (not loosened) so the bug
-        // stays visible rather than silently tolerated; splits without
-        // chunking-at-offset (2218, seq_len-1) still hold the tight P1
-        // bound.
-        let chunked_at_offset = seq_len - split > 256 && split > 0;
-        let tol = if chunked_at_offset { f32::INFINITY } else { 3e-4 };
-        if chunked_at_offset {
-            eprintln!(
-                "split={split}: KNOWN BUG (model.rs attention_scores_and_values, not gguf.rs) — \
-                 max_abs_diff={max_abs_diff} not gated, see comment above"
-            );
-        }
         assert!(
-            max_abs_diff < tol,
-            "split={split}: max_abs_diff {max_abs_diff} exceeds {tol}"
+            max_abs_diff < 3e-4,
+            "{fixture} split={split}: max_abs_diff {max_abs_diff} exceeds 3e-4"
         );
 
         // greedy continuation from this split-prefill cache
@@ -561,25 +526,42 @@ fn split_prefill_matches_single_prefill() {
             let hidden = model.forward_hidden(&[next], &mut cache).unwrap();
             logits_vec = llm_wasm::model::logits_to_vec(model.lm_head(hidden)).unwrap();
         }
-        eprintln!("split={split}: decoded_a={decoded_a:?} decoded_b={decoded_b:?}");
-        if chunked_at_offset {
-            if decoded_a != decoded_b {
-                eprintln!(
-                    "split={split}: KNOWN BUG — greedy continuation also diverged \
-                     (decoded_a={decoded_a:?} decoded_b={decoded_b:?}), not gated, see comment above"
-                );
-            }
-        } else {
-            assert_eq!(decoded_a, decoded_b, "split={split}: greedy continuation diverged");
-        }
+        eprintln!("{fixture} split={split}: decoded_a={decoded_a:?} decoded_b={decoded_b:?}");
+        assert_eq!(
+            decoded_a, decoded_b,
+            "{fixture} split={split}: greedy continuation diverged"
+        );
     }
 
-    eprintln!("split-prefill report: {max_diff_report:?}");
-    let vocab_check = vocab; // silence unused warning if vocab used only above
-    let _ = vocab_check;
+    eprintln!("{fixture} split-prefill report: {max_diff_report:?}");
+}
 
-    // Second-utterance simulation: restore(split) then prefill a *different*
-    // suffix, compare against a fresh single prefill of that full sequence.
+#[test]
+fn split_prefill_matches_single_prefill() {
+    // 02_tools_single, seq_len=2225: split=2218 (T=7, no chunking),
+    // split=1000 (T=1225, chunked at nonzero offset — the bug this test
+    // guards against), split=seq_len-1 (T=1, decode/matvec path).
+    check_split_prefill("02_tools_single", &[2218, 1000, 2225 - 1], 12288);
+
+    // 03_tools_multiturn, seq_len=2354: split=2221 (T=133 suffix, the real
+    // MCP tool-result case) and split=1823 (T=531 suffix) — both chunked at
+    // a nonzero offset, both must hold the tight bound.
+    check_split_prefill("03_tools_multiturn", &[2221, 1823], 12288);
+}
+
+/// Second-utterance simulation: `restore(split)` then prefill a *different*
+/// suffix, compare against a fresh single prefill of that full sequence.
+#[test]
+fn split_prefill_reuse_matches_fresh_alt_suffix() {
+    let Some(tokens) = load_tokens("02_tools_single") else {
+        return;
+    };
+    let device = WgpuDevice::default();
+    let Some(model) = load_model(&device) else {
+        return;
+    };
+    let max_ctx = 12288;
+
     let split = 2218usize;
     let alt_suffix: Vec<u32> = tokens[split..].iter().rev().cloned().collect(); // deliberately different tail
     let mut alt_full = tokens[..split].to_vec();
