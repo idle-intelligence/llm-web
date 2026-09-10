@@ -9,20 +9,25 @@
 // output columns).
 //
 // TK=32 is exactly one Q4_0 block, so each K-tile step needs only one scale
-// per weight row (no partial-block handling). TM=TN=128, 16x16=256 threads
-// per workgroup, each thread computes an 8x8 micro-tile of the output
-// (128/16=8 per axis).
+// per weight row (no partial-block handling). Shipped constants below are
+// TM=TN=64/MICRO=4 (see docs/BENCHMARKS.md K2's `v3`): 16x16=256 threads
+// per workgroup, each thread computes a 4x4 micro-tile of the output
+// (64/16=4 per axis).
 //
-// v1 of this kernel used TM=TN=64/MICRO=4 (16KB shared mem) and *regressed*
-// prefill 4.4x vs the naive kernel (368s vs 84s on the 2225-token
-// `02_tools_single` fixture) despite passing correctness tests — with only
-// 512 FMAs of compute between each pair of workgroupBarrier() calls (one
-// Q4_0 block's worth, TK=32), barrier/sync overhead dominated over the
-// weight-reuse win. Doubling TM/TN to 128 (MICRO=8) quadruples the compute
-// (2048 FMAs) done per barrier pair for the same TK=32 dequant/load cost,
-// at the price of doubling shared memory to 32KB/workgroup (still under
-// Metal's default per-threadgroup limit) and more registers/thread (64
-// accumulators instead of 16).
+// v1 of this kernel (TM=TN=64/MICRO=4, scalar per-nibble dequant, 16KB
+// shared mem) *regressed* prefill 4.4x vs the naive kernel (368s vs 84s on
+// the 2225-token `02_tools_single` fixture) despite passing correctness
+// tests — with only 512 FMAs of compute between each pair of
+// workgroupBarrier() calls (one Q4_0 block's worth, TK=32), barrier/sync
+// overhead dominated over the weight-reuse win. A TM=TN=128/MICRO=8 variant
+// (`v2` in docs/BENCHMARKS.md K2, quadrupling FMAs per barrier pair to 2048
+// at the cost of 32KB shared mem and 64 accumulators/thread instead of 16)
+// was measured and found slower than a vectorized (u32-word, 8 values/read)
+// dequant at the original TM=TN=64/MICRO=4 size — so the 128/MICRO=8
+// variant was reverted; the constants below (`v3`) are the ones actually
+// shipped. This kernel is still not wired into `q4_matmul`'s default
+// dispatch (docs/BENCHMARKS.md K2) — it never closed the gap with the
+// naive kernel at any of these sizes.
 //
 // Dispatch: ceil(N / TN) workgroups in X, ceil(M / TM) in Y. B is assumed 1
 // (this crate's single-session assumption — Q4Attention::forward asserts
