@@ -38,6 +38,10 @@ use byteorder::{LittleEndian, ReadBytesExt};
 use cubecl::prelude::KernelId;
 use cubecl::server::{Bindings, CubeCount, Handle};
 use cubecl::{CubeTask, Runtime};
+use cubek_matmul::definition::{MatmulElems, MatmulGlobalElems};
+use cubek_matmul::launch::{launch_ref, MatmulInputHandleRef, Strategy};
+use cubek_matmul::routines::double_unit::DoubleUnitSelectionArgs;
+use cubek_matmul::routines::{BlueprintStrategy, TileSizeSelection};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
@@ -1167,18 +1171,92 @@ pub fn q4_dequant_scratch_to_vec(weights: &Q4Tensor, device: &WgpuDevice) -> Vec
 /// padding logic is needed.
 const SCRATCH_MATMUL_CHUNK_M: usize = 2048;
 
+/// Session 11 (docs/BENCHMARKS.md): pinned matmul strategy for the
+/// scratch-dequant path, bypassing Burn's `Tensor::matmul`/`autotune`
+/// entirely. Chosen from the natively-populated cubecl autotune cache
+/// (`target/autotune/0.9.0/.../burn_cubecl-kernel-matmul-tune-base.json.log`)
+/// for this hardware (Apple M2, Metal via wgpu): every CMMA/MMA candidate
+/// (`matmul_simple_cyclic_cmma`, `..._mma`, etc.) errors out at kernel
+/// selection with "No tile size is available for the problem" — this
+/// backend has no usable tensor-core path for these shapes — so the winner
+/// is always a `DoubleUnit` (double-buffered, non-tensor-core) kernel,
+/// varying only in `TileSizeSelection`. At the dominant scratch-matmul
+/// shape (`SCRATCH_MATMUL_CHUNK_M` = 2048 rows, K/N ∈ {2048, 11008, 256}),
+/// `MinTileSize` wins ((2048,2048,2048), (2048,256,2048), (2048,2048,16384)
+/// all -> `matmul_double_unit_min_tile_size`); `MaxTileSize` only wins for
+/// the minority smaller-M remainder chunks (<=1024 rows, e.g. the tail
+/// 256-row chunk of a 2304-row prefill). One const per platform as
+/// specified, both currently `MinTileSize`: native and web share the same
+/// wgpu/WebGPU kernel family and GPU (this Mac generates both the native
+/// autotune cache above and the Chromium WebGPU surface used for headless
+/// runs), and no separate persistent web autotune data exists to justify a
+/// different pin.
+#[cfg(not(feature = "web"))]
+const PINNED_MATMUL_TILE_SIZE: TileSizeSelection = TileSizeSelection::MinTileSize;
+#[cfg(feature = "web")]
+const PINNED_MATMUL_TILE_SIZE: TileSizeSelection = TileSizeSelection::MinTileSize;
+
+fn pinned_matmul_strategy() -> Strategy {
+    Strategy::DoubleUnit(BlueprintStrategy::Inferred(DoubleUnitSelectionArgs {
+        tile_size: PINNED_MATMUL_TILE_SIZE,
+    }))
+}
+
+/// `x[B,M,K] . w[1,K,N]` through `cubek_matmul::launch::launch_ref` with
+/// `pinned_matmul_strategy()`, replacing Burn's `Tensor::matmul` (which
+/// Burn's public API only lets us call with `Strategy::default()` —
+/// `Strategy::Auto` without `autotune`, autotune-benchmarked with it —
+/// never a caller-chosen `Strategy`). Both `x` and `w` are our own f32
+/// scratch tensors (dequant output / dequant-into-scratch weight), always
+/// contiguous, non-quantized, so the `MatmulInputHandleRef::new` (non-
+/// quantized) path applies.
+fn pinned_matmul(x: Tensor<Wgpu, 3>, w: Tensor<Wgpu, 3>) -> Tensor<Wgpu, 3> {
+    let x: CubeTensor<WgpuRuntime> = into_contiguous(x.into_primitive().tensor());
+    let w: CubeTensor<WgpuRuntime> = into_contiguous(w.into_primitive().tensor());
+    let client = x.client.clone();
+    let device = x.device.clone();
+    let [b, m, _k] = [x.shape.dims[0], x.shape.dims[1], x.shape.dims[2]];
+    let n = w.shape.dims[2];
+
+    let output_handle = client.empty(b * m * n * 4);
+    let out = CubeTensor::new_contiguous(
+        client.clone(),
+        device,
+        burn::prelude::Shape::from(vec![b, m, n]),
+        output_handle,
+        DType::F32,
+    );
+
+    let mut dtypes = MatmulElems::from_globals(&MatmulGlobalElems {
+        lhs: x.dtype.into(),
+        rhs: w.dtype.into(),
+        out: out.dtype.into(),
+    });
+    launch_ref(
+        &pinned_matmul_strategy(),
+        &client,
+        &MatmulInputHandleRef::new(x.as_handle_ref(), x.dtype.into()),
+        &MatmulInputHandleRef::new(w.as_handle_ref(), w.dtype.into()),
+        &out.as_handle_ref(),
+        &mut dtypes,
+    )
+    .expect("pinned scratch matmul launch failed");
+
+    Tensor::from_primitive(TensorPrimitive::Float(out))
+}
+
 /// Chunks `x[B,M,K] . w[1,K,N]` over the M dimension — see
 /// `SCRATCH_MATMUL_CHUNK_M`'s doc comment for why.
 fn scratch_matmul_chunked(x: Tensor<Wgpu, 3>, w: Tensor<Wgpu, 3>, m: usize) -> Tensor<Wgpu, 3> {
     if m <= SCRATCH_MATMUL_CHUNK_M {
-        return x.matmul(w);
+        return pinned_matmul(x, w);
     }
     let mut chunks = Vec::with_capacity(m.div_ceil(SCRATCH_MATMUL_CHUNK_M));
     let mut start = 0usize;
     while start < m {
         let len = SCRATCH_MATMUL_CHUNK_M.min(m - start);
         let x_chunk = x.clone().narrow(1, start, len);
-        chunks.push(x_chunk.matmul(w.clone()));
+        chunks.push(pinned_matmul(x_chunk, w.clone()));
         start += len;
     }
     Tensor::cat(chunks, 1)

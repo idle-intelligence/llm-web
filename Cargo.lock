@@ -2719,6 +2719,7 @@ dependencies = [
  "clap",
  "console_error_panic_hook",
  "cubecl",
+ "cubek-matmul",
  "getrandom 0.3.4",
  "js-sys",
  "minijinja",

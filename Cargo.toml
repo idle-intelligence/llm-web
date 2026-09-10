@@ -21,6 +21,16 @@ byteorder = "1.5"
 # Burn ML framework
 burn = { version = "0.20", default-features = false, features = ["std"] }
 cubecl = { version = "0.9", default-features = false, features = ["wgpu"] }
+# Session 11 (docs/BENCHMARKS.md): direct dependency so gguf.rs's scratch
+# matmul path can call `cubek_matmul::launch::launch_ref` with a pinned
+# `Strategy` instead of going through Burn's `Tensor::matmul`, which (with
+# `burn/autotune` on) re-benchmarks every candidate kernel at full size on
+# first use of each distinct shape — cheap natively (cubecl caches results
+# under `target/autotune/`) but has no persistent cache in the browser, so
+# every first prefill of a new length pays the full tuning cost (6.5 min
+# for a 2304-row prefill in real Chrome). Version pinned to match the
+# transitive dependency already resolved via burn-cubecl/cubek.
+cubek-matmul = { version = "0.1.1", default-features = false, features = ["std"] }
 
 # Templating (Jinja2-compatible chat templates)
 minijinja = { version = "2", features = ["json", "preserve_order"] }

@@ -1079,3 +1079,120 @@ gates it out), so `pad_m_bucket` never runs on the decode path.
 `cargo clippy --features wgpu --all-targets -- -D warnings` and
 `cargo clippy --target wasm32-unknown-unknown --no-default-features --features
 web --lib -- -D warnings` both clean.
+
+## Session 11 — pin the matmul strategy, stop the browser autotune spike
+
+Problem: in the user's real Chrome, the first prefill of a 13-tool session
+(2304 padded rows) took **6.5 minutes**. Cause: `burn/autotune` (Session 5)
+benchmarks every candidate matmul kernel at full size on first use of a
+shape, and has no persistent cache in the browser (native caches to disk —
+see below); Session 10's M-bucketing reduced the *number* of distinct
+shapes tuned but each first-touch of a bucket still paid the full
+benchmark-every-candidate cost. Headless repro before this session: 17s of
+tuning at 256 rows, scaling with M.
+
+### What autotune picked natively
+
+cubecl's autotune cache lives at `target/autotune/0.9.0/device-4-0-wgpu_wgsl_/
+burn_cubecl-kernel-matmul-tune-base.json.log` — `CacheConfig::Target`
+(`cubecl-runtime-0.9.0/src/config/cache.rs`), i.e. **project `target/`
+directory, disk-persistent, native-only**; there is no equivalent in the
+browser. Reading the JSON-lines cache (each line: shape -> per-candidate
+timings, `fastest_index`) after a full native run populated every
+production shape:
+
+| shape (M, N, K) | winner |
+|---|---|
+| (2048, 2048, 2048) | `matmul_double_unit_min_tile_size` |
+| (2048, 256, 2048) — k/v proj | `matmul_double_unit_min_tile_size` |
+| (2048, 2048, 16384)* | `matmul_double_unit_min_tile_size` |
+| (256, 2048, 2048) — 2304's remainder chunk | `matmul_double_unit_max_tile_size` |
+| (256, 2048, 16384)* | `matmul_double_unit_max_tile_size` |
+| (128/512/1024, 2048/16384, 2048) | `matmul_double_unit_max_tile_size` |
+| (1, N, K) — decode, M=1 | `matmul_naive` / `matmul_simple_unit_min_tile_size` |
+
+(*n=16384 entries are `tests/q4_matmul.rs` synthetic shapes sharing the
+same cache file, not the real model's N=11008 — no cache entry for the
+real ffn_up/down N=11008 shape existed yet at inspection time, but the
+pattern below is shape-independent.)
+
+The decisive finding: **every CMMA/MMA candidate strategy
+(`matmul_simple_cyclic_cmma`, `..._mma`, `..._tma_*`, etc.) fails kernel
+selection outright** on this hardware (Apple M2, Metal via wgpu) with
+`"Unable to launch matmul because a required feature is unavailable: No
+tile size is available for the problem."` — there is no usable tensor-core
+path for these shapes on this backend, so the winner is *always* a
+`DoubleUnit` (double-buffered, non-tensor-core) kernel
+(`cubek_matmul::routines::double_unit::DoubleUnitAlgorithm`), differing only
+in `TileSizeSelection::{Min,Max}TileSize`. At the dominant shape
+(`SCRATCH_MATMUL_CHUNK_M`=2048-row chunks), `MinTileSize` wins; `MaxTileSize`
+wins only for the smaller-M remainder chunks (<=1024 rows).
+
+### The pin
+
+Burn's public API (`burn_cubecl::kernel::matmul::{matmul, MatmulStrategy}`)
+only exposes `Autotune` vs `Cube` (which itself hardcodes
+`Strategy::default()` = `Strategy::Auto`, a heuristic, not a caller-chosen
+strategy) — there is no runtime knob to inject an explicit `cubek_matmul`
+`Strategy`. **First attempt** (disable `burn/autotune` crate-wide, let
+everything fall back to `Strategy::Auto`) was reverted: it made
+`full_forward`'s attention-path matmuls (`model.rs`, still going through
+`Tensor::matmul`) numerically wrong — full argmax mismatch from position 0,
+0/5 top5 overlap even on a 31-token prompt. `Strategy::Auto`'s
+un-benchmarked heuristic is not safe to rely on for this backend/shape mix.
+
+**Final fix**: `gguf.rs` adds a direct `cubek-matmul` dependency (already a
+transitive dep via `burn-cubecl`/`cubek`, version-pinned to match) and a new
+`pinned_matmul()` that calls `cubek_matmul::launch::launch_ref` directly —
+bypassing Burn's `Tensor::matmul`/autotune entirely — with
+`Strategy::DoubleUnit(BlueprintStrategy::Inferred(DoubleUnitSelectionArgs {
+tile_size: TileSizeSelection::MinTileSize }))` pinned as a `const`.
+`scratch_matmul_chunked` (the scratch-dequant path — the dominant cost, the
+only path that ever saw the multi-minute spike) now calls `pinned_matmul`
+instead of `x.matmul(w)`. `burn/autotune` stays **on** for the
+attention-path `Tensor::matmul` calls in `model.rs`: those shapes are cheap
+to tune (native cache: microseconds at M=1) and, per the reverted attempt
+above, not safe to run through the un-tuned fallback. One const pin for
+both native and web (`PINNED_MATMUL_TILE_SIZE` = `MinTileSize`): both share
+the same wgpu/WebGPU kernel family and the same GPU on this dev machine, and
+no separate persistent web-side autotune data exists to justify a different
+pin.
+
+### Verification
+
+Native, `--test-threads=1` (the default parallel test runner races on a
+shared wgpu device across `full_forward`'s test functions — a pre-existing
+test-isolation hazard, not a Session 11 regression; confirmed by first
+seeing garbage output under the default parallel runner, then 6/6 clean
+under serialized execution):
+
+- `full_forward`: 6/6 pass, greedy-exact (`test_forward_02_tools_single`,
+  `test_forward_03_tools_multiturn` included).
+- `q4_matmul`: 8/8 pass (1 ignored bench, unchanged).
+- `cargo check --features wgpu` and `cargo clippy --features wgpu -- -D
+  warnings` both clean.
+- Prefill tok/s, native, autotune-on-attention + pinned-scratch (this
+  session's warm disk cache for the attention shapes, same machine that
+  produced the table above — no meaningful "autotune off" native number
+  exists since that configuration was numerically wrong and abandoned):
+  2225 tokens in 41.1s (54.2 tok/s), 2354 tokens in 44.8s (52.6 tok/s) —
+  in line with Session 10's baseline (35.4s cold / 33.6s warm at 2225).
+
+Headless (Playwright's bundled Chromium, GPU otherwise idle):
+
+- `--tools none --prompt "Write one sentence about the sea." --max-new 32
+  --bench 32 --repeat 2`: first-ever prefill (28 tokens, cold — no prior
+  inference call in this page load) **1029ms**, no tuning spike at all.
+  Bench runs (22 new tokens each): prefill 302.0ms / 300.0ms, decode 12.46 /
+  12.41 tok/s — consistent across repeats, no re-tuning between runs.
+- Demo run (`--expect Paris`, the 240-row tool-prompt scenario from the
+  original bug report): final text `"The current weather in Paris is
+  partly cloudy with a temperature of 18°C."` (matches). Step 0 (240
+  tokens, cold) prefill **9619ms**; step 1 (288 tokens) prefill 3592ms.
+  Down from the **26s** pre-fix cold prefill at this same 240-row size —
+  a 2.7x reduction — but not fully at the ~3-4s "cold ≈ warm" target: a
+  ~6s gap between step 0 and step 1 remains, consistent with one-time
+  WebGPU pipeline/shader-compilation cost on first dispatch of each kernel
+  shape (orthogonal to autotune — not investigated further this session,
+  flagged for a follow-up). The multi-minute (6.5 min) autotune-driven
+  spike from the original bug report is gone.

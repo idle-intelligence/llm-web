@@ -873,6 +873,30 @@ so a chunked prefill's remainder chunk stays bucket-aligned too. See
 docs/BENCHMARKS.md Session 10 for the in-process bucket-reuse measurement and
 the padding-is-numerically-inert test in `tests/q4_matmul.rs`.
 
+**Session 11 update**: bucketing only reduced the *number* of distinct
+tuning passes — each one was still a real autotune benchmark, cheap natively
+(cubecl caches results on disk at `target/autotune/0.9.0/<device-key>/
+burn_cubecl-kernel-matmul-tune-base.json.log`, `CacheConfig::Target`,
+see `cubecl-runtime-0.9.0/src/config/cache.rs`) but with no browser
+equivalent, so the *first* prefill of a new bucket still paid the full
+benchmark-every-candidate cost in Chrome (6.5 min for a 2304-row session).
+Inspecting that native cache (`CUBECL_DEBUG_LOG=stdout` env var also
+logs autotune picks) shows every CMMA/MMA candidate strategy failing kernel
+selection outright on this Metal-via-wgpu backend ("No tile size is
+available for the problem"), so the winner at every shape sampled is a
+`DoubleUnit` (double-buffered, non-tensor-core) kernel, varying only by
+`cubek_matmul::routines::TileSizeSelection` (`MinTileSize` wins at the
+dominant M=2048-row scratch-matmul chunk; `MaxTileSize` only wins for
+smaller-M remainder chunks). `gguf.rs`'s scratch-matmul path
+(`pinned_matmul`) now calls `cubek_matmul::launch::launch_ref` directly with
+that `Strategy` pinned as a constant, bypassing Burn's `Tensor::matmul`/
+`autotune` entirely for the shapes that actually caused the multi-minute
+spike. `burn/autotune` stays enabled for the smaller attention-path matmuls
+in `model.rs` (cheap to tune, and empirically *not* safe to run through
+cubek's un-benchmarked `Strategy::Auto` fallback — an earlier attempt to
+disable `autotune` crate-wide produced numerically wrong attention output).
+See docs/BENCHMARKS.md Session 11 for cold/warm numbers.
+
 ## 14. Schema-constrained decoding (`src/grammar.rs`)
 
 A pure state machine — no GPU, no model — that decides, at every decoding

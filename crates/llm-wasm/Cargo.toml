@@ -18,6 +18,22 @@ wasm-opt = false
 
 [features]
 default = ["wgpu", "native"]
+# Session 11: `burn/autotune` stays ON. It has no persistent cache in the
+# browser (cubecl's autotune cache lives at `target/autotune/`, native
+# only), so every distinct prefill length re-benchmarks every candidate
+# matmul kernel at full size on first use (6.5 min for a 2304-row prefill
+# in real Chrome) — but the fix is not to disable autotune globally: with
+# it off, Burn's `Tensor::matmul` falls back to `cubek_matmul`'s
+# un-benchmarked `Strategy::Auto`, which produced numerically wrong output
+# for the attention path's 4D matmuls (`model.rs`'s Q@K^T/P@V) — see
+# docs/BENCHMARKS.md Session 11 for the `full_forward` failure this caused.
+# Instead, the scratch-matmul path (gguf.rs's `q4_matmul`, the dominant
+# cost at the shapes that actually trigger multi-minute tuning) now calls
+# `cubek_matmul::launch::launch_ref` directly with a pinned `Strategy`,
+# bypassing Burn's `Tensor::matmul`/autotune entirely for just that path.
+# The attention path keeps using Burn's `Tensor::matmul` with autotune on
+# — its shapes are far cheaper to tune (native cache: microseconds at
+# M=1) and, empirically, its own un-tuned fallback is not safe to use.
 wgpu = ["burn/wgpu", "burn/template", "burn/autotune"]
 # Native CLI + native tokenizer build (never compiled for wasm32 — the `llm-agent`
 # bin is gated on this feature via `required-features` above).
@@ -40,6 +56,7 @@ web = [
 # Burn ML framework
 burn = { workspace = true }
 cubecl = { workspace = true }
+cubek-matmul = { workspace = true }
 
 # Core
 anyhow = { workspace = true }
