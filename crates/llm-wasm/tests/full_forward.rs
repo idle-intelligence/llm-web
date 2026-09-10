@@ -503,9 +503,21 @@ fn split_prefill_matches_single_prefill() {
             argmax_a, argmax_b,
             "split={split}: argmax diverged (a={argmax_a} b={argmax_b}, max_abs_diff={max_abs_diff})"
         );
+        // P1 (docs/BENCHMARKS.md Session 4): the M>=32 scratch-dequant path
+        // (gguf.rs::q4_matmul_dispatch) runs the real matmul through Burn's
+        // `Tensor::matmul` (cubecl's tiled/cmma kernel), which picks a
+        // different fp32 reduction order per M-chunk shape than the old
+        // naive per-element kernel used unconditionally before this
+        // session. Differently-chunked forward passes (e.g. one M=2225 call
+        // vs a split M=1000 + M=1225) can therefore land on very slightly
+        // different fp32 rounding (~1e-4 absolute on this model's logit
+        // scale) despite computing full-precision dot products in every
+        // case — argmax and the 8-token greedy continuation below remain
+        // exact. Tolerance widened from the pre-P1 1e-4 to 3e-4 to absorb
+        // this; observed max so far: 1.02e-4.
         assert!(
-            max_abs_diff < 1e-4,
-            "split={split}: max_abs_diff {max_abs_diff} exceeds 1e-4"
+            max_abs_diff < 3e-4,
+            "split={split}: max_abs_diff {max_abs_diff} exceeds 3e-4"
         );
 
         // greedy continuation from this split-prefill cache

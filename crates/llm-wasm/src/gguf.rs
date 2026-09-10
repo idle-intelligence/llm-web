@@ -38,6 +38,7 @@ use byteorder::{LittleEndian, ReadBytesExt};
 use cubecl::prelude::KernelId;
 use cubecl::server::{Bindings, CubeCount, Handle};
 use cubecl::{CubeTask, Runtime};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -927,6 +928,130 @@ pub fn q4_matmul_tiled_forced(input: Tensor<Wgpu, 3>, weights: &Q4Tensor) -> Ten
     q4_matmul_dispatch(input, weights, true)
 }
 
+struct Q4DequantKernel;
+
+impl KernelSource for Q4DequantKernel {
+    fn source(&self) -> SourceTemplate {
+        SourceTemplate::new(include_str!("wgsl/shader_q4_dequant.wgsl"))
+    }
+
+    fn id(&self) -> KernelId {
+        KernelId::new::<Self>()
+    }
+}
+
+const DEQUANT_WG: u32 = 256;
+
+/// P1 Approach A threshold (docs/BENCHMARKS.md Session 4): below this M,
+/// the naive per-element kernel's redundant dequant isn't amortized enough
+/// across output rows to beat the naive kernel's simplicity/dispatch-count
+/// tradeoff, so decode-shaped calls (M=1) keep using the matvec kernel via
+/// the `b * m == 1` branch above this one, and small M falls through to the
+/// naive kernel.
+const SCRATCH_MATMUL_MIN_M: usize = 32;
+
+/// The tied lm_head (`token_embd.weight`, [151936, 2048]) is never routed
+/// through the scratch-dequant+matmul path: its dequantized scratch buffer
+/// would be 151936 * 2048 * 4 = ~1.16GB, and it's only ever run on a
+/// handful of rows at the end of prefill — stays on the naive/matvec path.
+const SCRATCH_MATMUL_MAX_N: usize = 100_000;
+
+thread_local! {
+    /// Reused across calls, grows to fit the largest layer matrix seen
+    /// (11008x2048x4 = ~90MB for this model's FFN up/gate/down
+    /// projections). Not shared across threads/devices by design — see
+    /// `q4_dequant_scratch`'s doc comment.
+    static DEQUANT_SCRATCH: RefCell<Option<(Handle, usize)>> = const { RefCell::new(None) };
+}
+
+/// P1 Approach A (docs/BENCHMARKS.md Session 4): dequantize `weights`
+/// ([N, K] Q4_0) into a transposed f32 scratch buffer of shape `[K, N]`
+/// via `shader_q4_dequant.wgsl`, reusing one thread-local scratch
+/// allocation across calls instead of allocating fresh each time. The
+/// transposed layout means the caller can run `x[B,M,K] . W[1,K,N]`
+/// directly through Burn's `Tensor::matmul` (cubecl's tiled/cmma kernels)
+/// with no separate transpose dispatch.
+fn q4_dequant_scratch(
+    client: &cubecl::client::ComputeClient<WgpuRuntime>,
+    weights: &Q4Tensor,
+) -> Handle {
+    let [n, k] = weights.shape();
+    let needed_bytes = n * k * 4;
+    let blocks_per_row = k / 32;
+
+    let handle = DEQUANT_SCRATCH.with(|cell| {
+        let mut cell = cell.borrow_mut();
+        let reuse = match &*cell {
+            Some((_, size)) => *size >= needed_bytes,
+            None => false,
+        };
+        if !reuse {
+            *cell = Some((client.empty(needed_bytes), needed_bytes));
+        }
+        cell.as_ref().unwrap().0.clone()
+    });
+
+    // 2D workgroup grid: WebGPU caps a single dispatch dimension at 65535
+    // workgroups, which a 1D dispatch can exceed for this model's larger
+    // layers (e.g. 11008x2048 needs 88064 workgroups of 256 threads).
+    let total = (n * k) as u32;
+    let wg_total = total.div_ceil(DEQUANT_WG);
+    const MAX_WG_DIM: u32 = 65535;
+    let wg_x = wg_total.min(MAX_WG_DIM);
+    let wg_y = wg_total.div_ceil(wg_x);
+    let threads_per_row = wg_x * DEQUANT_WG;
+
+    let info: [u32; 4] = [n as u32, k as u32, blocks_per_row as u32, threads_per_row];
+    let info_bytes: Vec<u8> = info.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let info_handle = client.create_from_slice(&info_bytes);
+
+    let bindings = Bindings::new()
+        .with_buffer(weights.nibbles.clone().binding())
+        .with_buffer(weights.scales.clone().binding())
+        .with_buffer(handle.clone().binding())
+        .with_buffer(info_handle.binding());
+
+    let kernel = SourceKernel::new(Q4DequantKernel, CubeDim::new_1d(DEQUANT_WG));
+    client
+        .launch(
+            Box::new(kernel) as Box<dyn CubeTask<AutoCompiler>>,
+            CubeCount::new_2d(wg_x, wg_y),
+            bindings,
+        )
+        .expect("Q4 dequant kernel launch failed");
+
+    handle
+}
+
+/// Largest M chunk for `scratch_matmul_chunked`'s calls into Burn's
+/// `Tensor::matmul`. Same root cause as `model.rs::ATTN_QUERY_CHUNK`
+/// (see its doc comment): this build's wgpu backend has no `autotune`
+/// cubecl feature, so it falls back to a fixed `Strategy::Auto` matmul
+/// kernel that panics with "shared memory ... hardware limit" once M gets
+/// into the low thousands on this M2/Metal adapter — observed at the full
+/// M=2225/2354 prefill lengths with "needs 40960 shared memory bytes but
+/// hardware limit is 32768". 256 matches `ATTN_QUERY_CHUNK` and is known
+/// not to panic for that kernel; verified separately for this matmul shape
+/// by `full_forward`'s greedy-match tests (docs/BENCHMARKS.md Session 4).
+const SCRATCH_MATMUL_CHUNK_M: usize = 256;
+
+/// Chunks `x[B,M,K] . w[1,K,N]` over the M dimension — see
+/// `SCRATCH_MATMUL_CHUNK_M`'s doc comment for why.
+fn scratch_matmul_chunked(x: Tensor<Wgpu, 3>, w: Tensor<Wgpu, 3>, m: usize) -> Tensor<Wgpu, 3> {
+    if m <= SCRATCH_MATMUL_CHUNK_M {
+        return x.matmul(w);
+    }
+    let mut chunks = Vec::with_capacity(m.div_ceil(SCRATCH_MATMUL_CHUNK_M));
+    let mut start = 0usize;
+    while start < m {
+        let len = SCRATCH_MATMUL_CHUNK_M.min(m - start);
+        let x_chunk = x.clone().narrow(1, start, len);
+        chunks.push(x_chunk.matmul(w.clone()));
+        start += len;
+    }
+    Tensor::cat(chunks, 1)
+}
+
 fn q4_matmul_dispatch(input: Tensor<Wgpu, 3>, weights: &Q4Tensor, force_tiled: bool) -> Tensor<Wgpu, 3> {
     let cube_input: CubeTensor<WgpuRuntime> = input.into_primitive().tensor();
     let cube_input = into_contiguous(cube_input);
@@ -945,13 +1070,12 @@ fn q4_matmul_dispatch(input: Tensor<Wgpu, 3>, weights: &Q4Tensor, force_tiled: b
     let device = cube_input.device.clone();
     let blocks_per_row = k / 32;
 
-    let output_handle = client.empty(b * m * n * 4);
-
     if skip_matvec_for_bench() {
         // Bench-only bypass: skip the kernel launch, return the
         // uninitialized buffer as-is. See `set_skip_matvec_for_bench`'s doc
         // comment — output is garbage, never enabled on a numerics-checked
         // path.
+        let output_handle = client.empty(b * m * n * 4);
         let output_tensor = CubeTensor::new_contiguous(
             client,
             device,
@@ -961,6 +1085,29 @@ fn q4_matmul_dispatch(input: Tensor<Wgpu, 3>, weights: &Q4Tensor, force_tiled: b
         );
         return Tensor::from_primitive(TensorPrimitive::Float(output_tensor));
     }
+
+    // P1 Approach A (docs/BENCHMARKS.md Session 4): for prefill-shaped
+    // calls (M >= 32) on layers small enough to dequant into a scratch f32
+    // buffer (excludes the 151936-wide lm_head), dequant once via
+    // `shader_q4_dequant.wgsl` and run the actual matmul through Burn's
+    // `Tensor::matmul` (cubecl's tiled/cmma kernels) instead of the naive
+    // per-element-redundant-dequant kernel. `force_tiled` (test-only, K2)
+    // bypasses this to keep exercising the tiled kernel directly.
+    if !force_tiled && m >= SCRATCH_MATMUL_MIN_M && n < SCRATCH_MATMUL_MAX_N {
+        let w_handle = q4_dequant_scratch(&client, weights);
+        let w_tensor = CubeTensor::new_contiguous(
+            client.clone(),
+            device.clone(),
+            burn::prelude::Shape::from(vec![1, k, n]),
+            w_handle,
+            DType::F32,
+        );
+        let x = Tensor::from_primitive(TensorPrimitive::Float(cube_input.clone()));
+        let w = Tensor::<Wgpu, 3>::from_primitive(TensorPrimitive::Float(w_tensor));
+        return scratch_matmul_chunked(x, w, m);
+    }
+
+    let output_handle = client.empty(b * m * n * 4);
 
     let info: [u32; 5] = [
         b as u32,
