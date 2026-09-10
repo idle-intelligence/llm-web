@@ -28,10 +28,13 @@
 // (this crate's single-session assumption — Q4Attention::forward asserts
 // it elsewhere; this kernel doesn't handle B>1).
 
+// K5 (docs/BENCHMARKS.md): see shader_q4_matvec.wgsl's binding comment —
+// `weights` is nibbles-only (4 aligned u32/block), scale lives in `scales`.
 @group(0) @binding(0) var<storage, read_write> weights: array<u32>;
-@group(0) @binding(1) var<storage, read_write> input: array<f32>;
-@group(0) @binding(2) var<storage, read_write> output: array<f32>;
-@group(0) @binding(3) var<storage, read_write> info: array<u32>;
+@group(0) @binding(1) var<storage, read_write> scales: array<f32>;
+@group(0) @binding(2) var<storage, read_write> input: array<f32>;
+@group(0) @binding(3) var<storage, read_write> output: array<f32>;
+@group(0) @binding(4) var<storage, read_write> info: array<u32>;
 
 const TM: u32 = 64u;
 const TN: u32 = 64u;
@@ -41,20 +44,6 @@ const MICRO: u32 = 4u;   // each thread computes a 4x4 micro-tile
 
 var<workgroup> w_tile: array<f32, 2048>; // [TN=64][TK=32]
 var<workgroup> x_tile: array<f32, 2048>; // [TM=64][TK=32]
-
-fn read_u32_unaligned(byte_offset: u32) -> u32 {
-    let word = byte_offset >> 2u;
-    let shift = (byte_offset & 3u) << 3u;
-    if (shift == 0u) {
-        return weights[word];
-    }
-    return (weights[word] >> shift) | (weights[word + 1u] << (32u - shift));
-}
-
-fn read_f16_scale(block_byte_offset: u32) -> f32 {
-    let bits = read_u32_unaligned(block_byte_offset) & 0xFFFFu;
-    return unpack2x16float(bits).x;
-}
 
 @compute @workgroup_size(16, 16, 1)
 fn main(
@@ -96,9 +85,8 @@ fn main(
         let base_i = wi * 4u;
         if (n_global < N) {
             let global_block = n_global * blocks_per_row + blk;
-            let block_byte = global_block * 18u;
-            let scale = read_f16_scale(block_byte);
-            let packed = read_u32_unaligned(block_byte + 2u + wi * 4u);
+            let scale = scales[global_block];
+            let packed = weights[global_block * 4u + wi];
             let b0 = packed & 0xFFu;
             let b1 = (packed >> 8u) & 0xFFu;
             let b2 = (packed >> 16u) & 0xFFu;

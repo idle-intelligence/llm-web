@@ -629,20 +629,31 @@ impl Seek for ShardedCursor {
 
 /// A Q4_0 quantized weight tensor living on GPU.
 ///
-/// The buffer contains raw Q4_0 blocks (18 bytes per block of 32 elements).
-/// The WGSL shader interprets the buffer as `array<u32>`. `Clone` is a cheap
-/// handle clone (ref-counted GPU buffer, not a copy) — used to share
-/// `token_embd.weight`'s buffer between the embedding table and the tied
-/// lm_head matmul.
+/// GGUF's on-disk Q4_0 block is 18 bytes (2-byte f16 scale + 16 bytes of
+/// paired nibbles) interleaved per 32-element block — 18 isn't a multiple of
+/// 4, so every other block's nibble data starts at a byte offset that isn't
+/// u32-aligned, forcing every WGSL nibble read through a two-word
+/// unaligned-load path (`read_u32_unaligned`) with no coalescing across
+/// lanes reading adjacent blocks. `from_q4_bytes` repacks on load into two
+/// separate, individually-aligned GPU buffers: `scales` (one f32 per block)
+/// and `nibbles` (16 bytes = exactly 4 u32 per block, scale stripped out) —
+/// see docs/BENCHMARKS.md's K5 section for the measured effect. All four
+/// WGSL kernels (naive, matvec, matvec_subgroup, tiled) read this layout.
+/// `Clone` is a cheap handle clone (ref-counted GPU buffer, not a copy) —
+/// used to share `token_embd.weight`'s buffers between the embedding table
+/// and the tied lm_head matmul.
 #[derive(Clone)]
 pub struct Q4Tensor {
-    pub(crate) handle: Handle,
+    pub(crate) nibbles: Handle,
+    pub(crate) scales: Handle,
     shape: [usize; 2],
     num_blocks: usize,
 }
 
 impl Q4Tensor {
-    /// Upload raw Q4_0 bytes to a GPU storage buffer.
+    /// Upload raw Q4_0 bytes (GGUF's interleaved 18-bytes/block on-disk
+    /// layout) to GPU, repacked into the two-buffer layout described on
+    /// [`Q4Tensor`].
     ///
     /// Shape is `[N, K]` = `[out_features, in_features]`.
     /// `raw_bytes` must contain exactly `(N * K / 32) * 18` bytes.
@@ -661,21 +672,26 @@ impl Q4Tensor {
             raw_bytes.len()
         );
 
-        let client = WgpuRuntime::client(device);
+        // Both output buffers are naturally 4-byte aligned (16 and 4 bytes
+        // per block respectively) — no padding needed, unlike the old
+        // single-buffer 18-bytes/block layout.
+        let mut nibbles_bytes = vec![0u8; num_blocks * 16];
+        let mut scales_bytes = vec![0u8; num_blocks * 4];
+        for blk in 0..num_blocks {
+            let bo = blk * 18;
+            let scale_bits = u16::from_le_bytes([raw_bytes[bo], raw_bytes[bo + 1]]);
+            let scale = f16_to_f32(scale_bits);
+            scales_bytes[blk * 4..blk * 4 + 4].copy_from_slice(&scale.to_le_bytes());
+            nibbles_bytes[blk * 16..blk * 16 + 16].copy_from_slice(&raw_bytes[bo + 2..bo + 18]);
+        }
 
-        // Pad to 4-byte alignment for array<u32> access in the WGSL shader.
-        let padded = if !raw_bytes.len().is_multiple_of(4) {
-            let pad = 4 - (raw_bytes.len() % 4);
-            let mut buf = raw_bytes.to_vec();
-            buf.resize(raw_bytes.len() + pad, 0);
-            buf
-        } else {
-            raw_bytes.to_vec()
-        };
-        let handle = client.create_from_slice(&padded);
+        let client = WgpuRuntime::client(device);
+        let nibbles = client.create_from_slice(&nibbles_bytes);
+        let scales = client.create_from_slice(&scales_bytes);
 
         Ok(Self {
-            handle,
+            nibbles,
+            scales,
             shape,
             num_blocks,
         })
@@ -878,7 +894,8 @@ fn q4_matmul_dispatch(input: Tensor<Wgpu, 3>, weights: &Q4Tensor, force_tiled: b
     let info_handle = client.create_from_slice(&info_bytes);
 
     let bindings = Bindings::new()
-        .with_buffer(weights.handle.clone().binding())
+        .with_buffer(weights.nibbles.clone().binding())
+        .with_buffer(weights.scales.clone().binding())
         .with_buffer(cube_input.handle.clone().binding())
         .with_buffer(output_handle.clone().binding())
         .with_buffer(info_handle.binding());

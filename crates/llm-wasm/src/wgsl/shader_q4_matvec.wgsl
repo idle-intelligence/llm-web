@@ -28,10 +28,16 @@
 // Dispatch: ceil(N / ROWS_PER_WG) workgroups in X, B in Y. Requires M==1
 // (caller in gguf.rs only dispatches this kernel for decode's M=1 step).
 
+// K5 (docs/BENCHMARKS.md): `weights` holds only the 16-byte nibble portion
+// of each Q4_0 block (4 u32/block, always aligned) — `gguf.rs::Q4Tensor`
+// strips the interleaved f16 scale into the separate `scales` buffer at
+// load time. This removes the unaligned two-word load every other block
+// used to require.
 @group(0) @binding(0) var<storage, read_write> weights: array<u32>;
-@group(0) @binding(1) var<storage, read_write> input: array<f32>;
-@group(0) @binding(2) var<storage, read_write> output: array<f32>;
-@group(0) @binding(3) var<storage, read_write> info: array<u32>;
+@group(0) @binding(1) var<storage, read_write> scales: array<f32>;
+@group(0) @binding(2) var<storage, read_write> input: array<f32>;
+@group(0) @binding(3) var<storage, read_write> output: array<f32>;
+@group(0) @binding(4) var<storage, read_write> info: array<u32>;
 
 const WG_SIZE: u32 = 256u;
 const THREADS_PER_ROW: u32 = 32u;
@@ -40,20 +46,6 @@ const TILE_K: u32 = 1024u;   // THREADS_PER_ROW * 32 (Q4_0 block size)
 
 var<workgroup> x_shared: array<f32, 1024>;
 var<workgroup> partial_sums: array<f32, 256>;
-
-fn read_u32_unaligned(byte_offset: u32) -> u32 {
-    let word = byte_offset >> 2u;
-    let shift = (byte_offset & 3u) << 3u;
-    if (shift == 0u) {
-        return weights[word];
-    }
-    return (weights[word] >> shift) | (weights[word + 1u] << (32u - shift));
-}
-
-fn read_f16_scale(block_byte_offset: u32) -> f32 {
-    let bits = read_u32_unaligned(block_byte_offset) & 0xFFFFu;
-    return unpack2x16float(bits).x;
-}
 
 @compute @workgroup_size(256, 1, 1)
 fn main(
@@ -102,13 +94,12 @@ fn main(
         if (row_has_output && k_lane < tile_blocks) {
             let blk = tile_start / 32u + k_lane;
             let global_block = n * blocks_per_row + blk;
-            let block_byte = global_block * 18u;
-            let scale = read_f16_scale(block_byte);
-            let data_start = block_byte + 2u;
+            let scale = scales[global_block];
+            let nibble_base = global_block * 4u; // 4 aligned u32/block
             let local_k = k_lane * 32u;
 
             for (var wi: u32 = 0u; wi < 4u; wi = wi + 1u) {
-                let packed = read_u32_unaligned(data_start + wi * 4u);
+                let packed = weights[nibble_base + wi];
                 let b0 = packed & 0xFFu;
                 let b1 = (packed >> 8u) & 0xFFu;
                 let b2 = (packed >> 16u) & 0xFFu;

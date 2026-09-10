@@ -13,24 +13,13 @@
 //
 // Based on voxtral-mini-realtime-rs/src/gguf/shader_naive.wgsl.
 
+// K5 (docs/BENCHMARKS.md): see shader_q4_matvec.wgsl's binding comment —
+// `weights` is nibbles-only (4 aligned u32/block), scale lives in `scales`.
 @group(0) @binding(0) var<storage, read_write> weights: array<u32>;
-@group(0) @binding(1) var<storage, read_write> input: array<f32>;
-@group(0) @binding(2) var<storage, read_write> output: array<f32>;
-@group(0) @binding(3) var<storage, read_write> info: array<u32>;
-
-fn read_u32_unaligned(byte_offset: u32) -> u32 {
-    let word = byte_offset >> 2u;
-    let shift = (byte_offset & 3u) << 3u;
-    if (shift == 0u) {
-        return weights[word];
-    }
-    return (weights[word] >> shift) | (weights[word + 1u] << (32u - shift));
-}
-
-fn read_f16_scale(block_byte_offset: u32) -> f32 {
-    let bits = read_u32_unaligned(block_byte_offset) & 0xFFFFu;
-    return unpack2x16float(bits).x;
-}
+@group(0) @binding(1) var<storage, read_write> scales: array<f32>;
+@group(0) @binding(2) var<storage, read_write> input: array<f32>;
+@group(0) @binding(3) var<storage, read_write> output: array<f32>;
+@group(0) @binding(4) var<storage, read_write> info: array<u32>;
 
 @compute @workgroup_size({{ workgroup_size_x }}, {{ workgroup_size_y }}, 1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -55,14 +44,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // Block-level iteration: read scale once per 32 elements, vectorized dequant
     for (var blk: u32 = 0u; blk < blocks_per_row; blk = blk + 1u) {
         let global_block = n * blocks_per_row + blk;
-        let block_byte = global_block * 18u;
-        let scale = read_f16_scale(block_byte);
+        let scale = scales[global_block];
         let k_base = blk * 32u;
 
-        // Read 16 data bytes as 4 u32 words, process with vec4 dot products
-        let data_start = block_byte + 2u;
+        // Read 16 data bytes as 4 aligned u32 words, process with vec4 dot products
+        let nibble_base = global_block * 4u;
         for (var wi: u32 = 0u; wi < 4u; wi = wi + 1u) {
-            let packed = read_u32_unaligned(data_start + wi * 4u);
+            let packed = weights[nibble_base + wi];
             let b0 = packed & 0xFFu;
             let b1 = (packed >> 8u) & 0xFFu;
             let b2 = (packed >> 16u) & 0xFFu;

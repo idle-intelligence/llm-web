@@ -118,6 +118,122 @@ greedy-decode tokens, which the task's acceptance bar (exact greedy-token match 
 02/03) does not tolerate. Given K1 succeeded and K2 didn't reach a shippable state,
 the remaining session budget went to K2 debugging instead. Left for future work.
 
+## Session 2 — measured breakdown (P1) + kernel bandwidth fix (K5)
+
+Nobody had measured *where* the 184ms/token and 84s prefill time actually went. This
+session adds instrumentation to `llm-agent bench` (`--decode-steps`) that reports:
+(a) isolated K1 matvec throughput at the model's four shapes, 100 iters/shape, one
+sync at the end; (b) an analytical GPU-dispatch-count estimate (list every op in one
+decoder layer × `num_layers`, since Burn's wgpu backend exposes no dispatch counter);
+(c) a decode per-token wall-time split, using a bench-only `set_skip_matvec_for_bench`
+flag (`gguf.rs`) that skips every `q4_matmul` kernel launch — the resulting decode
+step's wall time is "everything else" (RMSNorm, RoPE, attention, SwiGLU elementwise,
+residual adds, KV cache writes); (d) the same flag applied to prefill, splitting
+matmul-call time from attention+everything-else (not split further — see budget note
+below); (e) the sync-readback cost of `into_data()` alone on a 151936-f32 tensor.
+
+### P1 — measured breakdown (before K5), `02_tools_single` (2225 tokens), 32 decode steps
+
+**Isolated K1 matvec (M=1), 100 iters/shape:**
+
+| K | N | ms/call | GB/s |
+|---|---|---|---|
+| 2048 | 151936 (lm_head) | 6.569 | 26.6 |
+| 2048 | 11008 (gate/up) | 0.541 | 23.4 |
+| 11008 | 2048 (down) | 0.558 | 22.7 |
+| 2048 | 2048 (q/o) | 0.144 | 16.4 |
+
+All four shapes land at **16-27 GB/s** against the M2's ~100GB/s unified-memory peak
+(16-27% of peak) — well above the ~11 GB/s stt-wasm extrapolation in `docs/ENGINE.md`
+§10, but still far short of bandwidth-bound. Confirms the shader review's diagnosis
+(misaligned/uncoalesced nibble reads from the 18-bytes/block interleaved layout) as
+the mechanism, not a different bottleneck.
+
+**GPU dispatch count per decode token (analytical estimate — see `print_dispatch_estimate`
+in `llm-agent.rs` for the itemized per-op list):** ~44 ops/decoder layer × 36 layers +
+out_norm(~4) + lm_head(1) ≈ **~1589 dispatches/token**. RoPE (10/layer, mostly from
+`rotate_half`'s `cat`) and RMSNorm (8/layer, Burn's unfused mean/var/rsqrt/mul chain)
+are the two largest non-matmul contributors — both candidates for WGSL fusion (not
+attempted this session, see "next most valuable" below).
+
+**Decode per-token wall-time split (median of 32 steps, 184-192ms measured that run):**
+
+| component | ms |
+|---|---|
+| embedding dequant+upload (CPU) | 0.43 |
+| 36 layers of matvecs (sum of isolated numbers × per-layer counts; k/v_proj's N=256,K=2048 shape isn't one of the 4 measured — estimated by scaling the measured 2048×2048 GB/s by byte count) | 70.7 |
+| everything else on GPU (skip-matvec measurement: RMSNorm+RoPE+attention+SwiGLU+residuals+cache writes) | 75.4 |
+| final head matvec (N=151936, K=2048) | 6.6 (included in the 70.7 sum's total) |
+| **matvec_sum (36 layers + head)** | **77.3** |
+| sync readback of logits alone (`into_data`, 151936 f32 = 600KB) | 0.21 |
+
+`matvec_sum (77) + everything-else (75) ≈ 152ms`, vs the measured real decode step of
+~184ms — a ~32ms/step gap not accounted for by either bucket, most plausibly CPU-side
+per-dispatch/queue-submission overhead across ~1589 GPU dispatches (not something
+`skip_matvec_for_bench`'s bypass — which still submits every non-matmul op — isolates
+further within this session's time budget). **The two buckets are roughly equal size**:
+Q4 matvec bandwidth and "everything else" (dominated by RoPE/RMSNorm dispatch count
+and the KV cache's per-step `slice_assign`, see "next most valuable" below) are
+comparably expensive — fixing only the matvec kernel caps the achievable win at ~2x,
+not the ~5-8x the ≤40ms/token target would need.
+
+**Prefill breakdown (`02_tools_single`, 2225 tokens, before K5):** matmul-calls
+78.18s, attention+everything-else 6.18s, of 84.36s total — **prefill is >90% matmul
+time**, confirming `docs/ENGINE.md` §10's compute-bound diagnosis and that the naive
+kernel's per-element redundant dequant (K2's finding) is the lever, not attention
+chunking (already ruled out by K3) or cache-copy overhead.
+
+### K5 — Q4Tensor buffer repack (aligned nibbles + separate f32 scales), commit below
+
+Per shader-review finding: GGUF's on-disk Q4_0 block is 18 bytes (2-byte f16 scale +
+16 bytes nibbles); 18 isn't a multiple of 4, so every other block's nibble data starts
+mid-word, forcing every WGSL read through `read_u32_unaligned`'s two-load path with no
+coalescing across lanes reading adjacent blocks (consecutive lanes' byte offsets are
+18 apart, not 4). Fix (`gguf.rs::Q4Tensor::from_q4_bytes`): repack at load time into
+two aligned buffers — `scales: array<f32>` (one per block) and `weights: array<u32>`
+(nibbles only, exactly 4 u32/block, scale stripped) — applied uniformly to all four
+kernels (naive, matvec, matvec_subgroup, tiled) so there's one weight layout crate-wide
+and no duplicated GPU memory (net size increase: 20 bytes/block vs 18, ~11%). This also
+moots the shader review's alignment-padding concern (point 3) — the old code's
+"pad to 4 bytes" branch is gone entirely since both new buffers are inherently aligned.
+
+The read-only (`read` vs `read_write`) binding-qualifier cleanup the review also asked
+for (point 3) was **attempted and reverted**: cubecl-wgpu suballocates multiple logical
+buffers from shared physical arenas, and wgpu's usage tracker is whole-buffer, not
+per-range — marking some bindings `read` while `output` stayed `read_write` triggered
+`wgpu error: ... conflicting usages ... STORAGE_READ_ONLY ... STORAGE_READ_WRITE` as
+soon as two logical buffers happened to share a physical arena (surfaced immediately
+in `cargo test --test q4_matmul`, all four tests). Reverted to `read_write` everywhere
+(matches the pre-K5 baseline) — this runtime's memory model doesn't support the
+finer-grained qualifier split within one arena buffer.
+
+**Correctness**: `cargo test --release --features wgpu --test q4_matmul` (all 4
+non-ignored tests) and `cargo test --release --features wgpu --test full_forward --
+--test-threads=1` (all 3 greedy-match tests) pass, bit-identical to pre-K5.
+
+**Before/after** (`02_tools_single`, 2225 tokens, 32 decode steps; decode ms/token
+varied 184-208 across repeated runs both before and after K5 — machine-load noise on
+a shared M2, not attributable to the change with confidence at this sample size):
+
+| | prefill tok/s | prefill matmul-time | decode ms/token (median) | isolated matvec GB/s (K=2048,N=2048) |
+|---|---|---|---|---|
+| before K5 | 26.4 | 78.2s | 183.9 | 16.4 |
+| after K5 | 29.6 | 68.0s | 191-208 (noisy, ~flat-to-slightly-worse) | 17.5-24.5 |
+
+**K5 is a genuine ~11-13% prefill win** (78.2s → 68.0s matmul-call time, 26.4 → 29.6
+tok/s) — the naive kernel does `blocks_per_row` redundant reads per output element, so
+removing the misaligned-read tax pays off once per element, M times over during
+prefill (M=2225). **Decode is a wash**: K1's matvec issues only ~4 aligned-word reads
+per (row, block) pair regardless, so removing the misalignment tax saves less per call,
+and the extra binding (5 buffers vs 4 per dispatch, ~1589 dispatches/token) plausibly
+adds enough CPU-side per-dispatch overhead to offset the saving — not confirmed within
+this session's budget (would need per-dispatch CPU profiling, not just wall-clock GPU
+totals, to separate the two effects). Isolated matvec GB/s **did not reach the
+reviewer's 60-100GB/s target** — the repack removes the unaligned-load penalty but
+still has each lane read its own block's 4 words with a stride-4-words-per-lane access
+pattern (not true word-index-interleaved coalescing across lanes, which the reviewer's
+fuller suggestion called for and which this session's budget didn't reach — see below).
+
 ## Summary
 
 | kernel | status | prefill tok/s (02) | decode ms/token | target | met? |
@@ -127,9 +243,27 @@ the remaining session budget went to K2 debugging instead. Left for future work.
 | K3 (chunk=256) | shipped | 26.5 | 183.6 | ≥300 tok/s | no |
 | K2 (tiled, M>1) | attempted, reverted | 25.7 (naive) | 193.7 | ≥300 tok/s | no |
 | K4 (f16 KV) | not attempted | — | — | — | — |
+| K5 (Q4Tensor buffer repack) | shipped | 29.6 | ~190 (noisy, flat) | — | — |
 
 Neither target (decode ≤40ms/token, prefill ≥300 tok/s on the 2225-token prompt) was
-met this session. Decode improved 1.67x (K1); prefill is unchanged from baseline (K2
-didn't ship, K3 was neutral). Greedy-token-match numerics are exact and unchanged by
-every shipped change (K1, K3) — verified via `cargo test --release --features wgpu
---test full_forward -- --test-threads=1` after each commit.
+met this session. Decode improved 1.67x (K1); prefill improved a further ~11-13% this
+session (K5) after being unchanged from baseline through K2/K3. Greedy-token-match
+numerics are exact and unchanged by every shipped change (K1, K3, K5) — verified via
+`cargo test --release --features wgpu --test full_forward -- --test-threads=1` after
+each commit.
+
+**Single most valuable change not reached this session**: `kv.rs::KvCache::append`
+does `self.k[layer].clone().slice_assign(ranges, k)` — the explicit `.clone()` before
+`slice_assign` guarantees the tensor's reference count is ≥2 at the call, which
+prevents Burn/cubecl from mutating in place; every decode step this likely copies the
+*entire* per-layer `[1, n_kv_heads, max_ctx, head_dim]` cache tensor (12.58MB per
+layer at `max_ctx=12288`) rather than writing only the new `T` rows, ×36 layers ×2
+(k,v) ≈ 900MB of copy traffic every single decode token regardless of how few tokens
+are actually new. This is a plausible dominant contributor to the "everything else"
+75ms bucket measured above (a bandwidth estimate at ~24GB/s system throughput puts
+900MB at ~37ms, roughly half that bucket) and was found by inspection while writing
+this section, not measured in isolation — the next session should replace the clone
+with `std::mem::replace(&mut self.k[layer], <placeholder>)` before `slice_assign` (or
+confirm whether Burn's wgpu backend does in-place `slice_assign` at all when given a
+uniquely-owned tensor) and re-run the P1c decode breakdown to quantify the win before
+committing to a rewrite.
