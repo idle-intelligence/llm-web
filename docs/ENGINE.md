@@ -981,8 +981,10 @@ sampler's job to respect the mask, not this module's job to trust it did.
 
 Build-time-produced files that let any engine instance load a prefix's KV cache in one shot
 instead of running prefill token-by-token, per the idea in
-`trucs.ai/.claude/worktrees/sonos-mcp/docs/kv-cache-images.md` (read-only reference). Step 1 of
-that plan, f32 only — int8 packing (§"KV quantisation" in that doc) is a later step.
+`trucs.ai/.claude/worktrees/sonos-mcp/docs/kv-cache-images.md` (read-only reference). Steps 1-2 of
+that plan: the file format supports both `f32` and `q8_0` tensor encodings (§"KV quantisation" in
+that doc); reading `q8_0` directly in the attention kernels (rather than dequantizing at import)
+is still a later step.
 
 ### Format v1
 
@@ -1007,6 +1009,39 @@ cache), `n_layers`/`n_kv_heads`/`head_dim`/`dtype`/`engine`/`created`.
 No `sha2` crate: `cargo tree -i sha2` printed nothing, so `kvimg.rs` implements SHA-256 itself
 (~80 lines, FIPS 180-4, tested against the standard empty/`"abc"`/pangram vectors) rather than add
 a dependency this worker doesn't own `Cargo.toml` to add anyway.
+
+### `dtype: "q8_0"`
+
+Selected via `Header::dtype`; the container stays version 1 (the header already carries the
+layout selector) and v1 `f32` images still read unchanged (`v1_f32_images_still_read` in
+`tests/kvimg.rs`). Per tensor (`K` or `V`, flattened `[n_kv_heads, n_tokens, head_dim]` row-major,
+same as `f32`): values are grouped into blocks of 32 consecutive values along `head_dim`
+(`head_dim` must be a multiple of 32 — `head_dim=128` is 4 blocks/row), each block quantized to
+one `f32` scale (`absmax(block)/127`) plus 32 `i8` values packed 4-per-`u32` little-endian (so a
+future WGSL shader can read a block as 8 `u32` words directly) = 4 + 32 = 36 bytes per 32 values
+(1.125 B/value vs 4 B/value for `f32`, ~3.55x smaller). Within one tensor, all block scales are
+written first as a contiguous `f32` array, then all blocks' packed words follow as a contiguous
+`u32` array — two separately-bindable buffers (scales, packed data), mirroring the Q4 repack
+convention for a future kernel. `KvImage::quantize_q8_0`/`dequantize_q8_0` do the block math;
+`KvImage::layer_f32` is the dtype-agnostic per-layer accessor (`Vec<f32>`, copied for `f32`,
+dequantized for `q8_0`) an importer should use instead of special-casing dtype itself —
+`KvCache::import_prefix` already takes `Vec<f32>`, so no `kv.rs` changes were needed for this
+step.
+
+Measured on synthetic K/V-shaped data (mostly `|x| < 10`, ~0.5% outliers up to 100, 4096 blocks):
+max-abs error per block stayed within the `absmax/127` bound in every block (asserted in
+`q8_0_quantize_dequantize_roundtrip_error_bounds`), mean relative error 0.021. Payload size ratio
+vs `f32` for the same dims measured at 3.556x (`q8_0_file_roundtrip_write_read`), matching the
+36/32-bytes-per-value math above.
+
+The engine still holds KV in `f32` on the GPU — `KvCache` (`kv.rs`) is unchanged by this step, so
+a `q8_0` image is dequantized to `f32` at import (via `layer_f32`) rather than read directly by
+the attention kernels. Reading `q8_0` KV directly in the attention shaders (avoiding the
+dequantize-at-import copy and cutting GPU-resident KV memory, not just download size) is the next
+step, per the WGSL packed-int8 kernel plan in `kv-cache-images.md`'s "KV quantisation" section.
+llama.cpp reports q8_0 KV perplexity delta in the 0.002-0.05 range
+(`github.com/ggml-org/llama.cpp/discussions/20969`), well inside this project's own eval noise
+from tool-order/prompt-wording effects.
 
 ### `KvCache` API (`kv.rs`)
 
@@ -1041,10 +1076,18 @@ instead of copying the whole `max_ctx`-sized tensor. Sets `len = n_tokens` direc
   section above), gated on a 404 being a normal "no prebuilt image for this prefix" case rather
   than a load failure.
 
-### Sizes (f32; int8 next)
+### Sizes
 
-See `kv-cache-images.md`'s table: xLAM-2-3b-fc-r (36 layers, 2 kv heads, head_dim 128) — 13-tool
-prefix (~2300 tok) is ~170MB f32; 34-tool prefix (8140 tok) is ~600MB f32. Both are plausible only
-as a one-time download; int8 (packed 4/u32 + per-32-block f32 scale, per that doc's "KV
-quantisation" section) brings the 34-tool case to ~150MB and is the natural next step once this f32
-format is wired end-to-end.
+xLAM-2-3b-fc-r (36 layers, 2 kv heads, head_dim 128), `f32` vs `q8_0` (measured 3.556x ratio, per
+above):
+
+| tools-set | seq_len | f32 | q8_0 |
+|---|---|---|---|
+| 13 tools | ~2300 tok | 170 MB | ~48 MB |
+| 34 tools | 8140 tok | 600 MB | ~170 MB |
+
+`f32` is exact; `q8_0` includes the per-32-block `f32` scale overhead (hence not exactly 1/4 of
+`f32`). At 13 tools `q8_0` (~48 MB) is a comfortable one-time download; at 34 tools, ~170 MB is
+still the size that makes a cold-connection download plausible where 600 MB `f32` was not — see
+`kv-cache-images.md`'s "KV quantisation" section for the full rationale (int8 chosen over f16 to
+avoid the `shader-f16` WGSL extension, which has known gaps on Firefox/Linux/NVIDIA and Qualcomm).

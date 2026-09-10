@@ -24,6 +24,32 @@
 //! if a caller hands it a buffer that isn't aligned at all (e.g. read into
 //! an unaligned `Vec<u8>` sub-slice).
 //!
+//! ## `dtype: "q8_0"`
+//!
+//! Selected by `Header::dtype`; the container version stays 1 (the header
+//! already carries the layout selector, so no version bump is needed) and
+//! v1 f32 images remain readable unchanged. Per tensor (`K` or `V`,
+//! flattened `[n_kv_heads, n_tokens, head_dim]` row-major, same as f32):
+//! values are grouped into blocks of 32 consecutive values along
+//! `head_dim` (so `head_dim` must be a multiple of 32 — `head_dim=128` is
+//! 4 blocks/row), each block quantized to one `f32` scale
+//! (`absmax(block)/127`) plus 32 `i8` values packed 4-per-`u32`
+//! little-endian (so a WGSL shader can later read a block as 8 `u32`
+//! words directly) = 4 + 32 = 36 bytes per 32 values (1.125 B/value vs 4
+//! B/value for f32, ~3.55x smaller once the negligible header overhead is
+//! counted). Within one tensor, all block scales are written first as a
+//! contiguous `f32` array, then all blocks' packed words follow as a
+//! contiguous `u32` array — this mirrors the Q4 repack convention of two
+//! separately-bindable buffers (scales, packed data) for a future kernel.
+//! Layer order (K then V) and layer count are unchanged from f32.
+//!
+//! Attention still accumulates in f32 regardless of KV storage dtype;
+//! quantizing K/V does not touch the accumulator. See
+//! `docs/ENGINE.md`'s "Prefix KV images" section and
+//! `trucs.ai/.claude/worktrees/sonos-mcp/docs/kv-cache-images.md`'s "KV
+//! quantisation" section for the rationale (no `shader-f16` dependency,
+//! llama.cpp-reported q8_0 KV perplexity delta of 0.002-0.05).
+//!
 //! ## Hashing
 //!
 //! `model_hash` is intended to be a SHA-256 of the GGUF file. No `sha2`
@@ -70,6 +96,8 @@ pub enum KvImageError {
     BadMagic { expected: [u8; 6], actual: [u8; 6] },
     #[error("unsupported version: {0}")]
     UnsupportedVersion(u32),
+    #[error("unsupported dtype: {0:?}")]
+    UnsupportedDtype(String),
     #[error("invalid header JSON: {0}")]
     InvalidHeader(#[from] serde_json::Error),
     #[error("io error: {0}")]
@@ -82,18 +110,60 @@ fn n_tokens(header: &Header) -> usize {
     header.tokens.len()
 }
 
+/// Tensor storage dtype for [`KvImage::write`]. `Header::dtype` (a plain
+/// string, for forward-compat with dtypes this enum doesn't know about
+/// yet) must agree with the variant passed to `write` — see
+/// [`Dtype::as_str`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dtype {
+    F32,
+    Q8_0,
+}
+
+impl Dtype {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Dtype::F32 => "f32",
+            Dtype::Q8_0 => "q8_0",
+        }
+    }
+}
+
 pub struct KvImage;
 
 impl KvImage {
     /// Write a full image: magic, version, header (padded so tensor data
     /// starts 16-byte aligned from the start of the stream), then each
-    /// layer's `(k, v)` slices in order. `layers_iter` yields
-    /// `(&[f32] k, &[f32] v)` per layer, each already flattened
-    /// `[n_kv_heads, n_tokens, head_dim]`.
-    pub fn write<'a, W: Write, I>(w: &mut W, header: &Header, layers_iter: I) -> Result<(), KvImageError>
+    /// layer's `(k, v)` slices in order, encoded per `dtype` (see the
+    /// module docs' `dtype: "q8_0"` section for the on-disk layout).
+    /// `layers_iter` yields `(&[f32] k, &[f32] v)` per layer, each already
+    /// flattened `[n_kv_heads, n_tokens, head_dim]`, regardless of
+    /// `dtype` — quantization (if any) happens here.
+    pub fn write<'a, W: Write, I>(
+        w: &mut W,
+        header: &Header,
+        dtype: Dtype,
+        layers_iter: I,
+    ) -> Result<(), KvImageError>
     where
         I: IntoIterator<Item = (&'a [f32], &'a [f32])>,
     {
+        assert_eq!(
+            header.dtype,
+            dtype.as_str(),
+            "header.dtype={:?} does not match dtype arg={:?}",
+            header.dtype,
+            dtype.as_str()
+        );
+        if dtype == Dtype::Q8_0 {
+            assert_eq!(
+                header.head_dim % 32,
+                0,
+                "q8_0 requires head_dim % 32 == 0, got {}",
+                header.head_dim
+            );
+        }
+
         let header_json = serde_json::to_vec(header)?;
         let prefix_len = MAGIC.len() + 4 + 4 + header_json.len();
         let padded_len = prefix_len.div_ceil(16) * 16;
@@ -108,10 +178,26 @@ impl KvImage {
         let expect_len = header.n_kv_heads * n_tokens(header) * header.head_dim;
         let mut layers_written = 0;
         for (k, v) in layers_iter {
-            assert_eq!(k.len(), expect_len, "layer {layers_written} k length mismatch");
-            assert_eq!(v.len(), expect_len, "layer {layers_written} v length mismatch");
-            w.write_all(bytemuck_f32(k))?;
-            w.write_all(bytemuck_f32(v))?;
+            assert_eq!(
+                k.len(),
+                expect_len,
+                "layer {layers_written} k length mismatch"
+            );
+            assert_eq!(
+                v.len(),
+                expect_len,
+                "layer {layers_written} v length mismatch"
+            );
+            match dtype {
+                Dtype::F32 => {
+                    w.write_all(bytemuck_f32(k))?;
+                    w.write_all(bytemuck_f32(v))?;
+                }
+                Dtype::Q8_0 => {
+                    Self::write_q8_0_tensor(w, k)?;
+                    Self::write_q8_0_tensor(w, v)?;
+                }
+            }
             layers_written += 1;
         }
         assert_eq!(
@@ -119,6 +205,19 @@ impl KvImage {
             "layers_iter yielded {layers_written} layers, header says n_layers={}",
             header.n_layers
         );
+        Ok(())
+    }
+
+    /// Write one tensor's q8_0 encoding: all block scales (contiguous
+    /// `f32`) followed by all blocks' packed words (contiguous `u32`).
+    fn write_q8_0_tensor<W: Write>(w: &mut W, vals: &[f32]) -> Result<(), KvImageError> {
+        let (scales, words) = quantize_q8_0(vals);
+        for s in &scales {
+            w.write_all(&s.to_le_bytes())?;
+        }
+        for word in &words {
+            w.write_all(&word.to_le_bytes())?;
+        }
         Ok(())
     }
 
@@ -168,7 +267,10 @@ impl KvImage {
     /// returned by `read_header`), unless `buf`'s start (and thus
     /// `data_offset`) isn't 4-byte aligned in memory, in which case each
     /// layer's slice is copied into an owned, aligned buffer instead.
-    pub fn layer_slices<'a>(buf: &'a [u8], header: &Header) -> Result<Vec<LayerSlice<'a>>, KvImageError> {
+    pub fn layer_slices<'a>(
+        buf: &'a [u8],
+        header: &Header,
+    ) -> Result<Vec<LayerSlice<'a>>, KvImageError> {
         let data_offset = {
             let header_json_len = serde_json::to_vec(header)?.len();
             // Recompute the same padding rule `write` used, from the known
@@ -195,7 +297,10 @@ impl KvImage {
         let per_layer_bytes = per_tensor_bytes * 2;
         let need = data_offset + per_layer_bytes * header.n_layers;
         if buf.len() < need {
-            return Err(KvImageError::Truncated { need, got: buf.len() });
+            return Err(KvImageError::Truncated {
+                need,
+                got: buf.len(),
+            });
         }
 
         let base_ptr_aligned = (buf.as_ptr() as usize + data_offset).is_multiple_of(4);
@@ -223,6 +328,140 @@ impl KvImage {
         }
         Ok(out)
     }
+
+    /// dtype-agnostic per-layer accessor: returns `(k, v)` as owned `Vec<f32>`,
+    /// each flattened `[n_kv_heads, n_tokens, head_dim]`. For `dtype:
+    /// "f32"` this just copies the raw bytes (see [`Self::layer_slices_at`]
+    /// for a zero-copy alternative in that case); for `dtype: "q8_0"` it
+    /// dequantizes each block. This is the path an importer (e.g.
+    /// `KvCache::import_prefix`, which already takes `Vec<f32>`) should use
+    /// when it doesn't want to special-case dtype itself.
+    pub fn layer_f32(
+        buf: &[u8],
+        header: &Header,
+        data_offset: usize,
+        layer: usize,
+    ) -> Result<(Vec<f32>, Vec<f32>), KvImageError> {
+        let per_tensor = header.n_kv_heads * n_tokens(header) * header.head_dim;
+        let per_tensor_bytes = Self::tensor_bytes(header, per_tensor);
+        let per_layer_bytes = per_tensor_bytes * 2;
+        let off = data_offset + per_layer_bytes * layer;
+        let need = off + per_layer_bytes;
+        if buf.len() < need {
+            return Err(KvImageError::Truncated {
+                need,
+                got: buf.len(),
+            });
+        }
+        let k_bytes = &buf[off..off + per_tensor_bytes];
+        let v_bytes = &buf[off + per_tensor_bytes..off + per_layer_bytes];
+        let (k, v) = match header.dtype.as_str() {
+            "f32" => (copy_to_f32(k_bytes), copy_to_f32(v_bytes)),
+            "q8_0" => (
+                Self::decode_q8_0_tensor(k_bytes, per_tensor),
+                Self::decode_q8_0_tensor(v_bytes, per_tensor),
+            ),
+            other => return Err(KvImageError::UnsupportedDtype(other.to_string())),
+        };
+        Ok((k, v))
+    }
+
+    /// Byte size of one tensor (`K` or `V`) under `header.dtype`.
+    fn tensor_bytes(header: &Header, per_tensor_values: usize) -> usize {
+        match header.dtype.as_str() {
+            "f32" => per_tensor_values * 4,
+            "q8_0" => {
+                assert_eq!(
+                    per_tensor_values % 32,
+                    0,
+                    "q8_0 tensor length {per_tensor_values} not a multiple of block size 32"
+                );
+                let n_blocks = per_tensor_values / 32;
+                n_blocks * 36 // 4 bytes scale + 32 bytes (8 u32 words) per block
+            }
+            other => panic!("unsupported dtype {other:?}"),
+        }
+    }
+
+    fn decode_q8_0_tensor(bytes: &[u8], per_tensor: usize) -> Vec<f32> {
+        let n_blocks = per_tensor / 32;
+        let scales_bytes = &bytes[..n_blocks * 4];
+        let words_bytes = &bytes[n_blocks * 4..n_blocks * 4 + n_blocks * 32];
+        let scales: Vec<f32> = scales_bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        let words: Vec<u32> = words_bytes
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        dequantize_q8_0(&scales, &words, per_tensor)
+    }
+}
+
+/// Quantize `vals` (length a multiple of 32) into per-32-block `(scales,
+/// words)`: one `f32` scale (`absmax/127`) per block, and the block's 32
+/// values as `i8` packed 4-per-`u32` little-endian (`words.len() ==
+/// vals.len() / 4`). A zero-valued block gets scale `0.0` and all-zero
+/// words (dequantizing back to exact zero, not division by zero).
+pub fn quantize_q8_0(vals: &[f32]) -> (Vec<f32>, Vec<u32>) {
+    assert_eq!(
+        vals.len() % 32,
+        0,
+        "quantize_q8_0: length {} not a multiple of 32",
+        vals.len()
+    );
+    let n_blocks = vals.len() / 32;
+    let mut scales = Vec::with_capacity(n_blocks);
+    let mut words = Vec::with_capacity(n_blocks * 8);
+
+    for block in vals.chunks_exact(32) {
+        let absmax = block.iter().fold(0f32, |m, &x| m.max(x.abs()));
+        let scale = absmax / 127.0;
+        scales.push(scale);
+
+        let mut q = [0i8; 32];
+        if scale != 0.0 {
+            for (qi, &x) in q.iter_mut().zip(block.iter()) {
+                *qi = (x / scale).round().clamp(-127.0, 127.0) as i8;
+            }
+        }
+        for word_bytes in q.chunks_exact(4) {
+            let word = u32::from_le_bytes([
+                word_bytes[0] as u8,
+                word_bytes[1] as u8,
+                word_bytes[2] as u8,
+                word_bytes[3] as u8,
+            ]);
+            words.push(word);
+        }
+    }
+    (scales, words)
+}
+
+/// Inverse of [`quantize_q8_0`]: `scales.len() * 32 == len`, `words.len()
+/// == scales.len() * 8`.
+pub fn dequantize_q8_0(scales: &[f32], words: &[u32], len: usize) -> Vec<f32> {
+    assert_eq!(
+        len % 32,
+        0,
+        "dequantize_q8_0: length {len} not a multiple of 32"
+    );
+    let n_blocks = len / 32;
+    assert_eq!(scales.len(), n_blocks);
+    assert_eq!(words.len(), n_blocks * 8);
+
+    let mut out = Vec::with_capacity(len);
+    for b in 0..n_blocks {
+        let scale = scales[b];
+        for &word in &words[b * 8..b * 8 + 8] {
+            let bytes = word.to_le_bytes();
+            for byte in bytes {
+                out.push((byte as i8) as f32 * scale);
+            }
+        }
+    }
+    out
 }
 
 use std::borrow::Cow;
