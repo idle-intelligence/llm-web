@@ -578,6 +578,8 @@ their signatures. `cargo clippy --target wasm32-unknown-unknown --no-default-fea
 web -p llm-wasm` is clean and `wasm-pack build` (command above) succeeds; `pkg/` was rebuilt and
 recommitted.
 
+`pkg/` rebuilt 2026-09-10 after review fixes; headless runs pass.
+
 `initWgpuDevice()` now probes `adapter.features().contains(wgpu::Features::SUBGROUP)` and calls
 `gguf::set_subgroup_support(...)` before requesting the device, mirroring
 `sts-wasm/src/web/bindings.rs`'s `initWgpuDevice` exactly (same feature-diff-then-probe shape

@@ -38,6 +38,14 @@ export class LlmEngine {
      * address space.
      */
     load(tokenizer_json: string, tokenizer_config_json: string, on_progress: any): Promise<void>;
+    /**
+     * `#[wasm_bindgen(constructor)]` cannot return `Result` (no fallible
+     * JS constructor), so if `initWgpuDevice()` wasn't awaited first this
+     * silently falls back to `WgpuDevice::default()` rather than erroring
+     * — logged as a `console.warn` since a fallback device here almost
+     * certainly means every subsequent GPU call fails or targets the
+     * wrong adapter.
+     */
     constructor();
     /**
      * Continue the current turn with tool results, keyed by `call_id` from
