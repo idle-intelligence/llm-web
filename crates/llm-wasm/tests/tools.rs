@@ -106,3 +106,59 @@ fn format_tool_result_builds_tool_message() {
     let content = msg.content.expect("content should be set");
     assert_eq!(content, serde_json::Value::String(r#"{"households": []}"#.to_string()));
 }
+
+/// The bug this fixes: an MCP tool result whose payload is pretty-printed
+/// JSON text (real newlines + indentation) embedded as a *string* — e.g.
+/// `content: [{"type": "text", "text": "<pretty json>"}]` — must come out
+/// of `format_tool_result` with that embedded JSON compacted (no
+/// newlines, no indentation), not carrying its whitespace through as
+/// literal bytes inside the JSON string.
+#[test]
+fn compacts_pretty_printed_json_embedded_in_content_text() {
+    let pretty_payload = "{\n  \"households\": [\n    {\n      \"householdId\": \"Sonos_ABC123XYZ\"\n    }\n  ]\n}";
+    let result = json!({
+        "content": [
+            {"type": "text", "text": pretty_payload}
+        ]
+    });
+
+    let msg = format_tool_result("get_households_and_groups_and_players", &result);
+    let content = msg.content.expect("content should be set");
+    let content_str = content.as_str().expect("content should be a JSON string");
+
+    assert!(!content_str.contains('\n'), "embedded JSON should be compacted, got: {content_str}");
+    assert!(
+        !content_str.contains("    "),
+        "embedded JSON should have no indentation left, got: {content_str}"
+    );
+
+    // Decoding the outer content string then the inner `text` string
+    // should round-trip to the same JSON value the pretty payload encodes.
+    let outer: serde_json::Value = serde_json::from_str(content_str).unwrap();
+    let inner_text = outer["content"][0]["text"].as_str().unwrap();
+    let inner: serde_json::Value = serde_json::from_str(inner_text).unwrap();
+    assert_eq!(inner, serde_json::from_str::<serde_json::Value>(pretty_payload).unwrap());
+}
+
+/// A top-level string result (not wrapped in a `content` array) that
+/// itself parses as pretty-printed JSON gets the same treatment.
+#[test]
+fn compacts_pretty_printed_json_top_level_string_result() {
+    let pretty = "{\n  \"groupId\": \"RINCON_KITCHEN01:1\",\n  \"playbackState\": \"PAUSED\"\n}";
+    let msg = format_tool_result("pause", &json!(pretty));
+    let content = msg.content.unwrap();
+    let content_str = content.as_str().unwrap();
+    assert!(!content_str.contains('\n'));
+    // content_str is itself a JSON-encoded string of a JSON-encoded string.
+    let outer: String = serde_json::from_str(content_str).unwrap();
+    assert!(!outer.contains('\n'), "inner string should also be compacted, got: {outer}");
+}
+
+/// Plain, non-JSON text (e.g. an error message or free text tool result)
+/// is left completely verbatim — no attempt to "fix" it.
+#[test]
+fn non_json_text_is_left_verbatim() {
+    let msg = format_tool_result("pause", &json!("Kitchen is now paused."));
+    let content = msg.content.unwrap();
+    assert_eq!(content, serde_json::Value::String("\"Kitchen is now paused.\"".to_string()));
+}

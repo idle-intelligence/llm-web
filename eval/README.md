@@ -1,5 +1,22 @@
 # Sonos MCP agent eval
 
+**Tool result compaction:** every tool result is compacted before it
+enters a `tool` message (`tools.rs`'s `format_tool_result`, the one
+place both `agent.rs` and `web.rs` build it) — if the result, or any
+string nested inside it (e.g. an MCP `content: [{"type": "text", "text":
+"<json>"}]` item), parses as JSON, that JSON is re-serialized without
+newlines or indentation before the whole result is compact-encoded into
+the message. This matters because some MCP servers (Sonos's included)
+return pretty-printed JSON text: `get_households_and_groups_and_players`
+costs 394 tokens pretty vs 241 compact for the canned fixture (see
+`crates/llm-wasm/tests/tokenizer.rs`'s
+`compacting_households_fixture_reduces_token_count`), and the gap is
+larger on a real household with more players/groups — so
+`prefix_tokens` and any `prefill_s`/token counts recorded below reflect
+post-compaction sizes. A compacted result over `tools::MAX_RESULT_CHARS`
+(8000 chars) is never truncated — kept in full — but logs a
+`tracing::warn!` on the native side.
+
 Dry-run tool-call eval for the Sonos LLM agent (Phase 3 of
 `sonos/PLAN.md`). No live Sonos speakers involved — the agent runs
 against the canned household in `fixtures/sonos/results/`, and each

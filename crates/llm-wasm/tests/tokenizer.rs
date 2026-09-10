@@ -69,6 +69,39 @@ fn encode_matches_recorded_tokens_for_every_fixture() {
     println!("checked {checked} fixture(s) for encode/decode fidelity");
 }
 
+/// Token-count proxy for the MCP-result-compaction fix (`tools.rs`'s
+/// `compact_embedded_json`/`format_tool_result`): pretty-printing the
+/// households/groups/players fixture the way an MCP server's
+/// `json.dumps(result, indent=2)`-style output would costs real prompt
+/// tokens over the compact form the fix now produces. Prints both counts
+/// with `-- --nocapture`.
+#[test]
+fn compacting_households_fixture_reduces_token_count() {
+    let Some(tokenizer) = load_tokenizer() else {
+        return;
+    };
+
+    let fixture_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/sonos/results/get_households_and_groups_and_players.json");
+    let raw = std::fs::read_to_string(&fixture_path).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+
+    let pretty = serde_json::to_string_pretty(&value).unwrap();
+    let compact = serde_json::to_string(&value).unwrap();
+
+    let pretty_tokens = tokenizer.encode(&pretty, false).unwrap().len();
+    let compact_tokens = tokenizer.encode(&compact, false).unwrap().len();
+
+    println!(
+        "households/groups/players fixture: pretty = {pretty_tokens} tokens, compact = {compact_tokens} tokens"
+    );
+
+    assert!(
+        compact_tokens < pretty_tokens,
+        "expected compact ({compact_tokens}) < pretty ({pretty_tokens})"
+    );
+}
+
 #[test]
 fn eos_ids_are_im_end_and_endoftext() {
     let Some(tokenizer) = load_tokenizer() else {
