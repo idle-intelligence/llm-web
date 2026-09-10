@@ -42,6 +42,14 @@ name (not per-argument), then scored offline against
   `get_households_and_groups_and_players` with nothing to look up).
 - **Wrong room, wrong group/player id, or a missing required call is
   incorrect** — no partial credit.
+- **Args match by subset**: a required call's actual arguments must
+  contain every key in `expected.args` with the exact expected value;
+  extra keys the model included beyond `expected.args` are ignored.
+  This covers schema-required params the utterance doesn't determine
+  (e.g. `play_artist`'s `music_service`, which is required but not
+  named by "Play music by Nirvana in the kitchen." in `m11`) — any
+  value, or omission where the schema allows it, is accepted for keys
+  not listed in `expected.args`.
 - **Max 6 steps** per utterance. A run that exceeds 6 tool calls
   without producing the expected sequence is scored incorrect
   regardless of whether it eventually would have gotten there.
@@ -91,7 +99,7 @@ Example skeleton:
 | s01 | true    | 1     | 0.42      | 48.1          | 0.9     |
 | ... |         |       |           |               |         |
 
-## Run: xLAM-2-3b-fc-r Q4_K_M, 12 tools, native
+## Run: xLAM-2-3b-fc-r Q4_K_M, 13 tools, native
 
 | id  | correct | steps | prefill_s | decode_tok_s | total_s |
 |-----|---------|-------|-----------|---------------|---------|
@@ -103,7 +111,7 @@ Example skeleton:
 - `utterances.json` — the 20 scored utterances (10 `single`, 10
   `multi`), each with the expected tool-call sequence, canned-fixture
   argument values, accept mode, `tools12_ok` (solvable with the
-  12-tool subset in `fixtures/sonos/tools-12.json`), and notes.
+  13-tool subset in `fixtures/sonos/tools-12.json`; file still named tools-12.json), and notes.
 - `results/<date>.md` — one file per eval run (see above).
 
 ## How to run
@@ -125,8 +133,8 @@ llm-agent eval \
 
 - `--gguf` — path to the quantized model to eval.
 - `--tools` — `all` for the full 34-tool schema
-  (`fixtures/sonos/tools.json`) or `12` for the 12-tool subset
-  (`fixtures/sonos/tools-12.json`); see `eval::ToolSet`.
+  (`fixtures/sonos/tools.json`) or `12` for the 13-tool subset
+  (`fixtures/sonos/tools-12.json`, filename unchanged); see `eval::ToolSet`.
 - `--label` — a short name for this run, folded into the default output
   filename (`eval/results/<date>-<tools>-<label>-native.md`) and recorded
   in the report's parameters block. Defaults to `default`.

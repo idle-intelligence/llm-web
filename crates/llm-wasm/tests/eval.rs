@@ -205,7 +205,7 @@ fn tools12_case_is_skipped_under_the_12_tool_set() {
 
     let all_tools = eval::load_all_tools(fixtures_dir()).unwrap();
     let tools = eval::select_tools(&all_tools, ToolSet::Twelve, fixtures_dir()).unwrap();
-    assert_eq!(tools.len(), 12);
+    assert_eq!(tools.len(), 13);
 
     let report = eval::run_all(
         &mut agent,

@@ -7,7 +7,7 @@
           "groupId": "RINCON_KITCHEN01:1",
           "name": "Kitchen",
           "playbackState": "PAUSED",
-          "playerIds": ["RINCON_KITCHEN01"]
+          "playerIds": ["RINCON_KITCHEN01", "RINCON_KITCHEN02"]
         },
         {
           "groupId": "RINCON_LIVING01:2",
@@ -27,6 +27,11 @@
           "playerId": "RINCON_KITCHEN01",
           "name": "Kitchen",
           "capabilities": ["PLAYBACK", "AUDIO_CLIP", "VOICE"]
+        },
+        {
+          "playerId": "RINCON_KITCHEN02",
+          "name": "Kitchen Surround",
+          "capabilities": ["PLAYBACK"]
         },
         {
           "playerId": "RINCON_LIVING01",

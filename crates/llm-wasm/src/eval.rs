@@ -235,6 +235,20 @@ pub struct CaseResult {
 /// (`eval/README.md`, "Max 6 steps per utterance").
 const MAX_TOOL_CALLS: usize = 6;
 
+/// Whether `made` satisfies `expected` per `eval/README.md`'s "Args match
+/// by subset" rule: every key in `expected` (when it's a JSON object) must
+/// be present in `made` with the exact same value; keys in `made` beyond
+/// `expected` are ignored (e.g. a schema-required param the utterance
+/// doesn't determine, like `play_artist`'s `music_service`).
+fn args_match(expected: &Value, made: &Value) -> bool {
+    match (expected, made) {
+        (Value::Object(exp), Value::Object(got)) => {
+            exp.iter().all(|(k, v)| got.get(k) == Some(v))
+        }
+        _ => expected == made,
+    }
+}
+
 /// Score `calls_made` (in order) against `case.expected` per
 /// `eval/README.md`'s "Scoring rules". Returns `(correct, reason)`.
 pub fn score(case: &EvalCase, calls_made: &[ToolCall]) -> (bool, String) {
@@ -285,7 +299,7 @@ pub fn score(case: &EvalCase, calls_made: &[ToolCall]) -> (bool, String) {
                 for expected in &required {
                     match calls_made[cursor..]
                         .iter()
-                        .position(|c| c.name == expected.name && c.arguments == expected.args)
+                        .position(|c| c.name == expected.name && args_match(&expected.args, &c.arguments))
                     {
                         Some(offset) => cursor += offset + 1,
                         None => {
@@ -308,7 +322,7 @@ pub fn score(case: &EvalCase, calls_made: &[ToolCall]) -> (bool, String) {
                     .expected
                     .last()
                     .expect("EvalCase.expected is never empty");
-                if calls_made.iter().any(|c| c.name == last.name && c.arguments == last.args) {
+                if calls_made.iter().any(|c| c.name == last.name && args_match(&last.args, &c.arguments)) {
                     (true, "final read made with correct args".to_string())
                 } else {
                     (

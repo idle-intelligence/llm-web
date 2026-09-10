@@ -229,5 +229,29 @@
     "accept": "subset",
     "tools12_ok": false,
     "notes": "move_audio_to_players is not in the 12-tool subset. Its first argument is named source_group_id rather than group_id like every other group-scoped tool — an easy field-name slip."
+  },
+  {
+    "id": "m11",
+    "utterance": "Play music by Nirvana in the kitchen.",
+    "kind": "multi",
+    "expected": [
+      {"name": "get_households_and_groups_and_players", "args": {}},
+      {"name": "play_artist", "args": {"group_id": "RINCON_KITCHEN01:1", "artist": "Nirvana", "shuffle": false}}
+    ],
+    "accept": "subset",
+    "tools12_ok": true,
+    "notes": "music_service is required by play_artist's schema but not determined by the utterance; the scorer's subset-args matching (expected keys must match, extra keys in the actual call ignored — see eval/README.md's Scoring rules) means the model may include any music_service value without being penalized. shuffle defaults to false per m05's pattern for a required-but-unmentioned boolean."
+  },
+  {
+    "id": "m12",
+    "utterance": "Ungroup the kitchen.",
+    "kind": "multi",
+    "expected": [
+      {"name": "get_households_and_groups_and_players", "args": {}},
+      {"name": "remove_players_from_group", "args": {"group_id": "RINCON_KITCHEN01:1", "player_ids": ["RINCON_KITCHEN02"]}}
+    ],
+    "accept": "subset",
+    "tools12_ok": false,
+    "notes": "remove_players_from_group is not in the 12-tool subset. The fixture Kitchen group has two players (RINCON_KITCHEN01, RINCON_KITCHEN02) so 'ungroup' is unambiguous: remove the non-coordinator player RINCON_KITCHEN02, leaving RINCON_KITCHEN01 as the group's sole (coordinator) player."
   }
 ]
