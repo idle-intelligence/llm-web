@@ -59,6 +59,27 @@ const ALIGNMENT: u64 = 32;
 const NAIVE_WG_X: u32 = 16;
 const NAIVE_WG_Y: u32 = 16;
 
+/// WebGPU caps every `CubeCount`/dispatch dimension at 65535 workgroups
+/// (not just the 256-invocation-per-workgroup cap — a *separate* limit on
+/// dispatch group *count*). F1/F2's elementwise kernels (`rope_fused`,
+/// `silu_mul_fused`) flatten their whole `[rows, cols]` work into one 1D
+/// grid of `wg_size`-wide workgroups; at prefill sequence lengths in the
+/// low thousands that 1D count blows past 65535 (e.g. SiLU*up at T=2225,
+/// ffn_dim=11008: `2225*11008/256 ≈ 95674` workgroups — the bug this
+/// helper fixes, caught by `full_forward`'s prefill tests). Splits the flat
+/// 1D workgroup count into a 2D `(x, y)` grid with `x <= 65535`; the
+/// shader recovers the flat element index as
+/// `gid.y * (wg_x * wg_size) + gid.x` (see `shader_rope.wgsl`/
+/// `shader_silu_mul.wgsl`'s `row_width` info field). Returns
+/// `(wg_x, wg_y, row_width_elements)`.
+fn workgroups_2d(elements: usize, wg_size: u32) -> (u32, u32, u32) {
+    const MAX_WG_DIM: u32 = 65535;
+    let total_wg = (elements as u32).div_ceil(wg_size);
+    let wg_x = total_wg.clamp(1, MAX_WG_DIM);
+    let wg_y = total_wg.div_ceil(wg_x).max(1);
+    (wg_x, wg_y, wg_x * wg_size)
+}
+
 // Q4_0 matvec (M=1 decode) cooperative kernel: WG_SIZE=256, ROWS_PER_WG=8 —
 // see wgsl/shader_q4_matvec.wgsl's header comment. K1, unused by default
 // dispatch since Session 6 (see MATVEC_COALESCED_ROWS_PER_WG below).
@@ -1373,6 +1394,155 @@ pub fn rmsnorm_fused(x: Tensor<Wgpu, 3>, weight: Tensor<Wgpu, 1>, eps: f32) -> T
         DType::F32,
     );
     Tensor::from_primitive(TensorPrimitive::Float(output_tensor))
+}
+
+// ---------------------------------------------------------------------------
+// F1 — fused RoPE kernel
+// ---------------------------------------------------------------------------
+
+struct RopeKernel;
+
+impl KernelSource for RopeKernel {
+    fn source(&self) -> SourceTemplate {
+        SourceTemplate::new(include_str!("wgsl/shader_rope.wgsl"))
+    }
+
+    fn id(&self) -> KernelId {
+        KernelId::new::<Self>()
+    }
+}
+
+/// Fused rotate-half RoPE applied in place to `q`/`k`. `q`: `[1, T, H, Dh]`,
+/// `k`: `[1, T, Hkv, Dh]` (the natural `reshape()` layout, *before*
+/// `model.rs` permutes to `[1, H, T, Dh]`). `cos`/`sin`: `RoPE`'s
+/// `[max_seq_len, Dh]` precomputed tables. `offset`: absolute position of
+/// row 0. One dispatch total (both q and k) instead of the ~10-dispatch
+/// Burn op chain — see `wgsl/shader_rope.wgsl`'s doc comment for the layout
+/// and safety argument, and `model.rs::apply_rope`/`rotate_half` for the
+/// reference formula this replaces.
+pub fn rope_fused(
+    q: Tensor<Wgpu, 4>,
+    k: Tensor<Wgpu, 4>,
+    cos: &Tensor<Wgpu, 2>,
+    sin: &Tensor<Wgpu, 2>,
+    offset: usize,
+) -> (Tensor<Wgpu, 4>, Tensor<Wgpu, 4>) {
+    let cube_q: CubeTensor<WgpuRuntime> = q.into_primitive().tensor();
+    let cube_q = into_contiguous(cube_q);
+    let cube_k: CubeTensor<WgpuRuntime> = k.into_primitive().tensor();
+    let cube_k = into_contiguous(cube_k);
+    let cube_cos: CubeTensor<WgpuRuntime> = cos.clone().into_primitive().tensor();
+    let cube_cos = into_contiguous(cube_cos);
+    let cube_sin: CubeTensor<WgpuRuntime> = sin.clone().into_primitive().tensor();
+    let cube_sin = into_contiguous(cube_sin);
+
+    let t = cube_q.shape.dims[1];
+    let h = cube_q.shape.dims[2];
+    let dh = cube_q.shape.dims[3];
+    let hkv = cube_k.shape.dims[2];
+    let half = dh / 2;
+    let cos_stride = cube_cos.shape.dims[1];
+    assert_eq!(cube_k.shape.dims[3], dh, "RoPE q/k head_dim mismatch");
+    assert_eq!(cube_k.shape.dims[1], t, "RoPE q/k row-count mismatch");
+    assert_eq!(cos_stride, dh, "RoPE cos table stride/head_dim mismatch");
+
+    let client = cube_q.client.clone();
+    let device = cube_q.device.clone();
+
+    let total = t * (h + hkv) * half;
+    let (wg_x, wg_y, row_width) = workgroups_2d(total, 256);
+
+    let info: [f32; 7] = [
+        t as f32,
+        h as f32,
+        hkv as f32,
+        half as f32,
+        offset as f32,
+        cos_stride as f32,
+        row_width as f32,
+    ];
+    let info_bytes: Vec<u8> = info.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let info_handle = client.create_from_slice(&info_bytes);
+
+    let bindings = Bindings::new()
+        .with_buffer(cube_q.handle.clone().binding())
+        .with_buffer(cube_k.handle.clone().binding())
+        .with_buffer(cube_cos.handle.binding())
+        .with_buffer(cube_sin.handle.binding())
+        .with_buffer(info_handle.binding());
+
+    let kernel = SourceKernel::new(RopeKernel, CubeDim::new_1d(256));
+    client
+        .launch(
+            Box::new(kernel) as Box<dyn CubeTask<AutoCompiler>>,
+            CubeCount::new_2d(wg_x, wg_y),
+            bindings,
+        )
+        .expect("RoPE kernel launch failed");
+
+    let q_shape = burn::prelude::Shape::from(vec![1, t, h, dh]);
+    let k_shape = burn::prelude::Shape::from(vec![1, t, hkv, dh]);
+    let q_out = CubeTensor::new_contiguous(client.clone(), device.clone(), q_shape, cube_q.handle, DType::F32);
+    let k_out = CubeTensor::new_contiguous(client, device, k_shape, cube_k.handle, DType::F32);
+    (
+        Tensor::from_primitive(TensorPrimitive::Float(q_out)),
+        Tensor::from_primitive(TensorPrimitive::Float(k_out)),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// F2 — fused SiLU*up kernel
+// ---------------------------------------------------------------------------
+
+struct SiluMulKernel;
+
+impl KernelSource for SiluMulKernel {
+    fn source(&self) -> SourceTemplate {
+        SourceTemplate::new(include_str!("wgsl/shader_silu_mul.wgsl"))
+    }
+
+    fn id(&self) -> KernelId {
+        KernelId::new::<Self>()
+    }
+}
+
+/// Fused `silu(gate) * up`, in place into `gate`'s buffer. `gate`/`up`:
+/// same shape (`[1, T, ffn_dim]`). One dispatch instead of Burn's separate
+/// `silu` + `mul` chain — see `wgsl/shader_silu_mul.wgsl`'s doc comment.
+pub fn silu_mul_fused(gate: Tensor<Wgpu, 3>, up: Tensor<Wgpu, 3>) -> Tensor<Wgpu, 3> {
+    let cube_gate: CubeTensor<WgpuRuntime> = gate.into_primitive().tensor();
+    let cube_gate = into_contiguous(cube_gate);
+    let cube_up: CubeTensor<WgpuRuntime> = up.into_primitive().tensor();
+    let cube_up = into_contiguous(cube_up);
+    assert_eq!(cube_gate.shape.dims, cube_up.shape.dims, "silu_mul_fused shape mismatch");
+
+    let n: usize = cube_gate.shape.dims.iter().product();
+    let client = cube_gate.client.clone();
+    let device = cube_gate.device.clone();
+
+    let (wg_x, wg_y, row_width) = workgroups_2d(n, 256);
+
+    let info: [f32; 2] = [n as f32, row_width as f32];
+    let info_bytes: Vec<u8> = info.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let info_handle = client.create_from_slice(&info_bytes);
+
+    let bindings = Bindings::new()
+        .with_buffer(cube_gate.handle.clone().binding())
+        .with_buffer(cube_up.handle.binding())
+        .with_buffer(info_handle.binding());
+
+    let kernel = SourceKernel::new(SiluMulKernel, CubeDim::new_1d(256));
+    client
+        .launch(
+            Box::new(kernel) as Box<dyn CubeTask<AutoCompiler>>,
+            CubeCount::new_2d(wg_x, wg_y),
+            bindings,
+        )
+        .expect("SiLU*up kernel launch failed");
+
+    let shape = burn::prelude::Shape::from(cube_gate.shape.dims.clone());
+    let out = CubeTensor::new_contiguous(client, device, shape, cube_gate.handle, DType::F32);
+    Tensor::from_primitive(TensorPrimitive::Float(out))
 }
 
 // ---------------------------------------------------------------------------

@@ -338,17 +338,22 @@ fn bench_matvec_isolated(device: &WgpuDevice) -> Vec<(usize, usize, f64, f64)> {
 /// instrumented count (Burn's wgpu backend doesn't expose a dispatch
 /// counter to this crate); each line's multiplicity is read directly off
 /// `model.rs`'s decoder-block/attention/RoPE/FFN code paths.
+///
+/// Session 9 F1/F2: RoPE (10 -> 1) and SwiGLU's elementwise step (2 -> 1)
+/// were each replaced by one fused WGSL dispatch (`gguf::rope_fused`,
+/// `gguf::silu_mul_fused`) — see model.rs's `Q4Attention::forward`/
+/// `Q4FeedForward::forward`.
 fn print_dispatch_estimate(num_layers: usize) {
     let per_layer: &[(&str, usize)] = &[
         ("RMSNorm (attn_norm + ffn_norm, ~4 dispatches each: mean/var/rsqrt/mul)", 8),
         ("Q4Linear matmuls (q,k,v,o,gate,up,down)", 7),
         ("q/k/v bias adds", 3),
-        ("RoPE (apply_rope x2 for q,k: mul_scalar+cat+mul+mul+add each)", 10),
+        ("RoPE (fused kernel, F1 Session 9 — was 10: apply_rope x2 for q,k)", 1),
         ("repeat_kv cat (k_all, v_all)", 2),
         ("KV cache slice_assign (k, v)", 2),
         ("attention core (QK^T matmul, scale mul, mask compare+fill, softmax~3, PV matmul)", 8),
         ("residual adds (attn, ffn)", 2),
-        ("SwiGLU (silu, mul)", 2),
+        ("SiLU*up (fused kernel, F2 Session 9 — was 2: silu, mul)", 1),
     ];
     let per_layer_total: usize = per_layer.iter().map(|(_, n)| n).sum();
     println!("  per decoder layer:");
