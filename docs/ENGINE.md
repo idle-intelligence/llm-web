@@ -750,3 +750,69 @@ and watch for `[gpu-debug]` lines.
 
 A ready-to-run version of this harness lives at `scripts/headless/repro.mjs`
 (see `scripts/headless/README.md`).
+
+## Review fixes 2026-09-10
+
+1. `gguf.rs::GgufReader::open` — `metadata_kv_count`/`tensor_count`/`ndims`
+   from the untrusted header no longer drive unbounded `with_capacity`
+   (capped at `MAX_CAPACITY_HINT = 1<<16`); `ndims <= 4` is `ensure!`d; every
+   tensor's `offset` and `[abs_offset, abs_offset+byte_size)` range is
+   checked against the actual file length before any caller can slice it.
+2. `GgmlDtype::byte_size`/`GgufTensorInfo::{num_elements,byte_size}` return
+   `Result` (`checked_mul` chain, "tensor size overflow"/"element count
+   overflow"); `tensor_data` converts the result to `usize` via
+   `usize::try_from` with context instead of `as usize` truncation.
+   `EmbeddingStore::embed_id`/`embed_id_add_cpu` now return `Result` and
+   `ensure!` `id < vocab_size`; propagated through `LlmModel::embed_tokens`
+   -> `forward_hidden` -> `forward_logits`/`generate`, and every native
+   (`llm-agent.rs`) and WASM (`web.rs`) caller.
+3. `model::logits_to_vec` returns `Result` instead of
+   `.expect("f32 logits")`; `web.rs`'s async GPU-readback `.expect(...)` maps
+   to `JsError` instead. Swept the crate for other runtime-reachable
+   `expect`/`unwrap` on untrusted-data paths (GGUF bytes, tokenizer JSON,
+   model output) — none left outside `#[cfg(test)]` code and internal GPU
+   kernel-launch invariants (not driven by untrusted input).
+4. `load_q4_linear`/`load_q4_linear_with_bias` `ensure!(shape.len() == 2, ...)`
+   with the tensor name in the message, before indexing `shape[0]`/`shape[1]`.
+5. `sample::top_k`'s sort comparator is now NaN-safe: NaN logits are mapped
+   to `-inf` for the comparison only (never win top-k), non-NaN values use
+   `total_cmp` (total order, never panics). `greedy`'s strict `>` was
+   already NaN-safe and deterministic (first true max wins); added tests.
+6. `GgmlDtype::byte_size`/`GgufTensorInfo::num_elements` use a `checked_mul`
+   chain instead of raw `*`/`.product()` (see finding 2 above — same fix).
+7. `LlmEngine::new()` (`#[wasm_bindgen(constructor)]`, can't return `Result`)
+   still falls back to `WgpuDevice::default()` when `initWgpuDevice()`
+   wasn't awaited first, but now logs a `console.warn` explaining the
+   fallback almost certainly means later GPU calls fail; documented on the
+   method.
+8. Added `tests/gguf_malformed.rs` (8 cases, no GPU): truncated header (two
+   variants), absurd `tensor_count`/`metadata_kv_count`, `ndims = 9`, tensor
+   offset+size past EOF, offset alone past EOF, and a well-formed-file
+   sanity check — all via a small hand-rolled GGUF byte writer. Added
+   `sample.rs` unit tests for NaN in `greedy`/`top_k`.
+9. Subgroup matvec kernel gating (`shader_q4_matvec_subgroup.wgsl` hardcodes
+   `SUBGROUP_SIZE=32`): `web.rs`'s `initWgpuDevice` now only calls
+   `gguf::set_subgroup_support(true)` when `wgpu::Features::SUBGROUP` is
+   present **and** `adapter.limits().min_subgroup_size ==
+   max_subgroup_size == 32`. As of wgpu 26's `BROWSER_WEBGPU` backend these
+   limits always come back `0`/`0` (`Limits::default()` — the backend
+   doesn't query a real value from the browser), so the subgroup kernel is
+   effectively disabled on WebGPU today, with a comment explaining why and
+   what would need to change (wgpu, or the WebGPU spec, actually surfacing
+   subgroup size) for it to activate.
+10. `shader_q4_tiled.wgsl`'s header comment corrected: it previously
+    described the shipped kernel as TM=TN=128/MICRO=8, but the constants in
+    the file (and what's actually compiled) are TM=TN=64/MICRO=4
+    (`docs/BENCHMARKS.md` K2's `v3`, vectorized dequant); the 128/MICRO=8
+    variant (`v2`) was measured and found slower, then reverted. No code
+    change, comment only.
+
+### Deferred
+
+- **Agent/web duplication** (review finding 7): `web.rs`'s async step loop
+  duplicates `agent.rs`'s `Agent::step_inner` orchestration because Burn's
+  wgpu tensor readback has no sync-over-async escape hatch on wasm32 (see
+  `web.rs`'s module doc comment) — not addressed here.
+- **Per-step re-render cost** (review finding 6): each agent step
+  re-renders the full chat-template prompt from scratch rather than
+  incrementally extending it — not addressed here.
