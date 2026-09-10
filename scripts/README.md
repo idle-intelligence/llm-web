@@ -69,6 +69,41 @@ forward pass would produce a `[8140, 151936]` float32 logits.npy
 worth generating. `--render-only` with no name defaults to
 `RENDER_ONLY_NAMES` in the script (currently just `04_tools_all`).
 
+## Model-vs-port parity check (HF greedy generate vs. `llm-agent run`)
+
+```
+scripts/.venv/bin/python scripts/parity_eval.py hf    # one model load, all cases
+scripts/.venv/bin/python scripts/parity_eval.py port  # sequential llm-agent run invocations
+```
+
+Purpose: isolate whether the Sonos-eval score (`eval/results/2026-09-10-summary.md`,
+~25% correct, mostly from inventing ids instead of calling the listing tool
+first) traces to the model (xLAM-2-3b-fc-r itself) or the port (Burn+wgpu,
+Q4_0 GGUF) — by comparing HF bf16 MPS greedy `generate()` against
+`llm-agent run` on the byte-identical rendered/tokenized prompt for a
+handful of cases, bypassing the eval harness's multi-step/tool-execution/
+prefix-cache machinery entirely.
+
+`hf` stage: for a fixed list of case ids from `eval/utterances.json`, builds
+`[system, user(utterance)]` + the 12-tool set (`fixtures/sonos/tools-12.json`,
+via `make_inputs.mcp_to_function_tools`), renders with
+`apply_chat_template(add_generation_prompt=True)`, tokenizes the same way
+`export_reference.py` does (`tokenizer(rendered, add_special_tokens=False)`),
+writes tokens to `/Users/tc/.claude/jobs/ae1e446d/tmp/parity/<id>.tokens.json`,
+then runs one HF bf16 MPS greedy `generate()` per case (one model load for
+all cases), writing `<id>.hf.json`. Frees the model (`del` + `gc.collect()` +
+`torch.mps.empty_cache()`) before returning.
+
+`port` stage: runs `./target/release/llm-agent run --gguf <default-gguf>
+--tokens <id>.tokens.json --max-new 64 --tokenizer <model-dir>/tokenizer.json`
+once per case as a separate process, writing `<id>.port.json`. Run this
+stage only after the `hf` stage's model is fully freed (they must never
+share memory at once on a 16GB M2 — bf16 HF is ~6GB, the port's wgpu backend
+is ~3GB GPU).
+
+Results, method, and the model-vs-port conclusion:
+`eval/results/2026-09-10-parity.md`.
+
 ## Generate the Q4_0-dequant-matched reference
 
 ```
