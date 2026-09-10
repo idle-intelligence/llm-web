@@ -872,3 +872,107 @@ are; `SCRATCH_MATMUL_CHUNK_M` dropped from 2225 to 2048 (itself 128-aligned)
 so a chunked prefill's remainder chunk stays bucket-aligned too. See
 docs/BENCHMARKS.md Session 10 for the in-process bucket-reuse measurement and
 the padding-is-numerically-inert test in `tests/q4_matmul.rs`.
+
+## 14. Schema-constrained decoding (`src/grammar.rs`)
+
+A pure state machine — no GPU, no model — that decides, at every decoding
+step, which vocab tokens are legal continuations of xLAM-2's tool-call
+output. Not wired into the generate loop yet (see "Hook-in point" below);
+this section is the contract the eventual wiring builds on.
+
+**The grammar.** `Grammar::for_tools(tools: &[Tool], id_values: &IdValues)`
+builds the constraint for one turn. It accepts exactly:
+
+- **Free text** — decided by the first non-whitespace byte: anything other
+  than `[` switches the whole output to unconstrained text, accepted until
+  EOS. This mirrors `tools.rs::parse_output`'s own detection rule (does the
+  stripped output start with `[`).
+- **OR** a JSON array of one or more `{"name": ..., "arguments": {...}}`
+  call objects, where `name` is one of the tool names and `arguments`
+  satisfies that tool's `inputSchema`: every `required` key present (any
+  order), no unknown keys, values typed (string / integer / boolean /
+  array-of-string), `enum` respected, integers within `minimum`/`maximum`,
+  strings within `minLength`.
+- Whitespace: both the model's observed style (space after `:`, `, `
+  between items — see `fixtures/reference/logits/02_tools_single.json` and
+  `03_tools_multiturn.json`'s recorded greedy output) and the fully compact
+  form are accepted; anywhere else, no extra whitespace is allowed.
+
+**The id rule.** A string (or array-of-string) property whose name ends in
+`_id`/`_ids`, or whose schema `description` contains "ID", must take a
+value from `IdValues` — the set of id-shaped strings harvested from earlier
+tool results in the conversation (`IdValues::collect_from_result`, generic:
+any object key ending in "id" case-insensitively, plus any string that
+*looks* id-shaped — has a digit and a `_`/`:`/`-` separator, no whitespace,
+length ≥ 6 — no Sonos-specific regex). If that set is empty for a given
+property, the property cannot be emitted at all: `Grammar::for_tools` drops
+it from the tool's schema, and if it was required, drops the *tool* from
+the grammar entirely — its name never appears in the `"name"` choice, so
+the model can't even start typing it (`Grammar::can_call`). This is what
+`pause` looks like with no known group id: excluded outright, not merely
+rejected once `arguments` is wrong.
+
+**Token-level API.**
+
+```rust
+let vocab = TokenVocab::from_tokenizer(&tokenizer);      // once per generation
+let grammar = Grammar::for_tools(&tools, &id_values);     // once per turn
+let mut state = GrammarState::new(&grammar);
+
+loop {
+    let mask: TokenMask = state.allowed(&vocab);           // bitset over vocab ids
+    let token_id = sample(logits, &mask);                  // not implemented here
+    state.advance(token_id, &vocab);
+    if state.is_complete() { break; }
+}
+```
+
+`TokenVocab` precomputes every vocab id's exact byte string once
+(`Tokenizer::token_bytes`, added for this — `decode(&[id], false)`, keeping
+special tokens rather than silently dropping them) so `allowed()` never
+re-tokenizes. `GrammarState::allowed` walks each vocab token's bytes
+through the character-level matcher (`Grammar::step`, a hand-written byte
+DFA — no generic recursive grammar engine, since the schema shape here is
+fixed and flat) from a cheap `Copy` snapshot of the current parser
+position; a token is allowed iff every one of its bytes is accepted in
+sequence (it need not reach a *complete* grammar state, just not be
+rejected outright). EOS is added to the mask separately, only when
+`is_complete()`. Property/tool-name/enum/id matching is a linear
+prefix-elimination walk over a small candidate list held as `&[String]`
+(at most 34 tool names, a handful of properties or enum values per tool) —
+no tries built up front, no per-byte allocation.
+
+The one deliberate shared-mask optimization: inside free text, every token
+is valid, so `allowed()` returns a precomputed all-ones `TokenMask` instead
+of re-walking the vocab — the case the spec called out explicitly ("states
+repeat, e.g. inside free text everything is allowed").
+
+Constraints that depend on a variable-length suffix (integer
+`minimum`/`maximum`, string `minLength`, array `minItems`) are *not*
+checked digit-by-digit or char-by-char; they're checked once, at the
+terminal delimiter (the `,`/`}`/`]` right after the value), by re-parsing
+the accumulated buffer. This is the same "rejected at the closing
+character" shape as the required-field check (test (b)/(d): the `}` that
+would close `arguments` is the token that gets rejected, not some byte
+earlier in `group_id`/`shuffle`'s absence — there's nothing earlier to
+reject). Enum and id values, by contrast, *are* checked byte-by-byte (a
+wrong-enum first character is rejected immediately, not at the closing
+quote), since the full candidate set is known up front and prefix-matching
+it is free.
+
+**Hook-in point.** `sample.rs` owns the generate loop (another worker) and
+would call `state.allowed(&vocab)` before `greedy`/`top_k`, masking out
+disallowed logits (e.g. setting them to `-inf`) before argmax/top-k, then
+`state.advance(chosen_id, &vocab)` after each step. Not wired up by this
+change.
+
+**Limits.** Flat schemas only: `properties` of string/integer/boolean/
+array-of-string, no nested objects, arrays only of strings (matches every
+schema in `fixtures/sonos/tools.json`). Array-of-string *free* elements
+(no id/enum constraint) don't track backslash escapes as carefully as
+scalar string values do (accepts any escape pair without validating it's
+one of JSON's defined escapes) — acceptable for the id/enum-constrained
+elements this schema set actually uses, but a real generic-JSON-string
+validator would be stricter. `advance()` on a token the mask didn't allow
+is a documented no-op (state unchanged) rather than a panic, since it's the
+sampler's job to respect the mask, not this module's job to trust it did.

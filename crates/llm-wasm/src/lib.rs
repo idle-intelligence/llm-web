@@ -16,6 +16,7 @@ pub mod kv;
 #[cfg(feature = "wgpu")]
 pub mod sample;
 
+pub mod grammar;
 pub mod template;
 pub mod tools;
 pub mod agent;

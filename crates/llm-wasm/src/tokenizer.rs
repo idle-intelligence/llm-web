@@ -51,4 +51,24 @@ impl Tokenizer {
     pub fn eos_ids(&self) -> &[u32] {
         &self.eos_ids
     }
+
+    /// Total vocab size (including added/special tokens), i.e. the id
+    /// space a `grammar::TokenMask` must cover.
+    pub fn vocab_size(&self) -> usize {
+        self.inner.get_vocab_size(true)
+    }
+
+    /// The exact byte string a single token id decodes to, keeping special
+    /// tokens (`decode(.., skip_special=false)`) so callers can special-case
+    /// them (e.g. EOS) rather than have them silently vanish.
+    ///
+    /// Used by `grammar::Grammar` to precompute, once per generation, the
+    /// byte string of every vocab entry so token-level acceptance can be
+    /// checked by walking those bytes through the character matcher.
+    pub fn token_bytes(&self, id: u32) -> Vec<u8> {
+        self.inner
+            .decode(&[id], false)
+            .unwrap_or_default()
+            .into_bytes()
+    }
 }
