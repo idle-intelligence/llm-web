@@ -101,6 +101,8 @@ wired, the intended invocation is:
 llm-agent eval \
   --gguf /path/to/xLAM-2-3b-fc-r.Q4_K_M.gguf \
   --tools all|12 \
+  --label <name> \
+  --system "<system prompt>" \
   --out eval/results/<date>.md
 ```
 
@@ -108,8 +110,22 @@ llm-agent eval \
 - `--tools` — `all` for the full 34-tool schema
   (`fixtures/sonos/tools.json`) or `12` for the 12-tool subset
   (`fixtures/sonos/tools-12.json`); see `eval::ToolSet`.
+- `--label` — a short name for this run, folded into the default output
+  filename (`eval/results/<date>-<tools>-<label>-native.md`) and recorded
+  in the report's parameters block. Defaults to `default`.
+- `--system` — override the agent's system prompt (default: "You are a
+  helpful home assistant with access to Sonos speaker controls."),
+  recorded verbatim in the parameters block.
+- `--max-new-tokens` / `--max-steps` / `--max-ctx` — generation and
+  agent-loop limits (defaults 256 / 6 / 12288), also recorded in the
+  parameters block.
 - `--out` — where to write the rendered markdown (`eval::render_markdown`'s
-  output), following the `results/<date>.md` convention above.
+  output); defaults to `eval/results/<date>-<tools>-<label>-native.md`.
+
+The rendered report's parameters block also records the tool count, the
+token length of the constant system+tools prefix (`prefix_tokens`), the
+commit hash, and the machine — see `eval/results/2026-09-10-*-native.md`
+for examples.
 
 Until that subcommand exists, `crates/llm-wasm/tests/eval.rs` exercises
 the same `eval.rs` API end to end with a scripted `FixtureGenerator`
