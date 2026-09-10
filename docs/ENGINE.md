@@ -1061,6 +1061,56 @@ validator would be stricter. `advance()` on a token the mask didn't allow
 is a documented no-op (state unchanged) rather than a panic, since it's the
 sampler's job to respect the mask, not this module's job to trust it did.
 
+## Tool-schema token diet (`src/schemadiet.rs`)
+
+`agent.rs`/`web.rs` build `Tool`s from raw MCP `tools/list` entries via
+`Tool::from_mcp` (see `template.rs`), and those raw entries carry
+JSON-Schema fields the model never needs to decide what a valid call is —
+measured with the real xLAM-2 tokenizer + chat template
+(`crates/llm-wasm/tests/schemadiet.rs`, `system` + `tools` +
+`add_generation_prompt: true`, matching how both loops render the first
+prompt of a conversation), the 13-tool Sonos preamble
+(`fixtures/sonos/tools-12.json`) is **2499 tokens** and the 34-tool one
+(`fixtures/sonos/tools.json`) is **8129 tokens** at level 0 (no diet).
+
+`diet_tools(tools: &[Value], level: DietLevel) -> Vec<Value>` runs over
+the raw MCP tool objects *before* `Tool::from_mcp` — a pure
+`Vec<Value> -> Vec<Value>` transform, generic across MCP servers (nothing
+here is keyed on a Sonos tool or property name):
+
+- **Level 1** (safe, structural only, lossless in meaning): drops
+  `annotations`, `$schema`, a schema-level `title` that duplicates
+  `description`, `additionalProperties: false`, an empty `required: []`,
+  `minLength: 1` on a string (the default), and `minimum`/`maximum` when
+  set to the i64 extremes (±9007199254740991 — a schema author's
+  "effectively unbounded" spelling, not a real bound; `seek`'s
+  `delta_millis`/`position_millis` in the Sonos fixture do this). Every
+  property name, `required` entry, `enum`, and `type` survives untouched
+  — `tests/schemadiet.rs`'s `level1_preserves_property_signatures` checks
+  the full (name, required, enum, type) signature set per tool before/after,
+  and `level1_dieted_tools_parse_identically_in_grammar` confirms
+  `grammar::tools_from_json` (read-only use, owned by another worker)
+  parses the dieted list into the same tools/required/enums as the raw
+  one. Measured: **2382 tokens** (13 tools, -117) and **7738 tokens**
+  (34 tools, -391).
+- **Level 2** (level 1 + description trimming, default OFF because the
+  dedup step is meaning-affecting): collapses whitespace runs, then drops
+  any description sentence that already appeared verbatim in an earlier
+  tool's description (first tool keeps it, later tools lose it) — the
+  Sonos payload repeats sentences like "Group volume and player volume
+  are linked — changing one affects the other." across 8 tools. Sentence
+  splitting is abbreviation-aware (won't split "e.g."/"i.e." into bogus
+  fragments that could spuriously collide across tools — see
+  `split_sentences`'s doc comment). Measured: **2318 tokens** (13 tools,
+  -64 more) and **7407 tokens** (34 tools, -331 more).
+
+**Hook-in point** (not wired up here — other workers own `agent.rs`/
+`web.rs`): call `diet_tools(&raw_mcp_tools, DietLevel::Level1)` on the
+`tools/list` result before the per-tool loop that calls `Tool::from_mcp`
+in both loops. Level 2 is available but should be an explicit opt-in
+(e.g. a config flag), not a default, since it changes the literal text a
+human — or the model — reads per tool.
+
 ## Prefix KV images
 
 Build-time-produced files that let any engine instance load a prefix's KV cache in one shot
@@ -1080,10 +1130,16 @@ dropped — redundant with the flattened layout). `KvImage::layer_slices_at` ret
 views when the data region lands 4-byte aligned in memory, and falls back to an owned copy
 otherwise (`Cow<[f32]>`).
 
-Header fields: `model_hash` (sha256 of the GGUF file, or — for files too large to hash cheaply on
-every load — `content_fingerprint`'s `sha256(file_size || first 1MiB || last 1MiB)`, either is
-just an opaque string to this format), `prefix_key` (`sha256(model_hash || rendered_prefix_text)`
-— hashing the *rendered* prompt, not the system prompt and tool list separately, means the key is
+Header fields: `model_fingerprint` — deliberately **not** a hash of the whole GGUF file (1.7GB+):
+`gguf_header_fingerprint` hashes only the GGUF header region (magic through the end of the
+tensor-info table — a few KB, contains every tensor's name/shape/dtype, from
+`gguf::GgufReader::header_bytes`/`data_section_offset`) plus the file size, cheap enough to
+recompute on every native `kv-export` run and every browser `load()` (no on-disk cache, no
+`crypto.subtle` pass over the fetched shard bytes needed). `content_fingerprint`'s coarser
+`sha256(file_size || first 1MiB || last 1MiB)` remains available for callers without a parsed GGUF
+header handy; either is just an opaque string to this format. `prefix_key`
+(`sha256(model_fingerprint || rendered_prefix_text)` — hashing the *rendered* prompt, not the
+system prompt and tool list separately, means the key is
 sensitive to chat-template version, system-prompt wording, and tool ordering all at once, matching
 how `web.rs`'s `compute_prefix_len`/`resident_tokens` already treat the rendered prompt as the
 unit of comparison), `tokens` (the prefix's token ids, for a resident-tokens equality check before
@@ -1140,25 +1196,61 @@ its doc comment / D1 in `docs/BENCHMARKS.md`) so cubecl mutates the existing buf
 instead of copying the whole `max_ctx`-sized tensor. Sets `len = n_tokens` directly, so
 `snapshot()` reflects the imported prefix with no further calls needed.
 
-### Where this plugs in (next worker's wiring step)
+### Where this plugs in (wired up)
 
-- `bin/`: a `kv-export` subcommand (native only — this is a build step, not a runtime path) that
-  loads a model, renders the prefix (system prompt + tools, per `template.rs`), computes
-  `model_hash` + `prefix_key`, runs one prefill via `model.rs`'s existing `forward_hidden`, calls
-  `KvCache::export_prefix`, and writes a `.kvimg` with `KvImage::write`.
-- `web.rs`: on `load()`/`start()`, before falling back to full prefill, compute `prefix_key` for
-  the current tools+system-prompt and check for a matching resident/cached image; on a hit, fetch
-  `<model base>/kv/<prefix_key>.kvimg`, `KvImage::read_header` + `layer_slices`, verify
-  `header.model_hash` matches the loaded GGUF's hash and `header.tokens` matches the *literal*
-  leading tokens of the newly rendered prompt (same match discipline `run_step`'s
-  `effective_prefix` check already applies to `resident_tokens`), then `KvCache::import_prefix`
-  and set `resident_tokens = header.tokens.clone()`. Needs an async GPU-upload path (`import_prefix`
-  as given is fine — `from_data`/`slice_assign` don't require a sync readback — but the readback
-  path for a *miss* that then wants to write its own image back still needs `into_data_async`).
-- `worker.js`: a `fetch(kvUrl, {cache: 'no-store'})` guarded the same way shard/tokenizer fetches
-  already are (`res.ok` check, thrown-error-carries-stack convention per the "worker.js hardening"
-  section above), gated on a 404 being a normal "no prebuilt image for this prefix" case rather
-  than a load failure.
+- `bin/llm-agent.rs`'s `kv-export` subcommand (native only — a build step, not a runtime path):
+  `--gguf`, `--model-dir`, `--tools <MCP tools/list JSON>` (any file with that shape, not just the
+  two fixed fixtures — `eval.rs`'s tools loader is duplicated locally as `load_tools_generic`
+  rather than editing that module), `--system`, `--dtype f32|q8_0` (default `q8_0`), `--out-dir`
+  (default `~/Code/idle-intelligence/models/kv/`), `--tool-order listing-first|as-is`. Renders the
+  prefix as the common leading tokens between two content-free probe utterances (`"kv-export-
+  probe-alpha"` / `"totally-different-probe-beta"` — chosen with **no shared leading text**, since
+  an earlier version shared `"kv-export-probe-"` and the token-level common prefix overran into
+  probe-specific tokens; **must** match `web.rs`'s `render_kv_prefix_tokens` verbatim, or the two
+  sides compute different `prefix_key`s for the same actual prefix), prefills
+  it via `forward_hidden`, calls `KvCache::export_prefix`, and writes `<out-dir>/<prefix_key>.kvimg`
+  + a `<prefix_key>.json` sidecar (the header, pretty-printed). `model_fingerprint` is computed
+  from `gguf::GgufReader::header_bytes` (a few KB, before `load_deferred` consumes the loader) +
+  file size via `kvimg::gguf_header_fingerprint` — no on-disk cache needed, since it never reads
+  the full 1.7GB GGUF (an earlier version streamed a full-file SHA-256 into
+  `<out-dir>/model-hashes.json`; dropped per the coordinator's "do NOT hash the full GGUF" note).
+- `web.rs`: `LlmEngine::load()` computes `model_fingerprint` itself, inside the same braced block
+  that opens the loader and calls `load_deferred` — `Q4ModelLoader::reader()`/`reader_mut()` expose
+  `file_len()`/`header_bytes()` on the wasm-side `GgufReader<ShardedCursor>` exactly as they do
+  natively, so this needs no bytes beyond what `appendModelShard` already staged and no JS-side
+  pass over the shard buffers. `LlmEngine.prefixKey(tools_json, system)` renders the prefix the
+  same way `kv-export` does and returns `sha256(model_fingerprint || prefix_text)`.
+  `LlmEngine.importKvImage(bytes, tools_json, system)` validates `header.model_fingerprint`,
+  `header.tokens` (exact match against the freshly-rendered prefix — same discipline `run_step`'s
+  `effective_prefix` check already applies to `resident_tokens`), and `header.prefix_key`/shape
+  before calling `KvCache::import_prefix` and setting `resident_tokens`; returns `false` (not an
+  error) on any mismatch so the caller falls back to normal prefill. Synchronous — `import_prefix`
+  only writes (`from_data`/`slice_assign`), no GPU readback needed.
+  `LlmEngine.exportKvImage(tools_json, system)` is the miss-path counterpart: async (uses the new
+  `KvCache::export_prefix_async`, `into_data_async`-based), checks `resident_tokens` already covers
+  the rendered prefix, and returns a `.kvimg` byte buffer for the caller to persist.
+- `worker.js`: no longer computes anything model-identity-related itself — `model_fingerprint` is
+  entirely `web.rs`'s concern now (see above), so `load()` takes no extra param beyond tokenizer/
+  template JSON + the progress callback. On each `run`, before `start()`: `prefixKey()`, then check
+  OPFS (`navigator.storage.getDirectory()`)
+  and then `fetch(<modelBase>/kv/<key>.kvimg, {cache:'no-store'})` (404 is a normal miss, not an
+  error) for a matching image; on a hit, `importKvImage()` and (if it came from the network) save a
+  copy to OPFS for next time; on a miss, `start()` runs its normal full prefill and the worker
+  fire-and-forgets an `exportKvImage()` + OPFS save afterward. `<modelBase>/kv/` is derived from the
+  GGUF shard URL by substituting its `/gguf/` path segment (`deriveKvBaseUrl`) — matches
+  `scripts/serve_models.py` serving the whole `models/` tree, `kv/` a sibling of `gguf/`/`hf/`.
+  `'status'` messages with `phase: 'kv-image'` and a human `note` report the outcome;
+  `docs/ENGINE.md`'s worker protocol comment (top of `worker.js`) documents the message shapes.
+
+Debug-only, not part of the KV-image feature itself: `LlmEngine.setPrefillKernel("naive"|"pinned")`
+(`web.rs`) / `gguf::set_force_naive_kernel` toggle production `ForceKernel::Auto` routing (which
+takes the pinned scratch-dequant + Burn matmul path at prefill's M>=32 shapes) vs forcing the naive
+per-element kernel for every prefill matmul — a numerical-divergence A/B bisection aid for browser
+runs that produce a different first tool call than native at the same tokens, added alongside this
+work at the coordinator's request; not used by any production path. `step.promptTokenIds` (added to
+`run_step`'s JSON output) and a per-step top-5 `(id, logit)` console log serve the same
+bisection — see `scripts/headless/run.mjs --tokens-out` for extracting a step's prompt token ids
+into a file for `llm-agent run --tokens <file>` native comparison.
 
 ### Sizes
 

@@ -17,6 +17,20 @@ post-compaction sizes. A compacted result over `tools::MAX_RESULT_CHARS`
 (8000 chars) is never truncated — kept in full — but logs a
 `tracing::warn!` on the native side.
 
+**Tool-schema token diet:** the tool preamble itself (the `tools/list`
+schemas rendered into the system turn, separate from any tool *result*)
+also carries avoidable tokens — `schemadiet.rs`'s `diet_tools` strips
+JSON-Schema fields the model doesn't need to decide what a valid call is
+(`annotations`, redundant `title`, `additionalProperties: false`, empty
+`required: []`, `minLength: 1`, i64-extreme `minimum`/`maximum`) without
+changing any property name, `required` list, `enum`, or `type`. Measured
+against the real tokenizer + chat template
+(`crates/llm-wasm/tests/schemadiet.rs`): the 13-tool Sonos preamble goes
+from 2499 to 2382 tokens and the 34-tool one from 8129 to 7738 tokens.
+Not wired into this eval's agent loop yet — see `docs/ENGINE.md`
+§"Tool-schema token diet" for the hook-in point and level-2 (opt-in,
+description-deduping) numbers.
+
 Dry-run tool-call eval for the Sonos LLM agent (Phase 3 of
 `sonos/PLAN.md`). No live Sonos speakers involved — the agent runs
 against the canned household in `fixtures/sonos/results/`, and each

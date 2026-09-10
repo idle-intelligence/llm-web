@@ -19,6 +19,7 @@ pub mod kvimg;
 pub mod sample;
 
 pub mod grammar;
+pub mod schemadiet;
 pub mod template;
 pub mod tools;
 pub mod agent;
