@@ -22,7 +22,14 @@ pub fn greedy(logits: &[f32]) -> u32 {
 /// Top-K argmax indices with their (unmodified) logit values, descending.
 pub fn top_k(logits: &[f32], k: usize) -> Vec<(u32, f32)> {
     let mut idx: Vec<usize> = (0..logits.len()).collect();
-    idx.sort_unstable_by(|&a, &b| logits[b].partial_cmp(&logits[a]).unwrap());
+    // NaN-safe descending sort: map NaN to -inf for the comparison only (so
+    // a stray NaN logit sorts last, never wins top-k) and use `total_cmp`
+    // for the rest so the comparator is a total order (never panics).
+    idx.sort_unstable_by(|&a, &b| {
+        let ka = if logits[a].is_nan() { f32::NEG_INFINITY } else { logits[a] };
+        let kb = if logits[b].is_nan() { f32::NEG_INFINITY } else { logits[b] };
+        kb.total_cmp(&ka)
+    });
     idx.truncate(k);
     idx.into_iter().map(|i| (i as u32, logits[i])).collect()
 }
@@ -136,4 +143,28 @@ pub fn sample(
         }
     }
     candidates.last().map(|&(id, _)| id).unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn greedy_ignores_nan_and_is_deterministic() {
+        // NaN comparisons are always false, so `greedy`'s strict `>` never
+        // selects a NaN and the first (not last) true maximum wins.
+        let logits = [1.0, f32::NAN, 3.0, 3.0, f32::NAN, 2.0];
+        assert_eq!(greedy(&logits), 2);
+    }
+
+    #[test]
+    fn top_k_sorts_nan_without_panicking() {
+        let logits = [1.0, f32::NAN, 3.0, -f32::NAN, 2.0];
+        let top = top_k(&logits, 3);
+        assert_eq!(top.len(), 3);
+        // The two non-NaN finite values that matter should be ranked first.
+        assert_eq!(top[0].0, 2);
+        assert_eq!(top[1].0, 4);
+        assert_eq!(top[2].0, 0);
+    }
 }
