@@ -714,3 +714,73 @@ still ~7-8e-5 observed) while explicitly not gating on the known model.rs bug at
 split=1000 (loudly `eprintln!`s "KNOWN BUG" with the measured diff instead of
 silently loosening the tolerance). `test_forward_02_tools_single` /
 `test_forward_03_tools_multiturn` remain greedy-exact (20/20, 28/28).
+
+## Session 7: chunked-attention 11.14 divergence — root cause + fix
+
+Scope: `model.rs::attention_scores_and_values`'s chunked branch, left as a KNOWN
+BUG by Session 6. This session isolates and fixes it.
+
+**Repro, isolated from gguf.rs/RoPE/KV-cache entirely.** Added
+`model.rs::debug_tests::chunked_attention_matches_unchunked_synthetic`: synthetic
+random q/k/v tensors at offset=1000, T=1225 (mirrors the real split), no GGUF
+model or tokenizer involved. Calling `attention_scores_and_values` (chunked
+branch, T=1225 > `ATTN_QUERY_CHUNK`=256) vs the same formula called unchunked on
+identical tensors reproduced max-abs ~0.099 in under 30s, confirming the bug
+lives entirely inside `attention_scores_and_values`.
+
+**Ruled out contiguity (Session 6's leading hypothesis).** Forced every chunked
+narrow (`q_chunk`, `k_chunk`, `v_chunk`) through a sync CPU round-trip
+(`into_data()`/`from_data()`) to materialize row-major-contiguous tensors before
+`matmul`. Bit-identical divergence (same max-abs, same flat index) — contiguity
+is not the cause.
+
+**Bisected QK^T -> mask -> softmax -> P@V independently against a CPU f64
+reference**, at the diverging row (h=2, row=178, abs query pos 1178, chunk0 of
+5): raw QK^T scores matched the CPU dot products to ~1.3e-6 max-abs (including
+the masked region); the causal mask produced exactly the expected 1179 finite
+(unmasked) entries; softmax's output matched a CPU softmax over the same masked
+row to ~1.4e-8 max-abs and summed to 1.0. Only `probs.matmul(v_chunk)` (shape
+`[1,H,256,1256]` x `[1,H,1256,16]`) was wrong — manually matmul-ing the
+GPU-verified-correct `probs` row against `v` in CPU reproduced the correct
+unchunked answer, while Burn's GPU `matmul` call on the same tensors did not.
+
+**Confirmed as a generic Burn/cubecl wgpu matmul bug, unrelated to attention.**
+A plain `matmul` on fresh random tensors shaped `[1,4,256,1256]` x `[1,4,1256,16]`
+(no softmax, no attention, no masking) diverged from a CPU f64 reference by
+**33.79** max-abs at a random index — this is a correctness bug in Burn 0.20's
+wgpu matmul kernel selection (autotune or the fixed strategy fallback; not
+re-isolated further — out of scope to patch cubecl itself) once the contraction
+dimension (K, here 1256 — `kv_len`, in the low thousands during prefill) is
+large relative to the output width (N, here 16 — a stand-in for `head_dim`).
+
+**Fix: `model.rs::pv_matmul`.** Chunks the P@V matmul's contraction (K = kv_len)
+dimension into `PV_KV_CHUNK`=256-sized blocks and sums the partial products
+instead of one large-K/small-N `matmul` call, in both the chunked and unchunked
+branches of `attention_scores_and_values` (the non-chunked T<=256 branch can
+still have large `kv_len` at nonzero offset, same bug class). Verified against
+the CPU reference with block=128 on the K=1256 synthetic case: max-abs ~1e-6
+(vs ~0.1 unfixed).
+
+**Verification (all on `xLAM-2-3b-fc-r-q4_0.gguf`, M2/Metal, `CARGO_BUILD_JOBS=4`,
+sequential on GPU):**
+
+| test | result |
+|---|---|
+| `chunked_attention_matches_unchunked_synthetic` | max_abs_diff 7.2e-7 |
+| `split_prefill_matches_single_prefill` (02, splits 2218/1000/2224) | max_abs_diff 7.3e-5 / 7.4e-5 / 7.6e-5 — all argmax + 8-token greedy match |
+| `split_prefill_matches_single_prefill` (03, splits 2221/1823 — the real MCP tool-result-suffix shapes) | max_abs_diff 1.3e-4 / 9.9e-5 — all argmax + 8-token greedy match |
+| `split_prefill_reuse_matches_fresh_alt_suffix` | max_abs_diff 6.7e-5 |
+| `test_forward_02_tools_single` | greedy-exact 20/20, prefill 75.52 tok/s |
+| `test_forward_03_tools_multiturn` | greedy-exact 28/28, prefill 66.98 tok/s |
+| `tests/q4_matmul.rs` (all) | 7 passed, 1 ignored (bench), 0 failed |
+| `cargo clippy -p llm-wasm --features wgpu --all-targets -D warnings` | clean |
+| `cargo clippy -p llm-wasm --no-default-features --features web --target wasm32-unknown-unknown -D warnings` | clean |
+
+The `split_prefill_matches_single_prefill` KNOWN BUG branch (tolerance loosened
+to `f32::INFINITY` at split=1000) is removed; all splits now hold the tight 3e-4
+P1 bound, plus two new splits (2221/1823 on `03_tools_multiturn`, seq_len=2354)
+matching the real MCP tool-result-suffix shapes (133-token and 531-token
+suffixes). Prefill tok/s (75.52 on 02, 66.98 on 03) is well above Session 5's
+73.3 tok/s baseline for 02 — `pv_matmul`'s extra K-chunked matmul calls on the
+P@V step did not regress prefill throughput; the dominant cost remains the Q4
+matmul kernel (Session 2's K2 finding), not attention.

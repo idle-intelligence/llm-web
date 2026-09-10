@@ -622,6 +622,43 @@ blocking `engine.start`/`provideToolResults` calls so `index.html` can drive a p
 
 ## Known issues / fixed
 
+### 2026-09-10: Burn/cubecl wgpu matmul mis-computes for large-K/small-N shapes (fixed: chunked-attention 11.14 logit divergence)
+
+Symptom (Session 6, docs/BENCHMARKS.md): `full_forward.rs::split_prefill_matches_single_prefill`'s
+split=1000 case (prefix 1000 rows, then 1225 rows at offset 1000) showed max-abs
+logit diff 11.14 vs a single whole-prompt prefill. Session 6 traced this to
+`model.rs::attention_scores_and_values`'s `t > ATTN_QUERY_CHUNK` branch and
+exonerated `gguf.rs`/WGSL (both matmul kernels agree with a CPU reference to
+~1e-5 on every real weight shape, at every M value from the failing split) but
+left it unfixed as a KNOWN BUG, hypothesizing non-contiguous strides from
+`Tensor::narrow` on a permuted tensor feeding `Burn::matmul`.
+
+Root cause (Session 7): **not** contiguity — forcing every chunked tensor
+through a sync CPU round-trip before `matmul` produced a bit-identical
+divergence. Bisecting QK^T -> mask -> softmax -> P@V independently against a
+CPU f64 reference (`model.rs::debug_tests::chunked_attention_matches_unchunked_synthetic`,
+fully synthetic, no GGUF model) isolated the bug to the P@V matmul
+(`probs.matmul(v)`) specifically: QK^T and softmax matched the CPU reference to
+~1e-6/~1e-8, but `probs.matmul(v_chunk)` on shape `[1,H,256,1256]` x
+`[1,H,1256,16]` did not. Confirmed as a Burn 0.20/cubecl wgpu matmul kernel bug
+unrelated to attention entirely: a plain `matmul` on fresh random tensors of
+that same shape (no softmax, no masking) diverged from a CPU reference by 33.79
+max-abs. Trigger appears to be a large contraction dimension (K = kv_len, low
+thousands during prefill) paired with a small output width (N = head_dim).
+
+Fix: `model.rs::pv_matmul` chunks the P@V matmul's contraction (K) dimension
+into 256-element blocks and sums partial products instead of one large-K/
+small-N `matmul` call, used in both branches of `attention_scores_and_values`.
+Verified: all `split_prefill_matches_single_prefill` splits (including two new
+ones matching the real MCP tool-result-suffix shapes, 133-token and 531-token
+suffixes on `03_tools_multiturn`) now hold the tight 3e-4 bound (measured
+7e-5-1.3e-4); `test_forward_02/03` remain greedy-exact; prefill tok/s unchanged
+(75.52 tok/s on `02_tools_single`, above Session 5's 73.3 baseline). Did not
+patch cubecl itself (out of scope) — this workaround avoids the bad kernel
+selection rather than fixing it upstream, so any *other* future call site with
+a similarly large-K/small-N matmul shape should chunk its contraction dimension
+the same way rather than assuming Burn's `matmul` handles it correctly.
+
 ### 2026-09-10: Tint WGSL uniformity rejects `workgroupBarrier`/`subgroupAdd` after a storage-buffer-gated early return
 
 Symptom, real Chrome (Dawn/Tint), first compute dispatch of a run:
