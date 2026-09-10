@@ -348,6 +348,16 @@ pub struct EvalReport {
     pub mean_prefill_s: f64,
     pub mean_decode_tok_s: f64,
     pub mean_total_s: f64,
+    /// `--label` this run was invoked with (`eval/README.md`'s run
+    /// naming), verbatim into the parameters block.
+    pub label: String,
+    /// System prompt verbatim (`--system`, or the built-in default).
+    pub system_prompt: String,
+    pub max_new_tokens: usize,
+    pub max_steps: usize,
+    /// Token length of the constant system+tools prefix this run's cases
+    /// shared (see `agent.rs` module docs on prefix caching).
+    pub prefix_tokens: usize,
 }
 
 /// Run every case in `cases` against `agent` under `tool_set`, skipping
@@ -406,6 +416,11 @@ pub fn run_all<G: Generator>(
         mean_prefill_s,
         mean_decode_tok_s,
         mean_total_s,
+        label: String::new(),
+        system_prompt: String::new(),
+        max_new_tokens: 0,
+        max_steps: 0,
+        prefix_tokens: 0,
     }
 }
 
@@ -420,9 +435,15 @@ pub fn render_markdown(report: &EvalReport) -> String {
     let _ = writeln!(out);
     let _ = writeln!(
         out,
-        "## Run: {}, {}, {}",
-        report.model, report.tool_set, report.backend
+        "## Run: {}, {}, {}, label={}",
+        report.model, report.tool_set, report.backend, report.label
     );
+    let _ = writeln!(out);
+    let _ = writeln!(out, "- system: {:?}", report.system_prompt);
+    let _ = writeln!(out, "- tool_count: {}", report.tool_set.tool_count());
+    let _ = writeln!(out, "- max_new_tokens: {}", report.max_new_tokens);
+    let _ = writeln!(out, "- max_steps: {}", report.max_steps);
+    let _ = writeln!(out, "- prefix_tokens: {}", report.prefix_tokens);
     let _ = writeln!(out);
     let _ = writeln!(out, "| id | correct | steps | prefill_s | decode_tok_s | total_s | reason |");
     let _ = writeln!(out, "|----|---------|-------|-----------|---------------|---------|--------|");

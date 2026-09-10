@@ -71,6 +71,18 @@ enum Commands {
         max_steps: usize,
         #[arg(long = "max-ctx", default_value_t = 12288)]
         max_ctx: usize,
+        /// System prompt for the agent (verbatim into the report's
+        /// parameters block).
+        #[arg(
+            long,
+            default_value = "You are a helpful home assistant with access to Sonos speaker controls."
+        )]
+        system: String,
+        /// Run label, folded into the output filename
+        /// (`eval/results/<date>-<tools>-<label>-native.md`) and recorded
+        /// in the parameters block.
+        #[arg(long, default_value = "default")]
+        label: String,
     },
     /// Print GGUF header/tensor info for a model file.
     GgufInfo {
@@ -112,6 +124,8 @@ fn main() -> anyhow::Result<()> {
             max_new_tokens,
             max_steps,
             max_ctx,
+            system,
+            label,
         } => run_eval(
             gguf,
             model_dir,
@@ -123,6 +137,8 @@ fn main() -> anyhow::Result<()> {
             max_new_tokens,
             max_steps,
             max_ctx,
+            &system,
+            &label,
         ),
         Commands::GgufInfo { gguf } => gguf_info(&gguf),
         Commands::Bench {
@@ -640,6 +656,8 @@ fn run_eval(
     max_new_tokens: usize,
     max_steps: usize,
     max_ctx: usize,
+    system: &str,
+    label: &str,
 ) -> anyhow::Result<()> {
     let gguf_path = gguf.unwrap_or_else(|| home_relative(DEFAULT_GGUF_SUFFIX));
     let model_dir = model_dir.unwrap_or_else(|| home_relative(DEFAULT_MODEL_DIR_SUFFIX));
@@ -656,7 +674,7 @@ fn run_eval(
             ToolSet::All => "all",
             ToolSet::Twelve => "12",
         };
-        PathBuf::from(format!("eval/results/{date}-{tag}-native.md"))
+        PathBuf::from(format!("eval/results/{date}-{tag}-{label}-native.md"))
     });
 
     // -- load model --
@@ -691,14 +709,26 @@ fn run_eval(
     let results_dir = fixtures_dir.join("results");
     let generator = NativeGenerator::new(model, max_ctx);
     let caller = FixtureCaller::new(&results_dir);
-    let mut agent = Agent::new(
-        template,
-        tokenizer,
-        generator,
-        caller,
-        "You are a helpful home assistant with access to Sonos speaker controls.",
-        max_new_tokens,
-    );
+
+    // Common system+tools prefix token length, for the report's parameters
+    // block — mirrors `Agent::prefix_len_for` (agent.rs), computed here
+    // before `template`/`tokenizer` move into `Agent::new`.
+    let first_utterance = cases.first().map(|c| c.utterance.as_str()).unwrap_or("");
+    let prefix_tokens = {
+        let render = |utterance: &str| -> anyhow::Result<Vec<u32>> {
+            let messages = vec![
+                llm_wasm::template::Message::system(system),
+                llm_wasm::template::Message::user(utterance),
+            ];
+            let prompt = template.render_prompt(&messages, &tools, true)?;
+            tokenizer.encode(&prompt, false)
+        };
+        let a = render(first_utterance)?;
+        let b = render("\u{0}prefix-cache-probe\u{0}")?;
+        a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
+    };
+
+    let mut agent = Agent::new(template, tokenizer, generator, caller, system, max_new_tokens);
     agent.set_max_steps(max_steps);
 
     // -- run, printing progress as it goes --
@@ -735,7 +765,17 @@ fn run_eval(
         results.push(result);
     }
 
-    let report = aggregate_report(results, tool_set, &gguf_path, &date);
+    let report = aggregate_report(
+        results,
+        tool_set,
+        &gguf_path,
+        &date,
+        label,
+        system,
+        max_new_tokens,
+        max_steps,
+        prefix_tokens,
+    );
     let mut markdown = eval::render_markdown(&report);
 
     let commit = git_commit_hash();
@@ -773,11 +813,17 @@ fn skipped_case_result(case: &eval::EvalCase) -> eval::CaseResult {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn aggregate_report(
     results: Vec<eval::CaseResult>,
     tool_set: ToolSet,
     gguf_path: &std::path::Path,
     date: &str,
+    label: &str,
+    system_prompt: &str,
+    max_new_tokens: usize,
+    max_steps: usize,
+    prefix_tokens: usize,
 ) -> eval::EvalReport {
     let scored: Vec<&eval::CaseResult> = results.iter().filter(|r| !r.skipped).collect();
     let n = scored.len().max(1) as f64;
@@ -814,5 +860,10 @@ fn aggregate_report(
         mean_prefill_s,
         mean_decode_tok_s,
         mean_total_s,
+        label: label.to_string(),
+        system_prompt: system_prompt.to_string(),
+        max_new_tokens,
+        max_steps,
+        prefix_tokens,
     }
 }
