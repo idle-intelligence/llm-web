@@ -109,6 +109,24 @@ enum Commands {
         #[arg(long, default_value_t = 12288)]
         max_ctx: usize,
     },
+    /// Session 10: loads once, then runs a fixed sequence of prefills at
+    /// given prefix lengths of `tokens` (fresh `KvCache` per call, so each
+    /// timing is prefill-only), reporting per-call wall time — used to
+    /// check whether `pad_m_bucket`'s M-bucketing keeps `Tensor::matmul`'s
+    /// `autotune` from re-tuning on every distinct prefill length (see
+    /// docs/BENCHMARKS.md Session 10).
+    AutotuneSweep {
+        #[arg(long)]
+        gguf: PathBuf,
+        #[arg(long)]
+        tokens: PathBuf,
+        /// Comma-separated prefix lengths to prefill in order, e.g.
+        /// "2225,2225,531,531,640".
+        #[arg(long)]
+        lengths: String,
+        #[arg(long, default_value_t = 12288)]
+        max_ctx: usize,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -157,7 +175,54 @@ fn main() -> anyhow::Result<()> {
             decode_steps,
             max_ctx,
         } => bench(&gguf, &tokens, decode_steps, max_ctx),
+        Commands::AutotuneSweep {
+            gguf,
+            tokens,
+            lengths,
+            max_ctx,
+        } => autotune_sweep(&gguf, &tokens, &lengths, max_ctx),
     }
+}
+
+fn autotune_sweep(
+    gguf_path: &std::path::Path,
+    tokens_path: &std::path::Path,
+    lengths: &str,
+    max_ctx: usize,
+) -> anyhow::Result<()> {
+    let device = WgpuDevice::default();
+    let file = File::open(gguf_path)?;
+    let reader = BufReader::new(file);
+    let mut loader = Q4ModelLoader::new(reader)?;
+    let parts = loader.load_deferred(&device)?;
+    drop(loader);
+    let model = parts.finalize(&device)?;
+
+    let tokens_json = std::fs::read_to_string(tokens_path)?;
+    let prompt_ids: Vec<u32> = serde_json::from_str(&tokens_json)?;
+
+    let lens: Vec<usize> = lengths
+        .split(',')
+        .map(|s| s.trim().parse::<usize>().expect("lengths must be comma-separated integers"))
+        .collect();
+
+    for &m in &lens {
+        assert!(
+            m <= prompt_ids.len(),
+            "requested length {m} exceeds fixture length {}",
+            prompt_ids.len()
+        );
+        let ids = &prompt_ids[..m];
+        let mut cache = model.new_cache(max_ctx);
+        let t = std::time::Instant::now();
+        let hidden = model.forward_hidden(ids, &mut cache)?;
+        let last = hidden.narrow(1, m - 1, 1);
+        let logits = model.lm_head(last);
+        let _ = llm_wasm::model::logits_to_vec(logits)?;
+        let dt_ms = t.elapsed().as_secs_f64() * 1000.0;
+        println!("M={m:5}: {dt_ms:8.1} ms ({:.1} tok/s)", m as f64 / (dt_ms / 1000.0));
+    }
+    Ok(())
 }
 
 fn gguf_info(path: &std::path::Path) -> anyhow::Result<()> {
