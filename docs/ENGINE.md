@@ -984,11 +984,71 @@ wrong-enum first character is rejected immediately, not at the closing
 quote), since the full candidate set is known up front and prefix-matching
 it is free.
 
-**Hook-in point.** `sample.rs` owns the generate loop (another worker) and
-would call `state.allowed(&vocab)` before `greedy`/`top_k`, masking out
-disallowed logits (e.g. setting them to `-inf`) before argmax/top-k, then
-`state.advance(chosen_id, &vocab)` after each step. Not wired up by this
-change.
+**Wired up (Session 12).** `sample.rs::greedy_masked`/`top_k_masked` apply
+a `TokenMask` to a logits vec before argmax/top-k (disallowed ids simply
+never win, no `-inf` rewrite needed since the comparison already skips
+them). `grammar.rs`'s `Constraint` trait (`allowed`/`advance`/`forced_run`/
+`is_complete`) is the interface `model.rs::LlmModel::generate_with_constraint`
+drives; `GrammarConstraint<'g>` is the only implementation, wrapping a
+`GrammarState` + the real `Tokenizer` + a `TokenVocab`, with `allowed()`'s
+mask recomputed eagerly on every `advance()` so it's a cheap `&self`
+reference return. `generate()` is now a thin unconstrained wrapper
+(`constraint: None`) over the same function, so every existing
+unconstrained caller and `tests/full_forward.rs`'s greedy-exact checks are
+untouched.
+
+**Jump-forward.** `forced_run()` does *not* work by checking whether the
+`TokenMask` allows exactly one *vocab token* — that condition almost never
+holds inside a forced literal, because BPE gives multiple legal vocab
+tokens simultaneously at nearly every position (different-length
+segmentations of the same forced substring: e.g. `"name"` alone was
+observed with `mask.count()` between 3 and 6 at every byte position along
+its length, never 1, even though the literal text is fully determined).
+Instead, `GrammarConstraint::forced_bytes` walks the grammar's byte-level
+DFA (`Grammar::step`) one byte at a time, scanning all 256 possible next
+bytes at each position: as long as exactly one byte is ever legal, that
+byte is forced, tokenizer-independent. Once branching resumes (>1 legal
+byte) or the walk ends, `forced_run()` re-encodes the forced byte span
+with the *real tokenizer* (`Tokenizer::encode`, byte-level BPE — a pure
+function of the input bytes, no surrounding-context dependence) to get the
+canonical token ids, verifies the round-trip (`decode` the result back and
+compare bytes — a tokenizer surprise degrades to `None`, i.e. a normal
+masked step, never wrong output) and returns those. `model.rs`'s decode
+loop appends the whole run via one `forward_hidden` call (`M = run.len()`,
+the same multi-token prefill path prefill itself uses) instead of one
+decode step per token, then continues from that call's last-position
+logits — jump-forward literally skips per-token forward passes for
+anything the grammar has already fully decided, at the cost of the
+tokenizer re-encode-and-check (cheap: milliseconds, not a GPU op).
+Measured on fixture 03 (`tests/constrained.rs`): forced bytes cover the
+whole `[{"name": "..."`/`, "arguments": {"..."}}]` scaffolding and any
+uniquely-determined enum/id value; genuine choice points (the tool name's
+first byte, an enum's first byte when >1 candidate remains) are the only
+non-forced steps.
+
+**Agent wiring.** `Agent::set_constrained(bool)` turns this on; `Agent`
+accumulates an `IdValues` across the whole conversation from every tool
+result (`IdValues::collect_from_result`, called from
+`provide_tool_results`), builds a fresh `Grammar::for_tools` every
+`step_inner` call from the current `tools` + that running `IdValues`, and
+threads it through the new `Generator::generate_constrained` trait method
+(default impl: ignores the constraint, behaves exactly like
+`generate_with_cached_prefix` — `FixtureGenerator` relies on this).
+`Step` gained `model_steps`/`forced_tokens` for eval reporting (a
+jump-forward run of `k` tokens is 1 model step, not `k`).
+
+**`web.rs`'s job (not done by this change — that file is owned by the
+worker doing the browser wiring).** The web engine's decode loop needs
+the same shape `NativeGenerator::generate_constrained` in
+`bin/llm-agent.rs` has: build a `TokenVocab` once (cache it — expensive to
+rebuild per step), build a `Grammar::for_tools` per step from the current
+tool set + an `IdValues` accumulated the same way `Agent` does, wrap it in
+a `GrammarConstraint`, and call `LlmModel::generate_with_constraint`
+instead of the current unconstrained decode loop when the engine's
+constrained flag is set. No new WGSL/WASM concerns — this is pure
+CPU-side control flow around the same `forward_hidden`/`lm_head` calls the
+unconstrained path already makes, so the existing `into_data_async().await`
+readback discipline (no `.into_data()` in WASM) is unaffected either way.
 
 **Limits.** Flat schemas only: `properties` of string/integer/boolean/
 array-of-string, no nested objects, arrays only of strings (matches every
