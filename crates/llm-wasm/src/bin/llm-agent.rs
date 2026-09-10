@@ -41,6 +41,11 @@ enum Commands {
         tokenizer: Option<PathBuf>,
         #[arg(long, default_value_t = 12288)]
         max_ctx: usize,
+        /// Print a warning and generate unconstrained (schema-constrained
+        /// decoding needs a tool schema, which a bare token-id prompt
+        /// doesn't have — see `Eval`'s `--constrained` for the real thing).
+        #[arg(long)]
+        constrained: bool,
     },
     /// Run the Sonos MCP agent eval harness (`eval/README.md`) against the
     /// real (Burn+wgpu) model, prefix-caching the constant system+tools
@@ -91,6 +96,11 @@ enum Commands {
         /// in the parameters block.
         #[arg(long, default_value = "default")]
         label: String,
+        /// Schema-constrained decoding (docs/ENGINE.md "Schema-constrained
+        /// decoding"): jump-forward through grammar-forced spans instead
+        /// of sampling them one token at a time.
+        #[arg(long)]
+        constrained: bool,
     },
     /// Print GGUF header/tensor info for a model file.
     GgufInfo {
@@ -138,7 +148,16 @@ fn main() -> anyhow::Result<()> {
             max_new,
             tokenizer,
             max_ctx,
-        } => run(&gguf, &tokens, max_new, tokenizer.as_deref(), max_ctx),
+            constrained,
+        } => {
+            if constrained {
+                eprintln!(
+                    "--constrained ignored: `run` has no tool schema to constrain against \
+                     (bare token-id prompt) — use `eval --constrained` instead"
+                );
+            }
+            run(&gguf, &tokens, max_new, tokenizer.as_deref(), max_ctx)
+        }
         Commands::Eval {
             gguf,
             model_dir,
@@ -153,6 +172,7 @@ fn main() -> anyhow::Result<()> {
             max_ctx,
             system,
             label,
+            constrained,
         } => run_eval(
             gguf,
             model_dir,
@@ -167,6 +187,7 @@ fn main() -> anyhow::Result<()> {
             max_ctx,
             &system,
             &label,
+            constrained,
         ),
         Commands::GgufInfo { gguf } => gguf_info(&gguf),
         Commands::Bench {
@@ -684,6 +705,56 @@ impl Generator for NativeGenerator {
     fn last_call_timing(&self) -> (Duration, Duration) {
         (self.last_prefill, self.last_decode)
     }
+
+    /// Same prefix-reuse prefill as `generate_with_cached_prefix`, but the
+    /// decode tail is `model.rs`'s jump-forward loop
+    /// (`LlmModel::decode_with_constraint`) instead of plain greedy —
+    /// see `docs/ENGINE.md` "Schema-constrained decoding".
+    fn generate_constrained(
+        &mut self,
+        prompt_ids: &[u32],
+        prefix_len: usize,
+        max_new_tokens: usize,
+        stop_ids: &[u32],
+        constraint: Option<&mut dyn llm_wasm::grammar::Constraint>,
+    ) -> anyhow::Result<llm_wasm::agent::GenerateOutput> {
+        anyhow::ensure!(!prompt_ids.is_empty(), "generate called with an empty prompt");
+        let prefix_len = prefix_len.min(prompt_ids.len());
+        let reuse = prefix_len > 0
+            && prefix_len == self.cached_prefix.len()
+            && prompt_ids[..prefix_len] == self.cached_prefix[..];
+
+        let t_prefill = std::time::Instant::now();
+        let suffix_start = if reuse {
+            self.cache.restore(prefix_len);
+            prefix_len
+        } else {
+            self.cache.restore(0);
+            0
+        };
+        let suffix = &prompt_ids[suffix_start..];
+        let hidden = self.model.forward_hidden(suffix, &mut self.cache)?;
+        let last = hidden.narrow(1, suffix.len() - 1, 1);
+        let logits = self.model.lm_head(last);
+        let logits_vec = llm_wasm::model::logits_to_vec(logits)?;
+        self.last_prefill = t_prefill.elapsed();
+
+        if !reuse {
+            self.cached_prefix = prompt_ids[..prefix_len].to_vec();
+        }
+
+        let t_decode = std::time::Instant::now();
+        let (ids, stats) =
+            self.model
+                .decode_with_constraint(logits_vec, max_new_tokens, stop_ids, &mut self.cache, constraint)?;
+        self.last_decode = t_decode.elapsed();
+
+        Ok(llm_wasm::agent::GenerateOutput {
+            ids,
+            model_steps: stats.model_steps,
+            forced_tokens: stats.forced_tokens,
+        })
+    }
 }
 
 const DEFAULT_GGUF_SUFFIX: &str =
@@ -739,6 +810,7 @@ fn run_eval(
     max_ctx: usize,
     system: &str,
     label: &str,
+    constrained: bool,
 ) -> anyhow::Result<()> {
     let gguf_path = gguf.unwrap_or_else(|| home_relative(DEFAULT_GGUF_SUFFIX));
     let model_dir = model_dir.unwrap_or_else(|| home_relative(DEFAULT_MODEL_DIR_SUFFIX));
@@ -821,6 +893,7 @@ fn run_eval(
 
     let mut agent = Agent::new(template, tokenizer, generator, caller, system, max_new_tokens);
     agent.set_max_steps(max_steps);
+    agent.set_constrained(constrained);
 
     // -- run, printing progress as it goes --
     let mut results = Vec::with_capacity(cases.len());

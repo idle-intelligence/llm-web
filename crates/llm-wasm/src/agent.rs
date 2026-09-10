@@ -454,7 +454,7 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
         }
         let mut constraint_impl: Option<GrammarConstraint> = grammar_for_step
             .as_ref()
-            .map(|g| GrammarConstraint::new(g, self.token_vocab.as_ref().expect("built above")));
+            .map(|g| GrammarConstraint::new(g, &self.tokenizer, self.token_vocab.as_ref().expect("built above")));
         let constraint: Option<&mut dyn Constraint> =
             constraint_impl.as_mut().map(|c| c as &mut dyn Constraint);
 

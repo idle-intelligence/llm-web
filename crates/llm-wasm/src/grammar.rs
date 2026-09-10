@@ -594,7 +594,7 @@ impl Grammar {
                     } else {
                         None
                     }
-                } else if b == b'"' {
+                } else if b == b'"' && self.has_unseen_prop(tool, seen) {
                     Some(Pos::PropKey(
                         tool,
                         seen,
@@ -825,7 +825,7 @@ impl Grammar {
             }
 
             Pos::AfterVal(tool, seen) => match b {
-                b',' => Some(Pos::PropKeyStart(tool, seen, false)),
+                b',' if self.has_unseen_prop(tool, seen) => Some(Pos::PropKeyStart(tool, seen, false)),
                 b'}' => {
                     if self.required_satisfied(tool, seen) {
                         Some(Pos::CallClose)
@@ -877,6 +877,22 @@ impl Grammar {
             .iter()
             .enumerate()
             .all(|(i, p)| !p.required || (seen & (1 << i)) != 0)
+    }
+
+    /// Whether `tool` has at least one property not yet in `seen` — i.e.
+    /// whether a `,` at `Pos::AfterVal` could ever lead anywhere. Without
+    /// this check `,` was structurally always a legal one-byte transition
+    /// at `AfterVal` (deferred rejection: the next property-key attempt
+    /// would find no candidate names left and fail then), which is
+    /// harmless for `TokenMask`-based sampling (a token spelling a bare
+    /// `,` there just never wins against `}` in practice) but poisons
+    /// `GrammarConstraint::forced_bytes`'s "exactly one legal next byte"
+    /// test — it would see `,` as a live second option and refuse to force
+    /// through `}` even when `}` is the only byte that can ever complete
+    /// the grammar (`docs/ENGINE.md` "Schema-constrained decoding" /
+    /// jump-forward).
+    fn has_unseen_prop(&self, tool: usize, seen: u32) -> bool {
+        self.tools[tool].props.len() > seen.count_ones() as usize
     }
 }
 
@@ -968,23 +984,6 @@ impl TokenMask {
 
     pub fn count(&self) -> usize {
         self.bits.iter().map(|w| w.count_ones() as usize).sum()
-    }
-
-    /// The single set bit's index, if `count() == 1`; `None` otherwise
-    /// (used by `GrammarConstraint::forced_run` to identify the one
-    /// mandatory next token at each forced step).
-    fn single_id(&self) -> Option<u32> {
-        let mut found = None;
-        for (word_idx, &w) in self.bits.iter().enumerate() {
-            if w == 0 {
-                continue;
-            }
-            if w.count_ones() != 1 || found.is_some() {
-                return None;
-            }
-            found = Some(word_idx as u32 * 64 + w.trailing_zeros());
-        }
-        found
     }
 
     pub fn len(&self) -> usize {
@@ -1125,15 +1124,55 @@ pub trait Constraint {
 /// instead of re-walking the vocab per call.
 pub struct GrammarConstraint<'g> {
     state: GrammarState<'g>,
+    tokenizer: &'g crate::tokenizer::Tokenizer,
     vocab: &'g TokenVocab,
     mask: TokenMask,
 }
 
 impl<'g> GrammarConstraint<'g> {
-    pub fn new(grammar: &'g Grammar, vocab: &'g TokenVocab) -> Self {
+    pub fn new(grammar: &'g Grammar, tokenizer: &'g crate::tokenizer::Tokenizer, vocab: &'g TokenVocab) -> Self {
         let state = GrammarState::new(grammar);
         let mask = state.allowed(vocab);
-        Self { state, vocab, mask }
+        Self {
+            state,
+            tokenizer,
+            vocab,
+            mask,
+        }
+    }
+
+    /// The longest span of bytes, starting from the current position,
+    /// where the grammar's byte-level DFA (`Grammar::step`) accepts
+    /// exactly one continuation byte at each step — i.e. the literal text
+    /// the grammar has already fully committed to, independent of how the
+    /// tokenizer happens to chunk it into BPE pieces (see `forced_run`'s
+    /// doc comment on why token-level "exactly one legal token" is far too
+    /// strict: most positions inside a forced literal have *several*
+    /// legal vocab tokens simultaneously, one per differently-lengthed BPE
+    /// segmentation of the same forced substring).
+    fn forced_bytes(&self) -> Vec<u8> {
+        let grammar = self.state.grammar;
+        let mut pos = self.state.pos;
+        let mut out = Vec::new();
+        loop {
+            let mut found: Option<(u8, Pos<'g>)> = None;
+            let mut count = 0u32;
+            for b in 0u16..256 {
+                if let Some(np) = grammar.step(pos, b as u8) {
+                    count += 1;
+                    if count > 1 {
+                        break;
+                    }
+                    found = Some((b as u8, np));
+                }
+            }
+            let Some((b, np)) = (if count == 1 { found } else { None }) else {
+                break;
+            };
+            out.push(b);
+            pos = np;
+        }
+        out
     }
 }
 
@@ -1147,26 +1186,33 @@ impl<'g> Constraint for GrammarConstraint<'g> {
         self.mask = self.state.allowed(self.vocab);
     }
 
+    /// See `forced_bytes`: finds the unambiguous forced literal (byte
+    /// level, tokenizer-independent), then re-encodes it with the real
+    /// tokenizer to get the token ids the model's own BPE would produce
+    /// for that text — the ids `model.rs`'s jump-forward prefill actually
+    /// feeds through the KV cache. Byte-level BPE tokenization is a pure
+    /// function of the input bytes (no surrounding-context dependence), so
+    /// re-encoding the forced literal in isolation reproduces exactly what
+    /// the tokenizer would have chunked it into inline — verified
+    /// defensively by decoding the result back and comparing bytes; a
+    /// mismatch (tokenizer round-trip surprise) falls back to `None`
+    /// (normal masked per-token sampling for this step) rather than risk
+    /// feeding the model text it didn't actually mean to commit to.
     fn forced_run(&self) -> Option<Vec<u32>> {
-        let mut state = self.state.clone();
-        let mut mask = self.mask.clone();
-        let mut out = Vec::new();
-        while let Some(tok) = mask.single_id() {
-            if self.vocab.eos_ids.contains(&tok) {
-                break;
-            }
-            out.push(tok);
-            state.advance(tok, self.vocab);
-            if state.is_complete() {
-                break;
-            }
-            mask = state.allowed(self.vocab);
+        let bytes = self.forced_bytes();
+        if bytes.is_empty() {
+            return None;
         }
-        if out.is_empty() {
-            None
-        } else {
-            Some(out)
+        let text = std::str::from_utf8(&bytes).ok()?;
+        let tokens = self.tokenizer.encode(text, false).ok()?;
+        if tokens.is_empty() {
+            return None;
         }
+        let round_trip = self.tokenizer.decode(&tokens, false).ok()?;
+        if round_trip.as_bytes() != bytes.as_slice() {
+            return None;
+        }
+        Some(tokens)
     }
 
     fn is_complete(&self) -> bool {

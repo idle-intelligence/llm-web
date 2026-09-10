@@ -563,14 +563,31 @@ impl LlmModel {
         max_new: usize,
         stop_ids: &[u32],
         cache: &mut KvCache,
-        mut constraint: Option<&mut dyn Constraint>,
+        constraint: Option<&mut dyn Constraint>,
     ) -> Result<(Vec<u32>, GenerateStats)> {
         assert!(!prompt_ids.is_empty());
         let hidden = self.forward_hidden(prompt_ids, cache)?;
         let last = hidden.narrow(1, prompt_ids.len() - 1, 1);
         let logits = self.lm_head(last);
-        let mut logits_vec = logits_to_vec(logits)?;
+        let logits_vec = logits_to_vec(logits)?;
+        self.decode_with_constraint(logits_vec, max_new, stop_ids, cache, constraint)
+    }
 
+    /// The decode half of `generate_with_constraint`, split out so a
+    /// caller that already has its own prefill logic (e.g.
+    /// `bin/llm-agent.rs`'s `NativeGenerator`, which prefills only the
+    /// suffix not already resident via its own KV-prefix-reuse bookkeeping)
+    /// can reuse the jump-forward decode loop without re-prefilling
+    /// `prompt_ids` from scratch. `logits_vec` is the last prefill
+    /// position's logits (`[vocab]`, already read back to CPU).
+    pub fn decode_with_constraint(
+        &self,
+        mut logits_vec: Vec<f32>,
+        max_new: usize,
+        stop_ids: &[u32],
+        cache: &mut KvCache,
+        mut constraint: Option<&mut dyn Constraint>,
+    ) -> Result<(Vec<u32>, GenerateStats)> {
         let mut out = Vec::with_capacity(max_new);
         let mut stats = GenerateStats::default();
 
