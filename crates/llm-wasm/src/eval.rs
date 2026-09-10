@@ -139,6 +139,78 @@ pub fn select_tools(all: &[Tool], subset: ToolSet, fixtures_dir: impl AsRef<Path
     }
 }
 
+/// Which order the tool preamble is rendered in — independent of
+/// [`ToolSet`] (see docs/ENGINE.md "Known issues / fixed": tool order
+/// changes the model's first call). `ListingFirst` puts
+/// `get_households_and_groups_and_players` first; `Alphabetical` uses
+/// `tools.json`'s own (alphabetical) order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolOrder {
+    Alphabetical,
+    ListingFirst,
+}
+
+impl std::fmt::Display for ToolOrder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ToolOrder::Alphabetical => write!(f, "alphabetical"),
+            ToolOrder::ListingFirst => write!(f, "listing-first"),
+        }
+    }
+}
+
+/// [`select_tools`] plus a [`ToolOrder`] choice, for both [`ToolSet`]s:
+///
+/// - `Twelve` + `ListingFirst`: `tools-12.json`'s own order (identical to
+///   [`select_tools`] — the fixed behavior).
+/// - `Twelve` + `Alphabetical`: the pre-fix behavior — `all`'s
+///   (alphabetical) order filtered down to `tools-12.json`'s names,
+///   discarding `tools-12.json`'s curated order.
+/// - `All` + `Alphabetical`: `all` unchanged (identical to
+///   [`select_tools`] — `tools.json` is already alphabetical).
+/// - `All` + `ListingFirst`: `fixtures/sonos/tools-listing-first.json`'s
+///   order (the listing tool first, then the remaining 33 in `tools.json`
+///   order), looked up against `all`'s schemas.
+pub fn select_tools_ordered(
+    all: &[Tool],
+    subset: ToolSet,
+    order: ToolOrder,
+    fixtures_dir: impl AsRef<Path>,
+) -> Result<Vec<Tool>> {
+    let fixtures_dir = fixtures_dir.as_ref();
+    match (subset, order) {
+        (ToolSet::Twelve, ToolOrder::ListingFirst) => select_tools(all, subset, fixtures_dir),
+        (ToolSet::All, ToolOrder::Alphabetical) => Ok(all.to_vec()),
+        (ToolSet::Twelve, ToolOrder::Alphabetical) => {
+            let twelve = load_mcp_tools(fixtures_dir.join("tools-12.json"))?;
+            let names: std::collections::HashSet<&str> =
+                twelve.iter().map(|t| t.function.name.as_str()).collect();
+            Ok(all
+                .iter()
+                .filter(|t| names.contains(t.function.name.as_str()))
+                .cloned()
+                .collect())
+        }
+        (ToolSet::All, ToolOrder::ListingFirst) => {
+            let ordered = load_mcp_tools(fixtures_dir.join("tools-listing-first.json"))?;
+            ordered
+                .iter()
+                .map(|t| {
+                    all.iter()
+                        .find(|a| a.function.name == t.function.name)
+                        .cloned()
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "tools-listing-first.json tool `{}` not found in the full tool set",
+                                t.function.name
+                            )
+                        })
+                })
+                .collect()
+        }
+    }
+}
+
 /// Outcome of running one [`EvalCase`] against an [`Agent`].
 #[derive(Debug, Clone)]
 pub struct CaseResult {

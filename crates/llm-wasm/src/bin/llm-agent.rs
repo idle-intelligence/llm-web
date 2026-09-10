@@ -10,7 +10,7 @@ use burn::backend::wgpu::{Wgpu, WgpuDevice};
 use burn::tensor::Tensor;
 use clap::{Parser, Subcommand};
 use llm_wasm::agent::{Agent, FixtureCaller, Generator};
-use llm_wasm::eval::{self, ToolSet};
+use llm_wasm::eval::{self, ToolOrder, ToolSet};
 use llm_wasm::gguf::{q4_matmul, set_skip_matvec_for_bench, Q4ModelLoader, Q4Tensor};
 use llm_wasm::kv::KvCache;
 use llm_wasm::model::LlmModel;
@@ -55,6 +55,14 @@ enum Commands {
         /// (`fixtures/sonos/tools-12.json`).
         #[arg(long, default_value = "all")]
         tools: String,
+        /// `alphabetical` (`tools.json`'s own order, filtered for `--tools
+        /// 12`) or `listing-first` (`get_households_and_groups_and_players`
+        /// first — `tools-12.json`'s order for `--tools 12`,
+        /// `fixtures/sonos/tools-listing-first.json`'s order for `--tools
+        /// all`). Folded into the label/filename and the parameters block
+        /// (see docs/ENGINE.md "Known issues / fixed").
+        #[arg(long = "tool-order", default_value = "listing-first")]
+        tool_order: String,
         #[arg(long, default_value = "eval/utterances.json")]
         cases: PathBuf,
         #[arg(long, default_value = "fixtures/sonos")]
@@ -117,6 +125,7 @@ fn main() -> anyhow::Result<()> {
             gguf,
             model_dir,
             tools,
+            tool_order,
             cases,
             fixtures,
             out,
@@ -130,6 +139,7 @@ fn main() -> anyhow::Result<()> {
             gguf,
             model_dir,
             &tools,
+            &tool_order,
             &cases,
             &fixtures,
             out,
@@ -649,6 +659,7 @@ fn run_eval(
     gguf: Option<PathBuf>,
     model_dir: Option<PathBuf>,
     tools_arg: &str,
+    tool_order_arg: &str,
     cases_path: &std::path::Path,
     fixtures_dir: &std::path::Path,
     out: Option<PathBuf>,
@@ -667,6 +678,16 @@ fn run_eval(
         "12" => ToolSet::Twelve,
         other => anyhow::bail!("--tools must be `all` or `12`, got `{other}`"),
     };
+    let tool_order = match tool_order_arg {
+        "alphabetical" => ToolOrder::Alphabetical,
+        "listing-first" => ToolOrder::ListingFirst,
+        other => anyhow::bail!("--tool-order must be `alphabetical` or `listing-first`, got `{other}`"),
+    };
+    // Folded into the label so it lands in both the filename and the
+    // report's `label=...` parameters-block line (see docs/ENGINE.md
+    // "Known issues / fixed").
+    let label = format!("{label}-{tool_order}");
+    let label = label.as_str();
 
     let date = today();
     let out_path = out.unwrap_or_else(|| {
@@ -699,7 +720,7 @@ fn run_eval(
 
     // -- load tools + cases --
     let all_tools = eval::load_all_tools(fixtures_dir)?;
-    let tools = eval::select_tools(&all_tools, tool_set, fixtures_dir)?;
+    let tools = eval::select_tools_ordered(&all_tools, tool_set, tool_order, fixtures_dir)?;
     let mut cases = eval::load_cases(cases_path)?;
     if let Some(only) = &only {
         let ids: std::collections::HashSet<&str> = only.split(',').map(str::trim).collect();
