@@ -524,20 +524,26 @@ impl LlmEngine {
             .map_err(|e| JsError::new(&format!("forward pass failed: {e}")))?;
         self.resident_tokens.extend_from_slice(suffix);
         let last = hidden.narrow(1, suffix.len() - 1, 1);
-        let mut logits = model.lm_head(last);
+        let logits = model.lm_head(last);
+        // P2 (docs/BENCHMARKS.md Session 4): force GPU completion here via
+        // async readback, needed anyway for the first decode token, so
+        // `prefill_ms` measures actual GPU completion instead of just
+        // kernel-submission time (previously the sync point was the first
+        // iteration of the decode loop below, silently folding prefill's
+        // real GPU time into `decode_ms`).
+        let data = logits
+            .into_data_async()
+            .await
+            .map_err(|e| JsError::new(&format!("GPU readback failed: {e}")))?;
+        let mut logits_vec: Vec<f32> = data
+            .into_vec()
+            .map_err(|e| JsError::new(&format!("failed to read back f32 logits: {e:?}")))?;
         let prefill_ms = now_ms() - prefill_start;
 
         let stop_ids = tokenizer.eos_ids();
         let mut out_ids = Vec::with_capacity(self.max_new_tokens);
         let decode_start = now_ms();
         for _ in 0..self.max_new_tokens {
-            let data = logits
-                .into_data_async()
-                .await
-                .map_err(|e| JsError::new(&format!("GPU readback failed: {e}")))?;
-            let logits_vec: Vec<f32> = data
-                .into_vec()
-                .map_err(|e| JsError::new(&format!("failed to read back f32 logits: {e:?}")))?;
             let next = greedy(&logits_vec);
             out_ids.push(next);
             if stop_ids.contains(&next) {
@@ -547,7 +553,14 @@ impl LlmEngine {
                 .forward_hidden(&[next], cache)
                 .map_err(|e| JsError::new(&format!("forward pass failed: {e}")))?;
             self.resident_tokens.push(next);
-            logits = model.lm_head(hidden);
+            let logits = model.lm_head(hidden);
+            let data = logits
+                .into_data_async()
+                .await
+                .map_err(|e| JsError::new(&format!("GPU readback failed: {e}")))?;
+            logits_vec = data
+                .into_vec()
+                .map_err(|e| JsError::new(&format!("failed to read back f32 logits: {e:?}")))?;
         }
         let decode_ms = now_ms() - decode_start;
 
