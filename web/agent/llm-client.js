@@ -10,9 +10,12 @@ export class LlmClient {
    * @param {object} opts
    * @param {(name: string, args: object) => Promise<any>} opts.toolCaller
    * @param {(evt: object) => void} [opts.onEvent] - raw worker messages, for a log view
+   * @param {boolean} [opts.gpuDebug] - wrap GPUDevice calls in error scopes (slower; ?gpudebug=1 on the worker URL)
    */
-  constructor({ toolCaller, onEvent } = {}) {
-    this.worker = new Worker('./worker.js', { type: 'module' });
+  constructor({ toolCaller, onEvent, gpuDebug = false } = {}) {
+    const workerUrl = new URL('./worker.js', import.meta.url);
+    if (gpuDebug) workerUrl.searchParams.set('gpudebug', '1');
+    this.worker = new Worker(workerUrl, { type: 'module' });
     this.toolCaller = toolCaller;
     this.onEvent = onEvent || (() => {});
     this.nextRunId = 0;

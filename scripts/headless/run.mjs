@@ -170,7 +170,11 @@ async function main() {
     args: LAUNCH_ARGS,
   });
   const page = await browser.newPage();
-  await page.goto(URL_, { waitUntil: 'load' });
+  // gpu-debug is gated behind ?gpudebug=1 (web/agent/index.html forwards it
+  // to the worker) — the harness needs it ON to catch the root WebGPU
+  // validation error instead of only cascade spam.
+  const gpuDebugUrl = URL_ + (URL_.includes('?') ? '&' : '?') + 'gpudebug=1';
+  await page.goto(gpuDebugUrl, { waitUntil: 'load' });
 
   const adapterInfo = await checkWebGpuAdapter(page);
   console.log('=== WebGPU adapter check ===');

@@ -134,8 +134,14 @@ function startThinkingTimer(phase) {
   thinkingTimer = setInterval(tick, 200);
 }
 
+// ?gpudebug=1 on this page's own URL forwards to the worker (wraps GPUDevice
+// calls in error scopes; slower, but surfaces the root WebGPU validation
+// error instead of only cascade "invalid due to a previous error" spam).
+const gpuDebug = new URLSearchParams(location.search).get('gpudebug') === '1';
+
 const client = new LlmClient({
   toolCaller,
+  gpuDebug,
   onEvent: (msg) => {
     if (msg.type === 'progress') {
       const pct = msg.total ? msg.loaded / msg.total : 0;

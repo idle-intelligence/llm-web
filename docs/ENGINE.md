@@ -475,10 +475,11 @@ front (header + all tensor offsets are read before any tensor's bytes), so there
 incremental parse available to consume bytes as they arrive off the wire — `ShardedCursor` reads
 `Vec<Vec<u8>>` in memory, `Read+Seek`-compatible, purely to avoid ever forcing one contiguous
 >2GB `Vec<u8>` allocation (wasm32 pointer/length fields and some allocators choke well before the
-4GB address-space ceiling). **Decision: `worker.js`'s `load` handler fetches the (single, in this
-model's case) shard URL fully into memory with progress reporting, then calls
-`appendModelShard`/`load` once** — no attempt to stream tensor-by-tensor GPU upload during the
-fetch. 1.74GB resident in wasm linear memory, plus the GPU-side buffers `finalize()` allocates
+4GB address-space ceiling). **Decision: `worker.js`'s `load` handler streams each shard URL's
+fetch reader straight into the engine, coalescing chunks to ~16MB before each `appendModelShard`
+call (progress reported at least every 8MB)** — no full-shard JS buffer, and no attempt to stream
+tensor-by-tensor GPU upload beyond that. Peak wasm-linear-memory residency is one coalesced chunk
+at a time, not the whole 1.74GB shard, plus the GPU-side buffers `finalize()` allocates
 (dropped from CPU memory once GPU upload completes, per the existing two-phase `Q4ModelLoader`
 design), comfortably clears wasm32's 4GB ceiling with room for the KV cache (~906MB f32 at
 12288 ctx, `kv.rs`'s own arithmetic) and working buffers. If disk-side sharding is ever added
