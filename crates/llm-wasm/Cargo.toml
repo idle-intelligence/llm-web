@@ -18,7 +18,7 @@ wasm-opt = false
 
 [features]
 default = ["wgpu", "native"]
-wgpu = ["burn/wgpu", "burn/template"]
+wgpu = ["burn/wgpu", "burn/template", "burn/autotune"]
 # Native CLI + native tokenizer build (never compiled for wasm32 — the `llm-agent`
 # bin is gated on this feature via `required-features` above).
 native = ["dep:clap", "dep:tokenizers", "tokenizers/fancy-regex"]

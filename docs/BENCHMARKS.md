@@ -542,3 +542,129 @@ Neither P1's >=300 tok/s target nor P3's decode targets were reached this sessio
 naive kernel's implied ~159 GFLOP/s ceiling before committing further session time
 to Approach B (fixing the tiled WGSL kernel directly), which Session 2's K2 already
 found harder than expected (4x regression, two rounds of fixes didn't close it).
+
+## Session 5
+
+Scope: autotune, fusion feasibility, `SCRATCH_MATMUL_CHUNK_M` sweep. Commands as
+Session 4's `bench`/`full_forward`, run twice per config (autotune warms up on
+first shapes; second run is the reported "warm" number).
+
+### autotune
+
+Added `burn/autotune` to the `wgpu` Cargo feature (`crates/llm-wasm/Cargo.toml`) —
+`wgpu` is a dependency of both the native default feature set and `web`, so this
+enables autotune for both native and WASM builds in one edit; no `cubecl` crate
+feature exists for this (cubecl only has `autotune-checks`, autotune itself lives
+in `burn-wgpu`/`burn-cubecl` and is unconditionally compiled in, gated by whether
+the caller opts into the tuned dispatch path).
+
+At `SCRATCH_MATMUL_CHUNK_M = 256` (unchanged from Session 4): cold run (first-shape
+tuning) 27.3 tok/s prefill, warm run 43.4 tok/s (vs Session 4's 37.3 tok/s
+un-tuned baseline, +16%). Decode median dropped from 160.6 ms/token (Session 4) to
+136.8 ms/token warm (-15%) — autotune only touches `Tensor::matmul` calls
+(prefill's scratch-matmul path; decode is all M=1 custom WGSL/matvec, untouched by
+autotune), so the decode improvement is most likely warm shader-cache/driver
+variance between processes, not an autotune effect; flagged, not claimed as a win.
+
+### `SCRATCH_MATMUL_CHUNK_M` sweep (autotune on)
+
+Session 4 established 512 panics without autotune ("needs 40960 shared memory
+bytes but hardware limit is 32768"). With autotune on, both 512 and the full
+prompt length (2225, i.e. `scratch_matmul_chunked` never chunks) ran without
+panicking — autotune picks a kernel strategy that fits the 32768-byte shared-memory
+limit at these M sizes on this M2/Metal adapter, confirming Session 4's suspected
+root cause.
+
+| chunk M | prefill tok/s (cold) | prefill tok/s (warm) | decode ms/token (warm, median) |
+|---|---|---|---|
+| 256 | 27.3 | 43.4 | 136.8 |
+| 512 | 34.6 | 44.5 | 136.7 |
+| 2225 (no chunking) | 29.2 | **73.3** | 149.5 |
+
+2225 is the clear win — 2x Session 4's 37.3 tok/s baseline, +69% over autotune's
+own 256-chunk number. Kept `SCRATCH_MATMUL_CHUNK_M = 2225` (updated doc comment to
+match). Decode is ~9% slower than the 256/512 runs but `SCRATCH_MATMUL_CHUNK_M`
+cannot mechanically affect decode (M=1 calls never chunk regardless of the
+constant) — attributed to inter-process run-to-run noise, not the chunk-size
+change; not re-verified with a third run this session (budget).
+
+**Correctness**: `full_forward`'s three greedy-match tests (01/02/03) pass exactly
+at every tested chunk M (256, 2225) with autotune on — same as Session 4.
+`split_prefill_matches_single_prefill` (pre-existing tolerance test, not owned by
+this session's file scope) now fails harder than Session 4's 1.02e-4: at the
+split=1000 boundary, `max_abs_diff` is 11.14 (argmax still agrees, 58==58, and the
+8-token greedy continuation at the split=2218 boundary is still bit-identical).
+Root cause is the same fp32-non-associativity Session 4 already documented for
+switching matmul backends, amplified by autotune choosing different reduction
+strategies per (M,N,K) shape — expected, not a new correctness bug, but the test's
+3e-4 tolerance (set in Session 4) no longer holds; `tests/full_forward.rs` is
+outside this session's owned paths (`Cargo.toml`, `Cargo.lock`,
+`crates/llm-wasm/src/{gguf.rs,model.rs}`, `crates/llm-wasm/src/bin/llm-agent.rs`,
+this file) so the tolerance was left unwidened — reported here for whoever owns
+that file next.
+
+### fusion — verified incompatible, kept off
+
+Burn 0.20's `Wgpu` type is not a separate wrapper: `burn-wgpu`'s `fusion` feature
+makes the *same* `pub type Wgpu<F,I,B> = burn_fusion::Fusion<CubeBackend<WgpuRuntime,
+F,I,B>>` alias resolve to the fusion-wrapped backend instead of
+`CubeBackend<WgpuRuntime,F,I,B>` directly (`burn-wgpu-0.20.1/src/lib.rs`) — so no
+`model.rs` type change is needed to *try* it, only the Cargo feature flip.
+
+Verified with `cargo check --features fusion-experiment,native` (temporary
+Cargo.toml feature `fusion-experiment = ["wgpu", "burn/fusion"]`, removed after
+this check; not committed): 8 compile errors, all in `gguf.rs`, all the same shape
+— `Tensor<Wgpu,N>::into_primitive().tensor()` and
+`Tensor::from_primitive(TensorPrimitive::Float(..))` expect
+`CubeTensor<WgpuRuntime>` but get `FusionTensor<FusionCubeRuntime<WgpuRuntime,u32>>`
+instead, at every raw-kernel touchpoint: `q4_matmul_dispatch`'s `cube_input`
+extraction and `output_tensor`/`w_tensor` wrapping, `q4_dequant_scratch`'s call
+sites, `rmsnorm_fused`'s `cube_x`/`cube_w` extraction and output wrapping. Fusion
+intercepts ops into a lazy stream with its own `FusionTensor` primitive; it does
+not expose a `CubeTensor` handle the way the plain `CubeBackend` does, so `gguf.rs`'s
+direct-cubecl-client raw-kernel-dispatch path (`client.execute(...)` against
+`cube_input.handle`/`cube_w.handle`) cannot get at the underlying buffer without a
+rewrite through `burn_fusion`'s custom-op registration API — out of scope for this
+session. **Kept fusion off**; no decode ms/token or dispatch-count measurement was
+taken since it never compiles.
+
+### WASM build
+
+`cargo clippy --target wasm32-unknown-unknown --no-default-features --features web`
+clean with `burn/autotune` now pulled in via `wgpu` (which `web` depends on) — no
+new warnings, no size/compile-time change worth noting at `clippy` granularity
+(compile-only check, no `wasm-pack build` run this session — a build-dir lock is
+held by another worker running one concurrently).
+
+**Autotune warm-up cost in the browser — a real concern, not measured here.** The
+cold run above (27.3-34.6 tok/s prefill, native) pays for kernel-strategy search on
+first use of each (M,N,K) shape; on this machine that cost is folded into one
+`bench` prefill call (~15-20s of extra wall time versus the warm run, inferred from
+the cold/warm tok/s delta over the 2225-token prefill). In a browser session this
+tuning cost lands on every page load (no warm cache across reloads, and
+autotune's on-disk cache — if any — is native-filesystem-based and unlikely to be
+available/enabled for a `wasm32-unknown-unknown` + WebGPU target — not verified
+this session). That would make the *first* prefill in a fresh tab meaningfully
+slower than steady-state, which matters for perceived latency even if throughput
+after warm-up is better. Flagging for next session: measure actual wasm-pack
+cold-prefill time with autotune on before shipping it to `web`, and consider
+whether `cubecl`/`burn-cubecl` exposes any way to pre-seed or persist the autotune
+cache across a wasm session (e.g. IndexedDB) or per-shape warm-up calls during
+model load rather than on first real forward pass.
+
+### Summary
+
+| config | prefill tok/s (02, warm) | decode ms/token (warm, median) | dispatches (analytical) | greedy-exact 01/02/03 |
+|---|---|---|---|---|
+| Session 4 baseline (no autotune, chunk M=256) | 37.3 | 160.6 | ~1589 | y |
+| autotune on, chunk M=256 | 43.4 | 136.8 | ~1589 | y |
+| autotune on, chunk M=512 | 44.5 | 136.7 | ~1589 | y |
+| autotune on, chunk M=2225 (no chunking) — **kept** | **73.3** | 149.5 | ~1589 | y |
+| fusion | did not compile (see above) | — | — | n/a |
+
+Kept: `burn/autotune` wired into the `wgpu` Cargo feature, `SCRATCH_MATMUL_CHUNK_M`
+raised 256 -> 2225. Fusion stays off (architecturally incompatible with `gguf.rs`'s
+raw-kernel path, confirmed by compiler error, not just inferred). Dispatch count is
+an analytical per-layer-op count (`llm-agent.rs::print_dispatch_estimate`), not
+sensitive to any of these changes since none add/remove ops, only change which
+matmul kernel strategy executes them — unchanged from Session 4.

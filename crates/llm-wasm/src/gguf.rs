@@ -1024,16 +1024,27 @@ fn q4_dequant_scratch(
 }
 
 /// Largest M chunk for `scratch_matmul_chunked`'s calls into Burn's
-/// `Tensor::matmul`. Same root cause as `model.rs::ATTN_QUERY_CHUNK`
-/// (see its doc comment): this build's wgpu backend has no `autotune`
-/// cubecl feature, so it falls back to a fixed `Strategy::Auto` matmul
-/// kernel that panics with "shared memory ... hardware limit" once M gets
-/// into the low thousands on this M2/Metal adapter — observed at the full
-/// M=2225/2354 prefill lengths with "needs 40960 shared memory bytes but
-/// hardware limit is 32768". 256 matches `ATTN_QUERY_CHUNK` and is known
-/// not to panic for that kernel; verified separately for this matmul shape
-/// by `full_forward`'s greedy-match tests (docs/BENCHMARKS.md Session 4).
-const SCRATCH_MATMUL_CHUNK_M: usize = 256;
+/// `Tensor::matmul`. Session 4: this build had no `autotune` cubecl feature,
+/// so `Tensor::matmul` fell back to a fixed `Strategy::Auto` matmul kernel
+/// that panicked with "shared memory ... hardware limit" ("needs 40960
+/// shared memory bytes but hardware limit is 32768") once M got into the low
+/// thousands on this M2/Metal adapter, forcing a 256-wide chunk (matching
+/// `model.rs::ATTN_QUERY_CHUNK`'s same-root-cause workaround).
+///
+/// Session 5: enabled `burn/autotune` (see `Cargo.toml`'s `wgpu` feature) —
+/// autotune picks a kernel strategy that fits the 32768-byte shared-memory
+/// limit at this shape, so chunking is no longer required for correctness.
+/// Raised to 2225 (this benchmark's full prompt length, i.e.
+/// `scratch_matmul_chunked` never actually chunks at that prompt length) for
+/// throughput: 73.3 tok/s warm vs 43.4 tok/s at the old 256 chunk on the
+/// `02_tools_single` prefill (docs/BENCHMARKS.md Session 5) — fewer, larger
+/// `Tensor::matmul` calls beat more numerous smaller ones once autotune keeps
+/// them from panicking. Verified via `full_forward`'s greedy-match tests
+/// (01/02/03 exact) at both 256 and 2225; not verified past this prompt
+/// length's shape — if a much longer prefill panics again, the fix is to
+/// lower this back down (chunking still works correctly for M > this value,
+/// it's purely a throughput/safety-margin tradeoff, not a correctness one).
+const SCRATCH_MATMUL_CHUNK_M: usize = 2225;
 
 /// Chunks `x[B,M,K] . w[1,K,N]` over the M dimension — see
 /// `SCRATCH_MATMUL_CHUNK_M`'s doc comment for why.
