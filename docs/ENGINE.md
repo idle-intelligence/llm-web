@@ -653,6 +653,29 @@ condition was computed from a storage-buffer load, and no `return`/`break`/
 `continue` derived from such a load may skip a barrier call for only some
 invocations. Push the bounds check down into the loads/stores instead.
 
+**Addendum, same day:** the guard-work-not-barriers rule alone is not
+sufficient when the *loop itself* is bounded by a storage-buffer value and
+contains a barrier — `shader_q4_matvec.wgsl`'s tile loop
+(`loop { if (tile_start >= K) { break; } ... workgroupBarrier(); }`) still
+tripped Tint in the headless Chromium harness even after the return-before-
+barrier fix, because the loop's exit condition depends on `K` (read from
+`info`), which Tint taints non-uniform regardless of guard placement. Fix:
+stage every control value that drives a barrier-gating loop/branch through
+`var<workgroup>` + `workgroupUniformLoad` — thread 0 writes `info`'s fields
+into a `var<workgroup> array<...>`, then every thread reads it back via
+`let x = workgroupUniformLoad(&wg_array);` (one call for the whole array,
+not one per scalar — it already contains its own barrier pair). Tint's
+uniformity analysis special-cases `workgroupUniformLoad`'s result as
+uniform. Applied to `shader_rmsnorm.wgsl`, `shader_q4_matvec.wgsl`,
+`shader_q4_matvec_subgroup.wgsl`. Verified end-to-end in the headless
+Chromium harness (`web/agent/`, real Dawn/Tint): full prefill+decode with
+a tool call and a follow-up turn completed with no shader errors. Updated
+rule: **any control value that gates a loop or branch containing a barrier
+or subgroup op must be loaded via `workgroupUniformLoad`, not read directly
+from a storage buffer** — the guard-work-not-barriers pattern is still
+correct for per-thread bounds checks (`row < N`, `b < B`) that only guard
+work, never a barrier.
+
 ### 2026-09-10: `eval --tools 12` tool preamble silently reordered (not a KV-cache bug)
 
 Symptom: `llm-agent eval --tools 12` on `m01`/`s09` ("Pause the kitchen." / "Resume
