@@ -855,3 +855,20 @@ A ready-to-run version of this harness lives at `scripts/headless/repro.mjs`
 - **Per-step re-render cost** (review finding 6): each agent step
   re-renders the full chat-template prompt from scratch rather than
   incrementally extending it — not addressed here.
+
+### 2026-09-10: Autotune and prefill shapes
+
+`Tensor::matmul`'s `burn/autotune` (enabled since Session 5) tunes a kernel
+strategy per distinct `(M,N,K)` shape and has no persistent cache across a
+browser session — every new prefill length M paid a fresh tuning pass, and
+since every agent-loop utterance and tool result has a different M, this meant
+constant re-tuning rather than a one-time warm-up. Fixed in `gguf.rs`'s
+`q4_matmul_dispatch`: the scratch-dequant+matmul path now pads the input's M
+up to a fixed bucket (`pad_m_bucket` — multiples of 32 below 128, multiples of
+128 at/above) before calling `Tensor::matmul`, and slices the output back to
+the real M, so autotune only ever sees a small, reused set of shapes
+(128, 256, ..., 2304, ...) regardless of how ragged the actual prefill lengths
+are; `SCRATCH_MATMUL_CHUNK_M` dropped from 2225 to 2048 (itself 128-aligned)
+so a chunked prefill's remainder chunk stays bucket-aligned too. See
+docs/BENCHMARKS.md Session 10 for the in-process bucket-reuse measurement and
+the padding-is-numerically-inert test in `tests/q4_matmul.rs`.

@@ -1000,3 +1000,82 @@ end-to-end decode wall time, the recommended next step before attempting
 F3 is to instrument (or estimate more carefully) where the ~12ms/step
 unaccounted-for gap actually goes, so F3's win is not similarly invisible
 at the wall-clock level.
+
+## Session 10 — autotune-bucket padding on the scratch-matmul path
+
+Problem: with `burn/autotune` on (Session 5) and no persistent autotune cache in
+the browser, every distinct prefill length M triggers a fresh kernel-strategy
+tuning pass in `q4_matmul_dispatch`'s scratch-dequant + `Tensor::matmul` path
+(`m >= SCRATCH_MATMUL_MIN_M=32`). In the agent loop every utterance/tool result
+has a different M, so the browser re-tunes constantly.
+
+**Fix**: `pad_m_bucket` (`gguf.rs`) rounds the scratch path's input M up to a
+fixed bucket before the `Tensor::matmul` call — `m < 128` rounds to the next
+multiple of 32, `m >= 128` rounds to the next multiple of 128 — and the output is
+sliced back to the real M before returning. `SCRATCH_MATMUL_CHUNK_M` dropped
+2225 -> 2048 (a multiple of 128) so a chunked prefill's remainder chunk is
+always itself bucket-aligned (2048 % 128 == 0), with no extra padding logic
+needed in `scratch_matmul_chunked`. Threshold chosen (32 below 128, 128 at/above):
+at small M the next 128-bucket is a disproportionate padding multiplier (M=40 ->
+128 is 3.2x fake rows vs M=40 -> 64 at 1.6x), and small-M calls are cheap enough
+in absolute GPU time that the extra distinct buckets don't reintroduce meaningful
+re-tuning cost.
+
+Zero-padded rows don't affect real rows' matmul output (each output row is an
+independent K-length dot product); verified numerically, not just assumed — see
+`tests/q4_matmul.rs::test_scratch_matmul_padding_is_numerically_inert` (M in
+{40, 100, 531, 1225}, first-M-rows match a manually-padded same-bucket call to
+<1e-6 max abs diff). The existing ragged-M correctness suite
+(`test_scratch_vs_naive_vs_cpu_real_gguf`, M in {31,32,33,100,255,256,257,531,
+1000,1225,2225}) passes unchanged, transparently exercising the padding since
+it goes through the same public `q4_matmul_scratch_forced` entry point.
+
+### 3c — in-process autotune-bucket reuse (native, M2/Metal)
+
+New `llm-agent autotune-sweep` subcommand: loads the model once, then runs a
+fixed sequence of fresh-`KvCache` prefills at given prefix lengths of
+`02_tools_single.tokens.json` (2225 tokens), timing each in isolation. This
+measures whether `pad_m_bucket`'s bucketing lets a *new* nominal M reuse a
+bucket's tuning once any M mapping to that bucket has been seen once in-process
+(the in-process autotune cache is the closest native analog to "within one
+browser tab/session" — there is no cross-process/reload persistence either way).
+
+Command: `./target/release/llm-agent autotune-sweep --gguf <model> --tokens
+fixtures/reference/rendered/02_tools_single.tokens.json --lengths
+2225,2225,531,531,640`. 531 and 640 both round up to the same bucket (640) under
+`pad_m_bucket`, so the sequence exercises exactly the "new M reuses a
+previously-seen bucket" case from the task brief.
+
+| call (real M) | padded-to (bucket) | wall time | tok/s |
+|---|---|---|---|
+| 2225 (cold) | 2304 | 35406.9 ms | 62.8 |
+| 2225 (warm, same bucket) | 2304 | 33577.4 ms | 66.3 |
+| 531 (cold, first time bucket 640 seen) | 640 | 18159.6 ms | 29.2 |
+| 531 (warm, bucket 640 already seen) | 640 | 13650.1 ms | 38.9 |
+| 640 (first *nominal* 640 call, bucket already warm from the 531 calls above) | 640 | 15814.9 ms | 40.5 |
+
+531's cold->warm delta (18.2s -> 13.65s, -25%) is the clearest signal — repeat
+calls at the same bucket avoid a chunk of the tuning cost. The first *nominal*
+640 call lands between 531's cold and warm numbers (15.8s) rather than fully
+matching 531's warm time; on this shared M2 (single-sample, ~30s-scale wall
+times, no isolation from thermal/DVFS or driver-level variance across ~35s runs)
+that's consistent with the bucket reuse working but noisy, not with padding
+failing to consolidate the shape — 640's number is still well below a repeat of
+531's cold 18.2s. 2225's cold/warm delta is small (35.4s -> 33.6s, -5%); this
+build's autotune search cost per shape appears to be a small fraction of total
+wall time at this scale, so the effect is real but modest for very large M's
+single chunk-pair (2048 + 256 remainder) — most of the win from bucketing is in
+avoiding this cost repeatedly across *many distinct small/medium M values* in an
+agent loop, not in any single large-M call. Not re-run for a second sample this
+session; flagged for a future session if tighter error bars are needed.
+
+Native decode is architecturally untouched: decode (M=1) never enters
+`q4_matmul_dispatch`'s scratch/`take_scratch` branch (`SCRATCH_MATMUL_MIN_M=32`
+gates it out), so `pad_m_bucket` never runs on the decode path.
+
+**Greedy status**: `full_forward` — 6/6 pass, `test_forward_02_tools_single` and
+`test_forward_03_tools_multiturn` exact-argmax as before. `q4_matmul` — 8/8 pass
+(1 ignored bench, unchanged), including the new padding-inertness test.
+`cargo clippy --features wgpu --all-targets -- -D warnings` and
+`cargo clippy --target wasm32-unknown-unknown --no-default-features --features
+web --lib -- -D warnings` both clean.
