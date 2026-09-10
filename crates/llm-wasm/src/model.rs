@@ -414,7 +414,9 @@ impl LlmModel {
     }
 
     /// Embed `token_ids` on CPU (per-row Q4 dequant) and upload as `[1, T, hidden]`.
-    fn embed_tokens(&self, token_ids: &[u32]) -> Tensor<Wgpu, 3> {
+    /// `pub` (not just used internally) so `llm-agent bench` can time the
+    /// CPU dequant + upload step in isolation (docs/BENCHMARKS.md P1c).
+    pub fn embed_tokens(&self, token_ids: &[u32]) -> Tensor<Wgpu, 3> {
         let hidden = self.config.hidden_size;
         let mut data = vec![0.0f32; token_ids.len() * hidden];
         for (i, &id) in token_ids.iter().enumerate() {

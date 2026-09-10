@@ -769,6 +769,25 @@ pub fn has_subgroup_support() -> bool {
     HAS_SUBGROUPS.load(Ordering::Relaxed)
 }
 
+/// Bench-only instrumentation (docs/BENCHMARKS.md P1c): when set, `q4_matmul`
+/// skips its GPU kernel launch entirely and returns an uninitialized output
+/// buffer of the correct shape/dtype. Used by `llm-agent bench` to measure
+/// "everything else" (RMSNorm, RoPE, attention, SwiGLU elementwise, residual
+/// adds, cache writes) in isolation from the Q4 matvec/matmul cost. Defaults
+/// to `false`; never set outside the bench binary — output is garbage
+/// whenever this is `true`, so it must never be enabled on a path whose
+/// numerics are checked (`full_forward`'s greedy-match tests never touch
+/// this).
+static SKIP_MATVEC_FOR_BENCH: AtomicBool = AtomicBool::new(false);
+
+pub fn set_skip_matvec_for_bench(skip: bool) {
+    SKIP_MATVEC_FOR_BENCH.store(skip, Ordering::Relaxed);
+}
+
+pub fn skip_matvec_for_bench() -> bool {
+    SKIP_MATVEC_FOR_BENCH.load(Ordering::Relaxed)
+}
+
 struct Q4MatvecKernel;
 
 impl KernelSource for Q4MatvecKernel {
@@ -882,6 +901,21 @@ fn q4_matmul_dispatch(input: Tensor<Wgpu, 3>, weights: &Q4Tensor, force_tiled: b
     let blocks_per_row = k / 32;
 
     let output_handle = client.empty(b * m * n * 4);
+
+    if skip_matvec_for_bench() {
+        // Bench-only bypass: skip the kernel launch, return the
+        // uninitialized buffer as-is. See `set_skip_matvec_for_bench`'s doc
+        // comment — output is garbage, never enabled on a numerics-checked
+        // path.
+        let output_tensor = CubeTensor::new_contiguous(
+            client,
+            device,
+            burn::prelude::Shape::from(vec![b, m, n]),
+            output_handle,
+            DType::F32,
+        );
+        return Tensor::from_primitive(TensorPrimitive::Float(output_tensor));
+    }
 
     let info: [u32; 5] = [
         b as u32,
