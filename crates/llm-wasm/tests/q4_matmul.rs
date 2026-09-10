@@ -113,6 +113,21 @@ fn run_gpu_matmul(input: &[f32], q4_bytes: &[u8], m: usize, k: usize, n: usize) 
     out.into_data().into_vec::<f32>().expect("f32 output")
 }
 
+/// Like `run_gpu_matmul` but with an explicit batch dimension `b` (input
+/// shape `[b, m, k]`) — exercises `q4_matmul`'s `B`/`b_valid` handling
+/// directly, e.g. B>1 M=1 decode (classifier-free guidance's dual-batch KV
+/// caches). Batch rows are numerically independent (same weights, no
+/// cross-batch interaction), so `cpu_matmul(..., m = b*m, ...)` is a valid
+/// reference regardless of how the b/m split is expressed on the GPU side.
+fn run_gpu_matmul_b(input: &[f32], q4_bytes: &[u8], b: usize, m: usize, k: usize, n: usize) -> Vec<f32> {
+    let device = device();
+    let weights = Q4Tensor::from_q4_bytes(q4_bytes, [n, k], &device).expect("upload Q4 weights");
+    let input_t: Tensor<Wgpu, 3> =
+        Tensor::<Wgpu, 1>::from_floats(input, &device).reshape([b, m, k]);
+    let out = q4_matmul(input_t, &weights);
+    out.into_data().into_vec::<f32>().expect("f32 output")
+}
+
 fn run_gpu_matmul_tiled_forced(input: &[f32], q4_bytes: &[u8], m: usize, k: usize, n: usize) -> Vec<f32> {
     let device = device();
     let weights = Q4Tensor::from_q4_bytes(q4_bytes, [n, k], &device).expect("upload Q4 weights");
@@ -236,33 +251,67 @@ fn test_q4_matmul_synthetic_shapes() {
     }
 }
 
-/// K1: decode matvec (M=1) at N=151936 (lm_head/embedding width), both K
-/// values the model actually uses. `q4_matmul` dispatches the cooperative
-/// `shader_q4_matvec.wgsl` kernel whenever `B*M==1` (gguf.rs), so this
-/// exercises that kernel at the largest N in the model — the real
+/// Decode matvec (M=1) at N=151936 (lm_head/embedding width), both K
+/// values the model actually uses, B in {1, 2} — B>1 exercises the coalesced
+/// kernel's `b_valid`/`B` handling directly (Session 6: `q4_matmul` now
+/// dispatches the matvec kernel whenever `m==1`, not just `b*m==1` — see
+/// gguf.rs's dispatch comment). N=151936 = 37984 * MATVEC_COALESCED_ROWS_PER_WG
+/// (exact multiple, but still the largest N in the model and the shape most
+/// likely to expose an off-by-one in the dispatch grid math). The real
 /// `token_embd.weight` test below covers K=2048/N=151936 against real
-/// weights; this covers the synthetic K=11008/N=151936 combination too, for
-/// full N x K coverage at M=1 per the task brief.
+/// weights; this covers the synthetic K=11008/N=151936 combination too.
 #[test]
 fn test_q4_matvec_m1_large_n() {
     let shapes = [(2048usize, 151936usize), (11008, 151936)];
     for &(k, n) in &shapes {
         let (q4_bytes, cpu_weights) = random_q4(n, k, 0xFEED ^ (k as u64) ^ ((n as u64) << 20));
-        let input = random_input(1, k, 0xC0DE + k as u64);
-        let cpu_out = cpu_matmul(&input, &cpu_weights, 1, k, n);
-        let gpu_out = run_gpu_matmul(&input, &q4_bytes, 1, k, n);
-        assert_eq!(cpu_out.len(), gpu_out.len());
+        for &b in &[1usize, 2usize] {
+            let input = random_input(b, k, 0xC0DE + k as u64 + b as u64 * 7);
+            let cpu_out = cpu_matmul(&input, &cpu_weights, b, k, n);
+            let gpu_out = run_gpu_matmul_b(&input, &q4_bytes, b, 1, k, n);
+            assert_eq!(cpu_out.len(), gpu_out.len());
 
-        let mut max_err = 0f32;
-        for (c, g) in cpu_out.iter().zip(gpu_out.iter()) {
-            max_err = max_err.max((c - g).abs());
+            let mut max_err = 0f32;
+            for (c, g) in cpu_out.iter().zip(gpu_out.iter()) {
+                max_err = max_err.max((c - g).abs());
+            }
+            let tol = 0.05 * (k as f32).sqrt();
+            assert!(
+                max_err < tol,
+                "coalesced matvec K={k} N={n} B={b} M=1: max_err={max_err} exceeds tol={tol}"
+            );
+            println!("coalesced matvec K={k} N={n} B={b} M=1: max_err={max_err} (tol {tol})");
         }
-        let tol = 0.05 * (k as f32).sqrt();
-        assert!(
-            max_err < tol,
-            "K1 matvec K={k} N={n} M=1: max_err={max_err} exceeds tol={tol}"
-        );
-        println!("K1 matvec K={k} N={n} M=1: max_err={max_err} (tol {tol})");
+    }
+}
+
+/// Session 6: coalesced matvec (M=1) at the model's small/medium N shapes
+/// (2048, 11008), K in {2048, 11008}, B in {1, 2} — the N=151936 shapes are
+/// covered separately above (`test_q4_matvec_m1_large_n`) and against real
+/// GGUF weights (`test_q4_matmul_real_gguf_token_embd`) to avoid duplicating
+/// that test's large CPU-reference-buffer cost here.
+#[test]
+fn test_q4_matvec_coalesced_shapes() {
+    let shapes = [(2048usize, 2048usize), (2048, 11008), (11008, 2048), (11008, 11008)];
+    for &(k, n) in &shapes {
+        let (q4_bytes, cpu_weights) = random_q4(n, k, 0xC0A1E5CE ^ (k as u64) ^ ((n as u64) << 20));
+        for &b in &[1usize, 2usize] {
+            let input = random_input(b, k, 0x5A1AD + k as u64 + b as u64 * 13);
+            let cpu_out = cpu_matmul(&input, &cpu_weights, b, k, n);
+            let gpu_out = run_gpu_matmul_b(&input, &q4_bytes, b, 1, k, n);
+            assert_eq!(cpu_out.len(), gpu_out.len());
+
+            let mut max_err = 0f32;
+            for (c, g) in cpu_out.iter().zip(gpu_out.iter()) {
+                max_err = max_err.max((c - g).abs());
+            }
+            let tol = 0.05 * (k as f32).sqrt();
+            assert!(
+                max_err < tol,
+                "coalesced matvec K={k} N={n} B={b} M=1: max_err={max_err} exceeds tol={tol}"
+            );
+            println!("coalesced matvec K={k} N={n} B={b} M=1: max_err={max_err} (tol {tol})");
+        }
     }
 }
 

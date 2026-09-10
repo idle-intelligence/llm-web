@@ -784,3 +784,98 @@ suffixes). Prefill tok/s (75.52 on 02, 66.98 on 03) is well above Session 5's
 73.3 tok/s baseline for 02 — `pv_matmul`'s extra K-chunked matmul calls on the
 P@V step did not regress prefill throughput; the dominant cost remains the Q4
 matmul kernel (Session 2's K2 finding), not attention.
+
+## Session 8 — coalesced matvec (D3)
+
+Scope: `wgsl/shader_q4_matvec_coalesced.wgsl` (new), `gguf.rs` M=1 dispatch
+(kernel selection + workgroup sizing), `tests/q4_matmul.rs` M=1 coverage,
+`llm-agent bench` (no changes needed - its 4 isolated-matvec shapes already
+match the task's target list). Machine shared with another worker running
+`full_forward`/`q4_matmul` GPU tests concurrently per the task brief; all
+numbers below were re-measured with `pgrep -fl "full_forward-|llm-agent "`
+confirming no other GPU process running at measurement time (two runs back
+to back agreed to within 0.1ms, a third run taken *while* the other worker's
+`cargo test -p llm-wasm --features wgpu --test q4_matmul` was mid-run showed
+179ms/token - 1.8x worse - confirming the noise floor this task's brief
+warned about and why the idle-check matters).
+
+**Root cause (K1, superseded)**: each 32-lane row-group's lane owned one
+whole Q4_0 block (4 consecutive u32 words of the repacked `weights` buffer),
+so lane `l` read words `4l..4l+3` while lane `l+1` read `4l+4..4l+7` - a
+stride-4-words gap between lanes, uncoalesced. **Fix**: `weights` is repacked
+per row into `blocks_per_row * 4` consecutive words (unchanged from K5); the
+new kernel maps lane `l` to word `l`, `l+32`, `l+64`, ... within the row, so
+consecutive lanes read consecutive words - each 32-lane transaction reads a
+contiguous 128-byte run. `x` is read directly from `input` (not staged into
+workgroup-shared memory): it's tiny (K floats, 8-44KB) relative to the
+weight traffic this kernel is bandwidth-bound on, and stays cache-resident;
+staging was not measured as a separate variant given the isolated-GB/s
+numbers below already show the weight-read fix dominates. WG_SIZE=128,
+ROWS_PER_WG=4 (down from K1's 256/8 - fewer rows/workgroup gave the Tint
+compiler simpler control flow with no `workgroupUniformLoad` staging needed,
+since this kernel's only barriers are in the unconditional/uniform-bound
+final reduction, never gated by a runtime `K`/`N`/`B` branch - see the
+shader's header comment). Word loop unrolled x4.
+
+Also changed: `q4_matmul_dispatch`'s M==1 routing condition changed from
+`b * m == 1` to `m == 1` - the matvec kernel's `B`/`b_valid` handling
+(`wg_id.y`, per-batch guard) was already written to be batch-general in K1,
+just never reachable because the dispatch condition excluded B>1. Now B>1
+M=1 decode (e.g. classifier-free guidance's dual-batch KV caches) also takes
+the coalesced kernel instead of falling through to the naive per-element
+kernel. K1's kernel/shader is kept in-tree, selectable via the new
+`ForceKernel::MatvecK1` / `q4_matmul_matvec_k1_forced` for future A/B
+comparison, but is no longer reachable from `ForceKernel::Auto`.
+
+**Correctness**: `cargo test --release --features wgpu --test q4_matmul`
+(all 7 non-ignored tests) pass - extended `test_q4_matvec_m1_large_n`
+(N=151936, K in {2048,11008}) and new `test_q4_matvec_coalesced_shapes`
+(N in {2048,11008}, K in {2048,11008}) to cover B in {1,2} at M=1 for the
+N x K grid the task specified (the two large-N cases already existed
+from K1; N=151936 with K=11008 was already covered too). `cargo test
+--release --features wgpu --test full_forward -- --test-threads=1` (all 6
+tests): greedy-exact unchanged, run once after confirming the other
+worker's GPU tests were idle.
+
+**Isolated matvec GB/s** (`llm-agent bench`, 100 iters/shape, measured idle,
+two clean runs agreeing to <0.1 GB/s):
+
+| K | N | before (K1, Session 2) | after (coalesced) |
+|---|---|---|---|
+| 2048 | 151936 (lm_head) | 26.6 | **51.4** |
+| 2048 | 11008 (gate/up) | 23.4 | **43.8** |
+| 11008 | 2048 (down) | 22.7 | **51.0-51.2** |
+| 2048 | 2048 (q/o) | 16.4 | **33.7-33.8** |
+
+1.5-2.1x per shape. The >=60GB/s target is not met on any shape - closest is
+the two larger-byte-count shapes (lm_head, ffn_down) at ~51GB/s (85% of
+target); the two smaller shapes plateau lower, consistent with per-dispatch
+overhead being a larger fraction of a shorter kernel run (K=2048/N=2048 is
+2.36MB of weight traffic at 0.070ms/call - sub-100us calls are increasingly
+dispatch-overhead-bound on this GPU/driver, the same effect K2's tiled
+kernel ran into at a different scale). Not chased further this session -
+x-staging into shared memory (the other variant the task asked to measure)
+was skipped once the direct-global-read numbers already closed most of the
+gap; it remains the next thing to try if 60GB/s is still required.
+
+**Decode ms/token** (`02_tools_single`, 2225 tokens, median of 32 steps,
+measured idle, two clean runs both 101.1ms):
+
+| | before (Session 7 baseline, confounded by D1/D2a/attention changes) | after (coalesced matvec) |
+|---|---|---|
+| decode ms/token | 180-214ms range (Session 3/5/7 numbers, not a clean pre-change control on this exact codepath) | **101.1** |
+
+The <=100ms/token target is met to within measurement noise (101.1ms, two
+runs agreeing exactly) - 1.1ms over. Per-token breakdown (P1c): matvec_sum
+now 38.98ms (was 77.3ms at Session 2's K1 baseline on this same fixture, a
+1.98x reduction consistent with the isolated GB/s gains), "everything else"
+(RMSNorm/RoPE/attention/SwiGLU/residuals/cache-writes) 58.74ms - matvec is
+no longer the larger of the two buckets; a decode-step budget under 100ms
+now depends on shrinking "everything else" (Session 3's D2b/c/d RoPE/SiLU
+fusion, left undone, is the next lever per that session's own note).
+
+**x-staging variant chosen**: direct global reads from `input`, no
+workgroup-shared staging tile (see shader header comment for the bandwidth
+reasoning). Not empirically A/B'd against a staged variant within this
+session's time budget - flagged above as the next thing to try if further
+GB/s headroom is needed.

@@ -60,8 +60,13 @@ const NAIVE_WG_X: u32 = 16;
 const NAIVE_WG_Y: u32 = 16;
 
 // Q4_0 matvec (M=1 decode) cooperative kernel: WG_SIZE=256, ROWS_PER_WG=8 —
-// see wgsl/shader_q4_matvec.wgsl's header comment.
+// see wgsl/shader_q4_matvec.wgsl's header comment. K1, unused by default
+// dispatch since Session 6 (see MATVEC_COALESCED_ROWS_PER_WG below).
 const MATVEC_ROWS_PER_WG: usize = 8;
+
+// Session 6 coalesced matvec: WG_SIZE=128, ROWS_PER_WG=4 — see
+// wgsl/shader_q4_matvec_coalesced.wgsl's header comment.
+const MATVEC_COALESCED_ROWS_PER_WG: usize = 4;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -846,6 +851,23 @@ impl KernelSource for Q4MatvecKernel {
     }
 }
 
+/// Session 6 (docs/BENCHMARKS.md): word-interleaved coalesced matvec —
+/// replaces `Q4MatvecKernel` (K1) as the default portable (non-subgroup)
+/// M=1 kernel. K1 is kept in-tree (unused by default dispatch) as a
+/// reference/rollback point — see `wgsl/shader_q4_matvec_coalesced.wgsl`'s
+/// header comment for the access-pattern fix.
+struct Q4MatvecCoalescedKernel;
+
+impl KernelSource for Q4MatvecCoalescedKernel {
+    fn source(&self) -> SourceTemplate {
+        SourceTemplate::new(include_str!("wgsl/shader_q4_matvec_coalesced.wgsl"))
+    }
+
+    fn id(&self) -> KernelId {
+        KernelId::new::<Self>()
+    }
+}
+
 struct Q4MatvecSubgroupKernel;
 
 impl KernelSource for Q4MatvecSubgroupKernel {
@@ -937,6 +959,11 @@ pub enum ForceKernel {
     /// Force the scratch-dequant + Burn `Tensor::matmul` path even when M
     /// is below `SCRATCH_MATMUL_MIN_M`.
     Scratch,
+    /// Force K1's superseded stride-4-words matvec kernel (requires M==1) —
+    /// kept selectable for Session 6's before/after A/B bench comparison in
+    /// docs/BENCHMARKS.md; not used by production `ForceKernel::Auto`
+    /// routing, which now always takes the coalesced kernel for M==1.
+    MatvecK1,
 }
 
 /// Forces K2's tiled kernel regardless of M (native only, requires B==1) —
@@ -958,6 +985,12 @@ pub fn q4_matmul_naive_forced(input: Tensor<Wgpu, 3>, weights: &Q4Tensor) -> Ten
 /// test-only, see `ForceKernel::Scratch`.
 pub fn q4_matmul_scratch_forced(input: Tensor<Wgpu, 3>, weights: &Q4Tensor) -> Tensor<Wgpu, 3> {
     q4_matmul_dispatch(input, weights, ForceKernel::Scratch)
+}
+
+/// Forces K1's superseded matvec kernel (requires M==1) — test/bench-only,
+/// see `ForceKernel::MatvecK1`.
+pub fn q4_matmul_matvec_k1_forced(input: Tensor<Wgpu, 3>, weights: &Q4Tensor) -> Tensor<Wgpu, 3> {
+    q4_matmul_dispatch(input, weights, ForceKernel::MatvecK1)
 }
 
 struct Q4DequantKernel;
@@ -1161,7 +1194,7 @@ fn q4_matmul_dispatch(input: Tensor<Wgpu, 3>, weights: &Q4Tensor, force: ForceKe
     let take_scratch = match force {
         ForceKernel::Auto => m >= SCRATCH_MATMUL_MIN_M && n < SCRATCH_MATMUL_MAX_N,
         ForceKernel::Scratch => true,
-        ForceKernel::Tiled | ForceKernel::Naive => false,
+        ForceKernel::Tiled | ForceKernel::Naive | ForceKernel::MatvecK1 => false,
     };
     if take_scratch {
         let w_handle = q4_dequant_scratch(&client, weights);
@@ -1196,22 +1229,42 @@ fn q4_matmul_dispatch(input: Tensor<Wgpu, 3>, weights: &Q4Tensor, force: ForceKe
         .with_buffer(output_handle.clone().binding())
         .with_buffer(info_handle.binding());
 
-    // M==1 (decode): dispatch the cooperative matvec kernel (K1 —
-    // wgsl/shader_q4_matvec{,_subgroup}.wgsl) instead of the naive
-    // one-thread-per-output kernel. M>1 (prefill) keeps the naive kernel
-    // unless a test forces K2's tiled kernel (see `q4_matmul`'s doc comment
-    // — not the production default).
-    if force == ForceKernel::Auto && b * m == 1 {
-        let kernel: Box<dyn CubeTask<AutoCompiler>> = if has_subgroup_support() {
-            Box::new(SourceKernel::new(Q4MatvecSubgroupKernel, CubeDim::new_1d(256)))
+    // M==1 (decode): dispatch the cooperative matvec kernel (Session 6's
+    // coalesced kernel — wgsl/shader_q4_matvec_coalesced.wgsl, or K1's
+    // subgroup variant when available) instead of the naive
+    // one-thread-per-output kernel. Condition is `m == 1`, not `b * m == 1`
+    // — the matvec kernel's `b`/`B` handling (wg_id.y, `b_valid` guard) was
+    // already batch-general, so B>1 M=1 decode (e.g. classifier-free
+    // guidance's dual-batch KV caches) now also takes this path instead of
+    // falling through to the naive kernel. M>1 (prefill) keeps the naive
+    // kernel unless a test forces K2's tiled kernel (see `q4_matmul`'s doc
+    // comment — not the production default).
+    if force == ForceKernel::Auto && m == 1 {
+        let (kernel, rows_per_wg): (Box<dyn CubeTask<AutoCompiler>>, usize) = if has_subgroup_support() {
+            (
+                Box::new(SourceKernel::new(Q4MatvecSubgroupKernel, CubeDim::new_1d(256))),
+                MATVEC_ROWS_PER_WG,
+            )
         } else {
-            Box::new(SourceKernel::new(Q4MatvecKernel, CubeDim::new_1d(256)))
+            (
+                Box::new(SourceKernel::new(Q4MatvecCoalescedKernel, CubeDim::new_1d(128))),
+                MATVEC_COALESCED_ROWS_PER_WG,
+            )
         };
-        let wg_x = n.div_ceil(MATVEC_ROWS_PER_WG) as u32;
+        let wg_x = n.div_ceil(rows_per_wg) as u32;
         let wg_y = b as u32;
         client
             .launch(kernel, CubeCount::new_2d(wg_x, wg_y), bindings)
             .expect("Q4 matvec kernel launch failed");
+    } else if force == ForceKernel::MatvecK1 {
+        assert_eq!(m, 1, "ForceKernel::MatvecK1 requires M==1");
+        let kernel: Box<dyn CubeTask<AutoCompiler>> =
+            Box::new(SourceKernel::new(Q4MatvecKernel, CubeDim::new_1d(256)));
+        let wg_x = n.div_ceil(MATVEC_ROWS_PER_WG) as u32;
+        let wg_y = b as u32;
+        client
+            .launch(kernel, CubeCount::new_2d(wg_x, wg_y), bindings)
+            .expect("Q4 matvec (K1) kernel launch failed");
     } else if cfg!(not(target_arch = "wasm32")) && b == 1 && force == ForceKernel::Tiled {
         // K2 (native only, B==1, test-forced only): tiled matmul with
         // workgroup-shared dequant/weight reuse — see
