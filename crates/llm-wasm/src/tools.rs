@@ -126,3 +126,51 @@ pub fn format_tool_result(name: &str, result: &Value) -> Message {
         tool_call_id: None,
     }
 }
+
+/// If `result` is an MCP-shaped error — `isError: true` (MCP's
+/// `CallToolResult` convention: `{"isError": true, "content": [...]}`) or
+/// a top-level `error` field (as `ToolCaller`/native callers might carry
+/// it) — extract a human-readable message; `None` if `result` doesn't
+/// look like an error at all.
+pub fn tool_error_message(result: &Value) -> Option<String> {
+    if let Some(error) = result.get("error") {
+        let message = match error {
+            Value::String(s) => s.clone(),
+            Value::Object(o) => o
+                .get("message")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| error.to_string()),
+            other => other.to_string(),
+        };
+        return Some(message);
+    }
+    if result.get("isError").and_then(Value::as_bool) == Some(true) {
+        let message = result
+            .get("content")
+            .and_then(Value::as_array)
+            .and_then(|items| items.first())
+            .and_then(|item| item.get("text"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| "tool call failed".to_string());
+        return Some(message);
+    }
+    None
+}
+
+/// Build the `tool`-role `Message` fed back for an error result (see
+/// `tool_error_message`): `content` is the compact JSON string
+/// `{"error": "<message>"}`, distinct from `format_tool_result`'s shape so
+/// the model can tell a failed call from a successful one at a glance.
+pub fn format_tool_error(name: &str, message: &str) -> Message {
+    let content = to_json_compact_py(&serde_json::json!({ "error": message }))
+        .unwrap_or_else(|_| format!("{{\"error\": {message:?}}}"));
+    Message {
+        role: "tool".to_string(),
+        content: Some(Value::String(content)),
+        tool_calls: None,
+        name: Some(name.to_string()),
+        tool_call_id: None,
+    }
+}

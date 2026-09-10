@@ -1061,6 +1061,79 @@ validator would be stricter. `advance()` on a token the mask didn't allow
 is a documented no-op (state unchanged) rather than a panic, since it's the
 sampler's job to respect the mask, not this module's job to trust it did.
 
+## Agent loop (`src/agent.rs`)
+
+**Malformed-output retry policy.** A live browser run surfaced the model
+emitting `[]<|im_end|>` (an empty tool-call array) on two consecutive
+steps, each getting appended to history as an empty assistant turn —
+wasting 2 steps and teaching the model its own junk output was a valid
+conversational turn. `Agent::step_inner` now treats three shapes of model
+output as *invalid, not a turn*: an empty tool-call array (`[]`),
+output starting with `[` that doesn't parse as `Vec<ToolCall>`
+(`tools::parse_output`'s `Err` case), or a tool-call array naming a tool
+outside the current `tools` set. None of these get an assistant message
+appended to `messages`, and none consume the `max_steps` budget (that's
+charged once per `step_inner` call, before the retry loop). Instead
+`step_inner` regenerates, changing something each attempt so a
+deterministic sampler doesn't just reproduce the same junk:
+
+- **Retry 1**: turns schema-constrained decoding on for this attempt only
+  (`generate_attempt(force_constrained: true)`), if it wasn't already on
+  and `tools` is non-empty. Doesn't touch `self.constrained`.
+- **Retry 2**: appends a short generic nudge as a `user` message
+  (`RETRY_NOTE`: "Respond with a tool call from the list or a final
+  answer.") and regenerates with whatever constrained setting was already
+  active. This message *does* become part of history going forward.
+- Exhausting `max_retries` (default 2, `Agent::set_max_retries`) gives up
+  with `StepOutcome::Error { message: "model produced no valid call", step:
+  None }`.
+
+The accepted step's `Step.retries` records how many retries it took (0 if
+the first attempt was already valid).
+
+**Tool-error feedback.** `Agent::provide_tool_results` checks each result
+with `tools::tool_error_message` — `Some(msg)` for an MCP `isError: true`
+result (message pulled from `content[0].text`, generically) or a
+top-level `error` field (string, or an object's `message` key), `None`
+otherwise. An error result is *not* passed to `format_tool_result`;
+instead `tools::format_tool_error(name, msg)` builds a `tool`-role message
+whose `content` is the compact JSON string `{"error": "<msg>"}`, distinct
+in shape from a successful result so the model can tell them apart at a
+glance. A non-error result resets a running `consecutive_tool_errors`
+counter to 0; an error result increments it, and once it exceeds
+`MAX_CONSECUTIVE_TOOL_ERRORS` (2) — i.e. a third consecutive tool error —
+`provide_tool_results` gives up with `StepOutcome::Error` instead of
+feeding that error back and generating again. `Step.tool_errors` records
+the running consecutive-error count as of that step (0 unless the
+immediately preceding tool result was an error).
+
+**Step budget vs. retries.** `max_steps` (`Agent::set_max_steps`) counts
+only `step_inner` calls (one per `start`/`provide_tool_results`
+invocation) — the malformed-output retries inside a single `step_inner`
+call are capped separately by `max_retries` and never increment
+`step_index`.
+
+**Schema-diet hook-in.** `Agent::start_from_mcp(utterance, raw_mcp_tools)`
+is a new entry point alongside `start` for callers holding raw MCP
+`tools/list` entries rather than pre-built `Tool`s: it runs them through
+`schemadiet::diet_tools(_, DietLevel::Level1)` before `Tool::from_mcp`
+when `Agent`'s diet flag is on (`Agent::set_diet`, on by default), then
+calls `start`. `start`/`run` taking pre-built `Tool`s directly (as every
+existing test and the byte-fidelity template tests do) are completely
+unaffected — the diet only applies on the `start_from_mcp` path.
+
+**What `web.rs` must mirror** (not done here — that file's worker owns
+it): the same three behaviours, adapted to the step-wise browser loop —
+(1) an empty/unparsable/unknown-tool model output must not become an
+assistant turn; retry with constrained-on then a `user`-role nudge, capped
+at 2, then surface an error to the page; (2) an MCP tool result carrying
+`isError: true` (or an `error` field) must be fed back as a `tool` message
+with `{"error": "<msg>"}` content, not `format_tool_result`'s normal
+shape, and 3 consecutive tool errors should stop the turn with an error
+rather than looping; (3) apply `schemadiet::diet_tools(_, DietLevel::Level1)`
+to the raw `tools/list` result before the per-tool `Tool::from_mcp` loop,
+by default.
+
 ## Tool-schema token diet (`src/schemadiet.rs`)
 
 `agent.rs`/`web.rs` build `Tool`s from raw MCP `tools/list` entries via

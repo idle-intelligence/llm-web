@@ -1,6 +1,6 @@
 //! MCP tool-call parsing tests (phase 1a).
 
-use llm_wasm::tools::{format_tool_result, parse_output, ParsedOutput, ToolCall};
+use llm_wasm::tools::{format_tool_error, format_tool_result, parse_output, tool_error_message, ParsedOutput, ToolCall};
 use serde_json::json;
 use std::path::PathBuf;
 
@@ -161,4 +161,31 @@ fn non_json_text_is_left_verbatim() {
     let msg = format_tool_result("pause", &json!("Kitchen is now paused."));
     let content = msg.content.unwrap();
     assert_eq!(content, serde_json::Value::String("\"Kitchen is now paused.\"".to_string()));
+}
+
+#[test]
+fn tool_error_message_detects_mcp_is_error() {
+    let result = json!({"isError": true, "content": [{"type": "text", "text": "group not found"}]});
+    assert_eq!(tool_error_message(&result), Some("group not found".to_string()));
+}
+
+#[test]
+fn tool_error_message_detects_top_level_error_field() {
+    let result = json!({"error": "no such group"});
+    assert_eq!(tool_error_message(&result), Some("no such group".to_string()));
+}
+
+#[test]
+fn tool_error_message_is_none_for_a_normal_result() {
+    let result = json!({"groupId": "RINCON_KITCHEN01:1"});
+    assert_eq!(tool_error_message(&result), None);
+}
+
+#[test]
+fn format_tool_error_builds_error_tool_message() {
+    let msg = format_tool_error("pause", "group not found");
+    assert_eq!(msg.role, "tool");
+    assert_eq!(msg.name.as_deref(), Some("pause"));
+    let content = msg.content.expect("content should be set");
+    assert_eq!(content, serde_json::Value::String(r#"{"error": "group not found"}"#.to_string()));
 }

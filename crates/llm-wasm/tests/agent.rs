@@ -267,3 +267,192 @@ fn prefix_is_stable_across_utterances_for_same_tools() {
     assert!(common > 100, "expected a substantial shared prefix, got {common} tokens");
     assert!(common < a.len() && common < b.len());
 }
+
+// --- Retry / tool-error / schema-diet policy (see `docs/ENGINE.md` "Agent loop") ---
+
+/// (a) An empty tool-call array `[]` followed by a valid call: 1 retry
+/// recorded on step 1, 2 steps total, and the tool actually gets called
+/// (no bogus assistant turn was appended for the `[]`).
+#[test]
+fn retries_once_on_empty_array_then_calls_tool() {
+    let Some((template, tokenizer)) = load_agent_parts() else {
+        return;
+    };
+
+    let empty_turn = script_tokens(&tokenizer, "[]<|im_end|>");
+    let pause_turn = script_tokens(
+        &tokenizer,
+        r#"[{"name": "pause", "arguments": {"group_id": "RINCON_KITCHEN01:1"}}]<|im_end|>"#,
+    );
+    let answer_turn = script_tokens(&tokenizer, "Paused.<|im_end|>");
+
+    let generator = FixtureGenerator::new(vec![empty_turn, pause_turn, answer_turn]);
+    let caller = FixtureCaller::new(results_dir());
+    let mut agent = Agent::new(template, tokenizer, generator, caller, "sys", 64);
+
+    let transcript = agent
+        .run("pause the kitchen", &tools_12(), 6)
+        .expect("agent should recover from the empty array via retry");
+
+    assert_eq!(transcript.steps.len(), 2, "retry should not count as its own step");
+    assert_eq!(transcript.steps[0].retries, 1);
+    match &transcript.steps[0].parsed {
+        ParsedOutput::ToolCalls(calls) => assert_eq!(calls[0].name, "pause"),
+        other => panic!("expected tool call after retry, got {other:?}"),
+    }
+    assert_eq!(agent.caller().calls_seen.len(), 1);
+    assert_eq!(agent.caller().calls_seen[0].0, "pause");
+}
+
+/// (b) Two consecutive `[]` outputs, then a note-retry that produces a
+/// valid call: 2 retries recorded on the one step.
+#[test]
+fn retries_twice_with_note_then_calls_tool() {
+    let Some((template, tokenizer)) = load_agent_parts() else {
+        return;
+    };
+
+    let empty_turn = script_tokens(&tokenizer, "[]<|im_end|>");
+    let pause_turn = script_tokens(
+        &tokenizer,
+        r#"[{"name": "pause", "arguments": {"group_id": "RINCON_KITCHEN01:1"}}]<|im_end|>"#,
+    );
+
+    let generator = FixtureGenerator::new(vec![empty_turn.clone(), empty_turn, pause_turn]);
+    let caller = FixtureCaller::new(results_dir());
+    let mut agent = Agent::new(template, tokenizer, generator, caller, "sys", 64);
+
+    let outcome = agent.start("pause the kitchen", &tools_12());
+    match outcome {
+        StepOutcome::NeedTools { calls, step } => {
+            assert_eq!(step.retries, 2);
+            assert_eq!(calls[0].name, "pause");
+        }
+        StepOutcome::Final { .. } => panic!("expected NeedTools"),
+        StepOutcome::Error { message, .. } => panic!("unexpected error: {message}"),
+    }
+}
+
+/// (c) Three invalid outputs in a row (more than `max_retries` allows)
+/// gives up with `StepOutcome::Error` instead of looping forever.
+#[test]
+fn three_invalid_outputs_give_up_with_error() {
+    let Some((template, tokenizer)) = load_agent_parts() else {
+        return;
+    };
+
+    let empty_turn = script_tokens(&tokenizer, "[]<|im_end|>");
+    let generator = FixtureGenerator::new(vec![empty_turn.clone(), empty_turn.clone(), empty_turn]);
+    let caller = FixtureCaller::new(results_dir());
+    let mut agent = Agent::new(template, tokenizer, generator, caller, "sys", 64);
+
+    let outcome = agent.start("pause the kitchen", &tools_12());
+    match outcome {
+        StepOutcome::Error { message, step } => {
+            assert!(step.is_none());
+            assert!(message.contains("no valid call"), "unexpected message: {message}");
+        }
+        other => panic!("expected Error after exhausting retries, got: {other:?}"),
+    }
+}
+
+/// (d) A tool-error result is fed back as `{"error": ...}` and the model's
+/// next call is still accepted (one consecutive error is well under the
+/// give-up threshold).
+#[test]
+fn tool_error_result_is_fed_back_and_next_call_accepted() {
+    let Some((template, tokenizer)) = load_agent_parts() else {
+        return;
+    };
+
+    let pause_turn = script_tokens(
+        &tokenizer,
+        r#"[{"name": "pause", "arguments": {"group_id": "RINCON_KITCHEN01:1"}}]<|im_end|>"#,
+    );
+    let resume_turn = script_tokens(
+        &tokenizer,
+        r#"[{"name": "resume", "arguments": {"group_id": "RINCON_KITCHEN01:1"}}]<|im_end|>"#,
+    );
+
+    let generator = FixtureGenerator::new(vec![pause_turn, resume_turn]);
+    let caller = FixtureCaller::new(results_dir());
+    let mut agent = Agent::new(template, tokenizer, generator, caller, "sys", 64);
+
+    let outcome = agent.start("pause the kitchen", &tools_12());
+    let call_id = match outcome {
+        StepOutcome::NeedTools { calls, .. } => calls[0].call_id.clone(),
+        other => panic!("expected NeedTools for step 1, got {other:?}"),
+    };
+
+    let outcome = agent.provide_tool_results(vec![(call_id, serde_json::json!({"error": "group not found"}))]);
+    match outcome {
+        StepOutcome::NeedTools { calls, step } => {
+            assert_eq!(calls[0].name, "resume");
+            assert_eq!(step.tool_errors, 1);
+            let prompt = agent.tokenizer().decode(&step.prompt_tokens, false).unwrap();
+            assert!(prompt.contains("{\"error\":"), "expected error feedback in prompt:\n{prompt}");
+        }
+        other => panic!("expected NeedTools (model's next call accepted), got {other:?}"),
+    }
+}
+
+/// (e) A call naming a tool outside the current `tools` set counts as a
+/// retry, not an accepted call.
+#[test]
+fn unknown_tool_name_retries_instead_of_calling() {
+    let Some((template, tokenizer)) = load_agent_parts() else {
+        return;
+    };
+
+    let unknown_turn = script_tokens(&tokenizer, r#"[{"name": "not_a_real_tool", "arguments": {}}]<|im_end|>"#);
+    let pause_turn = script_tokens(
+        &tokenizer,
+        r#"[{"name": "pause", "arguments": {"group_id": "RINCON_KITCHEN01:1"}}]<|im_end|>"#,
+    );
+
+    let generator = FixtureGenerator::new(vec![unknown_turn, pause_turn]);
+    let caller = FixtureCaller::new(results_dir());
+    let mut agent = Agent::new(template, tokenizer, generator, caller, "sys", 64);
+
+    let outcome = agent.start("pause the kitchen", &tools_12());
+    match outcome {
+        StepOutcome::NeedTools { calls, step } => {
+            assert_eq!(step.retries, 1);
+            assert_eq!(calls[0].name, "pause");
+        }
+        other => panic!("expected NeedTools after retrying past the unknown tool, got {other:?}"),
+    }
+}
+
+/// (f) With the schema diet on (the default), a raw MCP tool carrying an
+/// `annotations` field renders into a prompt that no longer contains it.
+#[test]
+fn diet_on_strips_annotations_from_rendered_prompt() {
+    let Some((template, tokenizer)) = load_agent_parts() else {
+        return;
+    };
+
+    let raw_tools = vec![serde_json::json!({
+        "name": "pause",
+        "description": "Pause playback on a group.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"group_id": {"type": "string"}},
+            "required": ["group_id"],
+        },
+        "annotations": {"title": "Pause", "readOnlyHint": false},
+    })];
+
+    let answer_turn = script_tokens(&tokenizer, "OK.<|im_end|>");
+    let generator = FixtureGenerator::new(vec![answer_turn]);
+    let caller = FixtureCaller::new(results_dir());
+    let mut agent = Agent::new(template, tokenizer, generator, caller, "sys", 64);
+
+    let outcome = agent.start_from_mcp("pause the kitchen", &raw_tools);
+    let step = match outcome {
+        StepOutcome::Final { step, .. } => step,
+        other => panic!("expected Final, got {other:?}"),
+    };
+    let prompt = agent.tokenizer().decode(&step.prompt_tokens, false).unwrap();
+    assert!(!prompt.contains("annotations"), "diet should have stripped annotations:\n{prompt}");
+}

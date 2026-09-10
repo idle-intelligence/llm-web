@@ -38,12 +38,20 @@
 //! has no cache to restore.
 
 use crate::grammar::{self, Constraint, Grammar, GrammarConstraint, IdValues, TokenVocab};
+use crate::schemadiet::{diet_tools, DietLevel};
 use crate::template::{ChatTemplate, Message, Tool, ToolCallEntry, ToolCallFunction};
 use crate::tokenizer::Tokenizer;
-use crate::tools::{format_tool_result, parse_output, ParsedOutput, ToolCall};
+use crate::tools::{format_tool_error, format_tool_result, parse_output, tool_error_message, ParsedOutput, ToolCall};
 use anyhow::{bail, Result};
 use serde_json::Value;
 use std::time::{Duration, Instant};
+
+/// A generic, non-committal nudge appended as a `user` message when a
+/// model output is malformed/empty/unknown-tool twice in a row (see
+/// `Agent::step_inner`'s retry policy) — the second and last retry, after
+/// "try again with the grammar constraint enabled" (the first retry) has
+/// also failed to produce a valid call.
+const RETRY_NOTE: &str = "Respond with a tool call from the list or a final answer.";
 
 /// Executes one tool call and returns its JSON result.
 pub trait ToolCaller {
@@ -131,6 +139,7 @@ pub struct GenerateOutput {
 }
 
 /// One render -> generate -> parse round of the agent loop.
+#[derive(Debug)]
 pub struct Step {
     pub prompt_tokens: Vec<u32>,
     pub generated_text: String,
@@ -162,11 +171,38 @@ pub struct Step {
     /// Of `tokens_generated`, how many were jump-forwarded (schema-forced,
     /// not individually sampled). 0 for an unconstrained step.
     pub forced_tokens: usize,
+    /// Number of malformed-output retries (`Agent`'s empty-array /
+    /// unparsable-JSON / unknown-tool retry policy — see `step_inner`)
+    /// spent before this step's output was accepted. 0 when the first
+    /// attempt was already valid. Does not count toward `max_steps`.
+    pub retries: usize,
+    /// Running count of *consecutive* tool-error results fed back into
+    /// the conversation as of this step (see `Agent::provide_tool_results`
+    /// / `tool_error_message`); 0 unless the immediately preceding
+    /// `provide_tool_results` call carried an error result.
+    pub tool_errors: usize,
 }
 
 pub struct Transcript {
     pub steps: Vec<Step>,
     pub final_text: String,
+}
+
+/// One `generate_attempt` round's output, before `step_inner` decides
+/// whether it's valid or needs a retry — `parsed` is `Err` for a parse
+/// failure (retryable) rather than short-circuiting like the other
+/// render/encode/generate/decode failures `generate_attempt` returns as
+/// `Err(String)` directly.
+struct AttemptOutput {
+    prompt_tokens: Vec<u32>,
+    generated_text: String,
+    parsed: Result<ParsedOutput, String>,
+    timings: Duration,
+    tokens_generated: usize,
+    prefill_time: Duration,
+    decode_time: Duration,
+    model_steps: usize,
+    forced_tokens: usize,
 }
 
 /// One tool call the model asked for, awaiting a result via
@@ -183,6 +219,7 @@ pub struct PendingToolCall {
 }
 
 /// Outcome of one step ([`Agent::start`] or [`Agent::provide_tool_results`]).
+#[derive(Debug)]
 pub enum StepOutcome {
     /// The model asked for one or more tool calls; execute them (by
     /// whatever means) and pass `(call_id, result)` pairs to
@@ -257,6 +294,21 @@ impl Generator for FixtureGenerator {
 /// overrides this per-call with its own `max_steps` argument instead.
 const DEFAULT_MAX_STEPS: usize = 8;
 
+/// Default per-step cap on malformed-output retries (empty tool-call
+/// array, unparsable JSON starting with `[`, or a call naming a tool not
+/// in the current `tools` set) — override with [`Agent::set_max_retries`].
+/// See `docs/ENGINE.md` "Agent loop" for the retry policy.
+const DEFAULT_MAX_RETRIES: usize = 2;
+
+/// Number of consecutive tool-error results (see `tool_error_message`)
+/// `Agent` will feed back to the model before giving up with
+/// `StepOutcome::Error` instead of trying a third time.
+const MAX_CONSECUTIVE_TOOL_ERRORS: usize = 2;
+
+/// Diet level applied to raw MCP tool lists by [`Agent::start_from_mcp`]
+/// when [`Agent`]'s diet flag is on (the default) — see `schemadiet.rs`.
+const AGENT_DIET_LEVEL: DietLevel = DietLevel::Level1;
+
 /// Drives one conversation turn: render the prompt, generate, parse the
 /// output, and either finish with plain text or execute the requested tool
 /// call(s) and loop.
@@ -268,12 +320,21 @@ pub struct Agent<G: Generator, C: ToolCaller> {
     system_prompt: String,
     max_new_tokens: usize,
     max_steps: usize,
+    max_retries: usize,
+    /// Whether [`Agent::start_from_mcp`] runs raw MCP tool lists through
+    /// `schemadiet::diet_tools` before `Tool::from_mcp`. On by default;
+    /// disable for byte-fidelity comparisons against undieted fixtures.
+    diet: bool,
 
     // Step-wise conversation state (see `start`/`provide_tool_results`).
     messages: Vec<Message>,
     tools: Vec<Tool>,
     step_index: usize,
     pending_calls: Vec<PendingToolCall>,
+    /// Consecutive tool-error results fed back so far this turn (reset by
+    /// `start`/`reset`, and whenever a non-error tool result arrives) —
+    /// see `provide_tool_results`.
+    consecutive_tool_errors: usize,
     /// Cached (tools set, common prefix token length), recomputed only when
     /// `tools` changes between `start` calls — see module docs.
     prefix_cache: Option<(Vec<Tool>, usize)>,
@@ -310,10 +371,13 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
             system_prompt: system_prompt.into(),
             max_new_tokens,
             max_steps: DEFAULT_MAX_STEPS,
+            max_retries: DEFAULT_MAX_RETRIES,
+            diet: true,
             messages: Vec::new(),
             tools: Vec::new(),
             step_index: 0,
             pending_calls: Vec::new(),
+            consecutive_tool_errors: 0,
             prefix_cache: None,
             constrained: false,
             id_values: IdValues::new(),
@@ -345,6 +409,19 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
         self.max_steps = max_steps;
     }
 
+    /// Override the per-step cap on malformed-output retries (default
+    /// [`DEFAULT_MAX_RETRIES`]) — see `step_inner`'s retry policy.
+    pub fn set_max_retries(&mut self, max_retries: usize) {
+        self.max_retries = max_retries;
+    }
+
+    /// Turn the MCP tool-schema token diet [`Agent::start_from_mcp`]
+    /// applies on/off. On by default; turn off for byte-fidelity tests
+    /// that must see the raw (undieted) schema.
+    pub fn set_diet(&mut self, diet: bool) {
+        self.diet = diet;
+    }
+
     /// Drop any in-progress conversation state (e.g. after an `Error`
     /// outcome, or to abandon a turn). Does not touch the KV-cache prefix
     /// cache, which is keyed by `tools` and safe to keep across turns.
@@ -353,6 +430,7 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
         self.tools.clear();
         self.step_index = 0;
         self.pending_calls.clear();
+        self.consecutive_tool_errors = 0;
         self.id_values = IdValues::new();
     }
 
@@ -365,6 +443,7 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
         self.messages = vec![Message::system(&self.system_prompt), Message::user(utterance)];
         self.step_index = 0;
         self.pending_calls.clear();
+        self.consecutive_tool_errors = 0;
         self.id_values = IdValues::new();
 
         match self.prefix_len_for(&self.tools, utterance) {
@@ -380,6 +459,16 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
         self.step_inner()
     }
 
+    /// Like [`Agent::start`], but takes raw MCP `tools/list` entries
+    /// (`{"name", "description", "inputSchema"}`) instead of already-built
+    /// `Tool`s — runs them through `schemadiet::diet_tools` (when
+    /// [`Agent::set_diet`] is on, the default) before `Tool::from_mcp`,
+    /// per `docs/ENGINE.md`'s "Tool-schema token diet" hook-in point.
+    pub fn start_from_mcp(&mut self, utterance: &str, raw_tools: &[Value]) -> StepOutcome {
+        let tools = tools_from_mcp(raw_tools, self.diet);
+        self.start(utterance, &tools)
+    }
+
     /// Continue the current turn with the results of the tool calls from
     /// the most recent `NeedTools` outcome, keyed by `call_id`. Unmatched
     /// or missing `call_id`s are silently skipped (their tool message is
@@ -388,8 +477,24 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
     pub fn provide_tool_results(&mut self, results: Vec<(String, Value)>) -> StepOutcome {
         for (call_id, result) in results {
             if let Some(pending) = self.pending_calls.iter().find(|c| c.call_id == call_id) {
-                self.id_values.collect_from_result(&result);
-                self.messages.push(format_tool_result(&pending.name, &result));
+                if let Some(error_message) = tool_error_message(&result) {
+                    self.consecutive_tool_errors += 1;
+                    if self.consecutive_tool_errors > MAX_CONSECUTIVE_TOOL_ERRORS {
+                        self.pending_calls.clear();
+                        return StepOutcome::Error {
+                            message: format!(
+                                "{} consecutive tool errors (giving up after {}): {error_message}",
+                                self.consecutive_tool_errors, MAX_CONSECUTIVE_TOOL_ERRORS
+                            ),
+                            step: None,
+                        };
+                    }
+                    self.messages.push(format_tool_error(&pending.name, &error_message));
+                } else {
+                    self.consecutive_tool_errors = 0;
+                    self.id_values.collect_from_result(&result);
+                    self.messages.push(format_tool_result(&pending.name, &result));
+                }
             }
         }
         self.pending_calls.clear();
@@ -409,24 +514,124 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
         }
         self.step_index += 1;
 
-        let prompt = match self.template.render_prompt(&self.messages, &self.tools, true) {
-            Ok(p) => p,
-            Err(e) => {
-                return StepOutcome::Error {
-                    message: format!("failed to render prompt: {e}"),
-                    step: None,
+        // Malformed-output retry loop (`docs/ENGINE.md` "Agent loop"): an
+        // empty tool-call array, unparsable `[...]` JSON, or a call naming
+        // a tool outside `self.tools` does *not* get appended to history
+        // as an assistant turn (that would just teach the model its own
+        // junk is valid conversation) — instead we regenerate, changing
+        // something each time so a deterministic sampler doesn't just
+        // reproduce the same output: attempt 1 turns schema-constrained
+        // decoding on (if not already on and tools are available), attempt
+        // 2 appends a short generic nudge as a `user` message. Exhausting
+        // `self.max_retries` gives up with `StepOutcome::Error`. Retries
+        // don't consume the `max_steps` budget (already charged above).
+        let mut retries = 0usize;
+        loop {
+            let force_constrained = retries == 1 && !self.constrained && !self.tools.is_empty();
+            let attempt = match self.generate_attempt(force_constrained) {
+                Ok(a) => a,
+                Err(message) => return StepOutcome::Error { message, step: None },
+            };
+
+            let invalid = match &attempt.parsed {
+                Err(_) => true,
+                Ok(ParsedOutput::ToolCalls(calls)) => {
+                    calls.is_empty()
+                        || calls
+                            .iter()
+                            .any(|c| !self.tools.iter().any(|t| t.function.name == c.name))
                 }
-            }
-        };
-        let prompt_tokens = match self.tokenizer.encode(&prompt, false) {
-            Ok(t) => t,
-            Err(e) => {
-                return StepOutcome::Error {
-                    message: format!("failed to encode prompt: {e}"),
-                    step: None,
+                Ok(ParsedOutput::Text(_)) => false,
+            };
+
+            if invalid {
+                if retries < self.max_retries {
+                    retries += 1;
+                    if retries == 2 {
+                        self.messages.push(Message::user(RETRY_NOTE));
+                    }
+                    continue;
                 }
+                return StepOutcome::Error {
+                    message: "model produced no valid call".to_string(),
+                    step: None,
+                };
             }
-        };
+
+            let AttemptOutput {
+                prompt_tokens,
+                generated_text,
+                parsed,
+                timings,
+                tokens_generated,
+                prefill_time,
+                decode_time,
+                model_steps,
+                forced_tokens,
+            } = attempt;
+            let parsed = parsed.expect("checked valid above");
+            let tool_errors = self.consecutive_tool_errors;
+
+            return match parsed {
+                ParsedOutput::ToolCalls(calls) => {
+                    let pending = pending_calls_from(&calls);
+                    let entries = tool_call_entries(&pending);
+                    self.messages.push(Message::assistant_tool_calls(entries));
+                    self.pending_calls = pending.clone();
+
+                    let step = Step {
+                        prompt_tokens,
+                        generated_text,
+                        parsed: ParsedOutput::ToolCalls(calls),
+                        tool_result: None,
+                        timings,
+                        tokens_generated,
+                        prefill_time,
+                        decode_time,
+                        model_steps,
+                        forced_tokens,
+                        retries,
+                        tool_errors,
+                    };
+                    StepOutcome::NeedTools { calls: pending, step }
+                }
+                ParsedOutput::Text(text) => {
+                    let step = Step {
+                        prompt_tokens,
+                        generated_text,
+                        parsed: ParsedOutput::Text(text.clone()),
+                        tool_result: None,
+                        timings,
+                        tokens_generated,
+                        prefill_time,
+                        decode_time,
+                        model_steps,
+                        forced_tokens,
+                        retries,
+                        tool_errors,
+                    };
+                    StepOutcome::Final { text, step }
+                }
+            };
+        }
+    }
+
+    /// One render -> encode -> generate -> decode -> parse round, with an
+    /// override to force schema-constrained decoding on for this attempt
+    /// regardless of `self.constrained` (used by `step_inner`'s retry
+    /// policy). Returns `Err(message)` only for failures that aren't part
+    /// of the retry policy (render/encode/generate/decode) — a parse
+    /// failure is returned as `Ok` with `parsed: Err(_)` so the caller can
+    /// decide whether to retry.
+    fn generate_attempt(&mut self, force_constrained: bool) -> Result<AttemptOutput, String> {
+        let prompt = self
+            .template
+            .render_prompt(&self.messages, &self.tools, true)
+            .map_err(|e| format!("failed to render prompt: {e}"))?;
+        let prompt_tokens = self
+            .tokenizer
+            .encode(&prompt, false)
+            .map_err(|e| format!("failed to encode prompt: {e}"))?;
 
         let prefix_len = self
             .prefix_cache
@@ -435,10 +640,12 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
             .map(|(_, len)| (*len).min(prompt_tokens.len()))
             .unwrap_or(0);
 
-        // Build this step's schema constraint (if `constrained`) from the
-        // current tool set + every id harvested from tool results so far —
-        // see `docs/ENGINE.md` "Schema-constrained decoding".
-        let grammar_tools: Vec<grammar::Tool> = if self.constrained {
+        // Build this step's schema constraint (if `constrained`, or this
+        // attempt forces it on) from the current tool set + every id
+        // harvested from tool results so far — see `docs/ENGINE.md`
+        // "Schema-constrained decoding".
+        let use_constrained = self.constrained || force_constrained;
+        let grammar_tools: Vec<grammar::Tool> = if use_constrained {
             self.tools
                 .iter()
                 .map(|t| grammar::Tool::from_schema(&t.function.name, &t.function.parameters))
@@ -446,10 +653,8 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
         } else {
             Vec::new()
         };
-        let grammar_for_step = self
-            .constrained
-            .then(|| Grammar::for_tools(&grammar_tools, &self.id_values));
-        if self.constrained && self.token_vocab.is_none() {
+        let grammar_for_step = use_constrained.then(|| Grammar::for_tools(&grammar_tools, &self.id_values));
+        if use_constrained && self.token_vocab.is_none() {
             self.token_vocab = Some(TokenVocab::from_tokenizer(&self.tokenizer));
         }
         let mut constraint_impl: Option<GrammarConstraint> = grammar_for_step
@@ -459,21 +664,16 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
             constraint_impl.as_mut().map(|c| c as &mut dyn Constraint);
 
         let start = Instant::now();
-        let out = match self.generator.generate_constrained(
-            &prompt_tokens,
-            prefix_len,
-            self.max_new_tokens,
-            self.tokenizer.eos_ids(),
-            constraint,
-        ) {
-            Ok(out) => out,
-            Err(e) => {
-                return StepOutcome::Error {
-                    message: format!("generation failed: {e}"),
-                    step: None,
-                }
-            }
-        };
+        let out = self
+            .generator
+            .generate_constrained(
+                &prompt_tokens,
+                prefix_len,
+                self.max_new_tokens,
+                self.tokenizer.eos_ids(),
+                constraint,
+            )
+            .map_err(|e| format!("generation failed: {e}"))?;
         let timings = start.elapsed();
         let out_ids = out.ids;
         let tokens_generated = out_ids.len();
@@ -484,62 +684,23 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
             breakdown => breakdown,
         };
 
-        let generated_text = match self.tokenizer.decode(&out_ids, false) {
-            Ok(t) => t,
-            Err(e) => {
-                return StepOutcome::Error {
-                    message: format!("failed to decode generated tokens: {e}"),
-                    step: None,
-                }
-            }
-        };
-        let parsed = match parse_output(&generated_text) {
-            Ok(p) => p,
-            Err(e) => {
-                return StepOutcome::Error {
-                    message: format!("failed to parse model output: {e}"),
-                    step: None,
-                }
-            }
-        };
+        let generated_text = self
+            .tokenizer
+            .decode(&out_ids, false)
+            .map_err(|e| format!("failed to decode generated tokens: {e}"))?;
+        let parsed = parse_output(&generated_text).map_err(|e| e.to_string());
 
-        match parsed {
-            ParsedOutput::ToolCalls(calls) => {
-                let pending = pending_calls_from(&calls);
-                let entries = tool_call_entries(&pending);
-                self.messages.push(Message::assistant_tool_calls(entries));
-                self.pending_calls = pending.clone();
-
-                let step = Step {
-                    prompt_tokens,
-                    generated_text,
-                    parsed: ParsedOutput::ToolCalls(calls),
-                    tool_result: None,
-                    timings,
-                    tokens_generated,
-                    prefill_time,
-                    decode_time,
-                    model_steps,
-                    forced_tokens,
-                };
-                StepOutcome::NeedTools { calls: pending, step }
-            }
-            ParsedOutput::Text(text) => {
-                let step = Step {
-                    prompt_tokens,
-                    generated_text,
-                    parsed: ParsedOutput::Text(text.clone()),
-                    tool_result: None,
-                    timings,
-                    tokens_generated,
-                    prefill_time,
-                    decode_time,
-                    model_steps,
-                    forced_tokens,
-                };
-                StepOutcome::Final { text, step }
-            }
-        }
+        Ok(AttemptOutput {
+            prompt_tokens,
+            generated_text,
+            parsed,
+            timings,
+            tokens_generated,
+            prefill_time,
+            decode_time,
+            model_steps,
+            forced_tokens,
+        })
     }
 
     /// Common leading token-id run between rendering `utterance` and a
@@ -592,6 +753,31 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
             }
         }
     }
+}
+
+/// Build `Tool`s from raw MCP `tools/list` entries, optionally running
+/// them through `schemadiet::diet_tools` first — see `Agent::start_from_mcp`
+/// and `docs/ENGINE.md`'s "Tool-schema token diet" hook-in point. Entries
+/// missing `name`/`description`/`inputSchema` are skipped rather than
+/// panicking (same "don't trust the wire" posture as `FixtureCaller`).
+fn tools_from_mcp(raw_tools: &[Value], diet: bool) -> Vec<Tool> {
+    let dieted;
+    let raw_tools = if diet {
+        dieted = diet_tools(raw_tools, AGENT_DIET_LEVEL);
+        &dieted
+    } else {
+        raw_tools
+    };
+    raw_tools
+        .iter()
+        .filter_map(|t| {
+            Some(Tool::from_mcp(
+                t.get("name")?.as_str()?,
+                t.get("description")?.as_str()?,
+                t.get("inputSchema")?.clone(),
+            ))
+        })
+        .collect()
 }
 
 fn pending_calls_from(calls: &[ToolCall]) -> Vec<PendingToolCall> {
