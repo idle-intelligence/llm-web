@@ -14,6 +14,7 @@ use burn::tensor::activation::softmax;
 use burn::tensor::{Int, Tensor};
 
 use crate::gguf::{EmbeddingStore, Q4Linear};
+use crate::grammar::Constraint;
 use crate::kv::KvCache;
 use crate::LlmConfig;
 
@@ -530,7 +531,8 @@ impl LlmModel {
     /// vec — matches `fixtures/reference/logits/*.json`'s
     /// `greedy_first_32_token_ids` convention). Only the last prefill
     /// position's logits are computed (never the full `T x vocab` matrix)
-    /// — see module doc comment on `forward_hidden`.
+    /// — see module doc comment on `forward_hidden`. Unconstrained
+    /// convenience wrapper over `generate_with_constraint`.
     pub fn generate(
         &self,
         prompt_ids: &[u32],
@@ -538,24 +540,94 @@ impl LlmModel {
         stop_ids: &[u32],
         cache: &mut KvCache,
     ) -> Result<Vec<u32>> {
+        let (ids, _stats) = self.generate_with_constraint(prompt_ids, max_new, stop_ids, cache, None)?;
+        Ok(ids)
+    }
+
+    /// Like `generate`, but drives an optional [`Constraint`] (see
+    /// `grammar.rs`) through the decode loop: at every step, if
+    /// `constraint.forced_run()` returns a non-empty run (the mask allows
+    /// exactly one token at each of the next several positions), those
+    /// tokens are appended without individual argmax/forward-pass-per-token
+    /// decode steps — instead, one `forward_hidden` prefill call of `M =
+    /// run.len()` runs them all through in a single model step, appending
+    /// to `cache` the same way prefill does (`docs/ENGINE.md` "Schema-
+    /// constrained decoding", jump-forward semantics). Otherwise, one
+    /// normal masked-argmax decode step runs (`sample::greedy_masked` when
+    /// the constraint has a mask, plain `sample::greedy` when
+    /// unconstrained). Returns the generated ids plus a step/token
+    /// breakdown for eval reporting.
+    pub fn generate_with_constraint(
+        &self,
+        prompt_ids: &[u32],
+        max_new: usize,
+        stop_ids: &[u32],
+        cache: &mut KvCache,
+        mut constraint: Option<&mut dyn Constraint>,
+    ) -> Result<(Vec<u32>, GenerateStats)> {
         assert!(!prompt_ids.is_empty());
         let hidden = self.forward_hidden(prompt_ids, cache)?;
         let last = hidden.narrow(1, prompt_ids.len() - 1, 1);
-        let mut logits = self.lm_head(last);
+        let logits = self.lm_head(last);
+        let mut logits_vec = logits_to_vec(logits)?;
 
         let mut out = Vec::with_capacity(max_new);
-        for _ in 0..max_new {
-            let logits_vec = logits_to_vec(logits)?;
-            let next = crate::sample::greedy(&logits_vec);
+        let mut stats = GenerateStats::default();
+
+        while out.len() < max_new {
+            let forced = constraint.as_deref().and_then(Constraint::forced_run).unwrap_or_default();
+            if !forced.is_empty() {
+                let take = forced.len().min(max_new - out.len());
+                let run = &forced[..take];
+                let hidden = self.forward_hidden(run, cache)?;
+                for &t in run {
+                    if let Some(c) = constraint.as_deref_mut() {
+                        c.advance(t);
+                    }
+                }
+                out.extend_from_slice(run);
+                stats.model_steps += 1;
+                stats.forced_tokens += run.len();
+                if take < forced.len() {
+                    // Hit max_new mid-run: stop without sampling further.
+                    break;
+                }
+                let last = hidden.narrow(1, run.len() - 1, 1);
+                let logits = self.lm_head(last);
+                logits_vec = logits_to_vec(logits)?;
+                continue;
+            }
+
+            let next = match constraint.as_deref().and_then(Constraint::allowed) {
+                Some(mask) => crate::sample::greedy_masked(&logits_vec, mask),
+                None => crate::sample::greedy(&logits_vec),
+            };
             out.push(next);
+            stats.model_steps += 1;
+            if let Some(c) = constraint.as_deref_mut() {
+                c.advance(next);
+            }
             if stop_ids.contains(&next) {
                 break;
             }
             let hidden = self.forward_hidden(&[next], cache)?;
-            logits = self.lm_head(hidden);
+            let logits = self.lm_head(hidden);
+            logits_vec = logits_to_vec(logits)?;
         }
-        Ok(out)
+        stats.total_tokens = out.len();
+        Ok((out, stats))
     }
+}
+
+/// Model-step / forced-token breakdown for `generate_with_constraint`
+/// (`docs/ENGINE.md` "Schema-constrained decoding"). `model_steps` counts
+/// forward passes (one jump-forward run of `k` forced tokens is 1 step, not
+/// `k`); `forced_tokens` + the sampled-token count equal `total_tokens`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GenerateStats {
+    pub model_steps: usize,
+    pub forced_tokens: usize,
+    pub total_tokens: usize,
 }
 
 /// Extract a `[1, 1, vocab]` (or `[1, T=1, vocab]`) logits tensor to a flat

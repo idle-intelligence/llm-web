@@ -37,6 +37,7 @@
 //! just ignores the hint and regenerates from the full prompt, since it
 //! has no cache to restore.
 
+use crate::grammar::{self, Constraint, Grammar, GrammarConstraint, IdValues, TokenVocab};
 use crate::template::{ChatTemplate, Message, Tool, ToolCallEntry, ToolCallFunction};
 use crate::tokenizer::Tokenizer;
 use crate::tools::{format_tool_result, parse_output, ParsedOutput, ToolCall};
@@ -87,6 +88,46 @@ pub trait Generator {
     fn last_call_timing(&self) -> (Duration, Duration) {
         (Duration::ZERO, Duration::ZERO)
     }
+
+    /// Like [`Generator::generate_with_cached_prefix`], but drives an
+    /// optional schema [`Constraint`] (`grammar.rs`) through the decode
+    /// loop — see `docs/ENGINE.md` "Schema-constrained decoding" for the
+    /// jump-forward semantics a concrete implementation backed by a real
+    /// model (`model.rs::LlmModel::generate_with_constraint`) should give
+    /// this. The default implementation ignores `constraint` entirely and
+    /// falls back to `generate_with_cached_prefix`, reporting every
+    /// generated token as one model step and zero forced tokens — correct
+    /// (unconstrained) but not what `Agent`'s `constrained: true` mode is
+    /// for; `FixtureGenerator` relies on this default since it has no
+    /// model to drive a real constraint through.
+    fn generate_constrained(
+        &mut self,
+        prompt_ids: &[u32],
+        prefix_len: usize,
+        max_new_tokens: usize,
+        stop_ids: &[u32],
+        constraint: Option<&mut dyn Constraint>,
+    ) -> Result<GenerateOutput> {
+        let _ = constraint;
+        let ids = self.generate_with_cached_prefix(prompt_ids, prefix_len, max_new_tokens, stop_ids)?;
+        let model_steps = ids.len();
+        Ok(GenerateOutput {
+            ids,
+            model_steps,
+            forced_tokens: 0,
+        })
+    }
+}
+
+/// Result of [`Generator::generate_constrained`]: the generated ids plus a
+/// model-step / forced-token breakdown (jump-forward runs count as one
+/// model step covering multiple tokens — see `model.rs::GenerateStats`,
+/// which a real implementation's `model_steps`/`forced_tokens` should
+/// mirror).
+pub struct GenerateOutput {
+    pub ids: Vec<u32>,
+    pub model_steps: usize,
+    pub forced_tokens: usize,
 }
 
 /// One render -> generate -> parse round of the agent loop.
@@ -113,6 +154,14 @@ pub struct Step {
     /// step's wall-clock time (same value as `timings`), i.e. prefill cost
     /// is folded into it rather than lost.
     pub decode_time: Duration,
+    /// Model forward-pass steps this step's generation took (a
+    /// jump-forward run of several forced tokens is 1 step — see
+    /// `GenerateOutput`). Equals `tokens_generated` for an unconstrained
+    /// step (every token costs its own step).
+    pub model_steps: usize,
+    /// Of `tokens_generated`, how many were jump-forwarded (schema-forced,
+    /// not individually sampled). 0 for an unconstrained step.
+    pub forced_tokens: usize,
 }
 
 pub struct Transcript {
@@ -228,6 +277,20 @@ pub struct Agent<G: Generator, C: ToolCaller> {
     /// Cached (tools set, common prefix token length), recomputed only when
     /// `tools` changes between `start` calls — see module docs.
     prefix_cache: Option<(Vec<Tool>, usize)>,
+
+    /// Whether to constrain generation to `grammar.rs`'s tool-call schema
+    /// (see [`Agent::set_constrained`]). Off by default so existing
+    /// unconstrained callers/tests are unaffected.
+    constrained: bool,
+    /// Id-shaped strings harvested from every tool result seen so far this
+    /// conversation (`IdValues::collect_from_result`, called from
+    /// `provide_tool_results`) — the only values a `*_id`/`*_ids` schema
+    /// property may take (`docs/ENGINE.md` "The id rule"). Reset in
+    /// `start`/`reset`.
+    id_values: IdValues,
+    /// Built lazily on first constrained step and cached — `TokenVocab`
+    /// precomputes every vocab id's byte string once, not once per step.
+    token_vocab: Option<TokenVocab>,
 }
 
 impl<G: Generator, C: ToolCaller> Agent<G, C> {
@@ -252,6 +315,9 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
             step_index: 0,
             pending_calls: Vec::new(),
             prefix_cache: None,
+            constrained: false,
+            id_values: IdValues::new(),
+            token_vocab: None,
         }
     }
 
@@ -261,6 +327,15 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
 
     pub fn tokenizer(&self) -> &Tokenizer {
         &self.tokenizer
+    }
+
+    /// Turn schema-constrained decoding on/off (`grammar.rs`,
+    /// `docs/ENGINE.md` "Schema-constrained decoding"). Off by default. A
+    /// `Generator` that doesn't override `generate_constrained` runs
+    /// unconstrained regardless of this flag (its default impl ignores the
+    /// constraint) — see that method's docs.
+    pub fn set_constrained(&mut self, constrained: bool) {
+        self.constrained = constrained;
     }
 
     /// Override the step budget the step-wise API (`start` /
@@ -278,6 +353,7 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
         self.tools.clear();
         self.step_index = 0;
         self.pending_calls.clear();
+        self.id_values = IdValues::new();
     }
 
     /// Begin a new turn: render `utterance` against `tools`, generate, and
@@ -289,6 +365,7 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
         self.messages = vec![Message::system(&self.system_prompt), Message::user(utterance)];
         self.step_index = 0;
         self.pending_calls.clear();
+        self.id_values = IdValues::new();
 
         match self.prefix_len_for(&self.tools, utterance) {
             Ok(len) => self.prefix_cache = Some((self.tools.clone(), len)),
@@ -311,6 +388,7 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
     pub fn provide_tool_results(&mut self, results: Vec<(String, Value)>) -> StepOutcome {
         for (call_id, result) in results {
             if let Some(pending) = self.pending_calls.iter().find(|c| c.call_id == call_id) {
+                self.id_values.collect_from_result(&result);
                 self.messages.push(format_tool_result(&pending.name, &result));
             }
         }
@@ -357,14 +435,38 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
             .map(|(_, len)| (*len).min(prompt_tokens.len()))
             .unwrap_or(0);
 
+        // Build this step's schema constraint (if `constrained`) from the
+        // current tool set + every id harvested from tool results so far —
+        // see `docs/ENGINE.md` "Schema-constrained decoding".
+        let grammar_tools: Vec<grammar::Tool> = if self.constrained {
+            self.tools
+                .iter()
+                .map(|t| grammar::Tool::from_schema(&t.function.name, &t.function.parameters))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let grammar_for_step = self
+            .constrained
+            .then(|| Grammar::for_tools(&grammar_tools, &self.id_values));
+        if self.constrained && self.token_vocab.is_none() {
+            self.token_vocab = Some(TokenVocab::from_tokenizer(&self.tokenizer));
+        }
+        let mut constraint_impl: Option<GrammarConstraint> = grammar_for_step
+            .as_ref()
+            .map(|g| GrammarConstraint::new(g, self.token_vocab.as_ref().expect("built above")));
+        let constraint: Option<&mut dyn Constraint> =
+            constraint_impl.as_mut().map(|c| c as &mut dyn Constraint);
+
         let start = Instant::now();
-        let out_ids = match self.generator.generate_with_cached_prefix(
+        let out = match self.generator.generate_constrained(
             &prompt_tokens,
             prefix_len,
             self.max_new_tokens,
             self.tokenizer.eos_ids(),
+            constraint,
         ) {
-            Ok(ids) => ids,
+            Ok(out) => out,
             Err(e) => {
                 return StepOutcome::Error {
                     message: format!("generation failed: {e}"),
@@ -373,7 +475,10 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
             }
         };
         let timings = start.elapsed();
+        let out_ids = out.ids;
         let tokens_generated = out_ids.len();
+        let model_steps = out.model_steps;
+        let forced_tokens = out.forced_tokens;
         let (prefill_time, decode_time) = match self.generator.last_call_timing() {
             (p, d) if p.is_zero() && d.is_zero() => (Duration::ZERO, timings),
             breakdown => breakdown,
@@ -414,6 +519,8 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
                     tokens_generated,
                     prefill_time,
                     decode_time,
+                    model_steps,
+                    forced_tokens,
                 };
                 StepOutcome::NeedTools { calls: pending, step }
             }
@@ -427,6 +534,8 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
                     tokens_generated,
                     prefill_time,
                     decode_time,
+                    model_steps,
+                    forced_tokens,
                 };
                 StepOutcome::Final { text, step }
             }

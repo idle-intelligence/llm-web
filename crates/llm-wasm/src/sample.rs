@@ -19,6 +19,36 @@ pub fn greedy(logits: &[f32]) -> u32 {
     best_idx as u32
 }
 
+/// Greedy decode restricted to `mask`: argmax over `logits` among ids
+/// `mask.is_allowed()`s. Panics-free even if `mask` is all-zero (returns
+/// index 0, same as `greedy`'s NEG_INFINITY-vs-NEG_INFINITY tie) — callers
+/// (`model.rs`'s constrained decode loop) never hand it an all-zero mask in
+/// practice, since `GrammarState::allowed` always leaves at least one byte
+/// legal.
+pub fn greedy_masked(logits: &[f32], mask: &crate::grammar::TokenMask) -> u32 {
+    let mut best_idx = 0usize;
+    let mut best_val = f32::NEG_INFINITY;
+    for (i, &v) in logits.iter().enumerate() {
+        if mask.is_allowed(i) && v > best_val {
+            best_val = v;
+            best_idx = i;
+        }
+    }
+    best_idx as u32
+}
+
+/// `top_k`, restricted to ids `mask.is_allowed()`s.
+pub fn top_k_masked(logits: &[f32], mask: &crate::grammar::TokenMask, k: usize) -> Vec<(u32, f32)> {
+    let mut idx: Vec<usize> = (0..logits.len()).filter(|&i| mask.is_allowed(i)).collect();
+    idx.sort_unstable_by(|&a, &b| {
+        let ka = if logits[a].is_nan() { f32::NEG_INFINITY } else { logits[a] };
+        let kb = if logits[b].is_nan() { f32::NEG_INFINITY } else { logits[b] };
+        kb.total_cmp(&ka)
+    });
+    idx.truncate(k);
+    idx.into_iter().map(|i| (i as u32, logits[i])).collect()
+}
+
 /// Top-K argmax indices with their (unmodified) logit values, descending.
 pub fn top_k(logits: &[f32], k: usize) -> Vec<(u32, f32)> {
     let mut idx: Vec<usize> = (0..logits.len()).collect();
@@ -166,5 +196,29 @@ mod tests {
         assert_eq!(top[0].0, 2);
         assert_eq!(top[1].0, 4);
         assert_eq!(top[2].0, 0);
+    }
+
+    #[test]
+    fn greedy_masked_ignores_disallowed_ids() {
+        use crate::grammar::TokenMask;
+        // Unmasked argmax would pick id 2 (value 5.0); masking it out
+        // should fall through to id 3 (3.0), the highest among allowed.
+        let logits = [1.0, 4.0, 5.0, 3.0, 2.0];
+        let mask = TokenMask::from_allowed(logits.len(), &[0, 1, 3]);
+        assert_eq!(greedy_masked(&logits, &mask), 1);
+
+        let mask = TokenMask::from_allowed(logits.len(), &[3]);
+        assert_eq!(greedy_masked(&logits, &mask), 3);
+    }
+
+    #[test]
+    fn top_k_masked_excludes_disallowed_ids() {
+        use crate::grammar::TokenMask;
+        let logits = [1.0, 4.0, 5.0, 3.0, 2.0];
+        let mask = TokenMask::from_allowed(logits.len(), &[0, 2, 3, 4]);
+        let top = top_k_masked(&logits, &mask, 2);
+        assert_eq!(top.len(), 2);
+        assert_eq!(top[0].0, 2); // 5.0, highest allowed
+        assert_eq!(top[1].0, 3); // 3.0, next allowed (id 1's 4.0 is masked out)
     }
 }

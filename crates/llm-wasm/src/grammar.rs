@@ -932,6 +932,19 @@ impl TokenMask {
         }
     }
 
+    /// Test/debug constructor: a mask over `len` ids with exactly
+    /// `allowed` set. `pub(crate)` — `sample.rs`'s masked-sampling unit
+    /// tests build fixture masks with this rather than going through a
+    /// full `Grammar`/`GrammarState`.
+    #[cfg(test)]
+    pub(crate) fn from_allowed(len: usize, allowed: &[usize]) -> Self {
+        let mut m = Self::new(len);
+        for &i in allowed {
+            m.set(i);
+        }
+        m
+    }
+
     fn all_ones(len: usize) -> Self {
         let mut bits = vec![u64::MAX; len.div_ceil(64)];
         let rem = len % 64;
@@ -957,6 +970,23 @@ impl TokenMask {
         self.bits.iter().map(|w| w.count_ones() as usize).sum()
     }
 
+    /// The single set bit's index, if `count() == 1`; `None` otherwise
+    /// (used by `GrammarConstraint::forced_run` to identify the one
+    /// mandatory next token at each forced step).
+    fn single_id(&self) -> Option<u32> {
+        let mut found = None;
+        for (word_idx, &w) in self.bits.iter().enumerate() {
+            if w == 0 {
+                continue;
+            }
+            if w.count_ones() != 1 || found.is_some() {
+                return None;
+            }
+            found = Some(word_idx as u32 * 64 + w.trailing_zeros());
+        }
+        found
+    }
+
     pub fn len(&self) -> usize {
         self.len
     }
@@ -966,7 +996,10 @@ impl TokenMask {
     }
 }
 
-/// Walks one generation through a `Grammar`, token by token.
+/// Walks one generation through a `Grammar`, token by token. `Clone` so
+/// `GrammarConstraint::forced_run` can trial-walk a scratch copy without
+/// disturbing the real state.
+#[derive(Clone)]
 pub struct GrammarState<'g> {
     grammar: &'g Grammar,
     pos: Pos<'g>,
@@ -1052,5 +1085,91 @@ impl<'g> GrammarState<'g> {
             }
         }
         true
+    }
+}
+
+// ---------------------------------------------------------------------
+// Constraint — the trait `model.rs::generate` and `agent.rs::Agent` drive
+// the decode loop through (see docs/ENGINE.md "Schema-constrained
+// decoding" for the jump-forward wiring). `GrammarConstraint` is the only
+// implementation today; the trait exists so `generate`'s signature doesn't
+// hard-code `GrammarState`/`TokenVocab`.
+// ---------------------------------------------------------------------
+
+pub trait Constraint {
+    /// The current token mask, or `None` if this constraint imposes no
+    /// restriction at all right now (a `GrammarConstraint` always returns
+    /// `Some` — even free text has a mask, just an all-ones one).
+    fn allowed(&self) -> Option<&TokenMask>;
+
+    /// Advance past one *accepted* token (same no-op-on-rejected-token
+    /// contract as `GrammarState::advance`).
+    fn advance(&mut self, token: u32);
+
+    /// The maximal run of tokens, starting from the current position,
+    /// where the mask allows exactly one token at each step — computed by
+    /// walking a scratch clone of the state forward, never touching the
+    /// real one. Excludes any trailing EOS (a single-EOS-allowed mask ends
+    /// the run without EOS in it, since EOS is the decode loop's own stop
+    /// signal, not a token to jump-forward over). `None`/empty means there
+    /// is no such run right now (the caller falls back to a normal masked
+    /// sampling step).
+    fn forced_run(&self) -> Option<Vec<u32>>;
+
+    fn is_complete(&self) -> bool;
+}
+
+/// `Constraint` adapter over `GrammarState` + `TokenVocab`. Owns an
+/// eagerly-computed mask for the current position (recomputed on every
+/// `advance`) so `allowed()` can be a cheap `&self` reference return
+/// instead of re-walking the vocab per call.
+pub struct GrammarConstraint<'g> {
+    state: GrammarState<'g>,
+    vocab: &'g TokenVocab,
+    mask: TokenMask,
+}
+
+impl<'g> GrammarConstraint<'g> {
+    pub fn new(grammar: &'g Grammar, vocab: &'g TokenVocab) -> Self {
+        let state = GrammarState::new(grammar);
+        let mask = state.allowed(vocab);
+        Self { state, vocab, mask }
+    }
+}
+
+impl<'g> Constraint for GrammarConstraint<'g> {
+    fn allowed(&self) -> Option<&TokenMask> {
+        Some(&self.mask)
+    }
+
+    fn advance(&mut self, token: u32) {
+        self.state.advance(token, self.vocab);
+        self.mask = self.state.allowed(self.vocab);
+    }
+
+    fn forced_run(&self) -> Option<Vec<u32>> {
+        let mut state = self.state.clone();
+        let mut mask = self.mask.clone();
+        let mut out = Vec::new();
+        while let Some(tok) = mask.single_id() {
+            if self.vocab.eos_ids.contains(&tok) {
+                break;
+            }
+            out.push(tok);
+            state.advance(tok, self.vocab);
+            if state.is_complete() {
+                break;
+            }
+            mask = state.allowed(self.vocab);
+        }
+        if out.is_empty() {
+            None
+        } else {
+            Some(out)
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        self.state.is_complete()
     }
 }
