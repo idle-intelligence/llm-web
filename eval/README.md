@@ -88,3 +88,29 @@ Example skeleton:
   argument values, accept mode, `tools12_ok` (solvable with the
   12-tool subset in `fixtures/sonos/tools-12.json`), and notes.
 - `results/<date>.md` — one file per eval run (see above).
+
+## How to run
+
+The scoring engine itself (`load_cases`, `select_tools`, `run_case`,
+`run_all`, `render_markdown`) lives in `crates/llm-wasm/src/eval.rs`.
+Wiring it up to the real (Burn+wgpu) `Generator` behind an `llm-agent`
+CLI subcommand is the engine worker's job, not this crate's — once
+wired, the intended invocation is:
+
+```sh
+llm-agent eval \
+  --gguf /path/to/xLAM-2-3b-fc-r.Q4_K_M.gguf \
+  --tools all|12 \
+  --out eval/results/<date>.md
+```
+
+- `--gguf` — path to the quantized model to eval.
+- `--tools` — `all` for the full 34-tool schema
+  (`fixtures/sonos/tools.json`) or `12` for the 12-tool subset
+  (`fixtures/sonos/tools-12.json`); see `eval::ToolSet`.
+- `--out` — where to write the rendered markdown (`eval::render_markdown`'s
+  output), following the `results/<date>.md` convention above.
+
+Until that subcommand exists, `crates/llm-wasm/tests/eval.rs` exercises
+the same `eval.rs` API end to end with a scripted `FixtureGenerator`
+standing in for the real model.

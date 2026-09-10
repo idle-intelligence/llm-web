@@ -20,6 +20,7 @@ pub mod template;
 pub mod tools;
 pub mod agent;
 pub mod tokenizer;
+pub mod eval;
 
 #[cfg(feature = "web")]
 pub mod web;
