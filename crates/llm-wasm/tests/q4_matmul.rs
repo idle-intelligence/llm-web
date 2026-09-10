@@ -17,7 +17,7 @@
 use burn::backend::wgpu::WgpuDevice;
 use burn::backend::Wgpu;
 use burn::tensor::Tensor;
-use llm_wasm::gguf::{q4_matmul, Q4Tensor};
+use llm_wasm::gguf::{q4_matmul, q4_matmul_tiled_forced, Q4Tensor};
 
 fn device() -> WgpuDevice {
     WgpuDevice::default()
@@ -110,11 +110,92 @@ fn run_gpu_matmul(input: &[f32], q4_bytes: &[u8], m: usize, k: usize, n: usize) 
     out.into_data().into_vec::<f32>().expect("f32 output")
 }
 
+fn run_gpu_matmul_tiled_forced(input: &[f32], q4_bytes: &[u8], m: usize, k: usize, n: usize) -> Vec<f32> {
+    let device = device();
+    let weights = Q4Tensor::from_q4_bytes(q4_bytes, [n, k], &device).expect("upload Q4 weights");
+    let input_t: Tensor<Wgpu, 3> =
+        Tensor::<Wgpu, 1>::from_floats(input, &device).reshape([1, m, k]);
+    let out = q4_matmul_tiled_forced(input_t, &weights);
+    out.into_data().into_vec::<f32>().expect("f32 output")
+}
+
+/// K2's tiled kernel (native, B==1, workgroup-shared dequant/weight reuse)
+/// at M in {64, 128, 256} — the task brief's M coverage for the prefill
+/// kernel. Not dispatched by default (`q4_matmul`'s doc comment /
+/// docs/BENCHMARKS.md: measured 4x slower than the naive kernel), but
+/// still correct — exercised directly via `q4_matmul_tiled_forced`.
+#[test]
+fn test_q4_matmul_tiled_k2_shapes() {
+    let shapes = [(2048usize, 2048usize), (2048, 11008), (11008, 2048)];
+    let ms = [64usize, 128usize, 256usize];
+
+    for &(k, n) in &shapes {
+        let (q4_bytes, cpu_weights) = random_q4(n, k, 0xDEC0DE ^ (k as u64) ^ ((n as u64) << 20));
+        for &m in &ms {
+            let input = random_input(m, k, 0xF00D + m as u64);
+            let cpu_out = cpu_matmul(&input, &cpu_weights, m, k, n);
+            let gpu_out = run_gpu_matmul_tiled_forced(&input, &q4_bytes, m, k, n);
+            assert_eq!(cpu_out.len(), gpu_out.len());
+
+            let mut max_err = 0f32;
+            for (c, g) in cpu_out.iter().zip(gpu_out.iter()) {
+                max_err = max_err.max((c - g).abs());
+            }
+            let tol = 0.05 * (k as f32).sqrt();
+            assert!(
+                max_err < tol,
+                "K2 tiled K={k} N={n} M={m}: max_err={max_err} exceeds tol={tol}"
+            );
+            println!("K2 tiled K={k} N={n} M={m}: max_err={max_err} (tol {tol})");
+        }
+    }
+}
+
 fn random_input(m: usize, k: usize, seed: u64) -> Vec<f32> {
     let mut rng = Xorshift::new(seed);
     (0..m * k)
         .map(|_| (rng.next_u32() % 2000) as f32 / 1000.0 - 1.0)
         .collect()
+}
+
+/// K2 micro-benchmark: isolates `q4_matmul`'s kernel throughput at a
+/// realistic prefill shape (M=2225 matches `02_tools_single`'s prompt
+/// length; K=2048/N=11008 matches ffn_gate/up's shape) without any model
+/// loading, so tile-parameter iteration takes seconds instead of minutes.
+/// `#[ignore]`d: not part of the correctness suite, run explicitly with
+/// `cargo test --release --features wgpu --test q4_matmul -- --ignored
+/// bench_tiled_matmul_shape --nocapture`.
+#[test]
+#[ignore]
+fn bench_tiled_matmul_shape() {
+    let (k, n, m) = (2048usize, 11008usize, 2225usize);
+    let (q4_bytes, _cpu_weights) = random_q4(n, k, 0xABCD);
+    let input = random_input(m, k, 0x1234);
+
+    let device = device();
+    let weights = Q4Tensor::from_q4_bytes(&q4_bytes, [n, k], &device).expect("upload");
+    let input_t: Tensor<Wgpu, 3> =
+        Tensor::<Wgpu, 1>::from_floats(input.as_slice(), &device).reshape([1, m, k]);
+
+    // Warm-up (pipeline compile).
+    let _ = q4_matmul_tiled_forced(input_t.clone(), &weights)
+        .into_data()
+        .into_vec::<f32>()
+        .unwrap();
+
+    let iters = 5;
+    let t0 = std::time::Instant::now();
+    for _ in 0..iters {
+        let out = q4_matmul_tiled_forced(input_t.clone(), &weights);
+        let _ = out.into_data().into_vec::<f32>().unwrap();
+    }
+    let dt = t0.elapsed().as_secs_f64() / iters as f64;
+    let flops = 2.0 * m as f64 * n as f64 * k as f64;
+    println!(
+        "M={m} K={k} N={n}: {:.1} ms/call, {:.2} GFLOP/s",
+        dt * 1000.0,
+        flops / dt / 1e9
+    );
 }
 
 /// Synthetic shapes matching the model's actual linear layers (excluding the

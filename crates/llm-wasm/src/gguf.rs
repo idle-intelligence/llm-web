@@ -777,6 +777,30 @@ impl KernelSource for Q4MatvecSubgroupKernel {
     }
 }
 
+/// K2 — tiled prefill (M>1) matmul with workgroup-shared dequant/weight
+/// reuse (wgsl/shader_q4_tiled.wgsl). Native-only: the naive kernel stays
+/// the WASM/WebGPU default for M>1 (docs/ENGINE.md §2 / this module's doc
+/// comment — "tiled kernel is native-only").
+#[cfg(not(target_arch = "wasm32"))]
+struct Q4MatmulTiledKernel;
+
+#[cfg(not(target_arch = "wasm32"))]
+impl KernelSource for Q4MatmulTiledKernel {
+    fn source(&self) -> SourceTemplate {
+        SourceTemplate::new(include_str!("wgsl/shader_q4_tiled.wgsl"))
+    }
+
+    fn id(&self) -> KernelId {
+        KernelId::new::<Self>()
+    }
+}
+
+// Must match wgsl/shader_q4_tiled.wgsl's TM/TN constants.
+#[cfg(not(target_arch = "wasm32"))]
+const TILED_TM: usize = 64;
+#[cfg(not(target_arch = "wasm32"))]
+const TILED_TN: usize = 64;
+
 struct Q4MatmulNaiveKernel {
     workgroup_size_x: u32,
     workgroup_size_y: u32,
@@ -797,9 +821,33 @@ impl KernelSource for Q4MatmulNaiveKernel {
 /// Fused Q4_0 dequant+matmul on GPU.
 ///
 /// Computes `output[B, M, N] = input[B, M, K] × weights[N, K]^T`. General
-/// over M — serves both prefill (M = prompt length) and decode (M = 1)
-/// through the same naive kernel (docs/ENGINE.md §2).
+/// over M — serves both prefill (M = prompt length) and decode (M = 1).
+/// M==1 dispatches K1's cooperative matvec kernel; M>1 dispatches the naive
+/// kernel. K2 (wgsl/shader_q4_tiled.wgsl, tiled prefill matmul with
+/// workgroup-shared dequant/weight reuse) exists and passes correctness
+/// tests (`q4_matmul_tiled_forced` below, exercised by
+/// tests/q4_matmul.rs's `test_q4_matmul_synthetic_shapes`/`bench_tiled_*`)
+/// but is **not** dispatched here: measured at 30-40 GFLOP/s in isolation
+/// (docs/BENCHMARKS.md) vs the naive kernel's ~159 GFLOP/s effective at
+/// full-model granularity — a ~4x regression traced to two rounds of fixes
+/// (barrier:compute ratio, vectorized dequant reads) that moved the number
+/// by <35% total, not closed the gap; root cause not found within this
+/// session's budget. Left as tested-but-unused for future work rather than
+/// shipped as a regression — see that doc's K2 section.
 pub fn q4_matmul(input: Tensor<Wgpu, 3>, weights: &Q4Tensor) -> Tensor<Wgpu, 3> {
+    q4_matmul_dispatch(input, weights, false)
+}
+
+/// Forces K2's tiled kernel regardless of M (native only, requires B==1) —
+/// used only by tests/q4_matmul.rs to keep correctness coverage on the
+/// kernel while it's unselected in production. See `q4_matmul`'s doc
+/// comment for why it's not the default.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn q4_matmul_tiled_forced(input: Tensor<Wgpu, 3>, weights: &Q4Tensor) -> Tensor<Wgpu, 3> {
+    q4_matmul_dispatch(input, weights, true)
+}
+
+fn q4_matmul_dispatch(input: Tensor<Wgpu, 3>, weights: &Q4Tensor, force_tiled: bool) -> Tensor<Wgpu, 3> {
     let cube_input: CubeTensor<WgpuRuntime> = input.into_primitive().tensor();
     let cube_input = into_contiguous(cube_input);
 
@@ -837,7 +885,9 @@ pub fn q4_matmul(input: Tensor<Wgpu, 3>, weights: &Q4Tensor) -> Tensor<Wgpu, 3> 
 
     // M==1 (decode): dispatch the cooperative matvec kernel (K1 —
     // wgsl/shader_q4_matvec{,_subgroup}.wgsl) instead of the naive
-    // one-thread-per-output kernel. M>1 (prefill) keeps the naive kernel.
+    // one-thread-per-output kernel. M>1 (prefill) keeps the naive kernel
+    // unless a test forces K2's tiled kernel (see `q4_matmul`'s doc comment
+    // — not the production default).
     if b * m == 1 {
         let kernel: Box<dyn CubeTask<AutoCompiler>> = if has_subgroup_support() {
             Box::new(SourceKernel::new(Q4MatvecSubgroupKernel, CubeDim::new_1d(256)))
@@ -849,6 +899,23 @@ pub fn q4_matmul(input: Tensor<Wgpu, 3>, weights: &Q4Tensor) -> Tensor<Wgpu, 3> 
         client
             .launch(kernel, CubeCount::new_2d(wg_x, wg_y), bindings)
             .expect("Q4 matvec kernel launch failed");
+    } else if cfg!(not(target_arch = "wasm32")) && b == 1 && force_tiled {
+        // K2 (native only, B==1, test-forced only): tiled matmul with
+        // workgroup-shared dequant/weight reuse — see
+        // wgsl/shader_q4_tiled.wgsl.
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let kernel = SourceKernel::new(Q4MatmulTiledKernel, CubeDim::new_2d(16, 16));
+            let wg_x = n.div_ceil(TILED_TN) as u32;
+            let wg_y = m.div_ceil(TILED_TM) as u32;
+            client
+                .launch(
+                    Box::new(kernel) as Box<dyn CubeTask<AutoCompiler>>,
+                    CubeCount::new_2d(wg_x, wg_y),
+                    bindings,
+                )
+                .expect("Q4 tiled matmul kernel launch failed");
+        }
     } else {
         let kernel = SourceKernel::new(
             Q4MatmulNaiveKernel {
