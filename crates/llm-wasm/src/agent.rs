@@ -75,6 +75,18 @@ pub trait Generator {
         let _ = prefix_len;
         self.generate(prompt_ids, max_new_tokens, stop_ids)
     }
+
+    /// Prefill/decode timing breakdown for the most recently completed
+    /// `generate`/`generate_with_cached_prefix` call, for eval metrics
+    /// (`eval.rs`'s `mean_prefill_s`/`mean_decode_tok_s`). The default
+    /// returns `(Duration::ZERO, Duration::ZERO)` — "no breakdown
+    /// available" — in which case `Agent::step_inner` attributes its own
+    /// wall-clock measurement of the whole call to decode time instead. A
+    /// concrete implementation backed by a real KV cache (which knows when
+    /// prefill ends and decode begins) should override this.
+    fn last_call_timing(&self) -> (Duration, Duration) {
+        (Duration::ZERO, Duration::ZERO)
+    }
 }
 
 /// One render -> generate -> parse round of the agent loop.
@@ -90,6 +102,17 @@ pub struct Step {
     /// necessarily run the tools yet when the `Step` is handed back.
     pub tool_result: Option<Value>,
     pub timings: Duration,
+    /// Number of tokens sampled this step (`out_ids.len()`).
+    pub tokens_generated: usize,
+    /// Prefill time for this step's `generate_with_cached_prefix` call, or
+    /// `Duration::ZERO` when the `Generator` doesn't report a breakdown
+    /// (see `Generator::last_call_timing`).
+    pub prefill_time: Duration,
+    /// Decode time for this step's `generate_with_cached_prefix` call. When
+    /// the `Generator` doesn't report a breakdown, this is the whole
+    /// step's wall-clock time (same value as `timings`), i.e. prefill cost
+    /// is folded into it rather than lost.
+    pub decode_time: Duration,
 }
 
 pub struct Transcript {
@@ -350,6 +373,11 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
             }
         };
         let timings = start.elapsed();
+        let tokens_generated = out_ids.len();
+        let (prefill_time, decode_time) = match self.generator.last_call_timing() {
+            (p, d) if p.is_zero() && d.is_zero() => (Duration::ZERO, timings),
+            breakdown => breakdown,
+        };
 
         let generated_text = match self.tokenizer.decode(&out_ids, false) {
             Ok(t) => t,
@@ -383,6 +411,9 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
                     parsed: ParsedOutput::ToolCalls(calls),
                     tool_result: None,
                     timings,
+                    tokens_generated,
+                    prefill_time,
+                    decode_time,
                 };
                 StepOutcome::NeedTools { calls: pending, step }
             }
@@ -393,6 +424,9 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
                     parsed: ParsedOutput::Text(text.clone()),
                     tool_result: None,
                     timings,
+                    tokens_generated,
+                    prefill_time,
+                    decode_time,
                 };
                 StepOutcome::Final { text, step }
             }
