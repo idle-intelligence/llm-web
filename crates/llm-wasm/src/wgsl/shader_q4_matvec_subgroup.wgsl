@@ -21,7 +21,11 @@
 // taints as non-uniform) used to precede both workgroupBarrier() and
 // subgroupAdd() calls below, both of which require uniform control flow.
 // Guard loads/accumulation/store with `b_valid`/`row_has_output` instead;
-// keep every barrier and subgroupAdd() at the top level of `main`.
+// keep every barrier and subgroupAdd() at the top level of `main`. The
+// tile loop's `tile_start >= K` break also gates a barrier, so `K` (and
+// every other control value read from `info`) is staged through
+// `var<workgroup>` + `workgroupUniformLoad` instead of read directly —
+// see shader_q4_matvec.wgsl's header comment for why.
 
 enable subgroups;
 
@@ -39,6 +43,7 @@ const ROWS_PER_WG: u32 = 8u; // WG_SIZE / SUBGROUP_SIZE
 const TILE_K: u32 = 1024u;   // SUBGROUP_SIZE * 32 (Q4_0 block size)
 
 var<workgroup> x_shared: array<f32, 1024>;
+var<workgroup> wg_info: array<u32, 5>;
 
 @compute @workgroup_size(256, 1, 1)
 fn main(
@@ -46,10 +51,18 @@ fn main(
     @builtin(local_invocation_id) local_id: vec3<u32>,
     @builtin(subgroup_invocation_id) sg_id: u32,
 ) {
-    let B = info[0];
-    let K = info[2];
-    let N = info[3];
-    let blocks_per_row = info[4];
+    if (local_id.x == 0u) {
+        wg_info[0] = info[0];
+        wg_info[1] = info[1];
+        wg_info[2] = info[2];
+        wg_info[3] = info[3];
+        wg_info[4] = info[4];
+    }
+    let loaded_info = workgroupUniformLoad(&wg_info);
+    let B = loaded_info[0];
+    let K = loaded_info[2];
+    let N = loaded_info[3];
+    let blocks_per_row = loaded_info[4];
 
     let tid = local_id.x;
     let b = wg_id.y;

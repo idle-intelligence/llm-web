@@ -24,7 +24,13 @@
 // guard only the loads/accumulation/store with `if (valid)`, and leave
 // every workgroupBarrier() at the top level of `main` so it is always
 // reached by the whole workgroup. Invalid rows contribute 0 to the shared
-// reduction, which does not change the result for valid rows.
+// reduction, which does not change the result for valid rows. `rows`,
+// `hidden`, `eps` are staged through `var<workgroup>` + a single
+// `workgroupUniformLoad` (rather than read from `info` directly) so any
+// future loop/branch built on them is provably uniform to Tint too — see
+// shader_q4_matvec.wgsl's header comment for the loop-bound half of this
+// rule (not currently needed here since `hidden`'s loops don't wrap a
+// barrier, but kept consistent with the other two kernels).
 @group(0) @binding(0) var<storage, read_write> input: array<f32>;
 @group(0) @binding(1) var<storage, read_write> weight: array<f32>;
 @group(0) @binding(2) var<storage, read_write> output: array<f32>;
@@ -33,15 +39,22 @@
 const WG_SIZE: u32 = 256u;
 
 var<workgroup> partial_sums: array<f32, 256>;
+var<workgroup> wg_info: array<f32, 3>;
 
 @compute @workgroup_size(256, 1, 1)
 fn main(
     @builtin(workgroup_id) wg_id: vec3<u32>,
     @builtin(local_invocation_id) local_id: vec3<u32>,
 ) {
-    let rows = u32(info[0]);
-    let hidden = u32(info[1]);
-    let eps = info[2];
+    if (local_id.x == 0u) {
+        wg_info[0] = info[0];
+        wg_info[1] = info[1];
+        wg_info[2] = info[2];
+    }
+    let loaded_info = workgroupUniformLoad(&wg_info);
+    let rows = u32(loaded_info[0]);
+    let hidden = u32(loaded_info[1]);
+    let eps = loaded_info[2];
 
     let row = wg_id.x;
     let valid = row < rows;

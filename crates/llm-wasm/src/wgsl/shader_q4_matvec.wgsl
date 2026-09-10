@@ -33,10 +33,21 @@
 // in the tile loop below. `b` (== wg_id.y) is uniform per workgroup, but
 // `B` is loaded from a storage buffer and Tint conservatively taints every
 // storage-buffer load as non-uniform, so a branch that skips a later
-// barrier is rejected. Fix: never branch around a barrier — guard only the
-// loads/accumulation/store with `b_valid`/`row_has_output`, keep every
-// workgroupBarrier() at the top level of the tile loop so it is always
-// reached by the whole workgroup regardless of B or N.
+// barrier is rejected. Fix (part 1): never branch around a barrier — guard
+// only the loads/accumulation/store with `b_valid`/`row_has_output`, keep
+// every workgroupBarrier() at the top level of the tile loop so it is
+// always reached by the whole workgroup regardless of B or N.
+//
+// That guard alone isn't sufficient: the tile `loop { if (tile_start >= K)
+// { break; } ... workgroupBarrier(); }` still has a barrier reachable only
+// through a branch (the loop condition) computed from the same tainted `K`.
+// Fix (part 2): thread 0 stages the whole `info` buffer into a
+// `var<workgroup>` array, then every thread reads it back via
+// `workgroupUniformLoad`, which Tint's analysis treats as uniform (it
+// contains its own barrier pair). All loop/branch bounds that gate a
+// barrier or subgroup op must be read this way — see
+// `shader_rmsnorm.wgsl`/`shader_q4_matvec_subgroup.wgsl` for the same
+// pattern.
 
 // K5 (docs/BENCHMARKS.md): `weights` holds only the 16-byte nibble portion
 // of each Q4_0 block (4 u32/block, always aligned) — `gguf.rs::Q4Tensor`
@@ -56,16 +67,25 @@ const TILE_K: u32 = 1024u;   // THREADS_PER_ROW * 32 (Q4_0 block size)
 
 var<workgroup> x_shared: array<f32, 1024>;
 var<workgroup> partial_sums: array<f32, 256>;
+var<workgroup> wg_info: array<u32, 5>;
 
 @compute @workgroup_size(256, 1, 1)
 fn main(
     @builtin(workgroup_id) wg_id: vec3<u32>,
     @builtin(local_invocation_id) local_id: vec3<u32>,
 ) {
-    let B = info[0];
-    let K = info[2];
-    let N = info[3];
-    let blocks_per_row = info[4];
+    if (local_id.x == 0u) {
+        wg_info[0] = info[0];
+        wg_info[1] = info[1];
+        wg_info[2] = info[2];
+        wg_info[3] = info[3];
+        wg_info[4] = info[4];
+    }
+    let loaded_info = workgroupUniformLoad(&wg_info);
+    let B = loaded_info[0];
+    let K = loaded_info[2];
+    let N = loaded_info[3];
+    let blocks_per_row = loaded_info[4];
 
     let tid = local_id.x;
     let b = wg_id.y;
