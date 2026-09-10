@@ -39,6 +39,7 @@ const MAX_NEW = parseInt(args['max-new'] ?? '64', 10);
 const MAX_STEPS = parseInt(args['max-steps'] ?? '6', 10);
 const EXPECT = args.expect ? new RegExp(args.expect) : null;
 const BENCH_N = args.bench ? parseInt(args.bench, 10) : null;
+const REPEAT = args.repeat ? parseInt(args.repeat, 10) : 1;
 const TIMEOUT_LOAD = parseInt(args['timeout-load'] ?? String(10 * 60 * 1000), 10);
 const TIMEOUT_RUN = parseInt(args['timeout-run'] ?? String(6 * 60 * 1000), 10);
 const JSON_PATH = args.json ?? null;
@@ -236,28 +237,35 @@ async function main() {
     if (expectError) console.log(`FAIL: ${expectError}`);
 
     if (BENCH_N) {
-      console.log(`\n=== bench: tools=none, max-new=${BENCH_N} ===`);
-      const benchStart = Date.now();
-      const benchTranscript = await Promise.race([
-        page.evaluate(
-          ({ prompt, maxNewTokens }) => window.__llm.run(prompt, { tools: 'none', maxNewTokens, maxSteps: 1 }),
-          { prompt: PROMPT, maxNewTokens: BENCH_N }
-        ),
-        stopSignal.then(() => { throw new Error('gpu-debug-failure during bench'); }),
-        new Promise((_, rej) => setTimeout(() => rej(new Error('bench timeout')), TIMEOUT_RUN)),
-      ]);
-      const benchMs = Date.now() - benchStart;
-      const decodeStep = benchTranscript.steps[benchTranscript.steps.length - 1];
-      const decodeTokPerSec = decodeStep && decodeStep.decodeMs > 0
-        ? (decodeStep.tokens / (decodeStep.decodeMs / 1000))
-        : null;
-      report.bench = {
-        maxNewTokens: BENCH_N,
-        wallMs: benchMs,
-        step: decodeStep,
-        decodeTokPerSec,
-      };
-      console.log(`bench: ${decodeStep?.tokens} tok in decode=${decodeStep?.decodeMs?.toFixed(1)}ms -> ${decodeTokPerSec?.toFixed(2)} tok/s (decode-phase; see ENGINE.md TODO on prefill/decode split accuracy)`);
+      report.benchRuns = [];
+      for (let run = 1; run <= REPEAT; run++) {
+        console.log(`\n=== bench run ${run}/${REPEAT}: tools=none, max-new=${BENCH_N} ===`);
+        const benchStart = Date.now();
+        const benchTranscript = await Promise.race([
+          page.evaluate(
+            ({ prompt, maxNewTokens }) => window.__llm.run(prompt, { tools: 'none', maxNewTokens, maxSteps: 1 }),
+            { prompt: PROMPT, maxNewTokens: BENCH_N }
+          ),
+          stopSignal.then(() => { throw new Error('gpu-debug-failure during bench'); }),
+          new Promise((_, rej) => setTimeout(() => rej(new Error('bench timeout')), TIMEOUT_RUN)),
+        ]);
+        const benchMs = Date.now() - benchStart;
+        const decodeStep = benchTranscript.steps[benchTranscript.steps.length - 1];
+        const decodeTokPerSec = decodeStep && decodeStep.decodeMs > 0
+          ? (decodeStep.tokens / (decodeStep.decodeMs / 1000))
+          : null;
+        const benchResult = {
+          run,
+          maxNewTokens: BENCH_N,
+          wallMs: benchMs,
+          step: decodeStep,
+          decodeTokPerSec,
+        };
+        report.benchRuns.push(benchResult);
+        console.log(`bench run ${run}: ${decodeStep?.tokens} tok, prefill=${decodeStep?.prefillMs?.toFixed(1)}ms decode=${decodeStep?.decodeMs?.toFixed(1)}ms -> ${decodeTokPerSec?.toFixed(2)} tok/s (decode-phase; see ENGINE.md TODO on prefill/decode split accuracy)`);
+      }
+      // Keep `report.bench` as the last run for backward compatibility with existing readers.
+      report.bench = report.benchRuns[report.benchRuns.length - 1];
     }
   } catch (err) {
     console.log('Run failed:', String(err && err.stack ? err.stack : err));
