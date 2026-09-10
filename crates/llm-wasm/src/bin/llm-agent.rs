@@ -4,11 +4,18 @@
 use std::fs::File;
 use std::io::BufReader;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use burn::backend::wgpu::{Wgpu, WgpuDevice};
 use burn::tensor::Tensor;
 use clap::{Parser, Subcommand};
+use llm_wasm::agent::{Agent, FixtureCaller, Generator};
+use llm_wasm::eval::{self, ToolSet};
 use llm_wasm::gguf::{q4_matmul, set_skip_matvec_for_bench, Q4ModelLoader, Q4Tensor};
+use llm_wasm::kv::KvCache;
+use llm_wasm::model::LlmModel;
+use llm_wasm::template::ChatTemplate;
+use llm_wasm::tokenizer::Tokenizer;
 
 #[derive(Parser)]
 #[command(name = "llm-agent", about = "xLAM-2-3b-fc-r native CLI")]
@@ -35,8 +42,36 @@ enum Commands {
         #[arg(long, default_value_t = 12288)]
         max_ctx: usize,
     },
-    /// Evaluate the model against reference logits/outputs.
-    Eval,
+    /// Run the Sonos MCP agent eval harness (`eval/README.md`) against the
+    /// real (Burn+wgpu) model, prefix-caching the constant system+tools
+    /// prefix across cases with the same tool set.
+    Eval {
+        #[arg(long)]
+        gguf: Option<PathBuf>,
+        /// Directory containing `tokenizer.json` + `tokenizer_config.json`.
+        #[arg(long = "model-dir")]
+        model_dir: Option<PathBuf>,
+        /// `all` (34 tools, `fixtures/sonos/tools.json`) or `12`
+        /// (`fixtures/sonos/tools-12.json`).
+        #[arg(long, default_value = "all")]
+        tools: String,
+        #[arg(long, default_value = "eval/utterances.json")]
+        cases: PathBuf,
+        #[arg(long, default_value = "fixtures/sonos")]
+        fixtures: PathBuf,
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Comma-separated case ids to run instead of the full set, e.g.
+        /// `s01,m01`.
+        #[arg(long)]
+        only: Option<String>,
+        #[arg(long = "max-new-tokens", default_value_t = 256)]
+        max_new_tokens: usize,
+        #[arg(long = "max-steps", default_value_t = 6)]
+        max_steps: usize,
+        #[arg(long = "max-ctx", default_value_t = 12288)]
+        max_ctx: usize,
+    },
     /// Print GGUF header/tensor info for a model file.
     GgufInfo {
         gguf: PathBuf,
@@ -66,10 +101,29 @@ fn main() -> anyhow::Result<()> {
             tokenizer,
             max_ctx,
         } => run(&gguf, &tokens, max_new, tokenizer.as_deref(), max_ctx),
-        Commands::Eval => {
-            println!("eval: not implemented (fixture wiring is a later phase)");
-            Ok(())
-        }
+        Commands::Eval {
+            gguf,
+            model_dir,
+            tools,
+            cases,
+            fixtures,
+            out,
+            only,
+            max_new_tokens,
+            max_steps,
+            max_ctx,
+        } => run_eval(
+            gguf,
+            model_dir,
+            &tools,
+            &cases,
+            &fixtures,
+            out,
+            only,
+            max_new_tokens,
+            max_steps,
+            max_ctx,
+        ),
         Commands::GgufInfo { gguf } => gguf_info(&gguf),
         Commands::Bench {
             gguf,
@@ -439,4 +493,326 @@ fn bench(
     println!("  sync readback of logits (into_data, {vocab} f32): {readback_ms:.3} ms");
 
     Ok(())
+}
+
+/// Native `Generator` adapter over the real `LlmModel`: implements
+/// `generate_with_cached_prefix` by tracking the token ids currently
+/// resident in `cache` as a valid prefix and, when a step's `prefix_len`
+/// hint matches that stored prefix exactly, `KvCache::restore()`-ing to it
+/// and re-prefilling only the new suffix instead of the whole prompt (see
+/// `agent.rs`'s "Prefix caching" module docs and `kv.rs`'s
+/// `snapshot`/`restore`). A prefix mismatch (different tool set, or the
+/// very first call before anything is cached) falls back to a full
+/// `restore(0)` + full-prompt prefill, after which the new prefix is
+/// recorded for subsequent calls to reuse.
+struct NativeGenerator {
+    model: LlmModel,
+    cache: KvCache,
+    cached_prefix: Vec<u32>,
+    last_prefill: Duration,
+    last_decode: Duration,
+}
+
+impl NativeGenerator {
+    fn new(model: LlmModel, max_ctx: usize) -> Self {
+        let cache = model.new_cache(max_ctx);
+        Self {
+            model,
+            cache,
+            cached_prefix: Vec::new(),
+            last_prefill: Duration::ZERO,
+            last_decode: Duration::ZERO,
+        }
+    }
+}
+
+impl Generator for NativeGenerator {
+    fn generate(
+        &mut self,
+        prompt_ids: &[u32],
+        max_new_tokens: usize,
+        stop_ids: &[u32],
+    ) -> anyhow::Result<Vec<u32>> {
+        self.generate_with_cached_prefix(prompt_ids, 0, max_new_tokens, stop_ids)
+    }
+
+    fn generate_with_cached_prefix(
+        &mut self,
+        prompt_ids: &[u32],
+        prefix_len: usize,
+        max_new_tokens: usize,
+        stop_ids: &[u32],
+    ) -> anyhow::Result<Vec<u32>> {
+        anyhow::ensure!(!prompt_ids.is_empty(), "generate called with an empty prompt");
+        let prefix_len = prefix_len.min(prompt_ids.len());
+        let reuse = prefix_len > 0
+            && prefix_len == self.cached_prefix.len()
+            && prompt_ids[..prefix_len] == self.cached_prefix[..];
+
+        let t_prefill = std::time::Instant::now();
+        let suffix_start = if reuse {
+            self.cache.restore(prefix_len);
+            prefix_len
+        } else {
+            self.cache.restore(0);
+            0
+        };
+        let suffix = &prompt_ids[suffix_start..];
+        let hidden = self.model.forward_hidden(suffix, &mut self.cache);
+        let last = hidden.narrow(1, suffix.len() - 1, 1);
+        let logits = self.model.lm_head(last);
+        let mut logits_vec = llm_wasm::model::logits_to_vec(logits);
+        self.last_prefill = t_prefill.elapsed();
+
+        if !reuse {
+            self.cached_prefix = prompt_ids[..prefix_len].to_vec();
+        }
+
+        let t_decode = std::time::Instant::now();
+        let mut out = Vec::with_capacity(max_new_tokens);
+        for _ in 0..max_new_tokens {
+            let next = llm_wasm::sample::greedy(&logits_vec);
+            out.push(next);
+            if stop_ids.contains(&next) {
+                break;
+            }
+            let hidden = self.model.forward_hidden(&[next], &mut self.cache);
+            let logits = self.model.lm_head(hidden);
+            logits_vec = llm_wasm::model::logits_to_vec(logits);
+        }
+        self.last_decode = t_decode.elapsed();
+
+        Ok(out)
+    }
+
+    fn last_call_timing(&self) -> (Duration, Duration) {
+        (self.last_prefill, self.last_decode)
+    }
+}
+
+const DEFAULT_GGUF_SUFFIX: &str =
+    "Code/idle-intelligence/models/gguf/xlam-2-3b-fc-r/xLAM-2-3b-fc-r-q4_0.gguf";
+const DEFAULT_MODEL_DIR_SUFFIX: &str = "Code/idle-intelligence/models/hf/xLAM-2-3b-fc-r";
+
+fn home_relative(suffix: &str) -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_default();
+    PathBuf::from(format!("{home}/{suffix}"))
+}
+
+fn git_commit_hash() -> String {
+    std::process::Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn machine_line() -> String {
+    let kernel = std::process::Command::new("uname")
+        .arg("-r")
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    format!("Apple M2, 16 GB unified memory, macOS (Darwin {kernel})")
+}
+
+fn today() -> String {
+    std::process::Command::new("date")
+        .arg("+%Y-%m-%d")
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_else(|| "unknown-date".to_string())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_eval(
+    gguf: Option<PathBuf>,
+    model_dir: Option<PathBuf>,
+    tools_arg: &str,
+    cases_path: &std::path::Path,
+    fixtures_dir: &std::path::Path,
+    out: Option<PathBuf>,
+    only: Option<String>,
+    max_new_tokens: usize,
+    max_steps: usize,
+    max_ctx: usize,
+) -> anyhow::Result<()> {
+    let gguf_path = gguf.unwrap_or_else(|| home_relative(DEFAULT_GGUF_SUFFIX));
+    let model_dir = model_dir.unwrap_or_else(|| home_relative(DEFAULT_MODEL_DIR_SUFFIX));
+
+    let tool_set = match tools_arg {
+        "all" => ToolSet::All,
+        "12" => ToolSet::Twelve,
+        other => anyhow::bail!("--tools must be `all` or `12`, got `{other}`"),
+    };
+
+    let date = today();
+    let out_path = out.unwrap_or_else(|| {
+        let tag = match tool_set {
+            ToolSet::All => "all",
+            ToolSet::Twelve => "12",
+        };
+        PathBuf::from(format!("eval/results/{date}-{tag}-native.md"))
+    });
+
+    // -- load model --
+    let device = WgpuDevice::default();
+    let t0 = std::time::Instant::now();
+    let file = File::open(&gguf_path)
+        .map_err(|e| anyhow::anyhow!("opening --gguf {gguf_path:?}: {e}"))?;
+    let reader = BufReader::new(file);
+    let mut loader = Q4ModelLoader::new(reader)?;
+    let parts = loader.load_deferred(&device)?;
+    drop(loader);
+    let model = parts.finalize(&device)?;
+    eprintln!("model load: {:.2}s", t0.elapsed().as_secs_f32());
+
+    // -- load tokenizer + chat template --
+    let tok_path = model_dir.join("tokenizer.json");
+    let cfg_path = model_dir.join("tokenizer_config.json");
+    let tokenizer = Tokenizer::from_json(&std::fs::read(&tok_path)?)
+        .map_err(|e| anyhow::anyhow!("loading tokenizer from {tok_path:?}: {e}"))?;
+    let cfg: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&cfg_path)?)?;
+    let template = ChatTemplate::from_tokenizer_config(&cfg)?;
+
+    // -- load tools + cases --
+    let all_tools = eval::load_all_tools(fixtures_dir)?;
+    let tools = eval::select_tools(&all_tools, tool_set, fixtures_dir)?;
+    let mut cases = eval::load_cases(cases_path)?;
+    if let Some(only) = &only {
+        let ids: std::collections::HashSet<&str> = only.split(',').map(str::trim).collect();
+        cases.retain(|c| ids.contains(c.id.as_str()));
+    }
+
+    let results_dir = fixtures_dir.join("results");
+    let generator = NativeGenerator::new(model, max_ctx);
+    let caller = FixtureCaller::new(&results_dir);
+    let mut agent = Agent::new(
+        template,
+        tokenizer,
+        generator,
+        caller,
+        "You are a helpful home assistant with access to Sonos speaker controls.",
+        max_new_tokens,
+    );
+    agent.set_max_steps(max_steps);
+
+    // -- run, printing progress as it goes --
+    let mut results = Vec::with_capacity(cases.len());
+    for case in &cases {
+        if tool_set == ToolSet::Twelve && !case.tools12_ok {
+            println!("{}: skipped (tools12_ok=false)", case.id);
+            results.push(skipped_case_result(case));
+            continue;
+        }
+        let mut caller = FixtureCaller::new(&results_dir);
+        let result = eval::run_case(&mut agent, &tools, case, &mut caller);
+        let decode_s = result.decode_ms_total / 1000.0;
+        let decode_tok_s = if decode_s > 0.0 {
+            result.tokens_generated as f64 / decode_s
+        } else {
+            0.0
+        };
+        let calls: Vec<String> = result
+            .calls_made
+            .iter()
+            .map(|c| format!("{}({})", c.name, c.arguments))
+            .collect();
+        println!(
+            "{}: correct={} steps={} prefill_s={:.3} decode_tok_s={:.2} total_s={:.3} calls=[{}]",
+            result.id,
+            result.correct,
+            result.steps,
+            result.prefill_ms_total / 1000.0,
+            decode_tok_s,
+            result.total_ms / 1000.0,
+            calls.join(", "),
+        );
+        results.push(result);
+    }
+
+    let report = aggregate_report(results, tool_set, &gguf_path, &date);
+    let mut markdown = eval::render_markdown(&report);
+
+    let commit = git_commit_hash();
+    let machine = machine_line();
+    markdown.push_str(&format!(
+        "\n- commit: {commit}\n- machine: {machine}\n- gguf: {}\n- model-dir: {}\n",
+        gguf_path.display(),
+        model_dir.display(),
+    ));
+
+    if let Some(parent) = out_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&out_path, &markdown)?;
+    println!("wrote {}", out_path.display());
+
+    Ok(())
+}
+
+fn skipped_case_result(case: &eval::EvalCase) -> eval::CaseResult {
+    // Mirrors `eval.rs`'s private `skipped_result` (not `pub`), duplicated
+    // here since `run_eval` prints progress per-case and needs the same
+    // skip record `eval::run_all` would produce internally.
+    eval::CaseResult {
+        id: case.id.clone(),
+        correct: false,
+        skipped: true,
+        reason: "tools12_ok=false: not solvable under the 12-tool subset".to_string(),
+        steps: 0,
+        calls_made: Vec::new(),
+        prefill_ms_total: 0.0,
+        decode_ms_total: 0.0,
+        tokens_generated: 0,
+        total_ms: 0.0,
+    }
+}
+
+fn aggregate_report(
+    results: Vec<eval::CaseResult>,
+    tool_set: ToolSet,
+    gguf_path: &std::path::Path,
+    date: &str,
+) -> eval::EvalReport {
+    let scored: Vec<&eval::CaseResult> = results.iter().filter(|r| !r.skipped).collect();
+    let n = scored.len().max(1) as f64;
+    let correct_pct = scored.iter().filter(|r| r.correct).count() as f64 / n * 100.0;
+    let mean_steps = scored.iter().map(|r| r.steps as f64).sum::<f64>() / n;
+    let mean_prefill_s = scored.iter().map(|r| r.prefill_ms_total / 1000.0).sum::<f64>() / n;
+    let mean_total_s = scored.iter().map(|r| r.total_ms / 1000.0).sum::<f64>() / n;
+    let decode_tok_s_values: Vec<f64> = scored
+        .iter()
+        .filter_map(|r| {
+            let decode_s = r.decode_ms_total / 1000.0;
+            (decode_s > 0.0).then(|| r.tokens_generated as f64 / decode_s)
+        })
+        .collect();
+    let mean_decode_tok_s = if decode_tok_s_values.is_empty() {
+        0.0
+    } else {
+        decode_tok_s_values.iter().sum::<f64>() / decode_tok_s_values.len() as f64
+    };
+
+    let model = gguf_path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| gguf_path.display().to_string());
+
+    eval::EvalReport {
+        model,
+        tool_set,
+        backend: "native".to_string(),
+        date: date.to_string(),
+        results,
+        correct_pct,
+        mean_steps,
+        mean_prefill_s,
+        mean_decode_tok_s,
+        mean_total_s,
+    }
 }
