@@ -88,21 +88,26 @@ async function toolCaller(name, args) {
   return fn(args);
 }
 
+window.__llmLog = [];
+
 const logEl = document.getElementById('log');
 function logLine(text) {
+  window.__llmLog.push(text);
   const div = document.createElement('div');
   div.textContent = text;
   logEl.appendChild(div);
   logEl.scrollTop = logEl.scrollHeight;
 }
 function logStep(step) {
-  const div = document.createElement('div');
-  div.className = 'step ' + (step.calls ? 'tool' : 'final');
   const callsText = step.calls ? step.calls.map((c) => `${c.name}(${JSON.stringify(c.args)})`).join(', ') : '(final answer)';
-  div.textContent =
+  const text =
     `step ${step.index}: ${callsText} — prompt=${step.promptTokens} tok, ` +
     `prefill=${step.prefillMs.toFixed(1)}ms, decode=${step.decodeMs.toFixed(1)}ms, generated=${step.tokens} tok\n` +
     `  raw: ${step.text}`;
+  window.__llmLog.push(text);
+  const div = document.createElement('div');
+  div.className = 'step ' + (step.calls ? 'tool' : 'final');
+  div.textContent = text;
   logEl.appendChild(div);
   logEl.scrollTop = logEl.scrollHeight;
 }
@@ -147,10 +152,12 @@ document.getElementById('load-btn').addEventListener('click', async () => {
   try {
     const info = await client.load({ id: 'xlam-2-3b-fc-r', shards, tokenizerUrl, templateUrl });
     document.getElementById('status').textContent = `Ready: ${JSON.stringify(info)}`;
+    logLine(`ready: ${JSON.stringify(info)}`);
     document.getElementById('run-btn').disabled = false;
     document.getElementById('reset-btn').disabled = false;
   } catch (err) {
     document.getElementById('status').textContent = `Load failed: ${err.message || err}`;
+    logLine(`load error: ${err.message || err}`);
     document.getElementById('load-btn').disabled = false;
   }
 });

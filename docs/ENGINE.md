@@ -643,3 +643,21 @@ up each tool's schema in the full 34-tool list, instead of filtering the
 34-tool list's order. `llm-agent eval --tools 12 --only s09,m01 --label
 split-fix` after the fix: both call `get_households_and_groups_and_players({})`
 first (`correct=true`).
+
+### Headless repro
+
+`web/agent/worker.js` imports `./gpu-debug.js` before dynamically importing
+`pkg/llm_wasm.js`, wrapping `GPUDevice` methods in error scopes so Chrome's
+cascade errors (`[Invalid BindGroupLayout] ... is invalid due to a previous
+error`) surface their root validation message instead of only the downstream
+noise. `index.html` exposes every log line on `window.__llmLog` for
+automation. To reproduce headless with Playwright's bundled Chromium (never
+the user's real browser): start `python3 web/agent/serve.py` (port 8002,
+COOP/COEP) alongside the model server on :8001, then drive the page with
+`chromium.launch({ headless: true, args: ['--enable-unsafe-webgpu',
+'--enable-features=WebGPU', '--use-angle=metal', '--ignore-gpu-blocklist'] })`
+— WebGPU works fine in headless mode on this hardware (Apple M2, metal-3
+adapter) as long as the page has navigated to a real http(s) origin first;
+`navigator.gpu` is `undefined` on `about:blank`. Click `#load-btn`, wait for
+`window.__llmLog` to contain `ready`, fill `#utterance`, click `#run-btn`,
+and watch for `[gpu-debug]` lines.

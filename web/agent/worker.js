@@ -22,10 +22,12 @@
  *   {type:'error', id?, message}
  */
 
-import init, { initWgpuDevice, LlmEngine } from './pkg/llm_wasm.js';
+import './gpu-debug.js';
 
 let engine = null;
 let wasmReady = false;
+let initWgpuDevice = null;
+let LlmEngine = null;
 
 // Pending tool calls this worker is waiting on: callId -> {resolve, reject}
 const pendingToolCalls = new Map();
@@ -74,7 +76,10 @@ self.addEventListener('unhandledrejection', (e) => {
 // ---------------------------------------------------------------------------
 async function handleLoad(model) {
   if (!wasmReady) {
-    await init();
+    const pkg = await import('./pkg/llm_wasm.js');
+    initWgpuDevice = pkg.initWgpuDevice;
+    LlmEngine = pkg.LlmEngine;
+    await pkg.default();
     wasmReady = true;
   }
 
