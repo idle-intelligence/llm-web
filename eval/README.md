@@ -56,6 +56,27 @@ name (not per-argument), then scored offline against
 - A read-only multi-step item (e.g. `m07`, "what's the volume in the
   bedroom?") is correct if its final read happens with the right args;
   there's no mutating call to check.
+- **Unquantified volume nudges ("a bit", "a little", "monte le son"
+  with no number) use a delta of ±10** via `adjust_group_volume` on
+  the resolved group — `+10` for up, `-10` for down. This is a
+  convention chosen for the eval, not a value derived from any Sonos
+  default; see `s16`, `m23`, `m26`.
+- **New accept modes, not yet scored — `pending_harness: true`:**
+  `crates/llm-wasm/src/eval.rs`'s scorer does not yet implement these;
+  items using them are marked `pending_harness: true` so the current
+  scorer skips them (treat them the way `tools12_ok: false` items are
+  skipped under the 12-tool set) until the harness is extended.
+  - `accept: "no_mutation"` — the item's `expected` is `[]`; correct
+    means **no** mutating tool call was made (an unresolvable target,
+    e.g. a room that doesn't exist in the household — see `m21`). Read
+    calls, or a plain text answer, are fine.
+  - `accept: "any_play"` — the item's `expected` is `[]`; correct
+    means any single `play_*` call was made (any target, any content)
+    — used for fully ambiguous requests with no canonical answer, e.g.
+    `m22`, "play something".
+- **`lang: "fr"`** marks a French-language utterance; the expected
+  call sequence is scored identically to an equivalent English item —
+  see `m25`, `m26`.
 
 ## Metrics per row
 
@@ -108,10 +129,14 @@ Example skeleton:
 
 ## Files
 
-- `utterances.json` — the 20 scored utterances (10 `single`, 10
-  `multi`), each with the expected tool-call sequence, canned-fixture
-  argument values, accept mode, `tools12_ok` (solvable with the
-  13-tool subset in `fixtures/sonos/tools-12.json`; file still named tools-12.json), and notes.
+- `utterances.json` — 43 utterances (17 `single`, 26 `multi`; 2 of the
+  `multi` items are French, `lang: "fr"`), each with the expected
+  tool-call sequence, canned-fixture argument values, accept mode,
+  `tools12_ok` (solvable with the 13-tool subset in
+  `fixtures/sonos/tools-12.json`; file still named tools-12.json), and
+  notes. 2 items (`m21`, `m22`) use the new `no_mutation`/`any_play`
+  accept modes and are marked `pending_harness: true` — see "Scoring
+  rules" above.
 - `results/<date>.md` — one file per eval run (see above).
 
 ## How to run
