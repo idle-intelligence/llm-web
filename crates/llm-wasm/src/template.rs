@@ -53,18 +53,22 @@
 //! calls (i.e. genuinely dynamic maps, including every `serde_json::Value`
 //! we embed) go through minijinja's `ValueMap`, which is a `BTreeMap`
 //! (sorted by key) unless minijinja's own `preserve_order` feature is
-//! enabled — and neither that nor `serde_json`'s `preserve_order` feature
-//! is enabled here (`Cargo.toml` is frozen for this crate, so we didn't add
-//! either). Net effect: the *wrapper* objects we control the shape of
-//! (`{"type": ..., "function": {...}}`, `{"name": ..., "arguments": ...}`,
-//! etc.) render in exactly the declared field order; the one place we hold
+//! enabled. Both `serde_json`'s and minijinja's `preserve_order` features
+//! are enabled workspace-wide (see root `Cargo.toml`), so `serde_json::Map`
+//! and minijinja's `ValueMap` both preserve insertion order end to end. Net
+//! effect: the *wrapper* objects we control the shape of (`{"type": ...,
+//! "function": {...}}`, `{"name": ..., "arguments": ...}`, etc.) render in
+//! exactly the declared field order, same as before; the one place we hold
 //! genuinely freeform JSON — the JSON-Schema `parameters`/`inputSchema`
-//! blob, and `tool_calls[].arguments` — renders in *sorted* key order.
-//! This is a real limitation for arbitrary JSON, but every Sonos tool
-//! schema in `fixtures/sonos/tools.json` (all 34 tools, checked
-//! programmatically) already declares its JSON-Schema properties in
-//! alphabetical order, so sorted-key rendering happens to reproduce the
-//! fixtures' actual byte layout with no further work.
+//! blob, and `tool_calls[].arguments` — now renders in *insertion* order
+//! (the order keys appear in the source JSON) rather than sorted order.
+//! Every Sonos tool schema in `fixtures/sonos/tools.json` (all 34 tools,
+//! checked programmatically) already declares its JSON-Schema properties in
+//! alphabetical order, so this happens to reproduce the same byte layout as
+//! the old sorted-key behavior for these fixtures — but unlike the old
+//! behavior, it also correctly preserves argument order for
+//! `tool_calls[].arguments` objects built up programmatically (e.g. by
+//! `agent.rs`) in a specific, non-alphabetical order.
 
 use anyhow::{anyhow, Context, Result};
 use minijinja::value::{Kwargs, Value as MjValue};
