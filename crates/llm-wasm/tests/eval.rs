@@ -264,3 +264,149 @@ fn render_markdown_contains_summary_and_one_row_per_case() {
     assert!(markdown.contains("| m06 "), "missing row for m06:\n{markdown}");
     assert!(markdown.contains("skipped"), "expected m06's row to say skipped:\n{markdown}");
 }
+
+#[test]
+fn no_mutation_text_answer_is_correct() {
+    let Some((template, tokenizer)) = load_agent_parts() else {
+        return;
+    };
+    // m21 ("Pause the garage.") — no such room exists; the model should
+    // recognize that and answer with text, making no mutating call.
+    let answer_turn = script_tokens(&tokenizer, "I don't see a Garage in your household.<|im_end|>");
+    let mut agent = new_agent(template, tokenizer, vec![answer_turn]);
+
+    let tools = eval::load_all_tools(fixtures_dir()).unwrap();
+    let m21 = case("m21");
+    let mut caller = FixtureCaller::new(results_dir());
+    let result = eval::run_case(&mut agent, &tools, &m21, &mut caller);
+
+    assert!(result.correct, "expected m21 with a text answer to score correct: {}", result.reason);
+    assert_eq!(result.calls_made.len(), 0);
+}
+
+#[test]
+fn no_mutation_pause_call_is_incorrect() {
+    let Some((template, tokenizer)) = load_agent_parts() else {
+        return;
+    };
+    // Model hallucinates a garage group and pauses it — that's a mutating
+    // call, which no_mutation mode must reject.
+    let discover_turn = script_tokens(
+        &tokenizer,
+        r#"[{"name": "get_households_and_groups_and_players", "arguments": {}}]<|im_end|>"#,
+    );
+    let pause_turn = script_tokens(
+        &tokenizer,
+        r#"[{"name": "pause", "arguments": {"group_id": "RINCON_KITCHEN01:1"}}]<|im_end|>"#,
+    );
+    let answer_turn = script_tokens(&tokenizer, "Paused the garage.<|im_end|>");
+    let mut agent = new_agent(template, tokenizer, vec![discover_turn, pause_turn, answer_turn]);
+
+    let tools = eval::load_all_tools(fixtures_dir()).unwrap();
+    let m21 = case("m21");
+    let mut caller = FixtureCaller::new(results_dir());
+    let result = eval::run_case(&mut agent, &tools, &m21, &mut caller);
+
+    assert!(!result.correct, "expected m21 with a mutating pause call to score incorrect");
+    assert!(
+        result.reason.contains("mutating call"),
+        "expected reason to mention the mutating call, got: {}",
+        result.reason
+    );
+}
+
+#[test]
+fn any_play_valid_group_is_correct() {
+    let Some((template, tokenizer)) = load_agent_parts() else {
+        return;
+    };
+    // m22 ("Play something.") — fully ambiguous; any play_* call with a
+    // real group_id should be accepted.
+    let discover_turn = script_tokens(
+        &tokenizer,
+        r#"[{"name": "get_households_and_groups_and_players", "arguments": {}}]<|im_end|>"#,
+    );
+    let play_turn = script_tokens(
+        &tokenizer,
+        r#"[{"name": "play_station", "arguments": {"group_id": "RINCON_LIVING01:2", "station": "Any FM"}}]<|im_end|>"#,
+    );
+    let answer_turn = script_tokens(&tokenizer, "Playing a station in the Living Room.<|im_end|>");
+    let mut agent = new_agent(template, tokenizer, vec![discover_turn, play_turn, answer_turn]);
+
+    let tools = eval::load_all_tools(fixtures_dir()).unwrap();
+    let m22 = case("m22");
+    let mut caller = FixtureCaller::new(results_dir());
+    let result = eval::run_case(&mut agent, &tools, &m22, &mut caller);
+
+    assert!(result.correct, "expected m22 with a valid play_station call to score correct: {}", result.reason);
+}
+
+#[test]
+fn any_play_invented_group_is_incorrect() {
+    let Some((template, tokenizer)) = load_agent_parts() else {
+        return;
+    };
+    let discover_turn = script_tokens(
+        &tokenizer,
+        r#"[{"name": "get_households_and_groups_and_players", "arguments": {}}]<|im_end|>"#,
+    );
+    let play_turn = script_tokens(
+        &tokenizer,
+        r#"[{"name": "play_station", "arguments": {"group_id": "RINCON_MADEUP99:9", "station": "Any FM"}}]<|im_end|>"#,
+    );
+    let answer_turn = script_tokens(&tokenizer, "Playing a station.<|im_end|>");
+    let mut agent = new_agent(template, tokenizer, vec![discover_turn, play_turn, answer_turn]);
+
+    let tools = eval::load_all_tools(fixtures_dir()).unwrap();
+    let m22 = case("m22");
+    let mut caller = FixtureCaller::new(results_dir());
+    let result = eval::run_case(&mut agent, &tools, &m22, &mut caller);
+
+    assert!(!result.correct, "expected m22 with an invented group_id to score incorrect");
+}
+
+#[test]
+fn lang_field_deserializes_and_renders() {
+    // m25 ("Mets pause dans la cuisine.") carries `lang: "fr"` and is
+    // scored identically to the equivalent English case (m01).
+    let m25 = case("m25");
+    assert_eq!(m25.lang.as_deref(), Some("fr"));
+
+    let Some((template, tokenizer)) = load_agent_parts() else {
+        return;
+    };
+    let discover_turn = script_tokens(
+        &tokenizer,
+        r#"[{"name": "get_households_and_groups_and_players", "arguments": {}}]<|im_end|>"#,
+    );
+    let pause_turn = script_tokens(
+        &tokenizer,
+        r#"[{"name": "pause", "arguments": {"group_id": "RINCON_KITCHEN01:1"}}]<|im_end|>"#,
+    );
+    let answer_turn = script_tokens(&tokenizer, "Cuisine en pause.<|im_end|>");
+    let mut agent = new_agent(template, tokenizer, vec![discover_turn, pause_turn, answer_turn]);
+
+    let tools = eval::load_all_tools(fixtures_dir()).unwrap();
+    let mut caller = FixtureCaller::new(results_dir());
+    let result = eval::run_case(&mut agent, &tools, &m25, &mut caller);
+    assert!(result.correct, "expected m25 to score correct: {}", result.reason);
+
+    let report = eval::run_all(
+        &mut agent,
+        &tools,
+        &[case("m25")],
+        ToolSet::All,
+        results_dir(),
+        "test-model",
+        "2026-09-10",
+    );
+    let no_lang_markdown = eval::render_markdown(&report);
+    assert!(
+        !no_lang_markdown.contains("| lang |"),
+        "render_markdown (no cases given) should never show a lang column:\n{no_lang_markdown}"
+    );
+
+    let markdown = eval::render_markdown_with_cases(&report, &[m25]);
+    assert!(markdown.contains("| lang |"), "expected a lang column:\n{markdown}");
+    assert!(markdown.contains("| fr |"), "expected m25's row to show fr:\n{markdown}");
+}

@@ -22,6 +22,16 @@ use std::path::Path;
 pub enum Accept {
     Exact,
     Subset,
+    /// `expected` is `[]`; correct iff no mutating tool call was made
+    /// (reads are free) and the run ended in a final text answer, not
+    /// max-steps — see `eval/README.md`'s `m21`.
+    #[serde(rename = "no_mutation")]
+    NoMutation,
+    /// `expected` is `[]`; correct iff at least one mutating `play_*`
+    /// call was made with a `group_id` that exists in the fixture
+    /// household — see `eval/README.md`'s `m22`.
+    #[serde(rename = "any_play")]
+    AnyPlay,
 }
 
 /// One expected tool call in an [`EvalCase`]'s `expected` list.
@@ -42,6 +52,12 @@ pub struct EvalCase {
     pub tools12_ok: bool,
     #[serde(default)]
     pub notes: String,
+    /// `"fr"` etc. for a non-English utterance; scored identically to an
+    /// equivalent English item (`eval/README.md`). Unknown/absent fields
+    /// like this and `pending_harness` deserialise fine regardless —
+    /// serde ignores JSON keys with no matching struct field.
+    #[serde(default)]
+    pub lang: Option<String>,
 }
 
 /// Load the scored utterances from `eval/utterances.json`.
@@ -105,6 +121,52 @@ fn load_mcp_tools(path: impl AsRef<Path>) -> Result<Vec<Tool>> {
 /// `fixtures_dir`.
 pub fn load_all_tools(fixtures_dir: impl AsRef<Path>) -> Result<Vec<Tool>> {
     load_mcp_tools(fixtures_dir.as_ref().join("tools.json"))
+}
+
+/// Load `fixtures/sonos/tools.json` as raw MCP `tools/list` entries
+/// (`Value`s), kept opaque rather than converted to [`Tool`] — used only
+/// to look up a tool's `annotations.readOnlyHint` when deciding whether a
+/// call has a real side effect (see [`is_mutating`]).
+pub fn load_raw_tools(fixtures_dir: impl AsRef<Path>) -> Result<Vec<Value>> {
+    let path = fixtures_dir.as_ref().join("tools.json");
+    let raw = std::fs::read_to_string(&path).with_context(|| format!("reading tools from {path:?}"))?;
+    serde_json::from_str(&raw).with_context(|| format!("parsing tools from {path:?}"))
+}
+
+/// Whether a tool call named `name` has a real side effect. Prefers the
+/// tool's own `annotations.readOnlyHint` from `raw_tools` (MCP's own
+/// signal: `true` means read-only) when present; falls back to the
+/// `get_`-prefix heuristic used elsewhere in this module otherwise — so
+/// this works for any MCP tool set, not just Sonos's, once servers start
+/// annotating.
+fn is_mutating(name: &str, raw_tools: &[Value]) -> bool {
+    if let Some(hint) = raw_tools
+        .iter()
+        .find(|t| t["name"].as_str() == Some(name))
+        .and_then(|t| t["annotations"]["readOnlyHint"].as_bool())
+    {
+        return !hint;
+    }
+    !name.starts_with("get_")
+}
+
+/// The set of `groupId`s present in a `get_households_and_groups_and_players`
+/// result — used by `accept: "any_play"` to check a `play_*` call's
+/// `group_id` against a real group. `households` is the parsed tool result
+/// captured mid-run (see [`run_case`]) — `None` (the discovery tool was
+/// never called this run) or an unparseable value both yield an empty set,
+/// since this is scoring-time best effort, not a hard dependency.
+fn valid_group_ids(households: Option<&Value>) -> std::collections::HashSet<String> {
+    let Some(parsed) = households else {
+        return Default::default();
+    };
+    parsed["households"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|h| h["groups"].as_array().cloned().unwrap_or_default())
+        .filter_map(|g| g["groupId"].as_str().map(|s| s.to_string()))
+        .collect()
 }
 
 /// Select the [`Tool`]s for a given [`ToolSet`]: `all` unchanged for
@@ -251,7 +313,21 @@ fn args_match(expected: &Value, made: &Value) -> bool {
 
 /// Score `calls_made` (in order) against `case.expected` per
 /// `eval/README.md`'s "Scoring rules". Returns `(correct, reason)`.
-pub fn score(case: &EvalCase, calls_made: &[ToolCall]) -> (bool, String) {
+///
+/// `raw_tools` and `households` are only consulted by `no_mutation` /
+/// `any_play` cases (mutation detection and `group_id` validation
+/// respectively — `households` is the parsed
+/// `get_households_and_groups_and_players` result captured during the run,
+/// if any, see [`run_case`]); `ended_in_final` is whether the run
+/// terminated with a [`crate::agent::StepOutcome::Final`] rather than
+/// hitting max-steps or erroring — `no_mutation` requires it.
+pub fn score(
+    case: &EvalCase,
+    calls_made: &[ToolCall],
+    raw_tools: &[Value],
+    households: Option<&Value>,
+    ended_in_final: bool,
+) -> (bool, String) {
     if calls_made.len() > MAX_TOOL_CALLS {
         return (
             false,
@@ -332,6 +408,41 @@ pub fn score(case: &EvalCase, calls_made: &[ToolCall]) -> (bool, String) {
                 }
             }
         }
+        Accept::NoMutation => {
+            if !ended_in_final {
+                return (
+                    false,
+                    "no_mutation mode: run did not end in a final text answer".to_string(),
+                );
+            }
+            match calls_made.iter().find(|c| is_mutating(&c.name, raw_tools)) {
+                None => (true, "no mutating call made; final text answer given".to_string()),
+                Some(c) => (
+                    false,
+                    format!("no_mutation mode: mutating call {}({}) was made", c.name, c.arguments),
+                ),
+            }
+        }
+        Accept::AnyPlay => {
+            let group_ids = valid_group_ids(households);
+            match calls_made.iter().find(|c| {
+                c.name.starts_with("play_")
+                    && is_mutating(&c.name, raw_tools)
+                    && c.arguments
+                        .get("group_id")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|id| group_ids.contains(id))
+            }) {
+                Some(c) => (
+                    true,
+                    format!("any_play mode: {}({}) made with a valid group_id", c.name, c.arguments),
+                ),
+                None => (
+                    false,
+                    "any_play mode: no play_* call with a valid group_id was made".to_string(),
+                ),
+            }
+        }
     }
 }
 
@@ -340,6 +451,15 @@ pub fn score(case: &EvalCase, calls_made: &[ToolCall]) -> (bool, String) {
 /// `eval/README.md`'s max-6-tool-calls rule independently of `Agent`'s own
 /// step budget, and so `caller`'s `calls_seen` reflects exactly this case
 /// (call with a fresh `FixtureCaller` per case).
+///
+/// Along the way this captures the result of any
+/// `get_households_and_groups_and_players` call the run makes, so `score`
+/// can validate an `accept: "any_play"` case's `group_id` against it
+/// without this function needing a `results_dir` of its own — the fixture
+/// tools set has no `annotations.readOnlyHint` entries today, so mutation
+/// detection here falls back to the `get_`-prefix heuristic (see
+/// [`is_mutating`]); `score` also accepts real tool annotations directly
+/// for callers (e.g. [`run_all`]) that have them.
 pub fn run_case<G: Generator>(
     agent: &mut Agent<G, FixtureCaller>,
     tools: &[Tool],
@@ -351,6 +471,7 @@ pub fn run_case<G: Generator>(
     let mut prefill_ms_total = 0.0f64;
     let mut decode_ms_total = 0.0f64;
     let mut tokens_generated = 0usize;
+    let mut households: Option<Value> = None;
 
     let mut accumulate = |step: &crate::agent::Step| {
         prefill_ms_total += step.prefill_time.as_secs_f64() * 1000.0;
@@ -365,18 +486,21 @@ pub fn run_case<G: Generator>(
             StepOutcome::Final { step, .. } => {
                 accumulate(&step);
                 let calls_made = to_tool_calls(&caller.calls_seen);
-                break score(case, &calls_made);
+                break score(case, &calls_made, &[], households.as_ref(), true);
             }
             StepOutcome::NeedTools { calls, step } => {
                 accumulate(&step);
                 let mut results = Vec::with_capacity(calls.len());
                 for call in &calls {
                     let result = caller.call(&call.name, &call.arguments).unwrap_or(Value::Null);
+                    if call.name == "get_households_and_groups_and_players" {
+                        households = Some(result.clone());
+                    }
                     results.push((call.call_id.clone(), result));
                 }
                 if caller.calls_seen.len() > MAX_TOOL_CALLS {
                     let calls_made = to_tool_calls(&caller.calls_seen);
-                    break score(case, &calls_made);
+                    break score(case, &calls_made, &[], households.as_ref(), false);
                 }
                 outcome = agent.provide_tool_results(results);
             }
@@ -524,10 +648,24 @@ pub fn run_all<G: Generator>(
 
 /// Render an [`EvalReport`] in the research-log layout `eval/README.md`
 /// specifies: a parameters block, then a per-case table, then a summary
-/// line.
+/// line. Equivalent to [`render_markdown_with_cases`] with no cases (so
+/// never shows a `lang` column) — `CaseResult` itself carries no `lang`,
+/// since it's the [`EvalCase`] a result came from that knows its language;
+/// pass the cases the report was built from to `render_markdown_with_cases`
+/// to get that column when any of them are non-English.
 pub fn render_markdown(report: &EvalReport) -> String {
+    render_markdown_with_cases(report, &[])
+}
+
+/// [`render_markdown`], plus a `lang` column (shown only if at least one of
+/// `cases` has a `lang`) — cases are matched to `report.results` by `id`.
+pub fn render_markdown_with_cases(report: &EvalReport, cases: &[EvalCase]) -> String {
     use std::fmt::Write;
     let mut out = String::new();
+
+    let lang_of = |id: &str| -> Option<&str> {
+        cases.iter().find(|c| c.id == id).and_then(|c| c.lang.as_deref())
+    };
 
     let _ = writeln!(out, "# Sonos MCP agent eval — {}", report.date);
     let _ = writeln!(out);
@@ -543,26 +681,52 @@ pub fn render_markdown(report: &EvalReport) -> String {
     let _ = writeln!(out, "- max_steps: {}", report.max_steps);
     let _ = writeln!(out, "- prefix_tokens: {}", report.prefix_tokens);
     let _ = writeln!(out);
-    let _ = writeln!(out, "| id | correct | steps | prefill_s | decode_tok_s | total_s | reason |");
-    let _ = writeln!(out, "|----|---------|-------|-----------|---------------|---------|--------|");
+    let show_lang = report.results.iter().any(|r| lang_of(&r.id).is_some());
+    if show_lang {
+        let _ = writeln!(out, "| id | correct | steps | prefill_s | decode_tok_s | total_s | lang | reason |");
+        let _ = writeln!(out, "|----|---------|-------|-----------|---------------|---------|------|--------|");
+    } else {
+        let _ = writeln!(out, "| id | correct | steps | prefill_s | decode_tok_s | total_s | reason |");
+        let _ = writeln!(out, "|----|---------|-------|-----------|---------------|---------|--------|");
+    }
     for r in &report.results {
+        let lang = lang_of(&r.id).unwrap_or("-");
         if r.skipped {
-            let _ = writeln!(out, "| {} | skipped | - | - | - | - | {} |", r.id, r.reason);
+            if show_lang {
+                let _ = writeln!(out, "| {} | skipped | - | - | - | - | {} | {} |", r.id, lang, r.reason);
+            } else {
+                let _ = writeln!(out, "| {} | skipped | - | - | - | - | {} |", r.id, r.reason);
+            }
             continue;
         }
         let decode_s = r.decode_ms_total / 1000.0;
         let decode_tok_s = if decode_s > 0.0 { r.tokens_generated as f64 / decode_s } else { 0.0 };
-        let _ = writeln!(
-            out,
-            "| {} | {} | {} | {:.3} | {:.2} | {:.3} | {} |",
-            r.id,
-            r.correct,
-            r.steps,
-            r.prefill_ms_total / 1000.0,
-            decode_tok_s,
-            r.total_ms / 1000.0,
-            r.reason,
-        );
+        if show_lang {
+            let _ = writeln!(
+                out,
+                "| {} | {} | {} | {:.3} | {:.2} | {:.3} | {} | {} |",
+                r.id,
+                r.correct,
+                r.steps,
+                r.prefill_ms_total / 1000.0,
+                decode_tok_s,
+                r.total_ms / 1000.0,
+                lang,
+                r.reason,
+            );
+        } else {
+            let _ = writeln!(
+                out,
+                "| {} | {} | {} | {:.3} | {:.2} | {:.3} | {} |",
+                r.id,
+                r.correct,
+                r.steps,
+                r.prefill_ms_total / 1000.0,
+                decode_tok_s,
+                r.total_ms / 1000.0,
+                r.reason,
+            );
+        }
     }
     let _ = writeln!(out);
     let scored = report.results.iter().filter(|r| !r.skipped).count();

@@ -75,19 +75,19 @@ name (not per-argument), then scored offline against
   the resolved group — `+10` for up, `-10` for down. This is a
   convention chosen for the eval, not a value derived from any Sonos
   default; see `s16`, `m23`, `m26`.
-- **New accept modes, not yet scored — `pending_harness: true`:**
-  `crates/llm-wasm/src/eval.rs`'s scorer does not yet implement these;
-  items using them are marked `pending_harness: true` so the current
-  scorer skips them (treat them the way `tools12_ok: false` items are
-  skipped under the 12-tool set) until the harness is extended.
-  - `accept: "no_mutation"` — the item's `expected` is `[]`; correct
-    means **no** mutating tool call was made (an unresolvable target,
-    e.g. a room that doesn't exist in the household — see `m21`). Read
-    calls, or a plain text answer, are fine.
-  - `accept: "any_play"` — the item's `expected` is `[]`; correct
-    means any single `play_*` call was made (any target, any content)
-    — used for fully ambiguous requests with no canonical answer, e.g.
-    `m22`, "play something".
+- **`accept: "no_mutation"`** — the item's `expected` is `[]`; correct
+  means **no** mutating tool call was made (an unresolvable target,
+  e.g. a room that doesn't exist in the household — see `m21`) and the
+  run ends in a final text answer, not max-steps. Read calls are fine.
+- **`accept: "any_play"`** — the item's `expected` is `[]`; correct
+  means at least one mutating `play_*` call was made with a
+  `group_id` that exists in the fixture household (any target, any
+  content) — used for fully ambiguous requests with no canonical
+  answer, e.g. `m22`, "play something".
+- **Mutating-call detection** (`no_mutation`/`any_play`): a tool call
+  is mutating per its `annotations.readOnlyHint` in
+  `fixtures/sonos/tools.json` when present (`true` = read-only),
+  falling back to the `get_`-prefix heuristic otherwise.
 - **`lang: "fr"`** marks a French-language utterance; the expected
   call sequence is scored identically to an equivalent English item —
   see `m25`, `m26`.
@@ -148,9 +148,8 @@ Example skeleton:
   tool-call sequence, canned-fixture argument values, accept mode,
   `tools12_ok` (solvable with the 13-tool subset in
   `fixtures/sonos/tools-12.json`; file still named tools-12.json), and
-  notes. 2 items (`m21`, `m22`) use the new `no_mutation`/`any_play`
-  accept modes and are marked `pending_harness: true` — see "Scoring
-  rules" above.
+  notes. 2 items (`m21`, `m22`) use the `no_mutation`/`any_play`
+  accept modes — see "Scoring rules" above.
 - `results/<date>.md` — one file per eval run (see above).
 
 ## How to run

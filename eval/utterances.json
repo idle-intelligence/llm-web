@@ -766,7 +766,6 @@
     "kind": "multi",
     "expected": [],
     "accept": "no_mutation",
-    "pending_harness": true,
     "tools12_ok": true,
     "notes": "No 'Garage' room/group/player exists in the canned household. Expect no mutating tool call (the model should say it can't find that room, not guess an id). accept:'no_mutation' is a new accept mode not yet scored by the current harness \u2014 see eval/README.md."
   },
@@ -776,7 +775,6 @@
     "kind": "multi",
     "expected": [],
     "accept": "any_play",
-    "pending_harness": true,
     "tools12_ok": true,
     "notes": "Fully ambiguous request \u2014 no room, artist, track, station, or playlist named. Any single play_* call (with any target group and any content) should be accepted; there is no one canonical expected sequence. accept:'any_play' is a new accept mode not yet scored by the current harness \u2014 see eval/README.md."
   },
