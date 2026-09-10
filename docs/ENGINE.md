@@ -732,3 +732,6 @@ adapter) as long as the page has navigated to a real http(s) origin first;
 `navigator.gpu` is `undefined` on `about:blank`. Click `#load-btn`, wait for
 `window.__llmLog` to contain `ready`, fill `#utterance`, click `#run-btn`,
 and watch for `[gpu-debug]` lines.
+
+A ready-to-run version of this harness lives at `scripts/headless/repro.mjs`
+(see `scripts/headless/README.md`).
