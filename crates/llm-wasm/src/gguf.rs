@@ -329,6 +329,7 @@ pub struct GgufReader<R: Read + Seek> {
     tensor_order: Vec<String>,
     metadata: HashMap<String, GgufValue>,
     data_section_offset: u64,
+    file_len: u64,
 }
 
 /// Cap on `with_capacity` hints derived from untrusted GGUF header counts
@@ -458,7 +459,37 @@ impl<R: Read + Seek> GgufReader<R> {
             tensor_order,
             metadata,
             data_section_offset,
+            file_len,
         })
+    }
+
+    /// Byte offset where the header (magic through the end of the
+    /// tensor-info table) ends and tensor data begins — used as the
+    /// cheap-to-hash region for `kvimg::gguf_header_fingerprint` instead of
+    /// hashing the whole (1.7GB+) file.
+    pub fn data_section_offset(&self) -> u64 {
+        self.data_section_offset
+    }
+
+    pub fn file_len(&self) -> u64 {
+        self.file_len
+    }
+
+    /// Read the header bytes (`[0, data_section_offset)` — a few KB,
+    /// magic/version/counts/metadata/tensor-info-table, contains tensor
+    /// names/shapes/dtypes) for `kvimg::gguf_header_fingerprint`. Safe to
+    /// call at any point after `open()`: every tensor read elsewhere seeks
+    /// explicitly first, so this doesn't need to restore the reader's
+    /// position afterward.
+    pub fn header_bytes(&mut self) -> Result<Vec<u8>> {
+        self.reader
+            .seek(SeekFrom::Start(0))
+            .context("seeking to GGUF header for fingerprint")?;
+        let mut buf = vec![0u8; self.data_section_offset as usize];
+        self.reader
+            .read_exact(&mut buf)
+            .context("reading GGUF header bytes for fingerprint")?;
+        Ok(buf)
     }
 
     pub fn version(&self) -> u32 {
@@ -963,7 +994,28 @@ impl KernelSource for Q4MatmulNaiveKernel {
 /// session's budget. Left as tested-but-unused for future work rather than
 /// shipped as a regression — see that doc's K2 section.
 pub fn q4_matmul(input: Tensor<Wgpu, 3>, weights: &Q4Tensor) -> Tensor<Wgpu, 3> {
-    q4_matmul_dispatch(input, weights, ForceKernel::Auto)
+    let force = if force_naive_kernel() {
+        ForceKernel::Naive
+    } else {
+        ForceKernel::Auto
+    };
+    q4_matmul_dispatch(input, weights, force)
+}
+
+/// Runtime A/B toggle (`LlmEngine.setPrefillKernel("naive"|"pinned")` in
+/// `web.rs`) between production `ForceKernel::Auto` routing (which, at
+/// prefill's M>=32 shapes, takes the pinned scratch-dequant + Burn matmul
+/// path — see `pinned_matmul_strategy`) and `ForceKernel::Naive` forced
+/// regardless of M — a browser-only numerical-divergence bisection aid, not
+/// used by any production path. Defaults to `false` (production routing).
+static FORCE_NAIVE_KERNEL: AtomicBool = AtomicBool::new(false);
+
+pub fn set_force_naive_kernel(force_naive: bool) {
+    FORCE_NAIVE_KERNEL.store(force_naive, Ordering::Relaxed);
+}
+
+pub fn force_naive_kernel() -> bool {
+    FORCE_NAIVE_KERNEL.load(Ordering::Relaxed)
 }
 
 /// Test-only routing override for `q4_matmul_dispatch`, isolating a
@@ -1824,6 +1876,10 @@ impl<R: Read + Seek> Q4ModelLoader<R> {
 
     pub fn reader(&self) -> &GgufReader<R> {
         &self.reader
+    }
+
+    pub fn reader_mut(&mut self) -> &mut GgufReader<R> {
+        &mut self.reader
     }
 
     /// Read a tensor's raw bytes directly (for tests / `gguf-info`; real
