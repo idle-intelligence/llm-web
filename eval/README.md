@@ -1,5 +1,15 @@
 # Sonos MCP agent eval
 
+**Fixtures are served MCP-shaped:** `agent::FixtureCaller` doesn't hand
+the canned JSON in `fixtures/sonos/results/<tool>.json` back as a parsed
+value — it wraps it the way a real MCP `tools/call` actually replies,
+`{"content":[{"type":"text","text":"<json>"}]}` (pretty-printed, 2-space
+indent, matching what Sonos's server sends), and a canned fixture with a
+top-level `error` field becomes `{"content":[...],"isError":true}`. So
+the native eval exercises the same parsing path as the browser — result
+compaction (below) and id harvesting both have to pull the payload back
+out of that embedded text, not just read it off a top-level field.
+
 **Tool result compaction:** every tool result is compacted before it
 enters a `tool` message (`tools.rs`'s `format_tool_result`, the one
 place both `agent.rs` and `web.rs` build it) — if the result, or any

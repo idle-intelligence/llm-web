@@ -1,6 +1,6 @@
 //! Agent loop tests (phase 1a).
 
-use llm_wasm::agent::{Agent, FixtureCaller, FixtureGenerator, StepOutcome};
+use llm_wasm::agent::{Agent, FixtureCaller, FixtureGenerator, StepOutcome, ToolCaller};
 use llm_wasm::template::{ChatTemplate, Tool};
 use llm_wasm::tokenizer::Tokenizer;
 use llm_wasm::tools::ParsedOutput;
@@ -422,6 +422,40 @@ fn unknown_tool_name_retries_instead_of_calling() {
         }
         other => panic!("expected NeedTools after retrying past the unknown tool, got {other:?}"),
     }
+}
+
+/// `FixtureCaller::call` must return the same shape a real MCP `tools/call`
+/// result has — `{"content":[{"type":"text","text":"<json>"}]}`, the
+/// payload JSON-encoded as pretty-printed *text*, not returned as a parsed
+/// value directly (that mismatch is what let the browser loop pass on
+/// native fixture-driven evals while failing against the real server: ids
+/// never got harvested from a value that was already parsed). This is the
+/// documented `CallToolResult` shape (see `agent::FixtureCaller`'s doc
+/// comment / `docs/ENGINE.md`); no live-run capture of the exact bytes was
+/// available to diff against, so this asserts the documented shape.
+#[test]
+fn fixture_caller_result_is_mcp_content_shaped() {
+    let mut caller = FixtureCaller::new(results_dir());
+    let result = caller.call("get_households_and_groups_and_players", &serde_json::json!({})).unwrap();
+
+    let content = result["content"].as_array().expect("result.content should be an array");
+    assert_eq!(content.len(), 1);
+    assert_eq!(content[0]["type"], "text");
+    let text = content[0]["text"].as_str().expect("content[0].text should be a string");
+
+    // The text is the fixture's JSON, pretty-printed (real newlines +
+    // 2-space indentation), not compacted onto one line.
+    assert!(text.contains('\n'), "expected pretty-printed JSON text:\n{text}");
+    assert!(text.contains("  \"households\""), "expected 2-space indentation:\n{text}");
+
+    // And it round-trips back to exactly the canned fixture value.
+    let fixture_path = results_dir().join("get_households_and_groups_and_players.json");
+    let expected: Value = serde_json::from_str(&std::fs::read_to_string(fixture_path).unwrap()).unwrap();
+    let embedded: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(embedded, expected);
+
+    // No top-level `error` in this fixture, so no `isError`.
+    assert!(result.get("isError").is_none());
 }
 
 /// (f) With the schema diet on (the default), a raw MCP tool carrying an

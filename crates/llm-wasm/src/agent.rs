@@ -260,8 +260,38 @@ impl ToolCaller for FixtureCaller {
         let path = self.results_dir.join(format!("{name}.json"));
         let data = std::fs::read_to_string(&path)
             .map_err(|e| anyhow::anyhow!("no fixture result for tool `{name}` at {path:?}: {e}"))?;
-        Ok(serde_json::from_str(&data)?)
+        let parsed: Value = serde_json::from_str(&data)?;
+        Ok(as_mcp_result(&parsed))
     }
+}
+
+/// Wrap a canned fixture value as the shape a real MCP `tools/call` result
+/// actually has — `{"content":[{"type":"text","text":"<json>"}]}`, the
+/// payload pretty-printed the way Sonos's (and MCP servers generally)
+/// server does, *not* returned as a parsed value directly. Making the
+/// fixture path faithful to this is what surfaces bugs (e.g. id
+/// harvesting from the embedded text) that only showed up against a real
+/// server and not against the old parsed-value fixture shape.
+///
+/// A fixture file carrying a top-level `error` field (none currently do,
+/// but the shape is supported) becomes an MCP error result instead:
+/// `{"content":[{"type":"text","text":"<message>"}],"isError":true}`, per
+/// MCP's `CallToolResult` error convention (see `tools::tool_error_message`).
+fn as_mcp_result(parsed: &Value) -> Value {
+    if let Some(error) = parsed.get("error") {
+        let message = match error {
+            Value::String(s) => s.clone(),
+            other => other.to_string(),
+        };
+        return serde_json::json!({
+            "content": [{"type": "text", "text": message}],
+            "isError": true,
+        });
+    }
+    let text = serde_json::to_string_pretty(parsed).unwrap_or_else(|_| parsed.to_string());
+    serde_json::json!({
+        "content": [{"type": "text", "text": text}],
+    })
 }
 
 /// A `Generator` that replays a scripted sequence of token-id vectors, one

@@ -66,3 +66,17 @@ several music-service play tools (`play_radio`, `play_station`,
 `play_sonos_favorite` via `favorite_id`, etc.) take extra optional params
 (`music_service`, `artist`, `album`, `shuffle`, etc.) — see `tools.json` for
 the full schemas.
+
+## `results/`
+
+One canned JSON file per tool, `results/<tool>.json`, the bare return
+value for that call against the household above (not per-argument). These
+files stay in the bare/parsed shape shown by `cat`ing them — but
+`agent::FixtureCaller::call` (`crates/llm-wasm/src/agent.rs`) doesn't hand
+that value back as-is: it wraps it as a real MCP `tools/call` result,
+`{"content":[{"type":"text","text":"<json>"}]}`, with the payload
+pretty-printed (2-space indent) the way Sonos's server sends it, and (for
+a fixture carrying a top-level `error` field) `isError: true` instead.
+Fixtures are served MCP-shaped; the native eval exercises the same
+parsing path as the browser, rather than a shortcut that only works
+against a pre-parsed value.

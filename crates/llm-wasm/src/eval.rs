@@ -150,6 +150,26 @@ fn is_mutating(name: &str, raw_tools: &[Value]) -> bool {
     !name.starts_with("get_")
 }
 
+/// If `result` is MCP `tools/call`-content-shaped — `{"content":[{"type":
+/// "text","text":"<json>"}]}`, what `FixtureCaller`/a real MCP server
+/// returns (see `agent::FixtureCaller::call`'s doc comment) — parse the
+/// first content item's `text` as JSON and return that; otherwise return
+/// `result` unchanged, so a bare parsed value (an older fixture shape, or
+/// a caller that already unwrapped it) still works. Mirrors
+/// `tools::compact_embedded_json`'s embedded-JSON parsing, scoped to just
+/// the one value this needs rather than pulling in that function's
+/// recursive compaction.
+fn parse_mcp_result(result: &Value) -> Value {
+    result
+        .get("content")
+        .and_then(Value::as_array)
+        .and_then(|items| items.first())
+        .and_then(|item| item.get("text"))
+        .and_then(Value::as_str)
+        .and_then(|text| serde_json::from_str(text).ok())
+        .unwrap_or_else(|| result.clone())
+}
+
 /// The set of `groupId`s present in a `get_households_and_groups_and_players`
 /// result — used by `accept: "any_play"` to check a `play_*` call's
 /// `group_id` against a real group. `households` is the parsed tool result
@@ -160,6 +180,7 @@ fn valid_group_ids(households: Option<&Value>) -> std::collections::HashSet<Stri
     let Some(parsed) = households else {
         return Default::default();
     };
+    let parsed = parse_mcp_result(parsed);
     parsed["households"]
         .as_array()
         .into_iter()
