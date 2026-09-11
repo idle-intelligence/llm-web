@@ -451,10 +451,12 @@ against real WebGPU `maxStorageBufferBindingSize` on M2/Chrome.
 - `await engine.start(utterance: string, toolsJson: string, optsJson: string): Promise<string>` —
   begins a turn; `toolsJson` is a JSON array of MCP `tools/list` entries
   (`{"name","description","inputSchema"}`), `optsJson` is `{"maxNewTokens"?, "maxSteps"?,
-  "systemPrompt"?, "constrained"?, "diet"?}` (all optional; `constrained`/`diet` default `true`).
+  "systemPrompt"?, "constrained"?, "requireToolCallFirstStep"?, "diet"?}` (all optional;
+  `constrained`/`requireToolCallFirstStep`/`diet` default `true` — see "Agent loop"'s
+  `require_tool_call_first_step` section for what the latter does and why).
   Returns a JSON **string** (not `serde-wasm-bindgen`, to avoid adding that dependency for a shape
   this simple):
-  `{"outcome":"needTools","calls":[{"call_id","name","arguments"}...],"step":{"promptTokens","text","prefillMs","decodeMs","tokens","modelSteps","forcedTokens","retries","toolErrors"}}`,
+  `{"outcome":"needTools","calls":[{"call_id","name","arguments"}...],"step":{"promptTokens","text","prefillMs","decodeMs","tokens","modelSteps","forcedTokens","retries","toolErrors","toolsForced"}}`,
   `{"outcome":"final","text":...,"step":{...}}`, or `{"outcome":"error","message":...}`.
   **Mirrors `agent.rs::Agent`'s behaviour** (`docs/ENGINE.md` "Agent loop" / "Schema-constrained
   decoding" — this was `web.rs`'s TODO, now done): `LlmEngine::run_step` builds a fresh
@@ -1326,6 +1328,65 @@ shape, and 3 consecutive tool errors should stop the turn with an error
 rather than looping; (3) apply `schemadiet::diet_tools(_, DietLevel::Level1)`
 to the raw `tools/list` result before the per-tool `Tool::from_mcp` loop,
 by default.
+
+**`require_tool_call_first_step` (2026-09-11) — forcing the first
+generation of a turn to attempt a tool call.** Observed on a real browser
+run (13-tool Sonos page, build `be8ea94`): the utterance "play nirvana on
+bloupblip" (`bloupblip` a real speaker not in the fixture set) produced, on
+step 0, 114 tokens of prose refusal — "The provided tools do not include a
+function to play a specific artist on a Sonos group... it is not possible..."
+— with **zero tool calls made**. The id rule (`Grammar::for_tools`: a tool
+whose required `*_id`/`*_ids` property has no known value is dropped from
+the grammar entirely — see "Schema-constrained decoding" below) correctly
+excluded `play_artist` (no ids known yet, nothing harvested). But the
+free-text branch was still open at `Pos::Start`, and one tool *was*
+callable — `get_households_and_groups_and_players`, which takes no
+arguments and would have supplied the ids `play_artist` needed. The model
+never called it; it reasoned itself into a refusal instead of looking
+anything up.
+
+The fix has two parts:
+
+- **`grammar.rs`: `Grammar::tools_only`.** Mirrors `Grammar::text_only()`'s
+  trick in the opposite direction: `Pos::Start` rejects a leading non-`[`
+  byte outright, so the free-text branch never opens — every generation
+  under this grammar must be a tool-call array. Unlike `text_only()` (which
+  drops the tool set to nothing), `tools_only()` is a chainable modifier —
+  `Grammar::for_tools(&tools, &id_values).tools_only()` — so it composes
+  with whichever id-restriction (`for_tools` or
+  `for_tools_unrestricted_ids`, after fail-open) the grammar was already
+  built under.
+- **`agent.rs`/`web.rs`: `require_tool_call_first_step` (on by default).**
+  On the first generation of a turn — `self.calls_made_this_turn` still
+  empty, i.e. no tool has been called yet this turn, including across
+  malformed-output retries of that same first step — with schema-constrained
+  decoding on and at least one tool still callable after the id rule (and
+  its fail-open relaxation), `generate_attempt` rebuilds the step's grammar
+  with `.tools_only()`. `Step.tools_forced` (`Step.toolsForced` in
+  `web.rs`'s JSON) records whether this step's grammar was forced this way.
+  Any *later* step of the same turn has `calls_made_this_turn` non-empty (a
+  tool call must have happened to reach it via `NeedTools` ->
+  `provide_tool_results`), so the condition is naturally false there — the
+  turn can still end with a prose `Final` answer once the model has looked
+  something up, exactly as before. `force_final_answer`'s
+  `Grammar::text_only()` fallback (the repeat-guard / exhausted-retries
+  path) is a separate, later-step code path and is unaffected — it still
+  needs to produce text.
+- **Interaction with fail-open.** If the id rule (even after fail-open
+  relaxation) leaves *no* tool callable at all, `require_tool_call_first_step`
+  does not force anything — there is no legal tool call to force, and
+  forcing one would be an impossible constraint. `generate_attempt` falls
+  back to the normal grammar (free-text branch open) in that case, same as
+  if the option were off.
+
+**Trade-off.** A chat-shaped question with tools present ("What can you
+do?") now costs one extra step: the grammar forces a tool call on step 0
+even though the question doesn't need one, so the model calls some tool
+first and only answers in prose on the next step, instead of answering
+directly. `eval/utterances.json`'s `s18` documents this cost explicitly.
+Weighed against the `bloupblip` failure — a tool call that should have
+happened never did — this crate takes the trade: silently unhelpful over
+one wasted step.
 
 ## Tool-schema token diet (`src/schemadiet.rs`)
 

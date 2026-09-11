@@ -204,6 +204,13 @@ pub struct Step {
     /// instead of answering still gets a `Final` outcome instead of
     /// `Error`. `false` for every other step.
     pub forced_text_answer: bool,
+    /// Set when this step was generated under `Grammar::tools_only` because
+    /// it was the first generation of the turn, no tool had been called yet,
+    /// and at least one tool was callable (`Agent::require_tool_call_first_step`
+    /// — see `docs/ENGINE.md` "Agent loop" / the `bloupblip` refusal this
+    /// guards against). `false` for every other step, including one forced
+    /// the other way by `force_final_answer`.
+    pub tools_forced: bool,
 }
 
 pub struct Transcript {
@@ -227,6 +234,7 @@ struct AttemptOutput {
     model_steps: usize,
     forced_tokens: usize,
     id_rule_relaxed: bool,
+    tools_forced: bool,
 }
 
 /// One tool call the model asked for, awaiting a result via
@@ -403,6 +411,18 @@ pub struct Agent<G: Generator, C: ToolCaller> {
     /// (see [`Agent::set_constrained`]). Off by default so existing
     /// unconstrained callers/tests are unaffected.
     constrained: bool,
+    /// Whether the first generation of a turn (no tool called yet this
+    /// turn), with at least one callable tool, must be a tool call —
+    /// `Grammar::tools_only` rather than the normal grammar's free-text
+    /// branch (see `docs/ENGINE.md` "Agent loop"). On by default: the
+    /// observed failure this guards against (`bloupblip`, see that doc) was
+    /// a first-step prose refusal that never looked anything up, even
+    /// though one tool — a listing call — was callable. Only has any effect
+    /// when `self.tools` is non-empty and generation is constrained; has no
+    /// effect on `force_final_answer`'s `Grammar::text_only` step, and
+    /// falls back to the normal grammar if no tool is callable even after
+    /// the id-rule fail-open relaxation (`generate_attempt`).
+    require_tool_call_first_step: bool,
     /// Id-shaped strings harvested from every tool result seen so far this
     /// conversation (`IdValues::collect_from_result`, called from
     /// `provide_tool_results`) — the only values a `*_id`/`*_ids` schema
@@ -454,6 +474,7 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
             consecutive_tool_errors: 0,
             resident_tokens: Vec::new(),
             constrained: false,
+            require_tool_call_first_step: true,
             id_values: IdValues::new(),
             token_vocab: None,
             successful_calls_this_turn: Vec::new(),
@@ -476,6 +497,12 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
     /// constraint) — see that method's docs.
     pub fn set_constrained(&mut self, constrained: bool) {
         self.constrained = constrained;
+    }
+
+    /// Override [`Agent::require_tool_call_first_step`]'s default (on) —
+    /// see that field's doc comment.
+    pub fn set_require_tool_call_first_step(&mut self, require: bool) {
+        self.require_tool_call_first_step = require;
     }
 
     /// Override the step budget the step-wise API (`start` /
@@ -679,6 +706,7 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
                 model_steps,
                 forced_tokens,
                 id_rule_relaxed,
+                tools_forced,
             } = attempt;
             let parsed = parsed.expect("checked valid above");
             let tool_errors = self.consecutive_tool_errors;
@@ -707,6 +735,7 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
                         id_rule_relaxed,
                         repeat_guard,
                         forced_text_answer: false,
+                        tools_forced,
                     };
                     StepOutcome::NeedTools { calls: pending, step }
                 }
@@ -727,6 +756,7 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
                         id_rule_relaxed,
                         repeat_guard,
                         forced_text_answer: false,
+                        tools_forced,
                     };
                     StepOutcome::Final { text, step }
                 }
@@ -758,6 +788,7 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
             model_steps,
             forced_tokens,
             id_rule_relaxed: _,
+            tools_forced: _,
         } = attempt;
         // The text-only grammar forbids a leading `[`, so `parsed` should
         // always come back `Ok(ParsedOutput::Text(_))` — but fall back to
@@ -784,6 +815,7 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
             id_rule_relaxed: false,
             repeat_guard,
             forced_text_answer: true,
+            tools_forced: false,
         };
         StepOutcome::Final { text, step }
     }
@@ -869,6 +901,24 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
         if id_rule_relaxed {
             grammar_for_step = Some(Grammar::for_tools_unrestricted_ids(&grammar_tools));
         }
+        // `require_tool_call_first_step` (`docs/ENGINE.md` "Agent loop"):
+        // the first generation of a turn, with at least one tool still
+        // callable after the id-rule (and its fail-open relaxation above),
+        // must be a tool call — rebuild under `Grammar::tools_only` so the
+        // free-text branch isn't there to refuse in prose without ever
+        // looking anything up. If no tool is callable even now, leave
+        // `grammar_for_step` as the normal grammar (its free-text branch is
+        // the only way to produce output at all in that case).
+        let tools_forced = !force_text_only
+            && use_constrained
+            && self.require_tool_call_first_step
+            && self.calls_made_this_turn.is_empty()
+            && grammar_for_step
+                .as_ref()
+                .is_some_and(|g| !g.callable_tool_names().is_empty());
+        if tools_forced {
+            grammar_for_step = grammar_for_step.map(Grammar::tools_only);
+        }
         if use_constrained && self.token_vocab.is_none() {
             self.token_vocab = Some(TokenVocab::from_tokenizer(&self.tokenizer));
         }
@@ -931,6 +981,7 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
             model_steps,
             forced_tokens,
             id_rule_relaxed,
+            tools_forced,
         })
     }
 

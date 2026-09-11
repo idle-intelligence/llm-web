@@ -803,3 +803,85 @@ fn fail_open_relaxes_id_rule_when_only_option_is_a_repeat() {
         other => panic!("expected NeedTools, got: {other:?}"),
     }
 }
+
+/// `require_tool_call_first_step` (on by default, `docs/ENGINE.md` "Agent
+/// loop" — the `bloupblip` refusal): the first generation of a turn, with
+/// at least one callable tool, is built under `Grammar::tools_only`
+/// regardless of what the model would have said, recorded as
+/// `Step.tools_forced`. `FixtureGenerator` ignores the actual constraint
+/// mask (see its doc comment) — this script stands in for "the model would
+/// have refused in prose"; the point of this test is that `generate_attempt`
+/// decided to build and pass the tools-only grammar for this attempt at
+/// all, not that the mask actually blocked prose from coming out.
+#[test]
+fn first_step_of_turn_forces_tool_call_grammar() {
+    let Some((template, tokenizer)) = load_agent_parts() else {
+        return;
+    };
+
+    let get_status = Tool::from_mcp(
+        "get_status",
+        "Read current status.",
+        serde_json::json!({"type": "object", "properties": {}, "required": []}),
+    );
+    let tools = vec![get_status];
+
+    let prose = script_tokens(&tokenizer, "I don't have a tool for that.<|im_end|>");
+    let generator = FixtureGenerator::new(vec![prose]);
+    let caller = FixtureCaller::new(results_dir());
+    let mut agent = Agent::new(template, tokenizer, generator, caller, "sys", 64);
+    agent.set_constrained(true);
+
+    let outcome = agent.start("what's the status?", &tools);
+    let StepOutcome::Final { step, .. } = outcome else {
+        panic!("expected Final (FixtureGenerator ignores the grammar mask), got {outcome:?}");
+    };
+    assert!(
+        step.tools_forced,
+        "first generation of a turn with a callable tool should be forced under Grammar::tools_only"
+    );
+}
+
+/// A later step of the same turn — after a tool has already been called —
+/// is not forced into `tools_only`: the turn can still end with a prose
+/// answer (`docs/ENGINE.md` "Agent loop").
+#[test]
+fn later_step_of_turn_can_still_answer_in_text() {
+    let Some((template, tokenizer)) = load_agent_parts() else {
+        return;
+    };
+
+    let get_status = Tool::from_mcp(
+        "get_status",
+        "Read current status.",
+        serde_json::json!({"type": "object", "properties": {}, "required": []}),
+    );
+    let tools = vec![get_status];
+
+    let status_call = script_tokens(&tokenizer, r#"[{"name": "get_status", "arguments": {}}]<|im_end|>"#);
+    let answer = script_tokens(&tokenizer, "Everything is idle.<|im_end|>");
+    let generator = FixtureGenerator::new(vec![status_call, answer]);
+    let caller = FixtureCaller::new(results_dir());
+    let mut agent = Agent::new(template, tokenizer, generator, caller, "sys", 64);
+    agent.set_constrained(true);
+
+    let outcome = agent.start("what's the status?", &tools);
+    let StepOutcome::NeedTools { calls, step } = outcome else {
+        panic!("expected first call to succeed, got {outcome:?}");
+    };
+    assert!(step.tools_forced, "first step of the turn should still be forced");
+
+    let result = serde_json::json!({"status": "idle"});
+    let outcome2 = agent.provide_tool_results(vec![(calls[0].call_id.clone(), result)]);
+    match outcome2 {
+        StepOutcome::Final { text, step } => {
+            assert_eq!(text, "Everything is idle.");
+            assert!(
+                !step.tools_forced,
+                "a later step, with a tool already called this turn, must not be forced into \
+                 tools_only — the turn must still be able to end with prose"
+            );
+        }
+        other => panic!("expected Final, got: {other:?}"),
+    }
+}

@@ -13,7 +13,7 @@
     ],
     "accept": "subset",
     "tools12_ok": true,
-    "notes": "No room named; the only currently PLAYING group in the canned household is Living Room, so that's the canonical target. A model may legitimately call get_households_and_groups_and_players first to find it \u2014 that read is free."
+    "notes": "No room named; the only currently PLAYING group in the canned household is Living Room, so that's the canonical target. A model may legitimately call get_households_and_groups_and_players first to find it — that read is free."
   },
   {
     "id": "s02",
@@ -265,7 +265,7 @@
     ],
     "accept": "subset",
     "tools12_ok": true,
-    "notes": "shuffle is required by play_sonos_favorite's schema even though the user never mentioned shuffling \u2014 the model must default it to false, which is easy to get wrong (some models omit required-but-unmentioned booleans)."
+    "notes": "shuffle is required by play_sonos_favorite's schema even though the user never mentioned shuffling — the model must default it to false, which is easy to get wrong (some models omit required-but-unmentioned booleans)."
   },
   {
     "id": "m06",
@@ -308,7 +308,7 @@
     ],
     "accept": "subset",
     "tools12_ok": true,
-    "notes": "A read-only multi-step case: both calls are reads, so there is no mutating call to check \u2014 correctness here means the second call happened with the right group_id."
+    "notes": "A read-only multi-step case: both calls are reads, so there is no mutating call to check — correctness here means the second call happened with the right group_id."
   },
   {
     "id": "m08",
@@ -329,7 +329,7 @@
     ],
     "accept": "subset",
     "tools12_ok": true,
-    "notes": "A relative delta ('by 10') should map to adjust_group_volume, not set_group_volume \u2014 tests the set vs. adjust distinction in the opposite direction from m02."
+    "notes": "A relative delta ('by 10') should map to adjust_group_volume, not set_group_volume — tests the set vs. adjust distinction in the opposite direction from m02."
   },
   {
     "id": "m09",
@@ -373,7 +373,7 @@
     ],
     "accept": "subset",
     "tools12_ok": false,
-    "notes": "move_audio_to_players is not in the 12-tool subset. Its first argument is named source_group_id rather than group_id like every other group-scoped tool \u2014 an easy field-name slip."
+    "notes": "move_audio_to_players is not in the 12-tool subset. Its first argument is named source_group_id rather than group_id like every other group-scoped tool — an easy field-name slip."
   },
   {
     "id": "m11",
@@ -395,7 +395,7 @@
     ],
     "accept": "subset",
     "tools12_ok": true,
-    "notes": "music_service is required by play_artist's schema but not determined by the utterance; the scorer's subset-args matching (expected keys must match, extra keys in the actual call ignored \u2014 see eval/README.md's Scoring rules) means the model may include any music_service value without being penalized. shuffle defaults to false per m05's pattern for a required-but-unmentioned boolean."
+    "notes": "music_service is required by play_artist's schema but not determined by the utterance; the scorer's subset-args matching (expected keys must match, extra keys in the actual call ignored — see eval/README.md's Scoring rules) means the model may include any music_service value without being penalized. shuffle defaults to false per m05's pattern for a required-but-unmentioned boolean."
   },
   {
     "id": "m12",
@@ -460,7 +460,7 @@
     ],
     "accept": "subset",
     "tools12_ok": false,
-    "notes": "Player-level mute (contrast with s13's group-level mute) \u2014 naming the individual speaker ('Kitchen Surround') rather than the room should route to set_player_mute/player_id, not set_group_mute/group_id. set_player_mute is not in the 12-tool subset."
+    "notes": "Player-level mute (contrast with s13's group-level mute) — naming the individual speaker ('Kitchen Surround') rather than the room should route to set_player_mute/player_id, not set_group_mute/group_id. set_player_mute is not in the 12-tool subset."
   },
   {
     "id": "s13",
@@ -481,7 +481,7 @@
     ],
     "accept": "subset",
     "tools12_ok": true,
-    "notes": "Room name (not an individual speaker) routes to set_group_mute/group_id \u2014 contrast with s12's player-level mute."
+    "notes": "Room name (not an individual speaker) routes to set_group_mute/group_id — contrast with s12's player-level mute."
   },
   {
     "id": "s14",
@@ -542,7 +542,7 @@
     ],
     "accept": "subset",
     "tools12_ok": true,
-    "notes": "No room named \u2014 the playing group (Living Room) is the canonical target, same as s01/s15. Delta convention (see eval/README.md): an unquantified 'a bit'/'a little' nudge is \u00b110; this case is the 'down' direction."
+    "notes": "No room named — the playing group (Living Room) is the canonical target, same as s01/s15. Delta convention (see eval/README.md): an unquantified 'a bit'/'a little' nudge is ±10; this case is the 'down' direction."
   },
   {
     "id": "s17",
@@ -767,7 +767,7 @@
     "expected": [],
     "accept": "no_mutation",
     "tools12_ok": true,
-    "notes": "No 'Garage' room/group/player exists in the canned household. Expect no mutating tool call (the model should say it can't find that room, not guess an id). accept:'no_mutation' is a new accept mode not yet scored by the current harness \u2014 see eval/README.md."
+    "notes": "No 'Garage' room/group/player exists in the canned household. Expect no mutating tool call (the model should say it can't find that room, not guess an id). accept:'no_mutation' is a new accept mode not yet scored by the current harness — see eval/README.md."
   },
   {
     "id": "m22",
@@ -776,7 +776,7 @@
     "expected": [],
     "accept": "any_play",
     "tools12_ok": true,
-    "notes": "Fully ambiguous request \u2014 no room, artist, track, station, or playlist named. Any single play_* call (with any target group and any content) should be accepted; there is no one canonical expected sequence. accept:'any_play' is a new accept mode not yet scored by the current harness \u2014 see eval/README.md."
+    "notes": "Fully ambiguous request — no room, artist, track, station, or playlist named. Any single play_* call (with any target group and any content) should be accepted; there is no one canonical expected sequence. accept:'any_play' is a new accept mode not yet scored by the current harness — see eval/README.md."
   },
   {
     "id": "m23",
@@ -803,7 +803,7 @@
     ],
     "accept": "subset",
     "tools12_ok": true,
-    "notes": "Two rooms, two different actions in one utterance \u2014 tests that the model doesn't apply one action to both rooms. Volume delta uses the same \u00b110 'a bit' convention as s16 (this is the 'up' direction, unquantified)."
+    "notes": "Two rooms, two different actions in one utterance — tests that the model doesn't apply one action to both rooms. Volume delta uses the same ±10 'a bit' convention as s16 (this is the 'up' direction, unquantified)."
   },
   {
     "id": "m24",
@@ -866,6 +866,37 @@
     ],
     "accept": "subset",
     "tools12_ok": true,
-    "notes": "French for 'Turn up the living room's volume', unquantified. Uses the same \u00b110 'a bit' delta convention as s16/m23 ('salon' = living room)."
+    "notes": "French for 'Turn up the living room's volume', unquantified. Uses the same ±10 'a bit' delta convention as s16/m23 ('salon' = living room)."
+  },
+  {
+    "id": "m27",
+    "utterance": "Play nirvana on BLOUPBLIP.",
+    "kind": "multi",
+    "expected": [
+      {
+        "name": "get_households_and_groups_and_players",
+        "args": {}
+      },
+      {
+        "name": "play_artist",
+        "args": {
+          "group_id": "RINCON_KITCHEN01:1",
+          "artist": "Nirvana",
+          "shuffle": false
+        }
+      }
+    ],
+    "accept": "subset",
+    "tools12_ok": true,
+    "notes": "Same pattern as m11 but with a real speaker name ('BLOUPBLIP') that has no match in the fixture household; the expected call uses the fixture's kitchen group id (RINCON_KITCHEN01:1) as a stand-in target the way m11/m13 do, since the harness has no fixture room actually named 'bloupblip'. Regression case for the observed browser failure (docs/ENGINE.md \"Agent loop\" / require_tool_call_first_step): with no id known yet, play_artist is correctly excluded from the grammar by the id rule, but before require_tool_call_first_step the free-text branch let the model answer with a prose refusal on step 0 instead of calling get_households_and_groups_and_players first."
+  },
+  {
+    "id": "s18",
+    "utterance": "What can you do?",
+    "kind": "single",
+    "expected": [],
+    "accept": "no_mutation",
+    "tools12_ok": true,
+    "notes": "Chat-shaped question with tools present; documents the cost of require_tool_call_first_step — the grammar forces a tool call on step 0 even though this question doesn't need one, so a tool call is made first, then the answer."
   }
 ]

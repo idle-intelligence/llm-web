@@ -261,6 +261,15 @@ pub struct Grammar {
     /// loop"): once retries are exhausted on a repeated or empty tool call,
     /// the model must produce a text answer, not another array.
     text_only: bool,
+    /// When set, `Pos::Start` never enters the free-text branch (a leading
+    /// non-`[` byte is rejected outright) — every generation is forced into
+    /// the tool-call-array branch instead. Mirror image of `text_only`; set
+    /// by [`Grammar::tools_only`] for both agent loops'
+    /// `require_tool_call_first_step` (`docs/ENGINE.md` "Agent loop"): the
+    /// first generation of a turn must at least attempt a tool call rather
+    /// than refuse in prose (the observed `bloupblip` failure this guards
+    /// against never looked anything up).
+    tools_only: bool,
 }
 
 fn resolve_plain(k: &PropKind) -> ResolvedKind {
@@ -310,7 +319,19 @@ impl Grammar {
             name_lit: vec!["name".to_string()],
             arguments_lit: vec!["arguments".to_string()],
             text_only: true,
+            tools_only: false,
         }
+    }
+
+    /// Same schema as `self`, but forced into tool-call-only mode:
+    /// `Pos::Start` never enters the free-text branch (a leading non-`[`
+    /// byte is rejected), mirroring how [`Grammar::text_only`] forces the
+    /// opposite. Unlike `text_only`, the tool set built by `for_tools` /
+    /// `for_tools_unrestricted_ids` is kept — only the "answer in prose
+    /// instead" escape hatch is removed. See `tools_only`'s field doc.
+    pub fn tools_only(mut self) -> Self {
+        self.tools_only = true;
+        self
     }
 
     fn build(tools: &[Tool], id_values: &IdValues, restrict_ids: bool) -> Self {
@@ -366,6 +387,7 @@ impl Grammar {
             name_lit: vec!["name".to_string()],
             arguments_lit: vec!["arguments".to_string()],
             text_only: false,
+            tools_only: false,
         }
     }
 
@@ -587,6 +609,8 @@ impl Grammar {
                     } else {
                         Some(Pos::ArrWs)
                     }
+                } else if self.tools_only {
+                    None
                 } else {
                     Some(Pos::FreeText)
                 }

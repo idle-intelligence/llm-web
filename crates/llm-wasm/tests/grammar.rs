@@ -196,6 +196,32 @@ fn text_only_accepts_prose() {
     assert!(state.is_complete());
 }
 
+// `Grammar::tools_only` (both agent loops' `require_tool_call_first_step`,
+// `docs/ENGINE.md` "Agent loop"): the free-text branch is rejected at
+// `Pos::Start` — a leading non-`[` byte is invalid — while the tool-call
+// array branch behaves exactly like `Grammar::for_tools`'s.
+#[test]
+fn tools_only_rejects_leading_prose() {
+    let tools = sonos_tools();
+    let grammar = Grammar::for_tools(&tools, &IdValues::new()).tools_only();
+    let mut state = GrammarState::new(&grammar);
+
+    assert!(
+        !state.feed_bytes(b"I can't do that."),
+        "tools_only grammar should reject a leading non-'[' byte outright"
+    );
+}
+
+#[test]
+fn tools_only_accepts_tool_call_array() {
+    let tools = sonos_tools();
+    let grammar = Grammar::for_tools(&tools, &IdValues::new()).tools_only();
+    let mut state = GrammarState::new(&grammar);
+
+    assert!(state.feed_bytes(br#"[{"name": "get_households_and_groups_and_players", "arguments": {}}]"#));
+    assert!(state.is_complete());
+}
+
 // (g) Mask time per step, printed.
 #[test]
 fn mask_time_per_step() {

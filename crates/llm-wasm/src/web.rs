@@ -226,6 +226,12 @@ pub struct LlmEngine {
     /// (see `docs/ENGINE.md` "Schema-constrained decoding"). On by
     /// default — set via `opts.constrained`.
     constrained: bool,
+    /// Whether the first generation of a turn (no tool called yet this
+    /// turn), with at least one callable tool, must be a tool call —
+    /// mirrors `agent.rs::Agent::require_tool_call_first_step` (see
+    /// `docs/ENGINE.md` "Agent loop"). On by default — set via
+    /// `opts.requireToolCallFirstStep`.
+    require_tool_call_first_step: bool,
     /// Whether `start()`/the KV-image entry points run raw MCP tool lists
     /// through `schemadiet::diet_tools` before `Tool::from_mcp`. On by
     /// default — set via `opts.diet`.
@@ -290,6 +296,7 @@ impl LlmEngine {
             step_index: 0,
             consecutive_tool_errors: 0,
             constrained: true,
+            require_tool_call_first_step: true,
             diet: true,
             id_values: IdValues::new(),
             token_vocab: None,
@@ -743,6 +750,10 @@ struct OptsIn {
     /// decoding"). Defaults to on (`LlmEngine::new`'s `constrained: true`)
     /// when omitted.
     constrained: Option<bool>,
+    /// Whether the first generation of a turn must be a tool call
+    /// (`docs/ENGINE.md` "Agent loop"). Defaults to on when omitted.
+    #[serde(rename = "requireToolCallFirstStep")]
+    require_tool_call_first_step: Option<bool>,
     /// Tool-schema token diet applied before `Tool::from_mcp` (`docs/
     /// ENGINE.md` "Tool-schema token diet"). Defaults to on when omitted.
     diet: Option<bool>,
@@ -765,6 +776,9 @@ fn apply_opts(engine: &mut LlmEngine, opts_json: &str) -> Result<(), JsError> {
     }
     if let Some(b) = opts.constrained {
         engine.constrained = b;
+    }
+    if let Some(b) = opts.require_tool_call_first_step {
+        engine.require_tool_call_first_step = b;
     }
     if let Some(b) = opts.diet {
         engine.diet = b;
@@ -836,6 +850,7 @@ struct AttemptOutput {
     model_steps: usize,
     forced_tokens: usize,
     id_rule_relaxed: bool,
+    tools_forced: bool,
 }
 
 /// Longest run of leading token ids shared by `a` and `b` — a prefix of
@@ -964,6 +979,7 @@ impl LlmEngine {
                 model_steps,
                 forced_tokens,
                 id_rule_relaxed,
+                tools_forced,
             } = attempt;
             let parsed = parsed.expect("checked valid above");
             let tool_errors = self.consecutive_tool_errors;
@@ -1013,6 +1029,7 @@ impl LlmEngine {
                             "idRuleRelaxed": id_rule_relaxed,
                             "repeatGuard": repeat_guard,
                             "forcedTextAnswer": false,
+                            "toolsForced": tools_forced,
                         },
                     })
                     .to_string())
@@ -1034,6 +1051,7 @@ impl LlmEngine {
                         "idRuleRelaxed": id_rule_relaxed,
                         "repeatGuard": repeat_guard,
                         "forcedTextAnswer": false,
+                        "toolsForced": tools_forced,
                     },
                 })
                 .to_string()),
@@ -1061,6 +1079,7 @@ impl LlmEngine {
             model_steps,
             forced_tokens,
             id_rule_relaxed: _,
+            tools_forced: _,
         } = attempt;
         // The text-only grammar forbids a leading `[`, so `parsed` should
         // always come back `Ok(ParsedOutput::Text(_))` — but fall back to
@@ -1087,6 +1106,7 @@ impl LlmEngine {
                 "idRuleRelaxed": false,
                 "repeatGuard": repeat_guard,
                 "forcedTextAnswer": true,
+                "toolsForced": false,
             },
         })
         .to_string())
@@ -1179,6 +1199,25 @@ impl LlmEngine {
             });
         if id_rule_relaxed {
             grammar_for_step = Some(Grammar::for_tools_unrestricted_ids(&grammar_tools));
+        }
+        // `require_tool_call_first_step` (`docs/ENGINE.md` "Agent loop";
+        // mirrors `agent.rs::generate_attempt`): the first generation of a
+        // turn, with at least one tool still callable after the id-rule
+        // (and its fail-open relaxation above), must be a tool call —
+        // rebuild under `Grammar::tools_only` so the free-text branch isn't
+        // there to refuse in prose without ever looking anything up. If no
+        // tool is callable even now, leave `grammar_for_step` as the normal
+        // grammar (its free-text branch is the only way to produce output
+        // at all in that case).
+        let tools_forced = !force_text_only
+            && use_constrained
+            && self.require_tool_call_first_step
+            && self.calls_made_this_turn.is_empty()
+            && grammar_for_step
+                .as_ref()
+                .is_some_and(|g| !g.callable_tool_names().is_empty());
+        if tools_forced {
+            grammar_for_step = grammar_for_step.map(Grammar::tools_only);
         }
         if use_constrained && self.token_vocab.is_none() {
             self.token_vocab = Some(TokenVocab::from_tokenizer(tokenizer));
@@ -1344,6 +1383,7 @@ impl LlmEngine {
             model_steps,
             forced_tokens,
             id_rule_relaxed,
+            tools_forced,
         })
     }
 }
