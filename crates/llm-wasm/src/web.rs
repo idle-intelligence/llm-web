@@ -239,6 +239,21 @@ pub struct LlmEngine {
     id_values: IdValues,
     /// Built lazily on first constrained step and cached.
     token_vocab: Option<TokenVocab>,
+    /// The tool calls from the immediately preceding step (regardless of
+    /// whether the result was an error) — mirrors `agent.rs`'s field of the
+    /// same name; see `run_step`'s generic repeated-call loop guard.
+    last_tool_calls: Option<Vec<crate::tools::ToolCall>>,
+    /// Every tool call the model has been given so far this turn — mirrors
+    /// `agent.rs`'s field of the same name; see the fail-open check in
+    /// `generate_attempt`. Reset in `start`/`reset`.
+    calls_made_this_turn: Vec<crate::tools::ToolCall>,
+    /// Prefix key already exported+saved to OPFS this session (see
+    /// `generate_attempt`'s before-decode write-back and
+    /// `import_kv_image`) — `None` until the first successful export or
+    /// import. Not reset by `start`/`reset` (it tracks the resident KV
+    /// prefix cache's contents, which those also don't drop except for
+    /// `reset`'s `cache.restore(0)` — see its own reset there).
+    kv_image_exported_key: Option<String>,
 }
 
 #[wasm_bindgen]
@@ -281,6 +296,9 @@ impl LlmEngine {
             diet: true,
             id_values: IdValues::new(),
             token_vocab: None,
+            last_tool_calls: None,
+            calls_made_this_turn: Vec::new(),
+            kv_image_exported_key: None,
         }
     }
 
@@ -409,6 +427,8 @@ impl LlmEngine {
         self.pending_calls.clear();
         self.consecutive_tool_errors = 0;
         self.id_values = IdValues::new();
+        self.last_tool_calls = None;
+        self.calls_made_this_turn.clear();
 
         match self.compute_prefix_len(&utterance) {
             Ok(len) => self.prefix_cache = Some((self.tools.clone(), len)),
@@ -461,6 +481,9 @@ impl LlmEngine {
         self.resident_tokens.clear();
         self.consecutive_tool_errors = 0;
         self.id_values = IdValues::new();
+        self.last_tool_calls = None;
+        self.calls_made_this_turn.clear();
+        self.kv_image_exported_key = None;
         if let Some(cache) = self.cache.as_mut() {
             cache.restore(0);
         }
@@ -475,6 +498,45 @@ impl LlmEngine {
     #[wasm_bindgen(js_name = setPrefillKernel)]
     pub fn set_prefill_kernel(&self, kernel: String) {
         crate::gguf::set_force_naive_kernel(kernel == "naive");
+    }
+
+    /// Debug/tooling entry point (coordinator's "priority fix", 2026-09-11):
+    /// dumps the *exact* dieted tools JSON + system + rendered prefix text
+    /// this engine would use to compute `prefixKey(tools_json, system)` —
+    /// so a caller (the demo page's "export prefix inputs" button, or
+    /// `scripts/headless/run.mjs --dump-prefix`) can save `{"tools":
+    /// <dieted raw JSON>, "system": ...}` to a file and hand it straight to
+    /// `bin/llm-agent.rs`'s `kv-export --tools <file> --system <system>`,
+    /// reproducing this exact `prefixKey`/`prefixText` byte for byte.
+    /// `kv-export` doesn't diet its own `--tools` input at all
+    /// (`load_tools_generic`), so this is the only way to get the two
+    /// sides to agree when the page's live `tools_json` differs from
+    /// whatever fixture a human might otherwise reach for — see
+    /// `docs/ENGINE.md` "Prefix KV images" for the mismatch this fixes.
+    /// Errors under the same conditions as `prefixKey`.
+    #[wasm_bindgen(js_name = prefixInputs)]
+    pub fn prefix_inputs(&self, tools_json: String, system: String) -> Result<String, JsError> {
+        let dieted_raw = diet_raw_tools(&tools_json, self.diet)?;
+        let tools = tools_from_raw(&dieted_raw)?;
+        let model_fingerprint = self.model_fingerprint.as_deref();
+        let tokenizer = self.tokenizer.as_ref().ok_or_else(|| JsError::new("model not loaded"))?;
+        let prefix_tokens = self
+            .render_kv_prefix_tokens(&tools, &system)
+            .map_err(|e| JsError::new(&format!("failed to render prefix: {e}")))?;
+        let prefix_text = tokenizer
+            .decode(&prefix_tokens, false)
+            .map_err(|e| JsError::new(&format!("failed to decode prefix tokens: {e}")))?;
+        let prefix_key = model_fingerprint.map(|fp| kvimg::prefix_key(fp, &prefix_text));
+        Ok(serde_json::json!({
+            "tools": dieted_raw,
+            "system": system,
+            "diet": self.diet,
+            "prefixText": prefix_text,
+            "prefixTokens": prefix_tokens.len(),
+            "modelFingerprint": model_fingerprint,
+            "prefixKey": prefix_key,
+        })
+        .to_string())
     }
 
     /// Prefix-KV-image cache key for `tools_json`/`system` under the
@@ -565,6 +627,12 @@ impl LlmEngine {
         let cache = self.cache.as_mut().ok_or_else(|| JsError::new("model not loaded"))?;
         cache.import_prefix(&layers, header.tokens.len());
         self.resident_tokens = header.tokens.clone();
+        // Mark this prefix as already handled so `generate_attempt`'s
+        // before-decode OPFS write-back doesn't redundantly re-export an
+        // image that was just imported (from OPFS or network — the
+        // network case's own OPFS save is `worker.js`'s job, since only it
+        // knows the image came from the network in the first place).
+        self.kv_image_exported_key = Some(header.prefix_key.clone());
         wasm_log(&format!(
             "[llm] imported kv image: {} tokens, {} bytes",
             header.tokens.len(),
@@ -709,20 +777,28 @@ fn apply_opts(engine: &mut LlmEngine, opts_json: &str) -> Result<(), JsError> {
     Ok(())
 }
 
-/// Build `Tool`s from raw MCP `tools/list` entries, optionally running them
-/// through `schemadiet::diet_tools` first — mirrors
-/// `agent.rs::tools_from_mcp`. Entries missing `name`/`description`/
-/// `inputSchema` are skipped rather than erroring.
-fn parse_tools_dieted(tools_json: &str, diet: bool) -> Result<Vec<Tool>, JsError> {
+/// Parse `tools_json` (a raw MCP `tools/list` array) and, when `diet` is
+/// on, run it through `schemadiet::diet_tools` — returns the *raw JSON*
+/// (post-diet, if applied), not `Tool`s, so a caller (`prefix_inputs`) can
+/// dump exactly the bytes that were rendered into the prompt, byte for
+/// byte — see `docs/ENGINE.md` "Prefix KV images": `kv-export --tools
+/// <dump>` doesn't diet at all (`load_tools_generic` in
+/// `bin/llm-agent.rs`), so handing it already-dieted tools is the only way
+/// its rendered prefix (and therefore its `prefix_key`) matches this
+/// engine's.
+fn diet_raw_tools(tools_json: &str, diet: bool) -> Result<Vec<serde_json::Value>, JsError> {
     let raw: Vec<serde_json::Value> =
         serde_json::from_str(tools_json).map_err(|e| JsError::new(&format!("invalid tools_json: {e}")))?;
-    let dieted;
-    let raw = if diet {
-        dieted = diet_tools(&raw, ENGINE_DIET_LEVEL);
-        &dieted
-    } else {
-        &raw
-    };
+    Ok(if diet { diet_tools(&raw, ENGINE_DIET_LEVEL) } else { raw })
+}
+
+/// Build `Tool`s from already-dieted (or intentionally undieted) raw MCP
+/// `tools/list` entries. Entries missing `name`/`inputSchema` error rather
+/// than being silently skipped (unlike `agent.rs::tools_from_mcp`, which
+/// skips them) — `web.rs`'s callers all pass a single JS-supplied array,
+/// where a malformed entry is much more likely a caller bug worth
+/// surfacing than a heterogeneous multi-server list worth tolerating.
+fn tools_from_raw(raw: &[serde_json::Value]) -> Result<Vec<Tool>, JsError> {
     raw.iter()
         .map(|t| {
             let name = t
@@ -734,6 +810,21 @@ fn parse_tools_dieted(tools_json: &str, diet: bool) -> Result<Vec<Tool>, JsError
             Ok(Tool::from_mcp(name, description, schema))
         })
         .collect()
+}
+
+/// Build `Tool`s from raw MCP `tools/list` entries, optionally running them
+/// through `schemadiet::diet_tools` first — mirrors
+/// `agent.rs::tools_from_mcp`.
+fn parse_tools_dieted(tools_json: &str, diet: bool) -> Result<Vec<Tool>, JsError> {
+    tools_from_raw(&diet_raw_tools(tools_json, diet)?)
+}
+
+/// Naming-convention heuristic for a read (non-mutating) tool — mirrors
+/// `agent.rs::is_read_tool` (see its doc comment for why: no MCP
+/// annotation to consult generically after the schema diet strips
+/// `annotations`).
+fn is_read_tool(name: &str) -> bool {
+    name.starts_with("get_") || name.starts_with("list_")
 }
 
 /// One [`LlmEngine::generate_attempt`] round's output, before `run_step`
@@ -749,6 +840,7 @@ struct AttemptOutput {
     tokens_generated: usize,
     model_steps: usize,
     forced_tokens: usize,
+    id_rule_relaxed: bool,
 }
 
 fn error_json(message: &str) -> String {
@@ -832,15 +924,34 @@ impl LlmEngine {
                 Ok(ParsedOutput::Text(_)) => false,
             };
 
-            if invalid {
+            // Generic repeated-call loop guard (`docs/ENGINE.md` "Agent
+            // loop"; mirrors `agent.rs::step_inner`) — a well-formed, valid
+            // call byte-identical to the immediately preceding step's
+            // call(s), fed a non-error result, is a wasted step, not a
+            // genuine retry of anything. `self.consecutive_tool_errors ==
+            // 0` excludes the legitimate case of retrying the same call
+            // after `tool_error_message` feedback asked it to.
+            let is_repeat = !invalid
+                && self.consecutive_tool_errors == 0
+                && matches!(&attempt.parsed, Ok(ParsedOutput::ToolCalls(calls)) if self.last_tool_calls.as_deref() == Some(calls.as_slice()));
+
+            if invalid || is_repeat {
                 if retries < MAX_RETRIES {
                     retries += 1;
-                    if retries == 2 {
+                    // A repeat's problem isn't output shape (any
+                    // constraint was already satisfied), so always go
+                    // straight to the nudge; a genuinely invalid first
+                    // attempt still gets one constrained-only retry first.
+                    if is_repeat || retries == 2 {
                         self.messages.push(Message::user(RETRY_NOTE));
                     }
                     continue;
                 }
-                return Ok(error_json("model produced no valid call"));
+                return Ok(error_json(if is_repeat {
+                    "model is repeating a call"
+                } else {
+                    "model produced no valid call"
+                }));
             }
 
             let AttemptOutput {
@@ -852,6 +963,7 @@ impl LlmEngine {
                 tokens_generated,
                 model_steps,
                 forced_tokens,
+                id_rule_relaxed,
             } = attempt;
             let parsed = parsed.expect("checked valid above");
             let tool_errors = self.consecutive_tool_errors;
@@ -880,6 +992,8 @@ impl LlmEngine {
                         .collect();
                     self.messages.push(Message::assistant_tool_calls(entries));
                     self.pending_calls = pending.clone();
+                    self.last_tool_calls = Some(calls.clone());
+                    self.calls_made_this_turn.extend(calls.iter().cloned());
 
                     Ok(serde_json::json!({
                         "outcome": "needTools",
@@ -897,6 +1011,7 @@ impl LlmEngine {
                             "forcedTokens": forced_tokens,
                             "retries": retries,
                             "toolErrors": tool_errors,
+                            "idRuleRelaxed": id_rule_relaxed,
                         },
                     })
                     .to_string())
@@ -915,6 +1030,7 @@ impl LlmEngine {
                         "forcedTokens": forced_tokens,
                         "retries": retries,
                         "toolErrors": tool_errors,
+                        "idRuleRelaxed": id_rule_relaxed,
                     },
                 })
                 .to_string()),
@@ -975,7 +1091,22 @@ impl LlmEngine {
         } else {
             Vec::new()
         };
-        let grammar_for_step = use_constrained.then(|| Grammar::for_tools(&grammar_tools, &self.id_values));
+        let mut grammar_for_step = use_constrained.then(|| Grammar::for_tools(&grammar_tools, &self.id_values));
+        // Fail-open (`docs/ENGINE.md` "Agent loop" — "fail-open"; mirrors
+        // `agent.rs::generate_attempt`): if every still-callable tool is a
+        // read tool already called this turn, the id rule left nothing
+        // new — rebuild without it instead of boxing the model into
+        // repeating itself.
+        let id_rule_relaxed = grammar_for_step.as_ref().is_some_and(|g| {
+            let callable = g.callable_tool_names();
+            !callable.is_empty()
+                && callable
+                    .iter()
+                    .all(|name| is_read_tool(name) && self.calls_made_this_turn.iter().any(|c| &c.name == name))
+        });
+        if id_rule_relaxed {
+            grammar_for_step = Some(Grammar::for_tools_unrestricted_ids(&grammar_tools));
+        }
         if use_constrained && self.token_vocab.is_none() {
             self.token_vocab = Some(TokenVocab::from_tokenizer(tokenizer));
         }
@@ -1029,6 +1160,32 @@ impl LlmEngine {
                 self.step_index - 1,
                 top5.join(", ")
             ));
+        }
+
+        // Best-effort export-and-save of the system+tools prefix to OPFS,
+        // right here — after the prefill that may have just made
+        // `resident_tokens` cover it, and *before* the decode loop below —
+        // so a later decode/tool-call failure this turn can't prevent the
+        // save (the coordinator's "robust OPFS write-back" ask: the
+        // previous design deferred this to a JS-side fire-and-forget call
+        // made only after the *whole* step, prefill+decode, had already
+        // resolved). A no-op after the first successful save this session
+        // for a given key (`self.kv_image_exported_key`), and a no-op
+        // entirely when unconstrained-by-prefix-cache-miss doesn't apply
+        // (checked inside).
+        if let Some(fp) = self.model_fingerprint.clone() {
+            maybe_export_kv_prefix_to_opfs(
+                &fp,
+                &self.tools,
+                &self.system_prompt,
+                tokenizer,
+                template,
+                model,
+                &*cache,
+                &self.resident_tokens,
+                &mut self.kv_image_exported_key,
+            )
+            .await;
         }
 
         let stop_ids = tokenizer.eos_ids();
@@ -1114,8 +1271,118 @@ impl LlmEngine {
             tokens_generated: out_ids.len(),
             model_steps,
             forced_tokens,
+            id_rule_relaxed,
         })
     }
+}
+
+/// Best-effort export-and-save of the current cache's system+tools prefix
+/// to OPFS — see the call site in `generate_attempt` for why this must run
+/// inline there (before the decode loop) rather than as a JS-side
+/// fire-and-forget call made after the whole step resolves. A free
+/// function, not an `LlmEngine` method, because it's called while several
+/// of `generate_attempt`'s local bindings already hold disjoint borrows of
+/// `self`'s fields (`&mut self` here would conflict with those).
+///
+/// Errors (a bad render, a JSON-incompatible tokenizer round-trip, an OPFS
+/// failure) are logged and swallowed, never propagated — this is a caching
+/// optimization, not a correctness path, and `run_step`'s caller has no use
+/// for a failure here derailing an otherwise-successful generation step.
+#[allow(clippy::too_many_arguments)]
+async fn maybe_export_kv_prefix_to_opfs(
+    model_fingerprint: &str,
+    tools: &[Tool],
+    system: &str,
+    tokenizer: &Tokenizer,
+    template: &ChatTemplate,
+    model: &LlmModel,
+    cache: &KvCache,
+    resident_tokens: &[u32],
+    already_exported: &mut Option<String>,
+) {
+    // Same two-probe technique `render_kv_prefix_tokens`/`bin/llm-agent.rs`'s
+    // `kv-export` use — duplicated here (rather than calling
+    // `LlmEngine::render_kv_prefix_tokens`, a `&self` method) because this
+    // free function only has the individual pieces of `self` it needs, not
+    // `self` itself — see the doc comment above.
+    let render = |u: &str| -> anyhow::Result<Vec<u32>> {
+        let messages = vec![Message::system(system), Message::user(u)];
+        let prompt = template.render_prompt(&messages, tools, true)?;
+        tokenizer.encode(&prompt, false).map_err(|e| anyhow::anyhow!("{e}"))
+    };
+    let (Ok(a), Ok(b)) = (render("kv-export-probe-alpha"), render("totally-different-probe-beta")) else {
+        return;
+    };
+    let prefix_len = a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count();
+    let prefix_tokens = a[..prefix_len].to_vec();
+    let n_tokens = prefix_tokens.len();
+    if n_tokens == 0 || n_tokens > resident_tokens.len() || resident_tokens[..n_tokens] != prefix_tokens[..] {
+        return;
+    }
+    let Ok(prefix_text) = tokenizer.decode(&prefix_tokens, false) else {
+        return;
+    };
+    let key = kvimg::prefix_key(model_fingerprint, &prefix_text);
+    if already_exported.as_deref() == Some(key.as_str()) {
+        return; // already exported this session
+    }
+
+    let layers = cache.export_prefix_async(n_tokens).await;
+    let cfg = model.config();
+    let header = Header {
+        model_fingerprint: model_fingerprint.to_string(),
+        prefix_key: key.clone(),
+        tokens: prefix_tokens,
+        n_layers: cfg.num_layers,
+        n_kv_heads: cfg.num_kv_heads,
+        head_dim: cfg.hidden_size / cfg.num_heads,
+        dtype: Dtype::Q8_0.as_str().to_string(),
+        engine: format!("llm-wasm/{}", env!("CARGO_PKG_VERSION")),
+        created: js_sys::Date::new_0().to_iso_string().as_string().unwrap_or_default(),
+    };
+    let n_tok = header.tokens.len();
+    let mut buf = Vec::new();
+    let layer_refs: Vec<(&[f32], &[f32])> = layers.iter().map(|(k, v)| (k.as_slice(), v.as_slice())).collect();
+    if KvImage::write(&mut buf, &header, Dtype::Q8_0, layer_refs).is_err() {
+        return;
+    }
+
+    // Mark as attempted before the OPFS write itself, so a failure below
+    // doesn't retry (and spam warnings) on every subsequent step of the
+    // same turn — matches the "once per session per key" contract the doc
+    // comment above promises.
+    *already_exported = Some(key.clone());
+    match opfs_save_kv_image(&key, &buf).await {
+        Ok(()) => wasm_log(&format!(
+            "[llm] kv image exported+saved to OPFS before decode ({key}, {n_tok} tokens, {} bytes)",
+            buf.len()
+        )),
+        Err(e) => wasm_log(&format!("[llm] kv image OPFS save failed ({key}): {e:?}")),
+    }
+}
+
+/// Write `bytes` to `<OPFS root>/<key>.kvimg`, creating the file if needed
+/// — the wasm-side equivalent of `worker.js`'s `opfsWriteKvImage`, using
+/// the File System Access API directly (`navigator.storage.getDirectory()`
+/// via the Worker's global scope, since there's no `window` in a Worker).
+async fn opfs_save_kv_image(key: &str, bytes: &[u8]) -> Result<(), JsValue> {
+    use wasm_bindgen::JsCast;
+    use wasm_bindgen_futures::JsFuture;
+    use web_sys::{FileSystemDirectoryHandle, FileSystemFileHandle, FileSystemGetFileOptions, FileSystemWritableFileStream, WorkerGlobalScope};
+
+    let global: WorkerGlobalScope = js_sys::global().unchecked_into();
+    let storage = global.navigator().storage();
+    let root: FileSystemDirectoryHandle = JsFuture::from(storage.get_directory()).await?.unchecked_into();
+
+    let opts = FileSystemGetFileOptions::new();
+    opts.set_create(true);
+    let file_handle: FileSystemFileHandle = JsFuture::from(root.get_file_handle_with_options(&format!("{key}.kvimg"), &opts))
+        .await?
+        .unchecked_into();
+    let writable: FileSystemWritableFileStream = JsFuture::from(file_handle.create_writable()).await?.unchecked_into();
+    JsFuture::from(writable.write_with_u8_array(bytes)?).await?;
+    JsFuture::from(writable.close()).await?;
+    Ok(())
 }
 
 /// Wall-clock milliseconds, for prefill/decode timings. `js_sys::Date::now`

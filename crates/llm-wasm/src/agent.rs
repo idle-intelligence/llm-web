@@ -181,6 +181,12 @@ pub struct Step {
     /// / `tool_error_message`); 0 unless the immediately preceding
     /// `provide_tool_results` call carried an error result.
     pub tool_errors: usize,
+    /// Set when this step's grammar was rebuilt via
+    /// `Grammar::for_tools_unrestricted_ids` instead of `Grammar::for_tools`
+    /// because every still-callable tool was a read tool already called
+    /// this turn (fail-open — see `docs/ENGINE.md` "Agent loop"). `false`
+    /// for an unconstrained step.
+    pub id_rule_relaxed: bool,
 }
 
 pub struct Transcript {
@@ -203,6 +209,7 @@ struct AttemptOutput {
     decode_time: Duration,
     model_steps: usize,
     forced_tokens: usize,
+    id_rule_relaxed: bool,
 }
 
 /// One tool call the model asked for, awaiting a result via
@@ -382,6 +389,18 @@ pub struct Agent<G: Generator, C: ToolCaller> {
     /// Built lazily on first constrained step and cached — `TokenVocab`
     /// precomputes every vocab id's byte string once, not once per step.
     token_vocab: Option<TokenVocab>,
+    /// The tool calls from the immediately preceding step (regardless of
+    /// whether the result was an error) — see `step_inner`'s generic
+    /// repeated-call loop guard: a step whose calls are byte-identical to
+    /// this, after a non-error result, is a wasted step, not a new attempt
+    /// at anything.
+    last_tool_calls: Option<Vec<ToolCall>>,
+    /// Every tool call the model has been given (i.e. every call in a
+    /// `NeedTools` step) so far this turn, in order — used only by the
+    /// fail-open "is the model stuck" check in `generate_attempt` (see
+    /// `docs/ENGINE.md` "Agent loop" — "fail-open"). Reset in
+    /// `start`/`reset`.
+    calls_made_this_turn: Vec<ToolCall>,
 }
 
 impl<G: Generator, C: ToolCaller> Agent<G, C> {
@@ -412,6 +431,8 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
             constrained: false,
             id_values: IdValues::new(),
             token_vocab: None,
+            last_tool_calls: None,
+            calls_made_this_turn: Vec::new(),
         }
     }
 
@@ -462,6 +483,8 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
         self.pending_calls.clear();
         self.consecutive_tool_errors = 0;
         self.id_values = IdValues::new();
+        self.last_tool_calls = None;
+        self.calls_made_this_turn.clear();
     }
 
     /// Begin a new turn: render `utterance` against `tools`, generate, and
@@ -475,6 +498,8 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
         self.pending_calls.clear();
         self.consecutive_tool_errors = 0;
         self.id_values = IdValues::new();
+        self.last_tool_calls = None;
+        self.calls_made_this_turn.clear();
 
         match self.prefix_len_for(&self.tools, utterance) {
             Ok(len) => self.prefix_cache = Some((self.tools.clone(), len)),
@@ -574,18 +599,38 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
                 Ok(ParsedOutput::Text(_)) => false,
             };
 
-            if invalid {
+            // Generic repeated-call loop guard (`docs/ENGINE.md` "Agent
+            // loop"): a well-formed, valid call that's byte-identical to
+            // the immediately preceding step's call(s), fed a non-error
+            // result, is a wasted step, not a genuine retry of anything —
+            // seen live as six consecutive
+            // `get_households_and_groups_and_players({})` steps once the
+            // model had nothing new to ask about. `self.consecutive_tool_errors
+            // == 0` excludes the legitimate case of retrying the same call
+            // after `tool_error_message` feedback asked it to.
+            let is_repeat = !invalid
+                && self.consecutive_tool_errors == 0
+                && matches!(&attempt.parsed, Ok(ParsedOutput::ToolCalls(calls)) if self.last_tool_calls.as_deref() == Some(calls.as_slice()));
+
+            if invalid || is_repeat {
                 if retries < self.max_retries {
                     retries += 1;
-                    if retries == 2 {
+                    // A repeat's problem isn't output *shape* (the
+                    // constraint, if any, was already satisfied) — forcing
+                    // it on again buys nothing, so always go straight to
+                    // the nudge for a repeat; a genuinely invalid first
+                    // attempt still gets one constrained-only retry first.
+                    if is_repeat || retries == 2 {
                         self.messages.push(Message::user(RETRY_NOTE));
                     }
                     continue;
                 }
-                return StepOutcome::Error {
-                    message: "model produced no valid call".to_string(),
-                    step: None,
+                let message = if is_repeat {
+                    "model is repeating a call".to_string()
+                } else {
+                    "model produced no valid call".to_string()
                 };
+                return StepOutcome::Error { message, step: None };
             }
 
             let AttemptOutput {
@@ -598,6 +643,7 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
                 decode_time,
                 model_steps,
                 forced_tokens,
+                id_rule_relaxed,
             } = attempt;
             let parsed = parsed.expect("checked valid above");
             let tool_errors = self.consecutive_tool_errors;
@@ -608,6 +654,8 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
                     let entries = tool_call_entries(&pending);
                     self.messages.push(Message::assistant_tool_calls(entries));
                     self.pending_calls = pending.clone();
+                    self.last_tool_calls = Some(calls.clone());
+                    self.calls_made_this_turn.extend(calls.iter().cloned());
 
                     let step = Step {
                         prompt_tokens,
@@ -622,6 +670,7 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
                         forced_tokens,
                         retries,
                         tool_errors,
+                        id_rule_relaxed,
                     };
                     StepOutcome::NeedTools { calls: pending, step }
                 }
@@ -639,6 +688,7 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
                         forced_tokens,
                         retries,
                         tool_errors,
+                        id_rule_relaxed,
                     };
                     StepOutcome::Final { text, step }
                 }
@@ -683,7 +733,23 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
         } else {
             Vec::new()
         };
-        let grammar_for_step = use_constrained.then(|| Grammar::for_tools(&grammar_tools, &self.id_values));
+        let mut grammar_for_step = use_constrained.then(|| Grammar::for_tools(&grammar_tools, &self.id_values));
+        // Fail-open (`docs/ENGINE.md` "Agent loop" — "fail-open"): if the
+        // id rule left the model nothing new to call — every still-
+        // callable tool is a read tool it's already called this turn —
+        // rebuild without the id restriction instead of leaving it boxed
+        // into repeating itself (that repeat is what `is_repeat` above
+        // would otherwise have to catch one wasted step later).
+        let id_rule_relaxed = grammar_for_step.as_ref().is_some_and(|g| {
+            let callable = g.callable_tool_names();
+            !callable.is_empty()
+                && callable
+                    .iter()
+                    .all(|name| is_read_tool(name) && self.calls_made_this_turn.iter().any(|c| &c.name == name))
+        });
+        if id_rule_relaxed {
+            grammar_for_step = Some(Grammar::for_tools_unrestricted_ids(&grammar_tools));
+        }
         if use_constrained && self.token_vocab.is_none() {
             self.token_vocab = Some(TokenVocab::from_tokenizer(&self.tokenizer));
         }
@@ -730,6 +796,7 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
             decode_time,
             model_steps,
             forced_tokens,
+            id_rule_relaxed,
         })
     }
 
@@ -790,6 +857,17 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
 /// and `docs/ENGINE.md`'s "Tool-schema token diet" hook-in point. Entries
 /// missing `name`/`description`/`inputSchema` are skipped rather than
 /// panicking (same "don't trust the wire" posture as `FixtureCaller`).
+/// Naming-convention heuristic for a read (non-mutating) tool — no MCP
+/// annotation to consult generically (`readOnlyHint` is stripped by the
+/// schema diet's `annotations` drop, and isn't guaranteed present even
+/// undieted), so this mirrors the one Sonos-adjacent-but-not-Sonos-specific
+/// convention already used elsewhere in this codebase (`tool_order`'s
+/// "listing-first"): a `get_`/`list_` prefix. Used only by the fail-open
+/// check in `generate_attempt` — see `docs/ENGINE.md` "Agent loop".
+fn is_read_tool(name: &str) -> bool {
+    name.starts_with("get_") || name.starts_with("list_")
+}
+
 fn tools_from_mcp(raw_tools: &[Value], diet: bool) -> Vec<Tool> {
     let dieted;
     let raw_tools = if diet {

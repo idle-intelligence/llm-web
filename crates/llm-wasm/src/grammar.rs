@@ -183,7 +183,19 @@ impl IdValues {
                 }
             }
             Value::String(s) => {
-                if looks_like_id(s) {
+                // MCP tool results commonly carry their payload as
+                // `{"content":[{"type":"text","text":"<pretty-printed JSON
+                // string>"}]}` (see `docs/ENGINE.md`'s "The id rule" and
+                // the real-MCP-shape regression this guards against) —
+                // mirrors `tools.rs::compact_embedded_json`'s detection of
+                // the same shape. Try parsing every string value as JSON
+                // first and recurse into it if it is one; only fall back to
+                // treating the raw string itself as a candidate id when it
+                // isn't (a real id string like `RINCON_KITCHEN01:1` never
+                // parses as JSON, so this adds no false negatives).
+                if let Ok(parsed) = serde_json::from_str::<Value>(s) {
+                    self.walk(&parsed);
+                } else if looks_like_id(s) {
                     self.insert(s.clone());
                 }
             }
@@ -264,6 +276,22 @@ fn resolve_plain(k: &PropKind) -> ResolvedKind {
 
 impl Grammar {
     pub fn for_tools(tools: &[Tool], id_values: &IdValues) -> Self {
+        Self::build(tools, id_values, true)
+    }
+
+    /// Like [`Grammar::for_tools`], but never drops a property or tool for
+    /// having no known id value — every `*_id`/`*_ids` property resolves
+    /// as an ordinary free string instead of being restricted to (or
+    /// dropped for lack of) `id_values`. Fail-open escape hatch for when
+    /// the id-restricted grammar would leave the model nothing new to
+    /// call (`docs/ENGINE.md` "Agent loop" — "fail-open"): both agent
+    /// loops rebuild with this instead of `for_tools` for one step when
+    /// every still-callable tool is a read tool already called this turn.
+    pub fn for_tools_unrestricted_ids(tools: &[Tool]) -> Self {
+        Self::build(tools, &IdValues::new(), false)
+    }
+
+    fn build(tools: &[Tool], id_values: &IdValues, restrict_ids: bool) -> Self {
         let id_list = id_values.sorted_vec();
         let mut resolved_tools = Vec::new();
         let mut tool_names = Vec::new();
@@ -273,7 +301,7 @@ impl Grammar {
             let mut props = Vec::new();
             let mut prop_names = Vec::new();
             for p in &t.properties {
-                if p.is_id {
+                if p.is_id && restrict_ids {
                     if id_list.is_empty() {
                         // Property cannot be emitted at all. If it was
                         // required, the whole tool is uncallable.
@@ -322,6 +350,14 @@ impl Grammar {
     /// helper).
     pub fn can_call(&self, name: &str) -> bool {
         self.tool_names.iter().any(|n| n == name)
+    }
+
+    /// Every tool name that survived id-availability filtering — the set
+    /// the model can actually start typing (`Grammar::can_call`'s data,
+    /// exposed as a slice for the fail-open "is the model stuck" check —
+    /// see `docs/ENGINE.md` "Agent loop").
+    pub fn callable_tool_names(&self) -> &[String] {
+        &self.tool_names
     }
 }
 

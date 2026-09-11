@@ -490,3 +490,122 @@ fn diet_on_strips_annotations_from_rendered_prompt() {
     let prompt = agent.tokenizer().decode(&step.prompt_tokens, false).unwrap();
     assert!(!prompt.contains("annotations"), "diet should have stripped annotations:\n{prompt}");
 }
+
+/// Generic repeated-call loop guard (`docs/ENGINE.md` "Agent loop"): the
+/// model calling the exact same tool with the exact same arguments as the
+/// immediately preceding (non-error) step, repeatedly, is a wasted step —
+/// not a legitimate retry of anything — and gives up with
+/// `StepOutcome::Error` instead of looping forever. Regression test for a
+/// live bug (owner's browser session, 2026-09-11): six consecutive
+/// `get_households_and_groups_and_players({})` steps once every id-taking
+/// tool was (wrongly, see the `grammar.rs` fix) uncallable.
+#[test]
+fn repeated_identical_call_gives_up_with_error() {
+    let Some((template, tokenizer)) = load_agent_parts() else {
+        return;
+    };
+
+    let listing_turn = script_tokens(
+        &tokenizer,
+        r#"[{"name": "get_households_and_groups_and_players", "arguments": {}}]<|im_end|>"#,
+    );
+
+    let generator = FixtureGenerator::new(vec![
+        listing_turn.clone(),
+        listing_turn.clone(),
+        listing_turn.clone(),
+        listing_turn,
+    ]);
+    let caller = FixtureCaller::new(results_dir());
+    let mut agent = Agent::new(template, tokenizer, generator, caller, "sys", 64);
+
+    let outcome = agent.start("what's playing?", &tools_12());
+    let StepOutcome::NeedTools { calls, step } = outcome else {
+        panic!("expected first call to succeed, got {outcome:?}");
+    };
+    assert_eq!(step.retries, 0);
+    assert_eq!(calls[0].name, "get_households_and_groups_and_players");
+
+    let result: Value = serde_json::from_str(
+        &std::fs::read_to_string(results_dir().join("get_households_and_groups_and_players.json")).unwrap(),
+    )
+    .unwrap();
+    let outcome2 = agent.provide_tool_results(vec![(calls[0].call_id.clone(), result)]);
+    match outcome2 {
+        StepOutcome::Error { message, step } => {
+            assert!(step.is_none());
+            assert!(message.contains("repeating"), "unexpected message: {message}");
+        }
+        other => panic!("expected Error after repeated identical calls, got: {other:?}"),
+    }
+}
+
+/// Fail-open (`docs/ENGINE.md` "Agent loop" — "fail-open"): when the only
+/// tools still callable under the id-restricted grammar are read tools
+/// already called this turn (the id rule left nothing new — e.g. a
+/// listing tool's result carried no id-shaped values, and the only
+/// mutating tool needs an id that's still unknown), the next step's
+/// grammar is rebuilt via `Grammar::for_tools_unrestricted_ids` instead of
+/// leaving the model boxed into repeating itself, and `Step.id_rule_relaxed`
+/// records it. `FixtureGenerator` ignores the actual mask (see its doc
+/// comment), so this only exercises the trigger condition itself, not
+/// generation under the relaxed grammar.
+#[test]
+fn fail_open_relaxes_id_rule_when_only_option_is_a_repeat() {
+    let Some((template, tokenizer)) = load_agent_parts() else {
+        return;
+    };
+
+    let get_status = Tool::from_mcp(
+        "get_status",
+        "Read current status.",
+        serde_json::json!({"type": "object", "properties": {}, "required": []}),
+    );
+    let pause = Tool::from_mcp(
+        "pause",
+        "Pause a group.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {"group_id": {"type": "string", "description": "The group ID."}},
+            "required": ["group_id"],
+        }),
+    );
+    let tools = vec![get_status, pause];
+
+    let status_call = script_tokens(&tokenizer, r#"[{"name": "get_status", "arguments": {}}]<|im_end|>"#);
+    // What the model would plausibly emit once the *relaxed* grammar makes
+    // `pause` typable at all (`FixtureGenerator` ignores the actual mask —
+    // see its doc comment — so this script stands in for "the model took
+    // the newly-opened option" rather than proving the mask forced it).
+    let pause_call = script_tokens(
+        &tokenizer,
+        r#"[{"name": "pause", "arguments": {"group_id": "group-123"}}]<|im_end|>"#,
+    );
+
+    let generator = FixtureGenerator::new(vec![status_call, pause_call]);
+    let caller = FixtureCaller::new(results_dir());
+    let mut agent = Agent::new(template, tokenizer, generator, caller, "sys", 64);
+    agent.set_constrained(true);
+
+    let outcome = agent.start("what's the status?", &tools);
+    let StepOutcome::NeedTools { calls, step } = outcome else {
+        panic!("expected first call to succeed, got {outcome:?}");
+    };
+    assert_eq!(calls[0].name, "get_status");
+    assert!(!step.id_rule_relaxed, "nothing to relax yet on the first call");
+
+    // Feed back a result with no id-shaped values at all — `pause` stays
+    // uncallable under the id-restricted grammar afterward.
+    let result = serde_json::json!({"status": "idle"});
+    let outcome2 = agent.provide_tool_results(vec![(calls[0].call_id.clone(), result)]);
+    match outcome2 {
+        StepOutcome::NeedTools { calls, step } => {
+            assert_eq!(calls[0].name, "pause");
+            assert!(
+                step.id_rule_relaxed,
+                "expected fail-open to trigger: get_status is a read tool already called with no ids harvested"
+            );
+        }
+        other => panic!("expected NeedTools, got: {other:?}"),
+    }
+}

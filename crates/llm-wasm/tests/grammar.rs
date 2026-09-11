@@ -274,3 +274,52 @@ fn multi_candidate_id_reachable_token_by_token_for_every_alternative() {
         );
     }
 }
+
+/// Regression test for the real-MCP-shape bug (owner's browser session,
+/// 2026-09-11): MCP tool results carry their payload as
+/// `{"content":[{"type":"text","text":"<pretty-printed JSON string>"}]}`,
+/// not as a bare JSON object/array — the households/groups/players listing
+/// is a JSON string *inside* `content[0].text`, not a nested value. Native
+/// evals never caught this because their fixtures hand the parsed JSON
+/// directly (`fixtures/sonos/results/*.json`), bypassing the `content`/
+/// `text` wrapper real MCP servers use. Before the fix, `IdValues` stayed
+/// empty against this shape, which made every `*_id`-taking tool
+/// (`pause`, `set_group_volume`, ...) uncallable per `Grammar::for_tools`'s
+/// "drop a tool with no known id" rule — the model could only ever repeat
+/// `get_households_and_groups_and_players`.
+#[test]
+fn collect_from_result_parses_ids_from_mcp_content_text_wrapper() {
+    let mcp_result = serde_json::json!({
+        "content": [{
+            "type": "text",
+            "text": serde_json::to_string_pretty(&serde_json::json!([{
+                "householdId": "Sonos_abc123XYZ.household",
+                "groups": [{
+                    "groupId": "RINCON_KITCHEN01:1",
+                    "players": [{"playerId": "RINCON_KITCHEN01:0", "name": "Kitchen"}],
+                }, {
+                    "groupId": "RINCON_LIVING01:2",
+                    "players": [{"playerId": "RINCON_LIVING01:0", "name": "Living Room"}],
+                }],
+            }]))
+            .unwrap(),
+        }],
+    });
+
+    let mut id_values = IdValues::new();
+    id_values.collect_from_result(&mcp_result);
+
+    let got = id_values.sorted_vec();
+    for expected in [
+        "Sonos_abc123XYZ.household",
+        "RINCON_KITCHEN01:1",
+        "RINCON_LIVING01:2",
+        "RINCON_KITCHEN01:0",
+        "RINCON_LIVING01:0",
+    ] {
+        assert!(
+            got.iter().any(|s| s == expected),
+            "expected {expected:?} to be harvested from the content/text-wrapped MCP result, got {got:?}"
+        );
+    }
+}
