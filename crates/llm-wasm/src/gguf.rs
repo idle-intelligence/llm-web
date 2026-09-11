@@ -2139,6 +2139,18 @@ impl KernelSource for AttnDecodeQ8Kernel {
     }
 }
 
+struct AttnDecodeF32Kernel;
+
+impl KernelSource for AttnDecodeF32Kernel {
+    fn source(&self) -> SourceTemplate {
+        SourceTemplate::new(include_str!("wgsl/shader_attn_decode_f32.wgsl"))
+    }
+
+    fn id(&self) -> KernelId {
+        KernelId::new::<Self>()
+    }
+}
+
 /// Quantize `t` new K or V rows (`input`: f32 handle, contiguous
 /// `[n_kv_heads, t, head_dim]`) into `scales`/`words` at row offset
 /// `dest_offset` — see `shader_kv_quantize.wgsl`'s header for the layout.
@@ -2277,5 +2289,58 @@ pub fn attn_decode_q8_dispatch(
     client
         .launch(kernel, CubeCount::new_1d(n_heads as u32), bindings)
         .expect("attn decode q8 kernel launch failed");
+    output
+}
+
+/// Fused decode-time (M=1) attention over an F32 KV cache — the
+/// no-dequant counterpart of [`attn_decode_q8_dispatch`], see
+/// `shader_attn_decode_f32.wgsl`'s header for the kernel and
+/// `k_cache`/`v_cache`'s expected layout (`kv.rs`'s `KvDtype::F32` storage,
+/// squeeze-batch `[n_kv_heads, max_ctx, head_dim]`). `q`: f32 handle
+/// `[n_heads, head_dim]` (already RoPE'd, batch/seq axes squeezed).
+/// `scratch` must have capacity >= `n_heads * max_ctx` f32 (reused across
+/// calls by the caller). Requires `head_dim == 128`. Returns a fresh f32
+/// handle `[n_heads, head_dim]`.
+#[allow(clippy::too_many_arguments)]
+pub fn attn_decode_f32_dispatch(
+    client: &cubecl::client::ComputeClient<WgpuRuntime>,
+    q: &Handle,
+    k_cache: &Handle,
+    v_cache: &Handle,
+    scratch: &Handle,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    kv_len: usize,
+    max_ctx: usize,
+    attn_scale: f32,
+) -> Handle {
+    assert_eq!(
+        head_dim, 128,
+        "attn_decode_f32 kernel's workgroup size is fixed at 128 == head_dim"
+    );
+    let output = client.empty(n_heads * head_dim * 4);
+    let info: [u32; 6] = [
+        n_heads as u32,
+        n_kv_heads as u32,
+        head_dim as u32,
+        kv_len as u32,
+        max_ctx as u32,
+        attn_scale.to_bits(),
+    ];
+    let info_bytes: Vec<u8> = info.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let info_handle = client.create_from_slice(&info_bytes);
+    let bindings = Bindings::new()
+        .with_buffer(q.clone().binding())
+        .with_buffer(k_cache.clone().binding())
+        .with_buffer(v_cache.clone().binding())
+        .with_buffer(scratch.clone().binding())
+        .with_buffer(output.clone().binding())
+        .with_buffer(info_handle.binding());
+    let kernel: Box<dyn CubeTask<AutoCompiler>> =
+        Box::new(SourceKernel::new(AttnDecodeF32Kernel, CubeDim::new_1d(128)));
+    client
+        .launch(kernel, CubeCount::new_1d(n_heads as u32), bindings)
+        .expect("attn decode f32 kernel launch failed");
     output
 }

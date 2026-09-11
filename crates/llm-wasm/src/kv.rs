@@ -350,6 +350,21 @@ impl KvCache {
         }
     }
 
+    /// `KvDtype::F32`-only: raw cubecl handles for `layer`'s K/V tensors
+    /// (`[1, n_kv_heads, max_ctx, head_dim]`, squeeze-batch layout — see
+    /// this module's doc comment), for the decode-time fused attention
+    /// kernel (`gguf::attn_decode_f32_dispatch`) to bind directly. Every
+    /// write goes through `slice_assign` on the existing tensor (see
+    /// `write`'s `mem::replace` trick), so the underlying buffer identity
+    /// is stable across calls and this handle stays valid without needing
+    /// to be re-fetched per token.
+    pub fn f32_layer(&self, layer: usize) -> (Handle, Handle) {
+        assert_eq!(self.dtype, KvDtype::F32, "f32_layer requires KvDtype::F32");
+        let k_cube = Self::into_cube(self.k_f32[layer].clone());
+        let v_cube = Self::into_cube(self.v_f32[layer].clone());
+        (k_cube.handle, v_cube.handle)
+    }
+
     /// `KvDtype::Q8_0`-only: raw handles for `layer`'s q8_0 buffers
     /// (`k_scales, k_words, v_scales, v_words`), for the decode-time fused
     /// attention kernel (`gguf::attn_decode_q8_dispatch`) to bind directly.

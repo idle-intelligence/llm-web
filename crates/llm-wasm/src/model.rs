@@ -200,11 +200,17 @@ impl Q4Attention {
         // out of the quantized cache (`gguf::attn_decode_q8_dispatch`,
         // `wgsl/shader_attn_decode_q8.wgsl`) — no dequant-to-f32 round trip,
         // no repeat_kv materialization, no Burn matmul/`pv_matmul` chunking
-        // workaround. Prefill (t>1), and decode against an F32-backed
-        // cache, keep the existing Burn-matmul attention path — see
-        // `kv.rs`'s module doc comment for why prefill isn't fused yet.
+        // workaround. Session 14: decode against an F32-backed cache (the
+        // production default, `KvDtype::F32`) takes the analogous fused
+        // kernel with no dequant at all (`gguf::attn_decode_f32_dispatch`,
+        // `wgsl/shader_attn_decode_f32.wgsl`), gated by `FUSED_DECODE_ATTN`
+        // for A/B against the Burn-matmul path. Prefill (t>1) always keeps
+        // the existing Burn-matmul attention path — see `kv.rs`'s module
+        // doc comment for why prefill isn't fused yet.
         let out = if t == 1 && cache.dtype() == KvDtype::Q8_0 {
             attn_decode_q8(&q, cache, layer_idx, self.n_heads, self.n_kv_heads, self.head_dim, kv_len, self.scale)
+        } else if t == 1 && cache.dtype() == KvDtype::F32 && FUSED_DECODE_ATTN && kv_len <= FUSED_DECODE_ATTN_MAX_KV_LEN {
+            attn_decode_f32(&q, cache, layer_idx, self.n_heads, self.n_kv_heads, self.head_dim, kv_len, self.scale)
         } else {
             let n_rep = self.n_heads / self.n_kv_heads;
             let (k_all, v_all) = cache.read_or_dequant_f32(layer_idx, kv_len);
@@ -261,6 +267,75 @@ fn attn_decode_q8(
     let out_handle = crate::gguf::attn_decode_q8_dispatch(
         &client, &q_cube.handle, k_scales, k_words, v_scales, v_words, &scratch, n_heads, n_kv_heads, head_dim, kv_len,
         max_ctx, scale,
+    );
+    let shape = burn::prelude::Shape::from(vec![1, n_heads, 1, head_dim]);
+    let cube_tensor = CubeTensor::new_contiguous(client, device, shape, out_handle, DType::F32);
+    Tensor::from_primitive(TensorPrimitive::Float(cube_tensor))
+}
+
+/// Session 14 (docs/BENCHMARKS.md): toggles the fused decode-attention
+/// kernel (`attn_decode_f32`) on for the production `KvDtype::F32` cache.
+/// Kept as a const (not a runtime flag) so the Burn-matmul path stays
+/// compiled in and reachable by flipping this one bool — the A/B fallback
+/// the task brief asked for — without a second code path to wire through
+/// `LlmConfig`.
+const FUSED_DECODE_ATTN: bool = true;
+
+/// Session 14 (docs/BENCHMARKS.md): the fused kernel's one-workgroup-per-
+/// head design (16 workgroups total, phase C's V-accumulation loop
+/// unstrided over `kv_len` per thread) wins at kv_len~2225 (median 90.8 vs
+/// 100.8 ms/token, fused vs Burn-matmul path) but *regresses* at
+/// kv_len~8140 (median 376.8 vs 334.6 ms/token) — too few workgroups to
+/// saturate the GPU once each thread's serial V-accumulation loop dominates.
+/// Gate the fused path to context lengths where it's measured to win;
+/// longer contexts fall back to the Burn-matmul path (chunked via
+/// `PV_KV_CHUNK`, which scales better here). A tiled/two-pass kernel with
+/// more workgroups per head would likely fix this at long context but is
+/// unimplemented this session — see docs/BENCHMARKS.md Session 14 "what's
+/// left".
+const FUSED_DECODE_ATTN_MAX_KV_LEN: usize = 4096;
+
+/// Session 14 (docs/BENCHMARKS.md): decode-time (t==1) fused QK^T ->
+/// softmax -> PV over a `KvDtype::F32` cache — the no-dequant counterpart
+/// of `attn_decode_q8` above. `q`: `[1, n_heads, 1, head_dim]` (already
+/// RoPE'd). Returns `[1, n_heads, 1, head_dim]`. Reuses the same
+/// thread-local scratch buffer as `attn_decode_q8` (disjoint call sites —
+/// exactly one of the two dtypes is active per `KvCache`, and the scratch
+/// buffer is generic float storage with no dtype-specific layout).
+#[allow(clippy::too_many_arguments)]
+fn attn_decode_f32(
+    q: &Tensor<Wgpu, 4>,
+    cache: &KvCache,
+    layer_idx: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    kv_len: usize,
+    scale: f32,
+) -> Tensor<Wgpu, 4> {
+    thread_local! {
+        static ATTN_SCRATCH_F32: std::cell::RefCell<Option<(cubecl::server::Handle, usize)>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    let q_cube: CubeTensor<WgpuRuntime> = into_contiguous(q.clone().into_primitive().tensor());
+    let client = q_cube.client.clone();
+    let device = q_cube.device.clone();
+    let max_ctx = cache.max_ctx();
+    let (k_cache, v_cache) = cache.f32_layer(layer_idx);
+
+    let needed = n_heads * max_ctx;
+    let scratch = ATTN_SCRATCH_F32.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let reuse = matches!(&*slot, Some((_, cap)) if *cap >= needed);
+        if !reuse {
+            *slot = Some((client.empty(needed * 4), needed));
+        }
+        slot.as_ref().unwrap().0.clone()
+    });
+
+    let out_handle = crate::gguf::attn_decode_f32_dispatch(
+        &client, &q_cube.handle, &k_cache, &v_cache, &scratch, n_heads, n_kv_heads, head_dim, kv_len, max_ctx, scale,
     );
     let shape = burn::prelude::Shape::from(vec![1, n_heads, 1, head_dim]);
     let cube_tensor = CubeTensor::new_contiguous(client, device, shape, out_handle, DType::F32);

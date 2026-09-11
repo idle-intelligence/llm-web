@@ -1448,3 +1448,51 @@ precision) is a design change beyond a wiring fix, not attempted this session gi
   natural next step once correctness is resolved, per the original task design.
 - **`llm-agent bench`-based end-to-end ms/token** (native binary, not owned by this session) once
   `Q8_0` is safe to flip on, for a real (not attention-only-estimated) decode ms/token number.
+
+## Session 14 — fused F32 decode attention (model.rs, gguf.rs, shader_attn_decode_f32.wgsl)
+
+Design: `shader_attn_decode_f32.wgsl` is Session 13's fused decode kernel
+(`shader_attn_decode_q8.wgsl`) adapted to the production `KvDtype::F32` cache — same one-workgroup-
+per-query-head, GQA-aware, three-phase (raw scores + running max -> exp/sum -> PV) structure, but
+reading K/V straight out of `kv.rs`'s contiguous `[n_kv_heads, max_ctx, head_dim]` f32 buffers
+(`KvCache::f32_layer`, new accessor) with no dequant step at all — even simpler than the q8_0
+kernel (no block/word unpacking). Wired into `model.rs`'s `Q4Attention::forward` as a third
+decode-time (t==1) branch alongside the existing q8_0-fused and Burn-matmul paths
+(`attn_decode_f32`, `gguf::attn_decode_f32_dispatch`).
+
+### Numerics (`tests/full_forward.rs`, `--test-threads=1`, all 7 tests)
+
+With the fused kernel active: last-position logits vs the Burn-matmul path stayed within the
+existing reference-vs-model tolerances used elsewhere in this suite (fixture 01: max_abs_diff
+4.5678 vs the *reference* transformers run — unchanged from the pre-existing `KvDtype::F32`
+baseline, since this session doesn't touch that comparison, only the internal
+Burn-matmul-vs-fused-kernel agreement); split-prefill and second-utterance-reuse regression tests
+(which do directly compare two code paths against each other) stayed at their pre-existing
+<=1.1e-4 max-abs bound. Greedy decode: fixture 02 20/20 exact match, fixture 03 28/28 exact match
+against the reference `greedy_first_32_token_ids` — unchanged from the `KvDtype::F32` baseline.
+
+### Bench — decode ms/token, Burn-matmul path vs fused kernel (idle GPU, `llm-agent bench --gguf
+xLAM-2-3b-fc-r-q4_0.gguf --tokens <fixture> --decode-steps N --max-ctx 12288`)
+
+| fixture | kv_len | Burn-matmul median | fused median | delta |
+|---|---|---|---|---|
+| 02_tools_single | ~2225 | 100.8 ms/token | 90.8 ms/token | -10% |
+| 04_tools_all | ~8140 | 334.6 ms/token | 376.8 ms/token | **+13% (regression)** |
+
+The one-workgroup-per-head design (16 workgroups total; phase C's V-accumulation loop is
+unstrided over `kv_len` per thread) wins at kv_len~2225 but is occupancy-limited at kv_len~8140 —
+too few workgroups to saturate the GPU once each thread's serial per-key loop dominates, exactly
+the risk the task brief called out. Fix applied: gated the fused path behind
+`FUSED_DECODE_ATTN_MAX_KV_LEN = 4096` (`model.rs`) so it only activates where measured to win;
+longer contexts fall back to the existing chunked Burn-matmul path. A tiled/two-pass kernel
+(more workgroups per head, second reduction pass) would likely fix the long-context case but is
+unimplemented this session.
+
+Dispatch count: unchanged in `llm-agent`'s static P1b estimate (that estimate is hardcoded per
+decoder-layer op count, not path-aware — `bin/llm-agent.rs` is owned by another worker this
+session, not edited). The real win is per-dispatch: attention core collapses from ~8 Burn
+dispatches (QK^T matmul, scale, mask compare+fill, softmax's ~3 ops, PV matmul, plus `repeat_kv`'s
+`cat`) to 1 fused dispatch, for kv_len <= 4096.
+
+Commits: `crates/llm-wasm/src/model.rs`, `src/kv.rs` (`f32_layer` accessor), `src/gguf.rs`
+(`attn_decode_f32_dispatch`), `src/wgsl/shader_attn_decode_f32.wgsl`.

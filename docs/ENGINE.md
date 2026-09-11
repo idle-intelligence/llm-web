@@ -477,6 +477,63 @@ against real WebGPU `maxStorageBufferBindingSize` on M2/Chrome.
   the rendered/cached prefix stays consistent between `start()` and the KV-image path. `step`'s
   `modelSteps`/`forcedTokens` mirror `model.rs::GenerateStats` (a jump-forward run of `k` tokens is
   1 model step, not `k`); `retries`/`toolErrors` mirror `agent.rs::Step`'s same-named fields.
+
+  **2026-09-11 addendum (coordinator-reported browser bug + fixes, both loops).** A live browser
+  run ("resume bloupblip") produced six consecutive `get_households_and_groups_and_players({})`
+  steps — every id-taking tool was uncallable. Root cause: `grammar.rs::IdValues::collect_from_result`
+  didn't parse JSON embedded in a string value, but a real MCP `tools/call` result's payload
+  *is* a JSON string inside `content[0].text`
+  (`{"content":[{"type":"text","text":"<pretty JSON>"}]}`), not a bare parsed value — native evals
+  passed because their fixtures handed the parsed value directly. Fixed generically in `walk`
+  (shared by both loops): every string value is now tried as JSON first and recursed into if it
+  parses, falling back to the `looks_like_id` heuristic only when it doesn't (a real id string
+  never parses as JSON, so no false negatives). `agent::FixtureCaller` and this page's own
+  `toolCaller` (`index.html`) were both updated to serve MCP-shaped results, so native evals and
+  the browser path now exercise the same parsing shape. Two more fixes landed alongside it:
+  - **Generic repeated-call loop guard** (both loops): a well-formed, valid call byte-identical
+    to the immediately preceding step's call(s), fed a non-error result, doesn't become a step —
+    it retries via the nudge (never the constrained-force retry, since the constraint was already
+    satisfied) and gives up with `"model is repeating a call"` after `max_retries`. `Step`/`step`
+    gained nothing new for this (it's folded into the existing `retries` count).
+  - **Fail-open** (`grammar.rs::Grammar::for_tools_unrestricted_ids` + `callable_tool_names`): if,
+    after building the id-restricted grammar, every still-callable tool is a read tool
+    (`get_`/`list_`-prefixed) already called this turn — the id rule left nothing new to try —
+    the grammar is rebuilt without the id restriction (every `*_id`/`*_ids` property becomes an
+    ordinary free string) instead of leaving the model boxed into repeating itself. Both
+    `Step.id_rule_relaxed` (native) and `step.idRuleRelaxed` (`web.rs`'s JSON) record when this
+    fired.
+
+  **Prefix-key debugging (`LlmEngine::prefixInputs`, `js_name = prefixInputs`).** A second
+  coordinator-reported bug: a prefix KV image built from a fixture tools file + eval system
+  prompt + listing-first tool order missed against the live page (its own `tools/list` schemas,
+  subset order, system prompt) — any byte of difference changes `prefixKey`. `prefixInputs(tools_json,
+  system): string` (sync, no GPU) returns `{"tools": <dieted raw JSON>, "system", "diet",
+  "prefixText", "prefixTokens", "modelFingerprint", "prefixKey"}` — the exact bytes `prefixKey`/
+  `start()` would use — so a caller can save `{system, tools}` and hand it to `kv-export --tools
+  <file> --system <system>` to reproduce the key exactly (`kv-export`'s `load_tools_generic`
+  doesn't diet its `--tools` input at all, so the dump must already be post-diet). Wired up via
+  `web/agent/index.html`'s "Export prefix inputs" button and `worker.js`'s `dumpPrefix` message,
+  and `scripts/headless/run.mjs --dump-prefix <path>`. `worker.js` also now logs the prefix key on
+  every `run` (`console.log('[llm-worker] prefix key: ...')`, captured by the headless harness),
+  and its `status` notes are honest about hit vs. miss instead of a generic "checking" that read
+  the same either way: miss is `"no KV image for this tool set (key …); prefilling once, will be
+  saved to browser storage for next time"`, hit is `"KV image loaded (N tokens, M MB, T ms, from
+  <opfs|network>, key …)"`.
+
+  **Robust OPFS write-back.** The previous design exported+saved a freshly-prefilled prefix to
+  OPFS via a JS-side fire-and-forget call made *after* `engine.start()`'s whole step (prefill +
+  decode) had already resolved — a decode-time or tool-call failure later in the same turn meant
+  the save never happened, even though the prefix itself had been correctly prefilled. Moved
+  entirely into `generate_attempt` (`maybe_export_kv_prefix_to_opfs`, a free function — see its
+  doc comment for why not an `LlmEngine` method): right after the prefill that makes
+  `resident_tokens` cover the rendered system+tools prefix, and *before* the decode loop starts,
+  it exports the prefix (`KvCache::export_prefix_async`) and writes `<key>.kvimg` straight to OPFS
+  from Rust (`opfs_save_kv_image`, new `web-sys` features: `WorkerGlobalScope`/`WorkerNavigator`/
+  `StorageManager`/`FileSystemDirectoryHandle`/`FileSystemFileHandle`/
+  `FileSystemGetFileOptions`/`FileSystemWritableFileStream`/`WritableStream`) — no JS
+  orchestration needed for the save itself to be durable, and it happens once per session per key
+  (`LlmEngine.kv_image_exported_key`, also set by a successful `importKvImage` so an imported
+  prefix is never redundantly re-exported).
 - `await engine.provideToolResults(resultsJson: string): Promise<string>` — `resultsJson` is
   `[{"call_id","result"}...]`, keyed by the `call_id`s from the prior `needTools` outcome; same
   return shape as `start`.
@@ -643,6 +700,24 @@ blocking `engine.start`/`provideToolResults` calls so `index.html` can drive a p
 (`get_weather`, `set_thermostat`) already exercise the same UI without needing a fake model path.
 
 ## Known issues / fixed
+
+### 2026-09-11: Fused decode-time attention kernel for the production F32 KV cache (Session 14)
+
+`shader_attn_decode_f32.wgsl` fuses decode's (t==1) QK^T -> softmax -> PV into one dispatch per
+layer (one workgroup per query head, GQA-aware, f32 accumulation throughout), reading K/V directly
+out of `kv.rs`'s `KvDtype::F32` cache tensors via a new `KvCache::f32_layer` raw-handle accessor —
+no dequant step (this cache is already f32), replacing ~8 Burn dispatches (QK^T matmul, scale
+multiply, causal-mask compare+fill, softmax's several ops, PV matmul via `pv_matmul`'s
+contraction-chunking workaround, plus `repeat_kv`'s `cat`) with 1. It's the F32-cache counterpart
+of Session 13's `shader_attn_decode_q8.wgsl`, sharing that kernel's three-phase structure (raw
+scores + running max, then exp/sum, then PV) and `workgroupUniformLoad` uniformity discipline, but
+without any block/word unpacking. Measured (`docs/BENCHMARKS.md` Session 14): a ~10% decode
+ms/token win at kv_len~2225, but a regression at kv_len~8140 — 16 workgroups total isn't enough to
+keep the GPU saturated once each thread's unstrided per-key V-accumulation loop (phase C) dominates
+at long context. `model.rs`'s `Q4Attention::forward` therefore gates the fused path behind
+`FUSED_DECODE_ATTN_MAX_KV_LEN = 4096`, falling back to the existing chunked Burn-matmul path beyond
+that; a tiled/two-pass variant with more workgroups per head is the likely fix for long context but
+wasn't attempted this session.
 
 ### 2026-09-10: Burn/cubecl wgpu matmul mis-computes for large-K/small-N shapes (fixed: chunked-attention 11.14 logit divergence)
 
