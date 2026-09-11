@@ -54,7 +54,7 @@ use crate::sample::{greedy, greedy_masked};
 use crate::schemadiet::{diet_tools, DietLevel};
 use crate::template::{ChatTemplate, Message, Tool, ToolCallEntry, ToolCallFunction};
 use crate::tokenizer::Tokenizer;
-use crate::tools::{format_tool_error, format_tool_result, parse_output, tool_error_message, ParsedOutput};
+use crate::tools::{format_tool_error, format_tool_result, parse_output, tool_error_message, ParsedOutput, ToolCall};
 
 /// Default context length: sized (per `kv.rs`'s doc comment) for the 34-tool
 /// Sonos prompt plus conversation headroom.
@@ -239,14 +239,15 @@ pub struct LlmEngine {
     id_values: IdValues,
     /// Built lazily on first constrained step and cached.
     token_vocab: Option<TokenVocab>,
-    /// The tool calls from the immediately preceding step (regardless of
-    /// whether the result was an error) — mirrors `agent.rs`'s field of the
-    /// same name; see `run_step`'s generic repeated-call loop guard.
-    last_tool_calls: Option<Vec<crate::tools::ToolCall>>,
+    /// Every tool call made so far this turn whose result was *not* an
+    /// error, in order — mirrors `agent.rs`'s field of the same name; see
+    /// `run_step`'s generic repeated-call loop guard. Reset in
+    /// `start`/`reset`.
+    successful_calls_this_turn: Vec<ToolCall>,
     /// Every tool call the model has been given so far this turn — mirrors
     /// `agent.rs`'s field of the same name; see the fail-open check in
     /// `generate_attempt`. Reset in `start`/`reset`.
-    calls_made_this_turn: Vec<crate::tools::ToolCall>,
+    calls_made_this_turn: Vec<ToolCall>,
     /// Prefix key already exported+saved to OPFS this session (see
     /// `generate_attempt`'s before-decode write-back and
     /// `import_kv_image`) — `None` until the first successful export or
@@ -296,7 +297,7 @@ impl LlmEngine {
             diet: true,
             id_values: IdValues::new(),
             token_vocab: None,
-            last_tool_calls: None,
+            successful_calls_this_turn: Vec::new(),
             calls_made_this_turn: Vec::new(),
             kv_image_exported_key: None,
         }
@@ -427,7 +428,7 @@ impl LlmEngine {
         self.pending_calls.clear();
         self.consecutive_tool_errors = 0;
         self.id_values = IdValues::new();
-        self.last_tool_calls = None;
+        self.successful_calls_this_turn.clear();
         self.calls_made_this_turn.clear();
 
         match self.compute_prefix_len(&utterance) {
@@ -462,6 +463,10 @@ impl LlmEngine {
                     self.consecutive_tool_errors = 0;
                     self.id_values.collect_from_result(&r.result);
                     self.messages.push(format_tool_result(&pending.name, &r.result));
+                    self.successful_calls_this_turn.push(ToolCall {
+                        name: pending.name.clone(),
+                        arguments: pending.arguments.clone(),
+                    });
                 }
             }
         }
@@ -481,7 +486,7 @@ impl LlmEngine {
         self.resident_tokens.clear();
         self.consecutive_tool_errors = 0;
         self.id_values = IdValues::new();
-        self.last_tool_calls = None;
+        self.successful_calls_this_turn.clear();
         self.calls_made_this_turn.clear();
         self.kv_image_exported_key = None;
         if let Some(cache) = self.cache.as_mut() {
@@ -909,10 +914,12 @@ impl LlmEngine {
         self.step_index += 1;
 
         let mut retries = 0usize;
+        let mut repeat_guard = false;
         loop {
             let force_constrained = retries == 1 && !self.constrained && !self.tools.is_empty();
-            let attempt = self.generate_attempt(force_constrained).await?;
+            let attempt = self.generate_attempt(force_constrained, false).await?;
 
+            let empty_calls = matches!(&attempt.parsed, Ok(ParsedOutput::ToolCalls(calls)) if calls.is_empty());
             let invalid = match &attempt.parsed {
                 Err(_) => true,
                 Ok(ParsedOutput::ToolCalls(calls)) => {
@@ -926,14 +933,19 @@ impl LlmEngine {
 
             // Generic repeated-call loop guard (`docs/ENGINE.md` "Agent
             // loop"; mirrors `agent.rs::step_inner`) — a well-formed, valid
-            // call byte-identical to the immediately preceding step's
-            // call(s), fed a non-error result, is a wasted step, not a
-            // genuine retry of anything. `self.consecutive_tool_errors ==
-            // 0` excludes the legitimate case of retrying the same call
-            // after `tool_error_message` feedback asked it to.
+            // call identical (same name+args) to one already made *and
+            // answered without an error* earlier this run — not only the
+            // immediately preceding step — is a wasted step, not a genuine
+            // retry of anything. A repeat of a call whose earlier result
+            // *was* an error is excluded (not in
+            // `successful_calls_this_turn`) — retrying a failed call is
+            // legitimate.
             let is_repeat = !invalid
-                && self.consecutive_tool_errors == 0
-                && matches!(&attempt.parsed, Ok(ParsedOutput::ToolCalls(calls)) if self.last_tool_calls.as_deref() == Some(calls.as_slice()));
+                && matches!(&attempt.parsed, Ok(ParsedOutput::ToolCalls(calls))
+                    if calls.iter().any(|c| self.successful_calls_this_turn.contains(c)));
+            if is_repeat {
+                repeat_guard = true;
+            }
 
             if invalid || is_repeat {
                 if retries < MAX_RETRIES {
@@ -947,11 +959,17 @@ impl LlmEngine {
                     }
                     continue;
                 }
-                return Ok(error_json(if is_repeat {
-                    "model is repeating a call"
-                } else {
-                    "model produced no valid call"
-                }));
+                // Retries exhausted. A repeated or empty call means the
+                // model has (or believes it has) everything it needs but
+                // won't say so — force a text-only answer instead of
+                // erroring out with no answer at all. Any other kind of
+                // invalid output (unparsable JSON, an unknown tool name)
+                // still gives up with an error, since there's no evidence
+                // the model has anything useful to say.
+                if is_repeat || empty_calls {
+                    return self.force_final_answer(repeat_guard).await;
+                }
+                return Ok(error_json("model produced no valid call"));
             }
 
             let AttemptOutput {
@@ -992,7 +1010,6 @@ impl LlmEngine {
                         .collect();
                     self.messages.push(Message::assistant_tool_calls(entries));
                     self.pending_calls = pending.clone();
-                    self.last_tool_calls = Some(calls.clone());
                     self.calls_made_this_turn.extend(calls.iter().cloned());
 
                     Ok(serde_json::json!({
@@ -1012,6 +1029,8 @@ impl LlmEngine {
                             "retries": retries,
                             "toolErrors": tool_errors,
                             "idRuleRelaxed": id_rule_relaxed,
+                            "repeatGuard": repeat_guard,
+                            "forcedTextAnswer": false,
                         },
                     })
                     .to_string())
@@ -1031,11 +1050,64 @@ impl LlmEngine {
                         "retries": retries,
                         "toolErrors": tool_errors,
                         "idRuleRelaxed": id_rule_relaxed,
+                        "repeatGuard": repeat_guard,
+                        "forcedTextAnswer": false,
                     },
                 })
                 .to_string()),
             };
         }
+    }
+
+    /// Last resort when `run_step`'s malformed/repeated-call retry budget
+    /// is exhausted on a repeated or empty tool call — mirrors
+    /// `agent.rs::Agent::force_final_answer`: regenerate this step once
+    /// more under `Grammar::text_only` (no tool-call array allowed at all)
+    /// and return whatever text comes back as `"outcome":"final"`, so a
+    /// read-only question the model kept re-querying instead of answering
+    /// still ends with an answer instead of `"outcome":"error"`. Only a
+    /// genuine generation failure (render/encode/GPU/model) still errors.
+    async fn force_final_answer(&mut self, repeat_guard: bool) -> Result<String, JsError> {
+        let attempt = self.generate_attempt(false, true).await?;
+        let AttemptOutput {
+            prompt_tokens,
+            generated_text,
+            parsed,
+            prefill_ms,
+            decode_ms,
+            tokens_generated,
+            model_steps,
+            forced_tokens,
+            id_rule_relaxed: _,
+        } = attempt;
+        // The text-only grammar forbids a leading `[`, so `parsed` should
+        // always come back `Ok(ParsedOutput::Text(_))` — but fall back to
+        // the raw generated text rather than erroring on the off chance it
+        // doesn't (an empty/odd forced answer is still better than none).
+        let text = match &parsed {
+            Ok(ParsedOutput::Text(t)) => t.clone(),
+            _ => generated_text.clone(),
+        };
+        Ok(serde_json::json!({
+            "outcome": "final",
+            "text": text,
+            "step": {
+                "promptTokens": prompt_tokens.len(),
+                "promptTokenIds": prompt_tokens,
+                "text": generated_text,
+                "prefillMs": prefill_ms,
+                "decodeMs": decode_ms,
+                "tokens": tokens_generated,
+                "modelSteps": model_steps,
+                "forcedTokens": forced_tokens,
+                "retries": MAX_RETRIES,
+                "toolErrors": self.consecutive_tool_errors,
+                "idRuleRelaxed": false,
+                "repeatGuard": repeat_guard,
+                "forcedTextAnswer": true,
+            },
+        })
+        .to_string())
     }
 
     /// One render -> encode -> (restore prefix ->) prefill -> constrained
@@ -1052,7 +1124,12 @@ impl LlmEngine {
     /// `Ok(AttemptOutput{parsed: Err(_), ..})`, not `Err`, so `run_step`'s
     /// retry loop can decide whether to retry — only render/encode/
     /// GPU/model failures propagate as `Err`.
-    async fn generate_attempt(&mut self, force_constrained: bool) -> Result<AttemptOutput, JsError> {
+    ///
+    /// `force_text_only` (used only by `force_final_answer`) replaces the
+    /// whole tool-call grammar with `Grammar::text_only`, bypassing the id
+    /// rule / fail-open logic entirely — mirrors
+    /// `agent.rs::Agent::generate_attempt`'s `force_text_only` parameter.
+    async fn generate_attempt(&mut self, force_constrained: bool, force_text_only: bool) -> Result<AttemptOutput, JsError> {
         let template = self.template.as_ref().ok_or_else(|| JsError::new("model not loaded"))?;
         let tokenizer = self.tokenizer.as_ref().ok_or_else(|| JsError::new("model not loaded"))?;
 
@@ -1081,9 +1158,10 @@ impl LlmEngine {
         // Build this step's schema constraint (if `self.constrained`, or
         // this attempt forces it on) from the current tool set + every id
         // harvested from tool results so far — mirrors
-        // `agent.rs::Agent::generate_attempt`.
-        let use_constrained = self.constrained || force_constrained;
-        let grammar_tools: Vec<grammar::Tool> = if use_constrained {
+        // `agent.rs::Agent::generate_attempt`. `force_text_only` bypasses
+        // all of this: the constraint is `Grammar::text_only` outright.
+        let use_constrained = self.constrained || force_constrained || force_text_only;
+        let grammar_tools: Vec<grammar::Tool> = if use_constrained && !force_text_only {
             self.tools
                 .iter()
                 .map(|t| grammar::Tool::from_schema(&t.function.name, &t.function.parameters))
@@ -1091,19 +1169,24 @@ impl LlmEngine {
         } else {
             Vec::new()
         };
-        let mut grammar_for_step = use_constrained.then(|| Grammar::for_tools(&grammar_tools, &self.id_values));
+        let mut grammar_for_step = if force_text_only {
+            Some(Grammar::text_only())
+        } else {
+            use_constrained.then(|| Grammar::for_tools(&grammar_tools, &self.id_values))
+        };
         // Fail-open (`docs/ENGINE.md` "Agent loop" — "fail-open"; mirrors
         // `agent.rs::generate_attempt`): if every still-callable tool is a
         // read tool already called this turn, the id rule left nothing
         // new — rebuild without it instead of boxing the model into
         // repeating itself.
-        let id_rule_relaxed = grammar_for_step.as_ref().is_some_and(|g| {
-            let callable = g.callable_tool_names();
-            !callable.is_empty()
-                && callable
-                    .iter()
-                    .all(|name| is_read_tool(name) && self.calls_made_this_turn.iter().any(|c| &c.name == name))
-        });
+        let id_rule_relaxed = !force_text_only
+            && grammar_for_step.as_ref().is_some_and(|g| {
+                let callable = g.callable_tool_names();
+                !callable.is_empty()
+                    && callable
+                        .iter()
+                        .all(|name| is_read_tool(name) && self.calls_made_this_turn.iter().any(|c| &c.name == name))
+            });
         if id_rule_relaxed {
             grammar_for_step = Some(Grammar::for_tools_unrestricted_ids(&grammar_tools));
         }

@@ -254,6 +254,13 @@ pub struct Grammar {
     tool_names: Vec<String>,
     name_lit: Vec<String>,
     arguments_lit: Vec<String>,
+    /// When set, `Pos::Start` never enters the tool-call-array branch (a
+    /// leading `[` is rejected outright) — every generation is forced into
+    /// `Pos::FreeText` instead. Built by [`Grammar::text_only`] for the
+    /// agent loops' forced-final-answer fallback (`docs/ENGINE.md` "Agent
+    /// loop"): once retries are exhausted on a repeated or empty tool call,
+    /// the model must produce a text answer, not another array.
+    text_only: bool,
 }
 
 fn resolve_plain(k: &PropKind) -> ResolvedKind {
@@ -289,6 +296,21 @@ impl Grammar {
     /// every still-callable tool is a read tool already called this turn.
     pub fn for_tools_unrestricted_ids(tools: &[Tool]) -> Self {
         Self::build(tools, &IdValues::new(), false)
+    }
+
+    /// A grammar with no callable tools at all — `Pos::Start` rejects a
+    /// leading `[` outright, so the only legal output is free text. Used by
+    /// both agent loops' forced-final-answer fallback once retries are
+    /// exhausted on a repeated or empty tool call (`docs/ENGINE.md` "Agent
+    /// loop"): the model must answer, not emit another tool-call array.
+    pub fn text_only() -> Self {
+        Self {
+            tools: Vec::new(),
+            tool_names: Vec::new(),
+            name_lit: vec!["name".to_string()],
+            arguments_lit: vec!["arguments".to_string()],
+            text_only: true,
+        }
     }
 
     fn build(tools: &[Tool], id_values: &IdValues, restrict_ids: bool) -> Self {
@@ -343,6 +365,7 @@ impl Grammar {
             tool_names,
             name_lit: vec!["name".to_string()],
             arguments_lit: vec!["arguments".to_string()],
+            text_only: false,
         }
     }
 
@@ -559,7 +582,11 @@ impl Grammar {
                 if WS.contains(&b) {
                     Some(Pos::Start)
                 } else if b == b'[' {
-                    Some(Pos::ArrWs)
+                    if self.text_only {
+                        None
+                    } else {
+                        Some(Pos::ArrWs)
+                    }
                 } else {
                     Some(Pos::FreeText)
                 }

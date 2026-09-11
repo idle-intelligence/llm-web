@@ -1247,11 +1247,50 @@ calls `start`. `start`/`run` taking pre-built `Tool`s directly (as every
 existing test and the byte-fidelity template tests do) are completely
 unaffected — the diet only applies on the `start_from_mcp` path.
 
+**Generic repeated-call loop guard, and the forced text-only fallback
+(2026-09-11).** A live browser run ("List all my speakers.") called
+`get_households_and_groups_and_players({})`, got a result, then called it
+again — the repeat guard (added for the six-consecutive-repeats bug above)
+turned that into a hard `StepOutcome::Error`, so a plain read-only question
+died with no answer instead of ending in text. Two changes:
+
+- **Broader repeat detection.** `is_repeat` used to compare only against
+  the *immediately preceding* step's calls (`last_tool_calls`, now
+  removed). It now checks a call (by `name`+`arguments`) against every call
+  made so far this turn whose result was *not* an error
+  (`Agent::successful_calls_this_turn`, populated in
+  `provide_tool_results`'s non-error branch) — a repeat several steps back
+  is caught just as well as an immediate one. A call identical to one whose
+  *earlier* result *was* an error is deliberately excluded from that list,
+  so retrying a failed call still executes normally — retrying a failure is
+  legitimate, retrying a success is not.
+- **Forced text-only answer instead of `Error`.** When `step_inner`'s
+  retry loop exhausts `max_retries` on a call that's a repeat, or an empty
+  tool-call array (`[]`) — both cases where the model plausibly already has
+  what it needs but won't say so — it no longer gives up with `Error`.
+  Instead it makes one more `generate_attempt` with
+  `force_text_only: true`, which swaps the whole constraint for
+  `Grammar::text_only()` (`grammar.rs`: `Pos::Start` rejects a leading `[`
+  outright instead of entering the tool-call-array branch, so only free
+  text is reachable) and returns whatever text comes back as
+  `StepOutcome::Final`. Any other kind of invalid output (unparsable JSON,
+  an unknown tool name) still exhausts to `Error` as before — there's no
+  similar evidence the model has an answer ready. `Step.repeat_guard`
+  records whether a repeat was caught and nudged past on the way to this
+  step's outcome (regardless of whether that outcome was a normal model
+  answer or the forced one); `Step.forced_text_answer` records whether
+  *this* step's text specifically came from the forced branch rather than
+  the model's own choice.
+
 **What `web.rs` must mirror** (not done here — that file's worker owns
 it): the same three behaviours, adapted to the step-wise browser loop —
 (1) an empty/unparsable/unknown-tool model output must not become an
 assistant turn; retry with constrained-on then a `user`-role nudge, capped
-at 2, then surface an error to the page; (2) an MCP tool result carrying
+at 2; then, for a repeated or empty call specifically, force one more
+generation under a text-only grammar and return it as `"outcome":"final"`
+rather than erroring (any other kind of invalid output still surfaces
+`"outcome":"error"` to the page — see the 2026-09-11 addendum above, which
+`run_step`/`force_final_answer` mirror exactly); (2) an MCP tool result carrying
 `isError: true` (or an `error` field) must be fed back as a `tool` message
 with `{"error": "<msg>"}` content, not `format_tool_result`'s normal
 shape, and 3 consecutive tool errors should stop the turn with an error

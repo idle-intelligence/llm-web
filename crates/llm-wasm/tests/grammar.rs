@@ -172,6 +172,30 @@ fn free_text_accepted() {
     assert!(state.is_complete());
 }
 
+// `Grammar::text_only` (agent loops' forced-final-answer fallback,
+// `docs/ENGINE.md` "Agent loop"): a leading `[` is rejected outright — the
+// tool-call-array branch doesn't exist under this grammar — while prose is
+// accepted exactly like `Grammar::for_tools`'s free-text branch.
+#[test]
+fn text_only_rejects_leading_array_bracket() {
+    let grammar = Grammar::text_only();
+    let mut state = GrammarState::new(&grammar);
+
+    assert!(
+        !state.feed_bytes(b"["),
+        "text_only grammar should reject a leading '[' outright"
+    );
+}
+
+#[test]
+fn text_only_accepts_prose() {
+    let grammar = Grammar::text_only();
+    let mut state = GrammarState::new(&grammar);
+
+    assert!(state.feed_bytes(b"I already checked and nothing has changed."));
+    assert!(state.is_complete());
+}
+
 // (g) Mask time per step, printed.
 #[test]
 fn mask_time_per_step() {

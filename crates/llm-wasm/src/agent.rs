@@ -187,6 +187,20 @@ pub struct Step {
     /// this turn (fail-open — see `docs/ENGINE.md` "Agent loop"). `false`
     /// for an unconstrained step.
     pub id_rule_relaxed: bool,
+    /// Set when reaching this step required detecting and nudging past at
+    /// least one repeated identical tool call this turn (see `step_inner`'s
+    /// generic repeated-call loop guard, `docs/ENGINE.md` "Agent loop") —
+    /// regardless of whether the step that follows the nudge is a normal
+    /// model answer or a `forced_text_answer`. `false` when no repeat was
+    /// detected reaching this step.
+    pub repeat_guard: bool,
+    /// Set when this step's text answer wasn't produced by the model's own
+    /// choice but forced by regenerating under `Grammar::text_only` after
+    /// the malformed/repeated-call retry budget was exhausted (see
+    /// `step_inner`) — a read-only question the model kept re-querying
+    /// instead of answering still gets a `Final` outcome instead of
+    /// `Error`. `false` for every other step.
+    pub forced_text_answer: bool,
 }
 
 pub struct Transcript {
@@ -389,12 +403,14 @@ pub struct Agent<G: Generator, C: ToolCaller> {
     /// Built lazily on first constrained step and cached — `TokenVocab`
     /// precomputes every vocab id's byte string once, not once per step.
     token_vocab: Option<TokenVocab>,
-    /// The tool calls from the immediately preceding step (regardless of
-    /// whether the result was an error) — see `step_inner`'s generic
-    /// repeated-call loop guard: a step whose calls are byte-identical to
-    /// this, after a non-error result, is a wasted step, not a new attempt
-    /// at anything.
-    last_tool_calls: Option<Vec<ToolCall>>,
+    /// Every tool call made so far this turn whose result was *not* an
+    /// error, in order — see `step_inner`'s generic repeated-call loop
+    /// guard: a call identical (same name+args) to one of these is never
+    /// re-executed, no matter how many steps back it was made. A call
+    /// identical to one whose *earlier* result was an error is deliberately
+    /// excluded from this list — retrying a failed call is legitimate.
+    /// Reset in `start`/`reset`.
+    successful_calls_this_turn: Vec<ToolCall>,
     /// Every tool call the model has been given (i.e. every call in a
     /// `NeedTools` step) so far this turn, in order — used only by the
     /// fail-open "is the model stuck" check in `generate_attempt` (see
@@ -431,7 +447,7 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
             constrained: false,
             id_values: IdValues::new(),
             token_vocab: None,
-            last_tool_calls: None,
+            successful_calls_this_turn: Vec::new(),
             calls_made_this_turn: Vec::new(),
         }
     }
@@ -483,7 +499,7 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
         self.pending_calls.clear();
         self.consecutive_tool_errors = 0;
         self.id_values = IdValues::new();
-        self.last_tool_calls = None;
+        self.successful_calls_this_turn.clear();
         self.calls_made_this_turn.clear();
     }
 
@@ -498,7 +514,7 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
         self.pending_calls.clear();
         self.consecutive_tool_errors = 0;
         self.id_values = IdValues::new();
-        self.last_tool_calls = None;
+        self.successful_calls_this_turn.clear();
         self.calls_made_this_turn.clear();
 
         match self.prefix_len_for(&self.tools, utterance) {
@@ -549,6 +565,10 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
                     self.consecutive_tool_errors = 0;
                     self.id_values.collect_from_result(&result);
                     self.messages.push(format_tool_result(&pending.name, &result));
+                    self.successful_calls_this_turn.push(ToolCall {
+                        name: pending.name.clone(),
+                        arguments: pending.arguments.clone(),
+                    });
                 }
             }
         }
@@ -581,13 +601,15 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
         // `self.max_retries` gives up with `StepOutcome::Error`. Retries
         // don't consume the `max_steps` budget (already charged above).
         let mut retries = 0usize;
+        let mut repeat_guard = false;
         loop {
             let force_constrained = retries == 1 && !self.constrained && !self.tools.is_empty();
-            let attempt = match self.generate_attempt(force_constrained) {
+            let attempt = match self.generate_attempt(force_constrained, false) {
                 Ok(a) => a,
                 Err(message) => return StepOutcome::Error { message, step: None },
             };
 
+            let empty_calls = matches!(&attempt.parsed, Ok(ParsedOutput::ToolCalls(calls)) if calls.is_empty());
             let invalid = match &attempt.parsed {
                 Err(_) => true,
                 Ok(ParsedOutput::ToolCalls(calls)) => {
@@ -600,17 +622,21 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
             };
 
             // Generic repeated-call loop guard (`docs/ENGINE.md` "Agent
-            // loop"): a well-formed, valid call that's byte-identical to
-            // the immediately preceding step's call(s), fed a non-error
-            // result, is a wasted step, not a genuine retry of anything —
-            // seen live as six consecutive
-            // `get_households_and_groups_and_players({})` steps once the
-            // model had nothing new to ask about. `self.consecutive_tool_errors
-            // == 0` excludes the legitimate case of retrying the same call
-            // after `tool_error_message` feedback asked it to.
+            // loop"): a well-formed, valid call identical (same name+args)
+            // to one already made *and answered without an error* earlier
+            // this run — not only the immediately preceding step — is a
+            // wasted step, not a genuine retry of anything — seen live as
+            // six consecutive `get_households_and_groups_and_players({})`
+            // steps once the model had nothing new to ask about. A repeat
+            // of a call whose earlier result *was* an error is excluded
+            // (not in `successful_calls_this_turn`) — retrying a failed
+            // call is legitimate.
             let is_repeat = !invalid
-                && self.consecutive_tool_errors == 0
-                && matches!(&attempt.parsed, Ok(ParsedOutput::ToolCalls(calls)) if self.last_tool_calls.as_deref() == Some(calls.as_slice()));
+                && matches!(&attempt.parsed, Ok(ParsedOutput::ToolCalls(calls))
+                    if calls.iter().any(|c| self.successful_calls_this_turn.contains(c)));
+            if is_repeat {
+                repeat_guard = true;
+            }
 
             if invalid || is_repeat {
                 if retries < self.max_retries {
@@ -625,12 +651,20 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
                     }
                     continue;
                 }
-                let message = if is_repeat {
-                    "model is repeating a call".to_string()
-                } else {
-                    "model produced no valid call".to_string()
+                // Retries exhausted. A repeated or empty call means the
+                // model has (or believes it has) everything it needs but
+                // won't say so — force a text-only answer instead of
+                // erroring out with no answer at all. Any other kind of
+                // invalid output (unparsable JSON, an unknown tool name)
+                // still gives up with `Error`, since there's no evidence
+                // the model has anything useful to say.
+                if is_repeat || empty_calls {
+                    return self.force_final_answer(repeat_guard);
+                }
+                return StepOutcome::Error {
+                    message: "model produced no valid call".to_string(),
+                    step: None,
                 };
-                return StepOutcome::Error { message, step: None };
             }
 
             let AttemptOutput {
@@ -654,7 +688,6 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
                     let entries = tool_call_entries(&pending);
                     self.messages.push(Message::assistant_tool_calls(entries));
                     self.pending_calls = pending.clone();
-                    self.last_tool_calls = Some(calls.clone());
                     self.calls_made_this_turn.extend(calls.iter().cloned());
 
                     let step = Step {
@@ -671,6 +704,8 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
                         retries,
                         tool_errors,
                         id_rule_relaxed,
+                        repeat_guard,
+                        forced_text_answer: false,
                     };
                     StepOutcome::NeedTools { calls: pending, step }
                 }
@@ -689,6 +724,8 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
                         retries,
                         tool_errors,
                         id_rule_relaxed,
+                        repeat_guard,
+                        forced_text_answer: false,
                     };
                     StepOutcome::Final { text, step }
                 }
@@ -696,14 +733,73 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
         }
     }
 
-    /// One render -> encode -> generate -> decode -> parse round, with an
-    /// override to force schema-constrained decoding on for this attempt
-    /// regardless of `self.constrained` (used by `step_inner`'s retry
-    /// policy). Returns `Err(message)` only for failures that aren't part
-    /// of the retry policy (render/encode/generate/decode) — a parse
-    /// failure is returned as `Ok` with `parsed: Err(_)` so the caller can
-    /// decide whether to retry.
-    fn generate_attempt(&mut self, force_constrained: bool) -> Result<AttemptOutput, String> {
+    /// Last resort when `step_inner`'s malformed/repeated-call retry budget
+    /// is exhausted on a repeated or empty tool call: regenerate this step
+    /// once more under `Grammar::text_only` (no tool-call array allowed at
+    /// all — see that constructor's doc comment) and return whatever text
+    /// comes back as `StepOutcome::Final`, so a read-only question the
+    /// model kept re-querying instead of answering still ends with an
+    /// answer instead of `StepOutcome::Error`. Only a genuine generation
+    /// failure (render/encode/generate/decode) still returns `Error` here.
+    fn force_final_answer(&mut self, repeat_guard: bool) -> StepOutcome {
+        let attempt = match self.generate_attempt(false, true) {
+            Ok(a) => a,
+            Err(message) => return StepOutcome::Error { message, step: None },
+        };
+        let AttemptOutput {
+            prompt_tokens,
+            generated_text,
+            parsed,
+            timings,
+            tokens_generated,
+            prefill_time,
+            decode_time,
+            model_steps,
+            forced_tokens,
+            id_rule_relaxed: _,
+        } = attempt;
+        // The text-only grammar forbids a leading `[`, so `parsed` should
+        // always come back `Ok(ParsedOutput::Text(_))` — but fall back to
+        // the raw generated text rather than erroring on the off chance it
+        // doesn't (an empty/odd forced answer is still better than no
+        // answer at all).
+        let text = match &parsed {
+            Ok(ParsedOutput::Text(t)) => t.clone(),
+            _ => generated_text.clone(),
+        };
+        let step = Step {
+            prompt_tokens,
+            generated_text,
+            parsed: ParsedOutput::Text(text.clone()),
+            tool_result: None,
+            timings,
+            tokens_generated,
+            prefill_time,
+            decode_time,
+            model_steps,
+            forced_tokens,
+            retries: self.max_retries,
+            tool_errors: self.consecutive_tool_errors,
+            id_rule_relaxed: false,
+            repeat_guard,
+            forced_text_answer: true,
+        };
+        StepOutcome::Final { text, step }
+    }
+
+    /// One render -> encode -> generate -> decode -> parse round, with two
+    /// independent overrides used by `step_inner`'s retry policy:
+    /// `force_constrained` turns schema-constrained decoding on for this
+    /// attempt regardless of `self.constrained`; `force_text_only` (used
+    /// only by `force_final_answer`) replaces the whole tool-call grammar
+    /// with `Grammar::text_only`, so the model cannot emit a tool-call
+    /// array at all this attempt no matter what `self.tools`/`self.constrained`
+    /// say. The two are mutually exclusive in practice (`force_final_answer`
+    /// always passes `force_constrained: false`). Returns `Err(message)`
+    /// only for failures that aren't part of the retry policy (render/
+    /// encode/generate/decode) — a parse failure is returned as `Ok` with
+    /// `parsed: Err(_)` so the caller can decide whether to retry.
+    fn generate_attempt(&mut self, force_constrained: bool, force_text_only: bool) -> Result<AttemptOutput, String> {
         let prompt = self
             .template
             .render_prompt(&self.messages, &self.tools, true)
@@ -723,9 +819,12 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
         // Build this step's schema constraint (if `constrained`, or this
         // attempt forces it on) from the current tool set + every id
         // harvested from tool results so far — see `docs/ENGINE.md`
-        // "Schema-constrained decoding".
-        let use_constrained = self.constrained || force_constrained;
-        let grammar_tools: Vec<grammar::Tool> = if use_constrained {
+        // "Schema-constrained decoding". `force_text_only` bypasses all of
+        // this: the constraint is `Grammar::text_only` outright, and the
+        // id rule / fail-open logic (which only makes sense for a tool-call
+        // grammar) never runs.
+        let use_constrained = self.constrained || force_constrained || force_text_only;
+        let grammar_tools: Vec<grammar::Tool> = if use_constrained && !force_text_only {
             self.tools
                 .iter()
                 .map(|t| grammar::Tool::from_schema(&t.function.name, &t.function.parameters))
@@ -733,20 +832,25 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
         } else {
             Vec::new()
         };
-        let mut grammar_for_step = use_constrained.then(|| Grammar::for_tools(&grammar_tools, &self.id_values));
+        let mut grammar_for_step = if force_text_only {
+            Some(Grammar::text_only())
+        } else {
+            use_constrained.then(|| Grammar::for_tools(&grammar_tools, &self.id_values))
+        };
         // Fail-open (`docs/ENGINE.md` "Agent loop" — "fail-open"): if the
         // id rule left the model nothing new to call — every still-
         // callable tool is a read tool it's already called this turn —
         // rebuild without the id restriction instead of leaving it boxed
         // into repeating itself (that repeat is what `is_repeat` above
         // would otherwise have to catch one wasted step later).
-        let id_rule_relaxed = grammar_for_step.as_ref().is_some_and(|g| {
-            let callable = g.callable_tool_names();
-            !callable.is_empty()
-                && callable
-                    .iter()
-                    .all(|name| is_read_tool(name) && self.calls_made_this_turn.iter().any(|c| &c.name == name))
-        });
+        let id_rule_relaxed = !force_text_only
+            && grammar_for_step.as_ref().is_some_and(|g| {
+                let callable = g.callable_tool_names();
+                !callable.is_empty()
+                    && callable
+                        .iter()
+                        .all(|name| is_read_tool(name) && self.calls_made_this_turn.iter().any(|c| &c.name == name))
+            });
         if id_rule_relaxed {
             grammar_for_step = Some(Grammar::for_tools_unrestricted_ids(&grammar_tools));
         }
