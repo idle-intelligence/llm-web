@@ -432,16 +432,14 @@ pub struct Agent<G: Generator, C: ToolCaller> {
     /// Built lazily on first constrained step and cached — `TokenVocab`
     /// precomputes every vocab id's byte string once, not once per step.
     token_vocab: Option<TokenVocab>,
-    /// Every tool call made so far this turn whose result was *not* an
-    /// error, in order — see `step_inner`'s generic repeated-call loop
-    /// guard: a call identical (same name+args) to one of these is never
-    /// re-executed, no matter how many steps back it was made. A call
-    /// identical to one whose *earlier* result was an error is deliberately
-    /// excluded from this list — retrying a failed call is legitimate.
-    /// Reset in `start`/`reset`.
-    successful_calls_this_turn: Vec<ToolCall>,
     /// Every tool call the model has been given (i.e. every call in a
-    /// `NeedTools` step) so far this turn, in order — used only by the
+    /// `NeedTools` step) so far this turn, in order — regardless of
+    /// whether its result later came back an error. Used both by
+    /// `step_inner`'s generic repeated-call loop guard (a call identical
+    /// — same name+args — to one of these is never re-executed, no
+    /// matter how many steps back it was made or whether that earlier
+    /// call errored: the error text is already fed back, so the model
+    /// must change the arguments or call a different tool) and by the
     /// fail-open "is the model stuck" check in `generate_attempt` (see
     /// `docs/ENGINE.md` "Agent loop" — "fail-open"). Reset in
     /// `start`/`reset`.
@@ -477,7 +475,6 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
             require_tool_call_first_step: true,
             id_values: IdValues::new(),
             token_vocab: None,
-            successful_calls_this_turn: Vec::new(),
             calls_made_this_turn: Vec::new(),
         }
     }
@@ -537,7 +534,6 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
         self.pending_calls.clear();
         self.consecutive_tool_errors = 0;
         self.id_values = IdValues::new();
-        self.successful_calls_this_turn.clear();
         self.calls_made_this_turn.clear();
     }
 
@@ -552,7 +548,6 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
         self.pending_calls.clear();
         self.consecutive_tool_errors = 0;
         self.id_values = IdValues::new();
-        self.successful_calls_this_turn.clear();
         self.calls_made_this_turn.clear();
 
         self.step_inner()
@@ -593,10 +588,6 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
                     self.consecutive_tool_errors = 0;
                     self.id_values.collect_from_result(&result);
                     self.messages.push(format_tool_result(&pending.name, &result));
-                    self.successful_calls_this_turn.push(ToolCall {
-                        name: pending.name.clone(),
-                        arguments: pending.arguments.clone(),
-                    });
                 }
             }
         }
@@ -651,17 +642,22 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
 
             // Generic repeated-call loop guard (`docs/ENGINE.md` "Agent
             // loop"): a well-formed, valid call identical (same name+args)
-            // to one already made *and answered without an error* earlier
-            // this run — not only the immediately preceding step — is a
-            // wasted step, not a genuine retry of anything — seen live as
-            // six consecutive `get_households_and_groups_and_players({})`
-            // steps once the model had nothing new to ask about. A repeat
-            // of a call whose earlier result *was* an error is excluded
-            // (not in `successful_calls_this_turn`) — retrying a failed
-            // call is legitimate.
+            // to one already made earlier this run — not only the
+            // immediately preceding step — is never re-executed, whether
+            // that earlier call's result was an error or not: the error
+            // text (if any) is already fed back into the conversation, so
+            // the model must change the arguments or call a different tool
+            // rather than retry byte-for-byte — seen live both as six
+            // consecutive `get_households_and_groups_and_players({})`
+            // steps once the model had nothing new to ask about, and as
+            // the same invalid `group_id` re-tried against
+            // `get_now_playing` after the relay had already said it was
+            // invalid (`bloupblip`, see docs/ENGINE.md "Typed ids"). A
+            // *different* call to the same tool (different arguments)
+            // remains allowed.
             let is_repeat = !invalid
                 && matches!(&attempt.parsed, Ok(ParsedOutput::ToolCalls(calls))
-                    if calls.iter().any(|c| self.successful_calls_this_turn.contains(c)));
+                    if calls.iter().any(|c| self.calls_made_this_turn.contains(c)));
             if is_repeat {
                 repeat_guard = true;
             }

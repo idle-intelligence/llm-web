@@ -18,7 +18,7 @@
 //! `fixtures/sonos/tools.json`.
 
 use serde_json::Value;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 // ---------------------------------------------------------------------
 // Tool schema (input side) — parsed from MCP `inputSchema` JSON Schema.
@@ -135,32 +135,74 @@ pub fn tools_from_json(list: &[Value]) -> Vec<Tool> {
 // ---------------------------------------------------------------------
 // IdValues — strings harvested from earlier tool results in the
 // conversation, the only values a `*_id`/`*_ids` property may take.
+//
+// Values are bucketed by a "type token" derived from the key they were
+// harvested under (`normalize_type_token`) so that, e.g., a `groupId` and
+// a `playerId` never land in the same pool — see docs/ENGINE.md "Typed
+// ids" for the regression (a player id satisfying a `group_id` property)
+// this guards against. Values harvested from a key that isn't itself
+// id-shaped (`is_id_key`) fall into the untyped `""` bucket, exactly like
+// the old flat-set behaviour.
 // ---------------------------------------------------------------------
 
 #[derive(Debug, Clone, Default)]
-pub struct IdValues(BTreeSet<String>);
+pub struct IdValues(BTreeMap<String, BTreeSet<String>>);
 
 impl IdValues {
     pub fn new() -> Self {
-        Self(BTreeSet::new())
+        Self(BTreeMap::new())
     }
 
+    /// Insert into the untyped (`""`) bucket — the same as harvesting a
+    /// value from a key that isn't id-shaped. Test/debug convenience: a
+    /// property whose typed bucket is empty falls back to this one (see
+    /// `candidates_for`), so building an `IdValues` this way still works
+    /// against `Grammar::for_tools` exactly as before typed buckets
+    /// existed.
     pub fn insert(&mut self, s: impl Into<String>) {
-        self.0.insert(s.into());
+        self.insert_typed("", s);
+    }
+
+    pub fn insert_typed(&mut self, token: &str, s: impl Into<String>) {
+        self.0.entry(token.to_string()).or_default().insert(s.into());
     }
 
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.0.values().all(|set| set.is_empty())
     }
 
+    /// Every value harvested so far, across every type bucket — test/debug
+    /// helper; production code should go through `candidates_for` instead,
+    /// which respects typing.
     pub fn sorted_vec(&self) -> Vec<String> {
-        self.0.iter().cloned().collect()
+        let mut all: BTreeSet<String> = BTreeSet::new();
+        for set in self.0.values() {
+            all.extend(set.iter().cloned());
+        }
+        all.into_iter().collect()
+    }
+
+    /// Candidate values for a schema property whose name normalises to
+    /// `token` (see `normalize_type_token`): the typed bucket for `token`,
+    /// or — only when that bucket is empty — the untyped `""` bucket. A
+    /// property's typed bucket taking priority (even a non-empty one) is
+    /// exactly what keeps a `player` id from ever satisfying a `group_id`
+    /// property once *any* group id has been harvested.
+    pub fn candidates_for(&self, token: &str) -> Vec<String> {
+        let typed = self.0.get(token);
+        match typed {
+            Some(set) if !set.is_empty() => set.iter().cloned().collect(),
+            _ => self.0.get("").map(|set| set.iter().cloned().collect()).unwrap_or_default(),
+        }
     }
 
     /// Harvest id-shaped strings from one tool result: values of keys
-    /// ending in `id` (case-insensitive — covers `Id`/`_id`/`ID`), plus,
-    /// generically (no Sonos-specific regexes), any string that *looks*
-    /// like an id token (`looks_like_id`) regardless of its key.
+    /// that look id-shaped (`is_id_key` — case-insensitive `id`/`ids`
+    /// suffix, covering `Id`/`_id`/`ID`/`Ids`/`_ids`) go into the type
+    /// bucket named by that key (`normalize_type_token`), unconditionally;
+    /// any other string that generically *looks* like an id token
+    /// (`looks_like_id`), regardless of its key, goes into the untyped
+    /// `""` bucket exactly as before typed buckets existed.
     pub fn collect_from_result(&mut self, json: &Value) {
         self.walk(json);
     }
@@ -169,12 +211,11 @@ impl IdValues {
         match v {
             Value::Object(map) => {
                 for (k, val) in map {
-                    if k.to_ascii_lowercase().ends_with("id") {
-                        if let Value::String(s) = val {
-                            self.insert(s.clone());
-                        }
+                    if is_id_key(k) {
+                        self.walk_id_value(val, &normalize_type_token(k));
+                    } else {
+                        self.walk(val);
                     }
-                    self.walk(val);
                 }
             }
             Value::Array(items) => {
@@ -196,11 +237,88 @@ impl IdValues {
                 if let Ok(parsed) = serde_json::from_str::<Value>(s) {
                     self.walk(&parsed);
                 } else if looks_like_id(s) {
-                    self.insert(s.clone());
+                    self.insert_typed("", s.clone());
                 }
             }
             _ => {}
         }
+    }
+
+    /// Walk a value known to sit directly under an id-shaped key
+    /// (`is_id_key`): every string reached — directly, or as an element of
+    /// an array (`player_ids: [...]`) — goes into `token`'s bucket
+    /// unconditionally, no `looks_like_id` shape check (the key already
+    /// told us it's an id). A string that turns out to be embedded JSON
+    /// (the MCP `content`/`text` wrapper) is parsed and handed to the
+    /// normal `walk`, which re-derives typing from its own keys — an
+    /// id-shaped key never actually wraps a JSON-string payload in
+    /// practice, but this keeps the two walks consistent if it ever did.
+    fn walk_id_value(&mut self, v: &Value, token: &str) {
+        match v {
+            Value::String(s) => {
+                if let Ok(parsed) = serde_json::from_str::<Value>(s) {
+                    self.walk(&parsed);
+                } else {
+                    self.insert_typed(token, s.clone());
+                }
+            }
+            Value::Array(items) => {
+                for it in items {
+                    self.walk_id_value(it, token);
+                }
+            }
+            _ => self.walk(v),
+        }
+    }
+}
+
+/// Whether `key` looks id-shaped enough to harvest its value(s)
+/// unconditionally (rather than only when the value itself
+/// `looks_like_id`) — case-insensitive `id`/`ids` suffix, covering
+/// `Id`/`_id`/`ID` and, for arrays of ids, `Ids`/`_ids`. Same
+/// false-positive shape as any suffix heuristic (a key literally named
+/// `valid` or `kids` would also match) — pre-existing for the singular
+/// case, accepted here as generic and not Sonos-specific.
+fn is_id_key(k: &str) -> bool {
+    let lower = k.to_ascii_lowercase();
+    lower.ends_with("id") || lower.ends_with("ids")
+}
+
+/// Normalises an id-shaped key (harvest side) or schema property name
+/// (constraint side) to a short "type token" grouping ids of the same
+/// kind — `groupId`/`group_id` and `player_ids`/`playerIds` normalise to
+/// `"group"`/`"player"` respectively, so a `group_id` property is
+/// restricted to values harvested from `groupId`-shaped keys, never
+/// `playerId`-shaped ones (docs/ENGINE.md "Typed ids" — the `bloupblip`
+/// regression this fixes: a player id satisfying `get_now_playing`'s
+/// `group_id`).
+///
+/// Rule, in order: lowercase; strip the longest matching trailing suffix
+/// among `_ids`, `ids`, `_id`, `id`; take the last `_`-separated segment
+/// of what remains (drops a leading qualifier — `source_player_id` and
+/// `destination_player_ids` both give `"player"`, `group_id` gives
+/// `"group"`); strip any leftover non-alphanumeric characters; singularise
+/// a final trailing `s`.
+///
+/// Known limits (documented, not fixed here — generic, not Sonos-specific):
+/// a qualifier joined by camelCase rather than `_` (`sourcePlayerId`) isn't
+/// split — the whole remainder becomes the token (`"sourceplayer"`), so it
+/// won't line up with a plain `player_id`/`playerId` property. A name that
+/// *is* only the suffix (`"id"`, `"ids"`) normalises to the empty string —
+/// the untyped bucket. Singularisation is a bare trailing-`s` strip, not
+/// real pluralisation, so it won't undo an irregular plural.
+fn normalize_type_token(name: &str) -> String {
+    let lower = name.to_ascii_lowercase();
+    let stripped = ["_ids", "ids", "_id", "id"]
+        .iter()
+        .find_map(|suffix| lower.strip_suffix(suffix))
+        .unwrap_or(lower.as_str());
+    let last_seg = stripped.rsplit('_').next().unwrap_or(stripped);
+    let alnum: String = last_seg.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+    if alnum.len() > 1 && alnum.ends_with('s') {
+        alnum[..alnum.len() - 1].to_string()
+    } else {
+        alnum
     }
 }
 
@@ -335,7 +453,6 @@ impl Grammar {
     }
 
     fn build(tools: &[Tool], id_values: &IdValues, restrict_ids: bool) -> Self {
-        let id_list = id_values.sorted_vec();
         let mut resolved_tools = Vec::new();
         let mut tool_names = Vec::new();
 
@@ -345,7 +462,12 @@ impl Grammar {
             let mut prop_names = Vec::new();
             for p in &t.properties {
                 if p.is_id && restrict_ids {
-                    if id_list.is_empty() {
+                    // Candidates are typed by the PROPERTY NAME's own type
+                    // token (`normalize_type_token`), not a flat pool of
+                    // every id ever seen — see `IdValues::candidates_for`
+                    // and docs/ENGINE.md "Typed ids".
+                    let candidates = id_values.candidates_for(&normalize_type_token(&p.name));
+                    if candidates.is_empty() {
                         // Property cannot be emitted at all. If it was
                         // required, the whole tool is uncallable.
                         if p.required {
@@ -354,9 +476,9 @@ impl Grammar {
                         continue;
                     }
                     let kind = match &p.kind {
-                        PropKind::String { .. } => ResolvedKind::StringEnum(id_list.clone()),
+                        PropKind::String { .. } => ResolvedKind::StringEnum(candidates),
                         PropKind::ArrayOfString { min_items } => ResolvedKind::Array {
-                            elem_candidates: Some(id_list.clone()),
+                            elem_candidates: Some(candidates),
                             min_items: *min_items,
                         },
                         other => resolve_plain(other),

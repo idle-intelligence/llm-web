@@ -693,11 +693,16 @@ fn fully_cached_repeat_guard_step_does_not_error() {
     }
 }
 
-/// A repeat whose *earlier* result was an error is allowed to execute
-/// again — retrying a failed call is legitimate, unlike retrying a call
-/// that already succeeded.
+/// Repeat-after-error (docs/ENGINE.md "Agent loop" / "Typed ids" —
+/// the `bloupblip` fix): a call identical (same tool *and* same
+/// arguments) to one already made this run is never re-executed a second
+/// time, whether that earlier call's result was an error or not — the
+/// error text is already fed back into the conversation, so the model
+/// must change the arguments or call a different tool rather than retry
+/// byte-for-byte. Mirrors `repeats_exhausting_retries_force_a_text_only_answer`,
+/// but the only tool result the model ever gets back is an error.
 #[test]
-fn repeat_after_an_error_result_is_reexecuted() {
+fn repeat_after_an_error_is_not_reexecuted() {
     let Some((template, tokenizer)) = load_agent_parts() else {
         return;
     };
@@ -710,8 +715,19 @@ fn repeat_after_an_error_result_is_reexecuted() {
     let tools = vec![get_status];
 
     let status_call = script_tokens(&tokenizer, r#"[{"name": "get_status", "arguments": {}}]<|im_end|>"#);
+    let forced_answer = script_tokens(&tokenizer, "I couldn't get the status.<|im_end|>");
 
-    let generator = FixtureGenerator::new(vec![status_call.clone(), status_call]);
+    // start() (1) + provide_tool_results()'s retry loop: attempt (2),
+    // retry 1 (3), retry 2 (4, exhausts `max_retries`) — all identical
+    // repeats of the same errored call — then the forced text-only
+    // generation (5).
+    let generator = FixtureGenerator::new(vec![
+        status_call.clone(),
+        status_call.clone(),
+        status_call.clone(),
+        status_call,
+        forced_answer,
+    ]);
     let caller = FixtureCaller::new(results_dir());
     let mut agent = Agent::new(template, tokenizer, generator, caller, "sys", 64);
 
@@ -720,17 +736,70 @@ fn repeat_after_an_error_result_is_reexecuted() {
         panic!("expected first call to succeed, got {outcome:?}");
     };
 
-    // Feed back an error result — the call is never added to
-    // `successful_calls_this_turn`.
+    let error_result = serde_json::json!({"error": "timeout"});
+    let outcome2 = agent.provide_tool_results(vec![(calls[0].call_id.clone(), error_result)]);
+    match outcome2 {
+        StepOutcome::Final { text, step } => {
+            assert_eq!(text, "I couldn't get the status.");
+            assert!(
+                step.repeat_guard,
+                "the identical post-error call should have been caught as a repeat, not re-executed"
+            );
+            assert!(step.forced_text_answer);
+        }
+        other => panic!("expected Final via the forced text-only answer, got: {other:?}"),
+    }
+}
+
+/// The repeat guard is keyed on name *and* arguments together: a call to
+/// the same tool with *different* arguments right after an error is not a
+/// repeat and executes immediately, un-nudged.
+#[test]
+fn repeat_after_an_error_with_different_args_is_allowed() {
+    let Some((template, tokenizer)) = load_agent_parts() else {
+        return;
+    };
+
+    let get_status = Tool::from_mcp(
+        "get_status",
+        "Read current status.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {"target": {"type": "string"}},
+            "required": ["target"],
+        }),
+    );
+    let tools = vec![get_status];
+
+    let kitchen_call = script_tokens(
+        &tokenizer,
+        r#"[{"name": "get_status", "arguments": {"target": "kitchen"}}]<|im_end|>"#,
+    );
+    let bedroom_call = script_tokens(
+        &tokenizer,
+        r#"[{"name": "get_status", "arguments": {"target": "bedroom"}}]<|im_end|>"#,
+    );
+
+    let generator = FixtureGenerator::new(vec![kitchen_call, bedroom_call]);
+    let caller = FixtureCaller::new(results_dir());
+    let mut agent = Agent::new(template, tokenizer, generator, caller, "sys", 64);
+
+    let outcome = agent.start("what's the status?", &tools);
+    let StepOutcome::NeedTools { calls, .. } = outcome else {
+        panic!("expected first call to succeed, got {outcome:?}");
+    };
+    assert_eq!(calls[0].arguments["target"], "kitchen");
+
     let error_result = serde_json::json!({"error": "timeout"});
     let outcome2 = agent.provide_tool_results(vec![(calls[0].call_id.clone(), error_result)]);
     match outcome2 {
         StepOutcome::NeedTools { calls, step } => {
             assert_eq!(calls[0].name, "get_status");
-            assert_eq!(step.retries, 0, "the identical retry should execute immediately, not be nudged away");
-            assert!(!step.repeat_guard, "a retry after an error is not the repeat guard's business");
+            assert_eq!(calls[0].arguments["target"], "bedroom");
+            assert_eq!(step.retries, 0, "a different-args call should execute immediately, not be nudged away");
+            assert!(!step.repeat_guard, "different arguments is not a repeat");
         }
-        other => panic!("expected the identical call to be allowed again after an error, got: {other:?}"),
+        other => panic!("expected the different-args call to be allowed after an error, got: {other:?}"),
     }
 }
 

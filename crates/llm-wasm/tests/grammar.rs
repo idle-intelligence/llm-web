@@ -325,6 +325,82 @@ fn multi_candidate_id_reachable_token_by_token_for_every_alternative() {
     }
 }
 
+/// Typed ids (`docs/ENGINE.md` "Typed ids" — the `bloupblip` regression,
+/// owner's browser session 2026-09-11): a player id must never satisfy a
+/// `group_id`-typed property, and vice versa, even though both are
+/// `RINCON_`-shaped strings the old flat `IdValues` set couldn't tell
+/// apart. Harvests real fixture data (households/groups/players) and
+/// checks three things: (1) `get_now_playing`'s `group_id` accepts the
+/// fixture's actual group id token-by-token and rejects the fixture's
+/// player id (a byte-for-byte prefix of that group id) at the first
+/// divergent byte; (2) `add_players_to_group`'s array-of-ids property
+/// (`player_ids`) accepts a player id element and rejects a group id
+/// element; (3) the untyped fallback bucket still works when a result
+/// carries no id-shaped keys at all.
+#[test]
+fn typed_ids_keep_group_and_player_pools_separate() {
+    let tools = sonos_tools();
+    let fixture_path = fixture_root().join("sonos/results/get_households_and_groups_and_players.json");
+    let fixture: Value = serde_json::from_str(&std::fs::read_to_string(&fixture_path).unwrap()).unwrap();
+
+    let mut id_values = IdValues::new();
+    id_values.collect_from_result(&fixture);
+
+    // (1) group_id: the real group id is accepted...
+    let grammar = Grammar::for_tools(&tools, &id_values);
+    let mut state = GrammarState::new(&grammar);
+    assert!(state.feed_bytes(
+        br#"[{"name": "get_now_playing", "arguments": {"group_id": "RINCON_KITCHEN01:1"}}]"#
+    ));
+    assert!(state.is_complete(), "the fixture's real group id should be accepted for group_id");
+
+    // ...but the player id sharing its `RINCON_KITCHEN01` prefix is
+    // rejected: the bytes up to and including that shared prefix are still
+    // a valid partial match against the group-id candidates, so acceptance
+    // holds there, but the very next byte — the closing quote, since the
+    // player id ends where the group id still expects `:1` — has no live
+    // candidate left and is rejected.
+    let mut state = GrammarState::new(&grammar);
+    assert!(
+        state.feed_bytes(br#"[{"name": "get_now_playing", "arguments": {"group_id": "RINCON_KITCHEN01"#),
+        "the shared prefix with the group id should still be a valid partial match"
+    );
+    assert!(
+        !state.feed_bytes(b"\""),
+        "closing the quote on the bare player id (not a real group id) should be rejected"
+    );
+
+    // (2) player_ids (array-of-ids): a real player id is accepted as an
+    // element...
+    let mut state = GrammarState::new(&grammar);
+    assert!(state.feed_bytes(
+        br#"[{"name": "add_players_to_group", "arguments": {"group_id": "RINCON_KITCHEN01:1", "player_ids": ["RINCON_KITCHEN01"]}}]"#
+    ));
+    assert!(state.is_complete());
+
+    // ...but a group id is not, even though it's also an id-shaped string
+    // known to `id_values` — it's in the wrong type bucket.
+    let mut state = GrammarState::new(&grammar);
+    assert!(!state.feed_bytes(
+        br#"[{"name": "add_players_to_group", "arguments": {"group_id": "RINCON_KITCHEN01:1", "player_ids": ["RINCON_KITCHEN01:1"]}}]"#
+    ));
+
+    // (3) Untyped fallback: a result with no id-shaped keys at all still
+    // populates the untyped ("") bucket via the generic `looks_like_id`
+    // shape heuristic, and a property whose typed bucket is empty (no
+    // `favorite`-typed value was ever harvested) still falls back to it —
+    // `get_sonos_favorites`'s `favorite_id` isn't in `tools.json`, so use
+    // `pause`'s `group_id` against a set of untyped-only ids instead.
+    let mut untyped = IdValues::new();
+    untyped.collect_from_result(&serde_json::json!({"lastKnownDevice": "RINCON_KITCHEN01:1"}));
+    let grammar2 = Grammar::for_tools(&tools, &untyped);
+    let mut state = GrammarState::new(&grammar2);
+    assert!(state.feed_bytes(
+        br#"[{"name": "pause", "arguments": {"group_id": "RINCON_KITCHEN01:1"}}]"#
+    ));
+    assert!(state.is_complete(), "the untyped fallback bucket should still constrain group_id");
+}
+
 /// Regression test for the real-MCP-shape bug (owner's browser session,
 /// 2026-09-11): MCP tool results carry their payload as
 /// `{"content":[{"type":"text","text":"<pretty-printed JSON string>"}]}`,

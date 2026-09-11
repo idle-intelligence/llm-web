@@ -242,14 +242,12 @@ pub struct LlmEngine {
     id_values: IdValues,
     /// Built lazily on first constrained step and cached.
     token_vocab: Option<TokenVocab>,
-    /// Every tool call made so far this turn whose result was *not* an
-    /// error, in order — mirrors `agent.rs`'s field of the same name; see
-    /// `run_step`'s generic repeated-call loop guard. Reset in
-    /// `start`/`reset`.
-    successful_calls_this_turn: Vec<ToolCall>,
-    /// Every tool call the model has been given so far this turn — mirrors
-    /// `agent.rs`'s field of the same name; see the fail-open check in
-    /// `generate_attempt`. Reset in `start`/`reset`.
+    /// Every tool call the model has been given so far this turn, in
+    /// order, regardless of whether its result later came back an error —
+    /// mirrors `agent.rs`'s field of the same name; used both by
+    /// `run_step`'s generic repeated-call loop guard (a call identical to
+    /// one of these, errored or not, is never re-executed) and the
+    /// fail-open check in `generate_attempt`. Reset in `start`/`reset`.
     calls_made_this_turn: Vec<ToolCall>,
     /// Prefix key already exported+saved to OPFS this session (see
     /// `generate_attempt`'s before-decode write-back and
@@ -300,7 +298,6 @@ impl LlmEngine {
             diet: true,
             id_values: IdValues::new(),
             token_vocab: None,
-            successful_calls_this_turn: Vec::new(),
             calls_made_this_turn: Vec::new(),
             kv_image_exported_key: None,
         }
@@ -431,7 +428,6 @@ impl LlmEngine {
         self.pending_calls.clear();
         self.consecutive_tool_errors = 0;
         self.id_values = IdValues::new();
-        self.successful_calls_this_turn.clear();
         self.calls_made_this_turn.clear();
 
         self.run_step().await
@@ -461,10 +457,6 @@ impl LlmEngine {
                     self.consecutive_tool_errors = 0;
                     self.id_values.collect_from_result(&r.result);
                     self.messages.push(format_tool_result(&pending.name, &r.result));
-                    self.successful_calls_this_turn.push(ToolCall {
-                        name: pending.name.clone(),
-                        arguments: pending.arguments.clone(),
-                    });
                 }
             }
         }
@@ -483,7 +475,6 @@ impl LlmEngine {
         self.resident_tokens.clear();
         self.consecutive_tool_errors = 0;
         self.id_values = IdValues::new();
-        self.successful_calls_this_turn.clear();
         self.calls_made_this_turn.clear();
         self.kv_image_exported_key = None;
         if let Some(cache) = self.cache.as_mut() {
@@ -930,16 +921,17 @@ impl LlmEngine {
 
             // Generic repeated-call loop guard (`docs/ENGINE.md` "Agent
             // loop"; mirrors `agent.rs::step_inner`) — a well-formed, valid
-            // call identical (same name+args) to one already made *and
-            // answered without an error* earlier this run — not only the
-            // immediately preceding step — is a wasted step, not a genuine
-            // retry of anything. A repeat of a call whose earlier result
-            // *was* an error is excluded (not in
-            // `successful_calls_this_turn`) — retrying a failed call is
-            // legitimate.
+            // call identical (same name+args) to one already made earlier
+            // this run — not only the immediately preceding step — is
+            // never re-executed, whether that earlier call's result was an
+            // error or not: the error text (if any) is already fed back
+            // into the conversation, so the model must change the
+            // arguments or call a different tool rather than retry
+            // byte-for-byte. A *different* call to the same tool (different
+            // arguments) remains allowed.
             let is_repeat = !invalid
                 && matches!(&attempt.parsed, Ok(ParsedOutput::ToolCalls(calls))
-                    if calls.iter().any(|c| self.successful_calls_this_turn.contains(c)));
+                    if calls.iter().any(|c| self.calls_made_this_turn.contains(c)));
             if is_repeat {
                 repeat_guard = true;
             }

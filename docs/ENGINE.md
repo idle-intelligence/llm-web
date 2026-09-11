@@ -1054,15 +1054,99 @@ builds the constraint for one turn. It accepts exactly:
 `_id`/`_ids`, or whose schema `description` contains "ID", must take a
 value from `IdValues` — the set of id-shaped strings harvested from earlier
 tool results in the conversation (`IdValues::collect_from_result`, generic:
-any object key ending in "id" case-insensitively, plus any string that
-*looks* id-shaped — has a digit and a `_`/`:`/`-` separator, no whitespace,
-length ≥ 6 — no Sonos-specific regex). If that set is empty for a given
-property, the property cannot be emitted at all: `Grammar::for_tools` drops
-it from the tool's schema, and if it was required, drops the *tool* from
-the grammar entirely — its name never appears in the `"name"` choice, so
-the model can't even start typing it (`Grammar::can_call`). This is what
-`pause` looks like with no known group id: excluded outright, not merely
-rejected once `arguments` is wrong.
+any object key ending in "id"/"ids" case-insensitively, plus any string
+that *looks* id-shaped — has a digit and a `_`/`:`/`-` separator, no
+whitespace, length ≥ 6 — no Sonos-specific regex). Candidates for a given
+property are typed (see "Typed ids" immediately below) rather than pooled
+flat; if the resulting candidate set is empty, the property cannot be
+emitted at all: `Grammar::for_tools` drops it from the tool's schema, and
+if it was required, drops the *tool* from the grammar entirely — its name
+never appears in the `"name"` choice, so the model can't even start typing
+it (`Grammar::can_call`). This is what `pause` looks like with no known
+group id: excluded outright, not merely rejected once `arguments` is wrong.
+
+### Typed ids (2026-09-12)
+
+**The bug.** Owner's real browser, 13 tools, build `9294f0c`, "what's
+playing on bloupblip?": step 0 correctly called
+`get_households_and_groups_and_players`. Steps 1–3 then called
+`get_now_playing({"group_id": "RINCON_804AF2B20A1A01400"})` — that string
+is `bloupblip`'s **playerId** from the listing result, not a **groupId**
+(the household's only group there was
+`RINCON_F0F6C1C493D801400:3443533531`). The relay rejected every attempt
+("the group_id is no longer valid... call
+get_households_and_groups_and_players for a current one"), and the run
+died at 3 consecutive tool errors. Root cause: `IdValues` was a single flat
+`BTreeSet<String>` — every id-shaped string harvested from every tool
+result, regardless of which key it came from, was an equally valid
+candidate for *any* `*_id`/`*_ids` property. A player id and a group id are
+both `RINCON_`-shaped opaque strings; nothing distinguished them.
+
+**The fix.** `IdValues` is now `BTreeMap<String, BTreeSet<String>>` — a
+"type token" bucket per kind of id, plus an untyped `""` bucket for the old
+flat behaviour.
+
+- **Harvest side (`IdValues::collect_from_result` / `walk`).** A key is
+  "id-shaped" (`is_id_key`) if it case-insensitively ends in `id` or `ids`
+  (covers `Id`/`_id`/`ID`/`Ids`/`_ids` — the plural addition over the old
+  rule, needed so `playerIds`/`player_ids` arrays are typed at all). For an
+  id-shaped key, every string reached under it — directly, or as an
+  element of an array (`playerIds: [...]`) — is inserted into that key's
+  type-token bucket *unconditionally* (no `looks_like_id` shape check; the
+  key already told us it's an id). For any other key, the old
+  `looks_like_id` heuristic still gates insertion, into the untyped `""`
+  bucket — this is what keeps the id rule working against a result with no
+  id-shaped keys at all (`IdValues::insert`/the old `ids(&[...])` test
+  helper still populate exactly this bucket, so every pre-typed-ids test
+  keeps passing unchanged).
+- **Normalisation rule (`normalize_type_token`, shared by both the harvest
+  key and the constraint property name).** Lowercase; strip the longest
+  matching trailing suffix among `_ids`, `ids`, `_id`, `id`; take the last
+  `_`-separated segment of what remains (drops a leading qualifier); strip
+  any leftover non-alphanumeric characters; singularise a final trailing
+  `s`. Examples: `groupId` → `group`, `player_ids`/`playerIds` → `player`,
+  `householdId` → `household`, `favoriteId` → `favorite`,
+  `source_player_id` → `player`, `destination_player_ids` → `player`.
+- **Known limits (documented, not fixed — generic, not Sonos-specific).**
+  A qualifier joined by camelCase rather than `_` (`sourcePlayerId`) isn't
+  split — the whole remainder becomes the token (`"sourceplayer"`), so it
+  won't line up with a plain `player_id`/`playerId` property; only
+  snake_case qualifiers are handled. A name that *is* only the suffix
+  (`"id"`, `"ids"`) normalises to the empty string, i.e. the untyped
+  bucket. Singularisation is a bare trailing-`s` strip, not real
+  pluralisation. The pre-existing `id`-suffix false-positive shape carries
+  over unchanged (a key literally named `valid` "ends in id"; now also a
+  key named `kids` "ends in ids") — accepted as a generic heuristic's cost,
+  same as before.
+- **Constraint side (`Grammar::build` / `IdValues::candidates_for`).** A
+  property's candidates are the typed bucket for `normalize_type_token(&
+  property_name)`, or — only when that typed bucket is empty —  the
+  untyped `""` bucket (`candidates_for`'s fallback). Typed-bucket priority
+  is what keeps a harvested player id from ever satisfying a `group_id`
+  property once *any* group id has been harvested; the untyped fallback is
+  what keeps existing behaviour (and every pre-typed-ids grammar test)
+  working when nothing typed has been seen yet. An array-of-ids property
+  (`player_ids`) restricts every element to the same typed candidate set.
+
+**Repeat-after-error (2026-09-12).** The observed failure above also
+relied on the model being *allowed* to retry the exact same wrong
+`group_id` three times in a row — the pre-existing repeat guard (see
+"Generic repeated-call loop guard" below) only ever excluded a call whose
+earlier result was an error from its "already made" bookkeeping
+(`successful_calls_this_turn`), on the theory that retrying a genuine
+failure (a transient timeout, say) is legitimate. That theory doesn't hold
+when the *error itself* already told the model exactly what's wrong and
+what to do about it ("call get_households_and_groups_and_players for a
+current one") — repeating byte-for-byte throws that feedback away. The
+fix: `successful_calls_this_turn` is removed; the repeat guard now checks
+against `calls_made_this_turn` (every call the model has been given this
+turn, regardless of how its result came back), so an identical call —
+same tool **and** same arguments — is never re-executed twice, whether the
+earlier result was an error or not. A call to the same tool with
+*different* arguments remains allowed (retrying with a corrected argument,
+per the error message's own instruction, is exactly the intended path
+now). The consecutive-tool-error cap (`MAX_CONSECUTIVE_TOOL_ERRORS`) is
+unchanged.
 
 **Token-level API.**
 
@@ -1288,13 +1372,15 @@ died with no answer instead of ending in text. Two changes:
 - **Broader repeat detection.** `is_repeat` used to compare only against
   the *immediately preceding* step's calls (`last_tool_calls`, now
   removed). It now checks a call (by `name`+`arguments`) against every call
-  made so far this turn whose result was *not* an error
-  (`Agent::successful_calls_this_turn`, populated in
-  `provide_tool_results`'s non-error branch) — a repeat several steps back
-  is caught just as well as an immediate one. A call identical to one whose
-  *earlier* result *was* an error is deliberately excluded from that list,
-  so retrying a failed call still executes normally — retrying a failure is
-  legitimate, retrying a success is not.
+  made so far this turn (`Agent::calls_made_this_turn`, populated as soon
+  as a `NeedTools` step is produced) — a repeat several steps back is
+  caught just as well as an immediate one. (2026-09-12: originally this
+  checked only calls whose result was *not* an error
+  (`successful_calls_this_turn`), on the theory that retrying a failure is
+  legitimate; see "Typed ids"'s "Repeat-after-error" addendum for why that
+  was tightened — an identical call is never re-executed regardless of how
+  its earlier result came back, only a *different*-arguments call to the
+  same tool still executes immediately.)
 - **Forced text-only answer instead of `Error`.** When `step_inner`'s
   retry loop exhausts `max_retries` on a call that's a repeat, or an empty
   tool-call array (`[]`) — both cases where the model plausibly already has
