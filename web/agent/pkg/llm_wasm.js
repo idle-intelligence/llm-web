@@ -26,6 +26,59 @@ export class LlmEngine {
         wasm.llmengine_appendModelShard(this.__wbg_ptr, ptr0, len0);
     }
     /**
+     * Export the current cache's system+tools prefix (for `tools_json`/
+     * `system`) as a `.kvimg` byte buffer — the counterpart to
+     * `import_kv_image`, called on a cache *miss* after the first prefill
+     * of a tool set so the worker can save the image to OPFS for next
+     * time. Errors (rather than exporting garbage) if `resident_tokens`
+     * doesn't currently cover the rendered prefix — call this only after
+     * a `start()`/step whose prefill included the full system+tools
+     * preamble. `dtype` is always `q8_0` (the format `docs/ENGINE.md`
+     * recommends for a one-time browser download — see kvimg.rs module
+     * docs).
+     * @param {string} tools_json
+     * @param {string} system
+     * @returns {Promise<Uint8Array>}
+     */
+    exportKvImage(tools_json, system) {
+        const ptr0 = passStringToWasm0(tools_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(system, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len1 = WASM_VECTOR_LEN;
+        const ret = wasm.llmengine_exportKvImage(this.__wbg_ptr, ptr0, len0, ptr1, len1);
+        return ret;
+    }
+    /**
+     * Import a prefix KV image (`bytes`, a full `.kvimg` file as fetched
+     * from `<modelBase>/kv/<prefix_key>.kvimg` or OPFS) in place of
+     * running prefill for `tools_json`/`system`'s system+tools preamble.
+     * Validates `header.model_fingerprint`, `header.prefix_key`, and
+     * `header.tokens` against what this engine/model/tools/system would
+     * actually render (same match discipline `run_step`'s
+     * `effective_prefix` check already applies to `resident_tokens`) —
+     * returns `Ok(false)` on any mismatch (caller falls back to normal
+     * prefill) rather than importing a wrong prefix. Synchronous:
+     * `KvCache::import_prefix` only writes (`from_data`/`slice_assign`),
+     * no GPU readback, so no async/await is needed on this path.
+     * @param {Uint8Array} bytes
+     * @param {string} tools_json
+     * @param {string} system
+     * @returns {boolean}
+     */
+    importKvImage(bytes, tools_json, system) {
+        const ptr0 = passArray8ToWasm0(bytes, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(tools_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len1 = WASM_VECTOR_LEN;
+        const ptr2 = passStringToWasm0(system, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len2 = WASM_VECTOR_LEN;
+        const ret = wasm.llmengine_importKvImage(this.__wbg_ptr, ptr0, len0, ptr1, len1, ptr2, len2);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        return ret[0] !== 0;
+    }
+    /**
      * JSON string with basic model/device info, for the page's status line.
      * @returns {string}
      */
@@ -88,6 +141,41 @@ export class LlmEngine {
         return this;
     }
     /**
+     * Prefix-KV-image cache key for `tools_json`/`system` under the
+     * currently loaded model (`docs/ENGINE.md` "Prefix KV images"):
+     * `sha256(model_fingerprint || rendered_prefix_text)`, computed the same way
+     * `bin/llm-agent.rs`'s `kv-export` subcommand computes it when writing
+     * an image, so a worker can `fetch(<modelBase>/kv/<key>.kvimg)` before
+     * its first prefill of a given tool set. Errors if the model isn't
+     * loaded yet (no `model_fingerprint`/tokenizer/template) or `tools_json` is
+     * malformed.
+     * @param {string} tools_json
+     * @param {string} system
+     * @returns {string}
+     */
+    prefixKey(tools_json, system) {
+        let deferred4_0;
+        let deferred4_1;
+        try {
+            const ptr0 = passStringToWasm0(tools_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            const len0 = WASM_VECTOR_LEN;
+            const ptr1 = passStringToWasm0(system, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            const len1 = WASM_VECTOR_LEN;
+            const ret = wasm.llmengine_prefixKey(this.__wbg_ptr, ptr0, len0, ptr1, len1);
+            var ptr3 = ret[0];
+            var len3 = ret[1];
+            if (ret[3]) {
+                ptr3 = 0; len3 = 0;
+                throw takeFromExternrefTable0(ret[2]);
+            }
+            deferred4_0 = ptr3;
+            deferred4_1 = len3;
+            return getStringFromWasm0(ptr3, len3);
+        } finally {
+            wasm.__wbindgen_free(deferred4_0, deferred4_1, 1);
+        }
+    }
+    /**
      * Continue the current turn with tool results, keyed by `call_id` from
      * the most recent `NeedTools` outcome. `results_json`:
      * `[{"call_id":"call_0","result":{...}}, ...]`. Same return shape as
@@ -107,6 +195,20 @@ export class LlmEngine {
      */
     reset() {
         wasm.llmengine_reset(this.__wbg_ptr);
+    }
+    /**
+     * Debug A/B toggle for a browser-only numerical-divergence bisection
+     * (see `gguf.rs`'s `force_naive_kernel`): `"naive"` forces the naive
+     * per-element Q4 matmul kernel for every prefill matmul regardless of
+     * M; anything else (including `"pinned"`, the default) restores
+     * production `ForceKernel::Auto` routing. Not used by any production
+     * code path.
+     * @param {string} kernel
+     */
+    setPrefillKernel(kernel) {
+        const ptr0 = passStringToWasm0(kernel, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.llmengine_setPrefillKernel(this.__wbg_ptr, ptr0, len0);
     }
     /**
      * Set the system prompt used by subsequent `start()` calls.
@@ -521,6 +623,10 @@ function __wbg_get_imports() {
             const ret = arg0.navigator;
             return ret;
         },
+        __wbg_new_0_35540e542ba689d2: function() {
+            const ret = new Date();
+            return ret;
+        },
         __wbg_new_227d7c05414eb861: function() {
             const ret = new Error();
             return ret;
@@ -832,6 +938,10 @@ function __wbg_get_imports() {
             const ret = arg0.then(arg1);
             return ret;
         },
+        __wbg_toISOString_b10dc1c193a89c15: function(arg0) {
+            const ret = arg0.toISOString();
+            return ret;
+        },
         __wbg_unmap_50b3be4aaf23fa39: function(arg0) {
             arg0.unmap();
         },
@@ -846,12 +956,12 @@ function __wbg_get_imports() {
             arg0.writeBuffer(arg1, arg2, arg3, arg4, arg5);
         }, arguments); },
         __wbindgen_generic_0000000000000001: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 3935, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 3952, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__hb2da000e6071c27b);
             return ret;
         },
         __wbindgen_generic_0000000000000002: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 4072, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 4089, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h2d808c2d349e4bb9);
             return ret;
         },
@@ -868,6 +978,13 @@ function __wbg_get_imports() {
         __wbindgen_generic_0000000000000005: function(arg0, arg1) {
             // Cast intrinsic for `Ref(String) -> Externref`.
             const ret = getStringFromWasm0(arg0, arg1);
+            return ret;
+        },
+        __wbindgen_generic_0000000000000006: function(arg0, arg1) {
+            var v0 = getArrayU8FromWasm0(arg0, arg1).slice();
+            wasm.__wbindgen_free(arg0, arg1 * 1, 1);
+            // Cast intrinsic for `Vector(U8) -> Externref`.
+            const ret = v0;
             return ret;
         },
         __wbindgen_init_externref_table: function() {

@@ -14,6 +14,33 @@ export class LlmEngine {
      */
     appendModelShard(shard: Uint8Array): void;
     /**
+     * Export the current cache's system+tools prefix (for `tools_json`/
+     * `system`) as a `.kvimg` byte buffer — the counterpart to
+     * `import_kv_image`, called on a cache *miss* after the first prefill
+     * of a tool set so the worker can save the image to OPFS for next
+     * time. Errors (rather than exporting garbage) if `resident_tokens`
+     * doesn't currently cover the rendered prefix — call this only after
+     * a `start()`/step whose prefill included the full system+tools
+     * preamble. `dtype` is always `q8_0` (the format `docs/ENGINE.md`
+     * recommends for a one-time browser download — see kvimg.rs module
+     * docs).
+     */
+    exportKvImage(tools_json: string, system: string): Promise<Uint8Array>;
+    /**
+     * Import a prefix KV image (`bytes`, a full `.kvimg` file as fetched
+     * from `<modelBase>/kv/<prefix_key>.kvimg` or OPFS) in place of
+     * running prefill for `tools_json`/`system`'s system+tools preamble.
+     * Validates `header.model_fingerprint`, `header.prefix_key`, and
+     * `header.tokens` against what this engine/model/tools/system would
+     * actually render (same match discipline `run_step`'s
+     * `effective_prefix` check already applies to `resident_tokens`) —
+     * returns `Ok(false)` on any mismatch (caller falls back to normal
+     * prefill) rather than importing a wrong prefix. Synchronous:
+     * `KvCache::import_prefix` only writes (`from_data`/`slice_assign`),
+     * no GPU readback, so no async/await is needed on this path.
+     */
+    importKvImage(bytes: Uint8Array, tools_json: string, system: string): boolean;
+    /**
      * JSON string with basic model/device info, for the page's status line.
      */
     info(): string;
@@ -48,6 +75,17 @@ export class LlmEngine {
      */
     constructor();
     /**
+     * Prefix-KV-image cache key for `tools_json`/`system` under the
+     * currently loaded model (`docs/ENGINE.md` "Prefix KV images"):
+     * `sha256(model_fingerprint || rendered_prefix_text)`, computed the same way
+     * `bin/llm-agent.rs`'s `kv-export` subcommand computes it when writing
+     * an image, so a worker can `fetch(<modelBase>/kv/<key>.kvimg)` before
+     * its first prefill of a given tool set. Errors if the model isn't
+     * loaded yet (no `model_fingerprint`/tokenizer/template) or `tools_json` is
+     * malformed.
+     */
+    prefixKey(tools_json: string, system: string): string;
+    /**
      * Continue the current turn with tool results, keyed by `call_id` from
      * the most recent `NeedTools` outcome. `results_json`:
      * `[{"call_id":"call_0","result":{...}}, ...]`. Same return shape as
@@ -59,6 +97,15 @@ export class LlmEngine {
      * the KV cache's resident tokens, keeping the loaded model.
      */
     reset(): void;
+    /**
+     * Debug A/B toggle for a browser-only numerical-divergence bisection
+     * (see `gguf.rs`'s `force_naive_kernel`): `"naive"` forces the naive
+     * per-element Q4 matmul kernel for every prefill matmul regardless of
+     * M; anything else (including `"pinned"`, the default) restores
+     * production `ForceKernel::Auto` routing. Not used by any production
+     * code path.
+     */
+    setPrefillKernel(kernel: string): void;
     /**
      * Set the system prompt used by subsequent `start()` calls.
      */
@@ -100,11 +147,15 @@ export interface InitOutput {
     readonly __wbg_llmengine_free: (a: number, b: number) => void;
     readonly initWgpuDevice: () => any;
     readonly llmengine_appendModelShard: (a: number, b: number, c: number) => void;
+    readonly llmengine_exportKvImage: (a: number, b: number, c: number, d: number, e: number) => any;
+    readonly llmengine_importKvImage: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => [number, number, number];
     readonly llmengine_info: (a: number) => [number, number];
     readonly llmengine_load: (a: number, b: number, c: number, d: number, e: number, f: any) => any;
     readonly llmengine_new: () => number;
+    readonly llmengine_prefixKey: (a: number, b: number, c: number, d: number, e: number) => [number, number, number, number];
     readonly llmengine_provideToolResults: (a: number, b: number, c: number) => any;
     readonly llmengine_reset: (a: number) => void;
+    readonly llmengine_setPrefillKernel: (a: number, b: number, c: number) => void;
     readonly llmengine_setSystemPrompt: (a: number, b: number, c: number) => void;
     readonly llmengine_start: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => any;
     readonly start: () => void;
