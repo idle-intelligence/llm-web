@@ -520,10 +520,21 @@ impl KvCache {
     /// back to OPFS without deadlocking.
     pub async fn export_prefix_async(&self, n_tokens: usize) -> Vec<(Vec<f32>, Vec<f32>)> {
         assert!(n_tokens <= self.max_ctx);
-        let mut out = Vec::with_capacity(self.k.len());
-        for (k, v) in self.k.iter().zip(self.v.iter()) {
-            let k_data = k.clone().narrow(2, 0, n_tokens).into_data_async().await.expect("GPU readback failed");
-            let v_data = v.clone().narrow(2, 0, n_tokens).into_data_async().await.expect("GPU readback failed");
+        let num_layers = match self.dtype {
+            KvDtype::F32 => self.k_f32.len(),
+            KvDtype::Q8_0 => self.k_scales.len(),
+        };
+        let mut out = Vec::with_capacity(num_layers);
+        for layer in 0..num_layers {
+            let (k, v) = match self.dtype {
+                KvDtype::F32 => (
+                    self.k_f32[layer].clone().narrow(2, 0, n_tokens),
+                    self.v_f32[layer].clone().narrow(2, 0, n_tokens),
+                ),
+                KvDtype::Q8_0 => self.read_or_dequant_f32(layer, n_tokens),
+            };
+            let k_data = k.into_data_async().await.expect("GPU readback failed");
+            let v_data = v.into_data_async().await.expect("GPU readback failed");
             out.push((
                 k_data.into_vec::<f32>().expect("K tensor is f32"),
                 v_data.into_vec::<f32>().expect("V tensor is f32"),
