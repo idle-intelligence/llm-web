@@ -290,6 +290,29 @@ pub struct CaseResult {
     pub decode_ms_total: f64,
     pub tokens_generated: usize,
     pub total_ms: f64,
+    /// Sum of `Step::forced_tokens` across this case's steps — tokens
+    /// jump-forwarded by the grammar rather than individually sampled.
+    pub forced_tokens: usize,
+    /// Sum of `Step::model_steps` across this case's steps — actual model
+    /// forward-pass steps taken (a jump-forward run of several forced
+    /// tokens counts as 1).
+    pub model_steps: usize,
+    /// Sum of `Step::retries` across this case's steps.
+    pub retries: usize,
+    /// Sum of `Step::tool_errors` across this case's steps (each step's
+    /// value is a running *consecutive*-error count, so this is not a
+    /// distinct-error count when a case sees more than one error streak).
+    pub tool_errors: usize,
+}
+
+/// `forced_tokens / tokens_generated`, or `0.0` when nothing was generated
+/// (skipped case, or unconstrained run with 0 forced tokens and 0 total).
+pub fn forced_share(forced_tokens: usize, tokens_generated: usize) -> f64 {
+    if tokens_generated == 0 {
+        0.0
+    } else {
+        forced_tokens as f64 / tokens_generated as f64
+    }
 }
 
 /// Max tool calls tolerated per utterance before it's scored incorrect
@@ -471,12 +494,20 @@ pub fn run_case<G: Generator>(
     let mut prefill_ms_total = 0.0f64;
     let mut decode_ms_total = 0.0f64;
     let mut tokens_generated = 0usize;
+    let mut forced_tokens = 0usize;
+    let mut model_steps = 0usize;
+    let mut retries = 0usize;
+    let mut tool_errors = 0usize;
     let mut households: Option<Value> = None;
 
     let mut accumulate = |step: &crate::agent::Step| {
         prefill_ms_total += step.prefill_time.as_secs_f64() * 1000.0;
         decode_ms_total += step.decode_time.as_secs_f64() * 1000.0;
         tokens_generated += step.tokens_generated;
+        forced_tokens += step.forced_tokens;
+        model_steps += step.model_steps;
+        retries += step.retries;
+        tool_errors += step.tool_errors;
     };
 
     let mut outcome = agent.start(&case.utterance, tools);
@@ -525,6 +556,10 @@ pub fn run_case<G: Generator>(
         decode_ms_total,
         tokens_generated,
         total_ms,
+        forced_tokens,
+        model_steps,
+        retries,
+        tool_errors,
     }
 }
 
@@ -553,6 +588,10 @@ fn skipped_result(case: &EvalCase) -> CaseResult {
         decode_ms_total: 0.0,
         tokens_generated: 0,
         total_ms: 0.0,
+        forced_tokens: 0,
+        model_steps: 0,
+        retries: 0,
+        tool_errors: 0,
     }
 }
 
@@ -570,6 +609,15 @@ pub struct EvalReport {
     pub mean_prefill_s: f64,
     pub mean_decode_tok_s: f64,
     pub mean_total_s: f64,
+    /// Mean of `CaseResult::model_steps` over scored cases.
+    pub mean_model_steps: f64,
+    /// Mean of `forced_share(r.forced_tokens, r.tokens_generated)` over
+    /// scored cases.
+    pub mean_forced_share: f64,
+    /// Sum of `CaseResult::retries` over scored cases.
+    pub total_retries: usize,
+    /// Sum of `CaseResult::tool_errors` over scored cases.
+    pub total_tool_errors: usize,
     /// `--label` this run was invoked with (`eval/README.md`'s run
     /// naming), verbatim into the parameters block.
     pub label: String,
@@ -626,6 +674,14 @@ pub fn run_all<G: Generator>(
     } else {
         decode_tok_s_values.iter().sum::<f64>() / decode_tok_s_values.len() as f64
     };
+    let mean_model_steps = scored.iter().map(|r| r.model_steps as f64).sum::<f64>() / n;
+    let mean_forced_share = scored
+        .iter()
+        .map(|r| forced_share(r.forced_tokens, r.tokens_generated))
+        .sum::<f64>()
+        / n;
+    let total_retries = scored.iter().map(|r| r.retries).sum();
+    let total_tool_errors = scored.iter().map(|r| r.tool_errors).sum();
 
     EvalReport {
         model: model.into(),
@@ -638,6 +694,10 @@ pub fn run_all<G: Generator>(
         mean_prefill_s,
         mean_decode_tok_s,
         mean_total_s,
+        mean_model_steps,
+        mean_forced_share,
+        total_retries,
+        total_tool_errors,
         label: String::new(),
         system_prompt: String::new(),
         max_new_tokens: 0,
@@ -683,47 +743,60 @@ pub fn render_markdown_with_cases(report: &EvalReport, cases: &[EvalCase]) -> St
     let _ = writeln!(out);
     let show_lang = report.results.iter().any(|r| lang_of(&r.id).is_some());
     if show_lang {
-        let _ = writeln!(out, "| id | correct | steps | prefill_s | decode_tok_s | total_s | lang | reason |");
-        let _ = writeln!(out, "|----|---------|-------|-----------|---------------|---------|------|--------|");
+        let _ = writeln!(out, "| id | correct | steps | prefill_s | decode_tok_s | total_s | tokens_gen | forced_tokens | forced_share | model_steps | retries | tool_errors | lang | reason |");
+        let _ = writeln!(out, "|----|---------|-------|-----------|---------------|---------|------------|----------------|--------------|-------------|---------|-------------|------|--------|");
     } else {
-        let _ = writeln!(out, "| id | correct | steps | prefill_s | decode_tok_s | total_s | reason |");
-        let _ = writeln!(out, "|----|---------|-------|-----------|---------------|---------|--------|");
+        let _ = writeln!(out, "| id | correct | steps | prefill_s | decode_tok_s | total_s | tokens_gen | forced_tokens | forced_share | model_steps | retries | tool_errors | reason |");
+        let _ = writeln!(out, "|----|---------|-------|-----------|---------------|---------|------------|----------------|--------------|-------------|---------|-------------|--------|");
     }
     for r in &report.results {
         let lang = lang_of(&r.id).unwrap_or("-");
         if r.skipped {
             if show_lang {
-                let _ = writeln!(out, "| {} | skipped | - | - | - | - | {} | {} |", r.id, lang, r.reason);
+                let _ = writeln!(out, "| {} | skipped | - | - | - | - | - | - | - | - | - | - | {} | {} |", r.id, lang, r.reason);
             } else {
-                let _ = writeln!(out, "| {} | skipped | - | - | - | - | {} |", r.id, r.reason);
+                let _ = writeln!(out, "| {} | skipped | - | - | - | - | - | - | - | - | - | - | {} |", r.id, r.reason);
             }
             continue;
         }
         let decode_s = r.decode_ms_total / 1000.0;
         let decode_tok_s = if decode_s > 0.0 { r.tokens_generated as f64 / decode_s } else { 0.0 };
+        let share = forced_share(r.forced_tokens, r.tokens_generated);
         if show_lang {
             let _ = writeln!(
                 out,
-                "| {} | {} | {} | {:.3} | {:.2} | {:.3} | {} | {} |",
+                "| {} | {} | {} | {:.3} | {:.2} | {:.3} | {} | {} | {:.2} | {} | {} | {} | {} | {} |",
                 r.id,
                 r.correct,
                 r.steps,
                 r.prefill_ms_total / 1000.0,
                 decode_tok_s,
                 r.total_ms / 1000.0,
+                r.tokens_generated,
+                r.forced_tokens,
+                share,
+                r.model_steps,
+                r.retries,
+                r.tool_errors,
                 lang,
                 r.reason,
             );
         } else {
             let _ = writeln!(
                 out,
-                "| {} | {} | {} | {:.3} | {:.2} | {:.3} | {} |",
+                "| {} | {} | {} | {:.3} | {:.2} | {:.3} | {} | {} | {:.2} | {} | {} | {} | {} |",
                 r.id,
                 r.correct,
                 r.steps,
                 r.prefill_ms_total / 1000.0,
                 decode_tok_s,
                 r.total_ms / 1000.0,
+                r.tokens_generated,
+                r.forced_tokens,
+                share,
+                r.model_steps,
+                r.retries,
+                r.tool_errors,
                 r.reason,
             );
         }
@@ -733,8 +806,9 @@ pub fn render_markdown_with_cases(report: &EvalReport, cases: &[EvalCase]) -> St
     let skipped = report.results.len() - scored;
     let _ = writeln!(
         out,
-        "**Summary**: correct {:.1}% ({} scored, {} skipped) — mean_steps {:.2}, mean_prefill_s {:.3}, mean_decode_tok_s {:.2}, mean_total_s {:.3}",
-        report.correct_pct, scored, skipped, report.mean_steps, report.mean_prefill_s, report.mean_decode_tok_s, report.mean_total_s
+        "**Summary**: correct {:.1}% ({} scored, {} skipped) — mean_steps {:.2}, mean_prefill_s {:.3}, mean_decode_tok_s {:.2}, mean_total_s {:.3}, mean_model_steps {:.2}, mean_forced_share {:.3}, total_retries {}, total_tool_errors {}",
+        report.correct_pct, scored, skipped, report.mean_steps, report.mean_prefill_s, report.mean_decode_tok_s, report.mean_total_s,
+        report.mean_model_steps, report.mean_forced_share, report.total_retries, report.total_tool_errors,
     );
 
     out

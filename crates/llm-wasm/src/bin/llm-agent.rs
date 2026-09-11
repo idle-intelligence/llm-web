@@ -1110,14 +1110,21 @@ fn run_eval(
             .iter()
             .map(|c| format!("{}({})", c.name, c.arguments))
             .collect();
+        let share = eval::forced_share(result.forced_tokens, result.tokens_generated);
         println!(
-            "{}: correct={} steps={} prefill_s={:.3} decode_tok_s={:.2} total_s={:.3} calls=[{}]",
+            "{}: correct={} steps={} prefill_s={:.3} decode_tok_s={:.2} total_s={:.3} tokens_gen={} forced_tokens={} forced_share={:.2} model_steps={} retries={} tool_errors={} calls=[{}]",
             result.id,
             result.correct,
             result.steps,
             result.prefill_ms_total / 1000.0,
             decode_tok_s,
             result.total_ms / 1000.0,
+            result.tokens_generated,
+            result.forced_tokens,
+            share,
+            result.model_steps,
+            result.retries,
+            result.tool_errors,
             calls.join(", "),
         );
         results.push(result);
@@ -1168,6 +1175,10 @@ fn skipped_case_result(case: &eval::EvalCase) -> eval::CaseResult {
         decode_ms_total: 0.0,
         tokens_generated: 0,
         total_ms: 0.0,
+        forced_tokens: 0,
+        model_steps: 0,
+        retries: 0,
+        tool_errors: 0,
     }
 }
 
@@ -1201,6 +1212,14 @@ fn aggregate_report(
     } else {
         decode_tok_s_values.iter().sum::<f64>() / decode_tok_s_values.len() as f64
     };
+    let mean_model_steps = scored.iter().map(|r| r.model_steps as f64).sum::<f64>() / n;
+    let mean_forced_share = scored
+        .iter()
+        .map(|r| eval::forced_share(r.forced_tokens, r.tokens_generated))
+        .sum::<f64>()
+        / n;
+    let total_retries = scored.iter().map(|r| r.retries).sum();
+    let total_tool_errors = scored.iter().map(|r| r.tool_errors).sum();
 
     let model = gguf_path
         .file_name()
@@ -1218,6 +1237,10 @@ fn aggregate_report(
         mean_prefill_s,
         mean_decode_tok_s,
         mean_total_s,
+        mean_model_steps,
+        mean_forced_share,
+        total_retries,
+        total_tool_errors,
         label: label.to_string(),
         system_prompt: system_prompt.to_string(),
         max_new_tokens,
