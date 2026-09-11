@@ -174,6 +174,26 @@ impl KvCache {
             .collect()
     }
 
+    /// Same as [`Self::export_prefix`] but via `into_data_async().await`
+    /// (a WebGPU buffer map, asynchronous-only in the browser — see
+    /// `model.rs`'s `logits_to_vec` doc comment) instead of the synchronous
+    /// `into_data()` readback, so `web.rs` can call this on a KV-image
+    /// cache *miss* (after its first full prefill) to write its own image
+    /// back to OPFS without deadlocking.
+    pub async fn export_prefix_async(&self, n_tokens: usize) -> Vec<(Vec<f32>, Vec<f32>)> {
+        assert!(n_tokens <= self.max_ctx);
+        let mut out = Vec::with_capacity(self.k.len());
+        for (k, v) in self.k.iter().zip(self.v.iter()) {
+            let k_data = k.clone().narrow(2, 0, n_tokens).into_data_async().await.expect("GPU readback failed");
+            let v_data = v.clone().narrow(2, 0, n_tokens).into_data_async().await.expect("GPU readback failed");
+            out.push((
+                k_data.into_vec::<f32>().expect("K tensor is f32"),
+                v_data.into_vec::<f32>().expect("V tensor is f32"),
+            ));
+        }
+        out
+    }
+
     /// Upload `layers` (per-layer `(k, v)` flat `[n_kv_heads, n_tokens,
     /// head_dim]` row-major, as produced by [`Self::export_prefix`] or
     /// `kvimg::KvImage::layer_slices`) into positions `[0, n_tokens)` of
