@@ -1002,6 +1002,27 @@ cubek's un-benchmarked `Strategy::Auto` fallback — an earlier attempt to
 disable `autotune` crate-wide produced numerically wrong attention output).
 See docs/BENCHMARKS.md Session 11 for cold/warm numbers.
 
+**Session 15 update**: Session 11's single process-wide pin was chosen only
+at the dominant M=2048 chunk shape, and left real throughput on the table at
+every other M an agent loop's tool-result prefills actually hit — the
+browser gate's ~460-token tool results were measured at ~24 tok/s (~145
+GFLOP/s, ~10% of f32 peak on this GPU). `llm-agent prefill-sweep` swept M x
+every non-CMMA/MMA `cubek_matmul::Strategy` (CMMA/MMA already dead per
+Session 11; `SimpleVecMat`/`DoubleVecMat` newly found dead too — they
+require column-major Rhs, but `q4_dequant_scratch`'s output is row-major) at
+two production shapes and found three clean regimes: M<=128 the naive
+per-element-dequant kernel wins outright (no scratch-dequant/pipeline
+overhead to amortize), 129<=M<1024 `DoubleUnit/MaxTileSize` wins by
+1.2-1.4x over `MinTileSize`, M>=1024 `MinTileSize` wins (Session 11's
+regime, unchanged). `gguf.rs::strategy_for_bucket(m)` now replaces the
+single pinned constant with this three-way table (`SCRATCH_MATMUL_MIN_M`
+raised 32->129 so M<=128 skips the scratch route entirely, same path as
+M==1's matvec); `pinned_matmul`/`scratch_matmul_chunked` call it per chunk,
+so a chunked prefill's 2048-row chunks and bucket-aligned remainder each get
+their own bucket's winner automatically. See docs/BENCHMARKS.md Session 15
+for the full sweep table and before/after numbers (M=460: 26.9->39.8 tok/s
+warm, +1.4x, zero regression at M=2225).
+
 ## 14. Schema-constrained decoding (`src/grammar.rs`)
 
 A pure state machine — no GPU, no model — that decides, at every decoding

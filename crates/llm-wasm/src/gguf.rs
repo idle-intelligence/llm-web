@@ -41,6 +41,7 @@ use cubecl::{CubeTask, Runtime};
 use cubek_matmul::definition::{MatmulElems, MatmulGlobalElems};
 use cubek_matmul::launch::{launch_ref, MatmulInputHandleRef, Strategy};
 use cubek_matmul::routines::double_unit::DoubleUnitSelectionArgs;
+use cubek_matmul::routines::simple_unit::SimpleUnitSelectionArgs;
 use cubek_matmul::routines::{BlueprintStrategy, TileSizeSelection};
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -1091,13 +1092,15 @@ impl KernelSource for Q4DequantKernel {
 
 const DEQUANT_WG: u32 = 256;
 
-/// P1 Approach A threshold (docs/BENCHMARKS.md Session 4): below this M,
-/// the naive per-element kernel's redundant dequant isn't amortized enough
-/// across output rows to beat the naive kernel's simplicity/dispatch-count
-/// tradeoff, so decode-shaped calls (M=1) keep using the matvec kernel via
+/// P1 Approach A threshold (docs/BENCHMARKS.md Session 4). Session 15
+/// raised this 32 -> 129 after `prefill-sweep` measured the naive
+/// per-element kernel beating every `DoubleUnit` scratch-matmul variant at
+/// M<=128 (~200 GFLOP/s flat vs 77-148 GFLOP/s) — see
+/// `strategy_for_bucket`'s doc comment for the full M-bucket breakdown.
+/// Below this M, decode-shaped calls (M=1) keep using the matvec kernel via
 /// the `b * m == 1` branch above this one, and small M falls through to the
 /// naive kernel.
-const SCRATCH_MATMUL_MIN_M: usize = 32;
+const SCRATCH_MATMUL_MIN_M: usize = 129;
 
 /// The tied lm_head (`token_embd.weight`, [151936, 2048]) is never routed
 /// through the scratch-dequant+matmul path: its dequantized scratch buffer
@@ -1223,46 +1226,71 @@ pub fn q4_dequant_scratch_to_vec(weights: &Q4Tensor, device: &WgpuDevice) -> Vec
 /// padding logic is needed.
 const SCRATCH_MATMUL_CHUNK_M: usize = 2048;
 
-/// Session 11 (docs/BENCHMARKS.md): pinned matmul strategy for the
-/// scratch-dequant path, bypassing Burn's `Tensor::matmul`/`autotune`
-/// entirely. Chosen from the natively-populated cubecl autotune cache
-/// (`target/autotune/0.9.0/.../burn_cubecl-kernel-matmul-tune-base.json.log`)
-/// for this hardware (Apple M2, Metal via wgpu): every CMMA/MMA candidate
-/// (`matmul_simple_cyclic_cmma`, `..._mma`, etc.) errors out at kernel
-/// selection with "No tile size is available for the problem" — this
-/// backend has no usable tensor-core path for these shapes — so the winner
-/// is always a `DoubleUnit` (double-buffered, non-tensor-core) kernel,
-/// varying only in `TileSizeSelection`. At the dominant scratch-matmul
-/// shape (`SCRATCH_MATMUL_CHUNK_M` = 2048 rows, K/N ∈ {2048, 11008, 256}),
-/// `MinTileSize` wins ((2048,2048,2048), (2048,256,2048), (2048,2048,16384)
-/// all -> `matmul_double_unit_min_tile_size`); `MaxTileSize` only wins for
-/// the minority smaller-M remainder chunks (<=1024 rows, e.g. the tail
-/// 256-row chunk of a 2304-row prefill). One const per platform as
-/// specified, both currently `MinTileSize`: native and web share the same
-/// wgpu/WebGPU kernel family and GPU (this Mac generates both the native
-/// autotune cache above and the Chromium WebGPU surface used for headless
-/// runs), and no separate persistent web autotune data exists to justify a
-/// different pin.
-#[cfg(not(feature = "web"))]
-const PINNED_MATMUL_TILE_SIZE: TileSizeSelection = TileSizeSelection::MinTileSize;
-#[cfg(feature = "web")]
-const PINNED_MATMUL_TILE_SIZE: TileSizeSelection = TileSizeSelection::MinTileSize;
-
-fn pinned_matmul_strategy() -> Strategy {
-    Strategy::DoubleUnit(BlueprintStrategy::Inferred(DoubleUnitSelectionArgs {
-        tile_size: PINNED_MATMUL_TILE_SIZE,
-    }))
+/// Session 11 (docs/BENCHMARKS.md) pinned a single `DoubleUnit/MinTileSize`
+/// strategy for every scratch-matmul call, chosen from the native autotune
+/// cache at the dominant M=2048 chunk shape. Session 15's `prefill-sweep`
+/// (see `llm-agent.rs`) measured every non-CMMA/MMA `Strategy` (every
+/// CMMA/MMA candidate still fails kernel selection on this Metal-via-wgpu
+/// backend with "No tile size is available for the problem", and
+/// `SimpleVecMat`/`DoubleVecMat` fail with "Only Col Major layout is
+/// supported for Rhs" against our row-major dequant-scratch weight layout —
+/// neither family is a candidate here) across M ∈ {64..2304} at the
+/// model's two largest shapes (attn 2048x2048, ffn_gate 2048x11008) and
+/// found the single pin was leaving real throughput on the table at every
+/// M except the M>=1024 regime it was tuned for:
+///
+/// - **M <= 128**: the naive per-element-dequant kernel (~200 GFLOP/s flat,
+///   no pipeline/dequant-scratch overhead) beats every `DoubleUnit`
+///   variant (77-148 GFLOP/s at M=64/128) — `q4_matmul_dispatch` now skips
+///   the scratch route entirely below `SCRATCH_MATMUL_MIN_M` (raised
+///   32->129) for these M, same as it already did for M==1.
+/// - **129 <= M < 1024**: `DoubleUnit/MaxTileSize` wins by 1.2-1.4x over
+///   `MinTileSize` at every measured bucket (256/384/512/640/768/896 —
+///   e.g. 512: 266.5 vs 185.6 GFLOP/s attn shape) and also beats naive from
+///   M=256 up (`SimpleUnit/MaxTileSize` is faster still in a couple of
+///   spots but panics with the 40960/32768-byte shared-memory error at
+///   M>=512, so it's not a safe universal pick for this range).
+/// - **M >= 1024**: `DoubleUnit/MinTileSize` wins decisively (435-489
+///   vs 278-296 GFLOP/s for `MaxTileSize` at M=1024/2048/2304) — this is
+///   the shape Session 11's pin was actually tuned for, so it's unchanged
+///   here.
+///
+/// `strategy_for_bucket` returns the winner for a given (already
+/// `pad_m_bucket`-aligned, or exactly `SCRATCH_MATMUL_CHUNK_M`) M —
+/// `scratch_matmul_chunked` calls it once per chunk, so the 2048-row chunks
+/// get `MinTileSize` and a smaller remainder chunk (e.g. 256 rows of a
+/// 2304-row prefill) gets `MaxTileSize` automatically. One function shared
+/// by native and web: both target the same wgpu/WebGPU kernel family and
+/// GPU on this dev machine, same as Session 11's single pin.
+fn strategy_for_bucket(bucket: usize) -> Strategy {
+    let tile_size = if bucket < 1024 {
+        TileSizeSelection::MaxTileSize
+    } else {
+        TileSizeSelection::MinTileSize
+    };
+    Strategy::DoubleUnit(BlueprintStrategy::Inferred(DoubleUnitSelectionArgs { tile_size }))
 }
 
 /// `x[B,M,K] . w[1,K,N]` through `cubek_matmul::launch::launch_ref` with
-/// `pinned_matmul_strategy()`, replacing Burn's `Tensor::matmul` (which
+/// `strategy_for_bucket(m)`, replacing Burn's `Tensor::matmul` (which
 /// Burn's public API only lets us call with `Strategy::default()` —
 /// `Strategy::Auto` without `autotune`, autotune-benchmarked with it —
 /// never a caller-chosen `Strategy`). Both `x` and `w` are our own f32
 /// scratch tensors (dequant output / dequant-into-scratch weight), always
 /// contiguous, non-quantized, so the `MatmulInputHandleRef::new` (non-
 /// quantized) path applies.
-fn pinned_matmul(x: Tensor<Wgpu, 3>, w: Tensor<Wgpu, 3>) -> Tensor<Wgpu, 3> {
+fn pinned_matmul(x: Tensor<Wgpu, 3>, w: Tensor<Wgpu, 3>, m: usize) -> Tensor<Wgpu, 3> {
+    pinned_matmul_with_strategy(x, w, &strategy_for_bucket(m))
+}
+
+/// Session 15 (docs/BENCHMARKS.md): `pinned_matmul` generalized to take an
+/// explicit `Strategy` instead of always using the Session 11 pin — lets
+/// `llm-agent prefill-sweep` (bench-only, see that command) measure every
+/// candidate `cubek_matmul::Strategy` at real production shapes without
+/// duplicating the dequant/launch plumbing. Production callers
+/// (`pinned_matmul`, `q4_matmul_dispatch` via the M-bucket strategy table)
+/// still go through this same function.
+fn pinned_matmul_with_strategy(x: Tensor<Wgpu, 3>, w: Tensor<Wgpu, 3>, strategy: &Strategy) -> Tensor<Wgpu, 3> {
     let x: CubeTensor<WgpuRuntime> = into_contiguous(x.into_primitive().tensor());
     let w: CubeTensor<WgpuRuntime> = into_contiguous(w.into_primitive().tensor());
     let client = x.client.clone();
@@ -1285,7 +1313,7 @@ fn pinned_matmul(x: Tensor<Wgpu, 3>, w: Tensor<Wgpu, 3>) -> Tensor<Wgpu, 3> {
         out: out.dtype.into(),
     });
     launch_ref(
-        &pinned_matmul_strategy(),
+        strategy,
         &client,
         &MatmulInputHandleRef::new(x.as_handle_ref(), x.dtype.into()),
         &MatmulInputHandleRef::new(w.as_handle_ref(), w.dtype.into()),
@@ -1297,18 +1325,83 @@ fn pinned_matmul(x: Tensor<Wgpu, 3>, w: Tensor<Wgpu, 3>) -> Tensor<Wgpu, 3> {
     Tensor::from_primitive(TensorPrimitive::Float(out))
 }
 
+/// Session 15: names for `llm-agent prefill-sweep`'s `--strategy` flag —
+/// every non-CMMA/MMA `cubek_matmul::Strategy` variant (Session 11 already
+/// established every CMMA/MMA candidate fails kernel selection on this
+/// Metal-via-wgpu backend with "No tile size is available for the
+/// problem", so this list only covers the unit/naive/vecmat family that
+/// actually launches) plus `"double_unit_min"`/`"double_unit_max"`
+/// (the Session 11 pin's two tile sizes) for a consistent before/after.
+pub const BENCH_STRATEGY_NAMES: &[&str] = &[
+    "naive",
+    "simple_unit_min",
+    "simple_unit_max",
+    "double_unit_min",
+    "double_unit_max",
+    "simple_vecmat",
+    "double_vecmat",
+];
+
+fn strategy_by_name(name: &str) -> Strategy {
+    match name {
+        "naive" => Strategy::Naive,
+        "simple_unit_min" => Strategy::SimpleUnit(BlueprintStrategy::Inferred(SimpleUnitSelectionArgs {
+            tile_size: TileSizeSelection::MinTileSize,
+        })),
+        "simple_unit_max" => Strategy::SimpleUnit(BlueprintStrategy::Inferred(SimpleUnitSelectionArgs {
+            tile_size: TileSizeSelection::MaxTileSize,
+        })),
+        "double_unit_min" => Strategy::DoubleUnit(BlueprintStrategy::Inferred(DoubleUnitSelectionArgs {
+            tile_size: TileSizeSelection::MinTileSize,
+        })),
+        "double_unit_max" => Strategy::DoubleUnit(BlueprintStrategy::Inferred(DoubleUnitSelectionArgs {
+            tile_size: TileSizeSelection::MaxTileSize,
+        })),
+        "simple_vecmat" => Strategy::SimpleVecMat(Default::default()),
+        "double_vecmat" => Strategy::DoubleVecMat(Default::default()),
+        other => panic!("unknown bench strategy name {other:?} (see BENCH_STRATEGY_NAMES)"),
+    }
+}
+
+/// Session 15 bench-only entry point: dequant `weights` into the shared
+/// scratch buffer (same `q4_dequant_scratch` production uses) then run the
+/// named `Strategy` directly, skipping `q4_matmul_dispatch`'s M/N routing,
+/// `pad_m_bucket`, and `scratch_matmul_chunked`'s chunking — a single
+/// unchunked call, so callers must keep `x`'s M within a size the chosen
+/// strategy can launch (see `llm-agent prefill-sweep`, which sweeps M up to
+/// 2304 and reports failures rather than panicking the whole sweep).
+pub fn bench_matmul_variant(
+    x: Tensor<Wgpu, 3>,
+    weights: &Q4Tensor,
+    device: &WgpuDevice,
+    strategy_name: &str,
+) -> Tensor<Wgpu, 3> {
+    let client = WgpuRuntime::client(device);
+    let handle = q4_dequant_scratch(&client, weights);
+    let [n, k] = weights.shape();
+    let w_tensor = CubeTensor::new_contiguous(
+        client,
+        device.clone(),
+        burn::prelude::Shape::from(vec![1, k, n]),
+        handle,
+        DType::F32,
+    );
+    let w = Tensor::<Wgpu, 3>::from_primitive(TensorPrimitive::Float(w_tensor));
+    pinned_matmul_with_strategy(x, w, &strategy_by_name(strategy_name))
+}
+
 /// Chunks `x[B,M,K] . w[1,K,N]` over the M dimension — see
 /// `SCRATCH_MATMUL_CHUNK_M`'s doc comment for why.
 fn scratch_matmul_chunked(x: Tensor<Wgpu, 3>, w: Tensor<Wgpu, 3>, m: usize) -> Tensor<Wgpu, 3> {
     if m <= SCRATCH_MATMUL_CHUNK_M {
-        return pinned_matmul(x, w);
+        return pinned_matmul(x, w, m);
     }
     let mut chunks = Vec::with_capacity(m.div_ceil(SCRATCH_MATMUL_CHUNK_M));
     let mut start = 0usize;
     while start < m {
         let len = SCRATCH_MATMUL_CHUNK_M.min(m - start);
         let x_chunk = x.clone().narrow(1, start, len);
-        chunks.push(pinned_matmul(x_chunk, w.clone()));
+        chunks.push(pinned_matmul(x_chunk, w.clone(), len));
         start += len;
     }
     Tensor::cat(chunks, 1)

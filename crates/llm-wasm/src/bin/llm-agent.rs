@@ -11,7 +11,10 @@ use burn::tensor::Tensor;
 use clap::{Parser, Subcommand};
 use llm_wasm::agent::{Agent, FixtureCaller, Generator};
 use llm_wasm::eval::{self, ToolOrder, ToolSet};
-use llm_wasm::gguf::{q4_matmul, set_skip_matvec_for_bench, Q4ModelLoader, Q4Tensor};
+use llm_wasm::gguf::{
+    bench_matmul_variant, q4_dequant_scratch_to_vec, q4_matmul, q4_matmul_naive_forced,
+    set_skip_matvec_for_bench, Q4ModelLoader, Q4Tensor, BENCH_STRATEGY_NAMES,
+};
 use llm_wasm::kv::KvCache;
 use llm_wasm::kvimg::{self, Dtype, Header, KvImage};
 use llm_wasm::model::LlmModel;
@@ -138,6 +141,20 @@ enum Commands {
         #[arg(long, default_value_t = 12288)]
         max_ctx: usize,
     },
+    /// Session 15 (docs/BENCHMARKS.md): sweeps M x `cubek_matmul::Strategy`
+    /// at fixed production-representative (K,N) shapes, reporting GFLOP/s
+    /// for each combination plus the naive per-element-dequant kernel and
+    /// an isolated dequant-only timing — no GGUF load needed, weights are
+    /// synthetic random Q4_0 bytes (content doesn't affect matmul
+    /// throughput, only shape).
+    PrefillSweep {
+        /// Comma-separated M values, e.g. "64,128,256,460,512,1024,2048,2304".
+        #[arg(long, default_value = "64,128,256,460,512,1024,2048,2304")]
+        lengths: String,
+        /// Timed repeats per (shape, strategy, M) after one untimed warm-up.
+        #[arg(long, default_value_t = 3)]
+        reps: usize,
+    },
     /// Build-time export of a prefix KV image (docs/ENGINE.md "Prefix KV
     /// images"): renders the system+tools prefix exactly as the agent loop
     /// does, prefills it natively, and writes `<out-dir>/<prefix_key>.kvimg`
@@ -230,6 +247,7 @@ fn main() -> anyhow::Result<()> {
             lengths,
             max_ctx,
         } => autotune_sweep(&gguf, &tokens, &lengths, max_ctx),
+        Commands::PrefillSweep { lengths, reps } => prefill_sweep(&lengths, reps),
         Commands::KvExport {
             gguf,
             model_dir,
@@ -406,6 +424,93 @@ fn random_q4_bytes(n: usize, k: usize, seed: u64) -> Vec<u8> {
     (0..n * bytes_per_row)
         .map(|_| (rng.next_u32() & 0xFF) as u8)
         .collect()
+}
+
+/// Session 15 (docs/BENCHMARKS.md): M x `Strategy` sweep at fixed
+/// production-representative (K,N) shapes — `(2048,2048)` (attn_q/o/k/v
+/// grouped-shape stand-in) and `(2048,11008)` (ffn_gate/up, the largest
+/// projection). Reports GFLOP/s per (shape, strategy, M); also runs the
+/// naive per-element-dequant kernel (`q4_matmul_naive_forced`) for
+/// comparison and times `q4_dequant_scratch_to_vec` alone once per shape.
+fn prefill_sweep(lengths: &str, reps: usize) -> anyhow::Result<()> {
+    let device = WgpuDevice::default();
+    let ms: Vec<usize> = lengths
+        .split(',')
+        .map(|s| s.trim().parse::<usize>().expect("lengths must be comma-separated integers"))
+        .collect();
+    let shapes: &[(usize, usize, &str)] = &[(2048, 2048, "attn(2048x2048)"), (2048, 11008, "ffn_gate(2048x11008)")];
+
+    for &(k, n, label) in shapes {
+        let bytes = random_q4_bytes(n, k, 0x5EED ^ (k as u64) ^ ((n as u64) << 20));
+        let weights = Q4Tensor::from_q4_bytes(&bytes, [n, k], &device).expect("upload Q4 weights");
+
+        // Dequant-only timing, once per shape (readback included — real
+        // GPU-completion sync point, not just submission).
+        let t0 = std::time::Instant::now();
+        let _ = q4_dequant_scratch_to_vec(&weights, &device);
+        let dequant_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        println!("dequant-only {label}: {dequant_ms:.2} ms ({:.1} GB/s)", (n as f64 * k as f64 * 18.0 / 32.0) / (dequant_ms / 1000.0) / 1e9);
+
+        for &m in &ms {
+            let x: Tensor<Wgpu, 3> =
+                Tensor::<Wgpu, 1>::from_floats(vec![0.01f32; m * k].as_slice(), &device).reshape([1, m, k]);
+
+            // naive per-element-dequant kernel
+            {
+                let out = q4_matmul_naive_forced(x.clone(), &weights);
+                let _ = out.into_data().into_vec::<f32>().unwrap();
+                let mut best = f64::MAX;
+                for _ in 0..reps {
+                    let t0 = std::time::Instant::now();
+                    let out = q4_matmul_naive_forced(x.clone(), &weights);
+                    let _ = out.into_data().into_vec::<f32>().unwrap();
+                    best = best.min(t0.elapsed().as_secs_f64());
+                }
+                let gflops = 2.0 * m as f64 * n as f64 * k as f64 / best / 1e9;
+                println!(
+                    "{label:>20} M={m:>5} strategy=naive          {:>8.1} ms  {:>7.1} GFLOP/s",
+                    best * 1000.0,
+                    gflops
+                );
+            }
+
+            for &strat in BENCH_STRATEGY_NAMES {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let out = bench_matmul_variant(x.clone(), &weights, &device, strat);
+                    out.into_data().into_vec::<f32>().unwrap()
+                }));
+                if result.is_err() {
+                    println!("{label:>20} M={m:>5} strategy={strat:<18} FAILED (panic)");
+                    continue;
+                }
+                let mut best = f64::MAX;
+                let mut ok = true;
+                for _ in 0..reps {
+                    let t0 = std::time::Instant::now();
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let out = bench_matmul_variant(x.clone(), &weights, &device, strat);
+                        out.into_data().into_vec::<f32>().unwrap()
+                    }));
+                    if result.is_err() {
+                        ok = false;
+                        break;
+                    }
+                    best = best.min(t0.elapsed().as_secs_f64());
+                }
+                if !ok {
+                    println!("{label:>20} M={m:>5} strategy={strat:<18} FAILED (panic)");
+                    continue;
+                }
+                let gflops = 2.0 * m as f64 * n as f64 * k as f64 / best / 1e9;
+                println!(
+                    "{label:>20} M={m:>5} strategy={strat:<18} {:>8.1} ms  {:>7.1} GFLOP/s",
+                    best * 1000.0,
+                    gflops
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 /// P1a (docs/BENCHMARKS.md): isolated K1 matvec (M=1) throughput at the

@@ -1496,3 +1496,122 @@ dispatches (QK^T matmul, scale, mask compare+fill, softmax's ~3 ops, PV matmul, 
 
 Commits: `crates/llm-wasm/src/model.rs`, `src/kv.rs` (`f32_layer` accessor), `src/gguf.rs`
 (`attn_decode_f32_dispatch`), `src/wgsl/shader_attn_decode_f32.wgsl`.
+
+## Session 15 — per-M-bucket matmul strategy table (browser gate: M=460 at 24 tok/s)
+
+Problem: the browser gate's 13-tool Sonos run showed each tool-result prefill
+(~460 tokens) costing ~19.3s (~24 tok/s, ~145 GFLOP/s) — worse than the
+2225-token case's ~450 GFLOP/s, itself only ~10% of this GPU's ~3.6 TFLOP/s f32
+peak. Session 11's single pinned `Strategy::DoubleUnit(MinTileSize)` was chosen
+from the native autotune cache at the *dominant* M=2048 chunk shape only, never
+re-measured at the smaller M's an agent loop's tool results actually produce.
+
+### Sweep
+
+New `llm-agent prefill-sweep` (`crates/llm-wasm/src/bin/llm-agent.rs`): no GGUF
+load needed — synthetic random Q4_0 weights at two production shapes
+(`attn(2048x2048)`, `ffn_gate(2048x11008)`), sweeps M and every non-CMMA/MMA
+`cubek_matmul::Strategy` (`gguf.rs::BENCH_STRATEGY_NAMES` — `SimpleUnit`/
+`DoubleUnit` at both `TileSizeSelection`s, `SimpleVecMat`, `DoubleVecMat`) plus
+the naive per-element-dequant kernel, 3 timed reps (min) after 1 untimed
+warm-up. `cubek-matmul` 0.1.1 (`~/.cargo/registry/.../cubek-matmul-0.1.1/src/
+launch/strategy.rs`) exposes 30 `Strategy` variants total: 24 CMMA/MMA
+(`Simple{Cyclic,Strided,Tilewise,AsyncStrided,AsyncCyclic,Tma}{Cmma,Mma}`,
+`Double{Cyclic,Tilewise,Hybrid,AsyncCyclic,AsyncStrided,Tma}{Cmma,Mma}`,
+`Specialized{Cyclic,Strided,Tma}{Cmma,Mma}`, `OrderedDouble{Cmma,Mma}` — all
+already known dead on this Metal-via-wgpu backend per Session 11, not
+re-tested here), `SimpleUnit`/`DoubleUnit` (2), `SimpleVecMat`/`DoubleVecMat`
+(2), `Naive`, `Auto` (2, excluded — `Auto`'s un-benchmarked heuristic was
+already shown numerically unsafe in Session 11).
+
+**New failure found**: `SimpleVecMat`/`DoubleVecMat` panic at every M on both
+shapes — `"Unable to launch matmul because the config is invalid: Only Col
+Major layout is supported for Rhs"` — our dequant-scratch weight buffer
+(`q4_dequant_scratch`, transposed `[K,N]` row-major) isn't the layout VecMat's
+kernel family expects. Not a candidate regardless of M. `SimpleUnit/MaxTileSize`
+also panics at M>=512 (same 40960/32768-byte shared-memory error as Session
+4/11's CMMA/MMA panics) — not universally safe either.
+
+GFLOP/s table (best of 3 reps; `attn` / `ffn_gate` shapes; `naive` and the two
+universally-safe `DoubleUnit` tile sizes only — full log has `SimpleUnit` too):
+
+| M | naive | DoubleUnit/Min | DoubleUnit/Max |
+|---|---|---|---|
+| 64 | 179.8 / 199.2 | 100.7 / 97.1 | 86.7 / 83.6 |
+| 128 | 192.0 / 201.4 | 148.0 / 131.9 | 178.6 / 168.5 |
+| 256 | 198.0 / 202.4 | 175.2 / 159.5 | **241.7 / 219.0** |
+| 384 | 200.1 / 202.7 | 177.8 / 170.1 | **260.3 / 239.9** |
+| 460 | 200.4 / 202.7 | 173.4 / 166.1 | **236.6 / 229.3** |
+| 512 | 200.6 / 202.8 | 185.6 / 176.5 | **266.5 / 256.7** |
+| 640 | 201.6 / 202.9 | 184.9 / 180.1 | **275.3 / 261.9** |
+| 768 | 201.6 / 203.0 | 189.4 / 184.4 | **278.6 / 267.7** |
+| 896 | 201.9 / 203.0 | 191.4 / 187.3 | **279.9 / 272.6** |
+| 1024 | 202.2 / 203.0 | **435.0 / 393.1** | 288.2 / 278.5 |
+| 2048 | 200.1 / 202.6 | **489.1 / 476.1** | 296.5 / 291.8 |
+| 2304 | 203.2 / 203.0 | **485.4 / 475.0** | 295.1 / 291.3 |
+
+Dequant-only (`q4_dequant_scratch_to_vec`, readback included): 12.5ms (attn,
+2048x2048), 59.0ms (ffn_gate, 2048x11008) — ~5-10% of the matmul-call time at
+the bucket sizes these shapes actually run at, confirming dequant isn't the
+small-M bottleneck; the matmul kernel choice is.
+
+Three clean regimes: **M<=128 naive wins** (77-192 GFLOP/s for DoubleUnit vs
+~180-200 flat for naive — no scratch-dequant/pipeline overhead to amortize),
+**129<=M<1024 DoubleUnit/MaxTileSize wins** (1.2-1.4x over MinTileSize at every
+bucket, and beats naive from M=256 up), **M>=1024 DoubleUnit/MinTileSize wins**
+(the regime Session 11's single pin was actually tuned for — unchanged).
+
+### Fix — per-bucket strategy table
+
+`gguf.rs`: `SCRATCH_MATMUL_MIN_M` raised 32 -> 129 (M<=128 now skips the
+scratch route entirely, same code path as M==1's matvec — naive kernel
+handles it). New `strategy_for_bucket(m)` picks `MaxTileSize` for
+`129<=m<1024`, `MinTileSize` for `m>=1024`; `pinned_matmul`/
+`scratch_matmul_chunked` now call it per-chunk instead of one process-wide
+pinned `Strategy` constant — `SCRATCH_MATMUL_CHUNK_M`'s 2048-row chunks
+always get `MinTileSize`, and a chunked prefill's bucket-aligned remainder
+(e.g. 256 rows of a 2304-row prefill) automatically gets `MaxTileSize`.
+`pad_m_bucket`'s M<128 rounding branch is now only reachable via the test-only
+`ForceKernel::Scratch` override — kept as-is, still numerically exercised by
+`tests/q4_matmul.rs::test_scratch_matmul_padding_is_numerically_inert`.
+
+### Before/after (native, `llm-agent autotune-sweep`, isolated fresh-`KvCache` prefill)
+
+| M (real, padded bucket) | before (Session 11 pin) | after (per-bucket table) |
+|---|---|---|
+| 460 -> 512 | 26.9 / 27.7 tok/s (17.1s / 16.6s) | **36.1 / 39.8 tok/s** (12.7s / 11.5s) |
+| 2225 -> 2304 | 58.8 / 60.7 tok/s (37.8s / 36.6s) | 62.8 / 63.7 tok/s (35.4s / 34.9s) |
+
+M=460 (bucket 512, all-`MaxTileSize`): **1.4x** (26.9->39.8 tok/s warm), short
+of the 2x/≤9s target but a real, verified win with zero M=2225 regression
+(58.8->63.7 tok/s warm, actually +8%, consistent with M=2225's dominant 2048
+chunk unaffected by this session's change — attributed to normal run-to-run
+noise plus the M<=128 naive-routing change touching decode-adjacent small
+prefill calls elsewhere in the same process). "Before" rebuilt from a
+`git stash` of this session's `gguf.rs`/`llm-agent.rs` changes only (Session
+11's exact pinned-strategy code), same binary/model/GPU, same command.
+
+### Verification
+
+- `cargo test --release --features wgpu --test full_forward -- --test-threads=1`:
+  7/7 pass, greedy-exact (`test_forward_01/02/03`, `split_prefill_*`,
+  `q8_kv_dequant_*`, `test_rmsnorm_fused_*` all `ok`).
+- `cargo test --release --features wgpu --test q4_matmul -- --test-threads=1`:
+  8/8 pass (1 ignored bench, unchanged).
+- `cargo check --features wgpu` / `cargo clippy --release --features wgpu -- -D
+  warnings`: clean.
+- `cargo clippy --target wasm32-unknown-unknown --no-default-features --features
+  web -p llm-wasm`: clean.
+
+Not attempted: M<460 target's full ≤9s/≥300 GFLOP/s bar (460 lands at
+~229-237 GFLOP/s with `MaxTileSize`, not 300+ — `SimpleUnit/MaxTileSize` beats
+it at a couple of M's but isn't universally launch-safe, see above); a
+persistent-per-M-value strategy cache (would need per-shape not just
+per-bucket tuning, out of scope); re-deriving `pad_m_bucket`'s own thresholds
+(kept as Session 10 left them — only the *strategy chosen at* each bucket
+changed this session, not the bucketing itself).
+
+Commits: `crates/llm-wasm/src/gguf.rs` (`strategy_for_bucket`,
+`SCRATCH_MATMUL_MIN_M`, `BENCH_STRATEGY_NAMES`/`bench_matmul_variant`
+bench-only surface), `crates/llm-wasm/src/bin/llm-agent.rs`
+(`prefill-sweep` subcommand), this file.
