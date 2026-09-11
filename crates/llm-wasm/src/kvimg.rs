@@ -52,19 +52,27 @@
 //!
 //! ## Hashing
 //!
-//! `model_hash` is intended to be a SHA-256 of the GGUF file. No `sha2`
-//! crate is in this workspace's dependency tree (`cargo tree -i sha2`
-//! prints nothing), so this module implements SHA-256 itself
-//! (`sha256_reader`) rather than adding a new dependency — this crate is
-//! not `Cargo.toml`-owned by this worker in any case. Callers that only
-//! have a size/mtime-cheap fingerprint available (e.g. can't afford to hash
-//! a multi-GB file on every load) may instead pass a cheaper fingerprint —
-//! sha256 of `(file_size_le_u64 || first 1 MiB || last 1 MiB)` — via
-//! `content_fingerprint`; either is just an opaque string as far as this
-//! module and `prefix_key` are concerned.
+//! `model_fingerprint` (named `model_hash` in an earlier version of this
+//! module — renamed because it is deliberately **not** a hash of the whole
+//! GGUF file) identifies the model without ever reading the full 1.7GB+
+//! file: `gguf_header_fingerprint` hashes only the GGUF header region
+//! (magic through the end of the tensor-info table — a few KB, contains
+//! every tensor's name/shape/dtype, so two different quantizations or
+//! checkpoints of "the same" model almost certainly differ here) plus the
+//! file size. Cheap enough to recompute on every load, natively (`llm-agent
+//! kv-export`, via `gguf::GgufReader::header_bytes`) and in the browser
+//! (`web.rs`, from the already-fetched shard bytes — no `crypto.subtle`
+//! pass over the whole model needed). `content_fingerprint` (size + first/
+//! last 1 MiB) is a coarser alternative kept for callers that don't have a
+//! parsed GGUF header handy; either is just an opaque string as far as this
+//! module and `prefix_key` are concerned. No `sha2` crate is in this
+//! workspace's dependency tree (`cargo tree -i sha2` prints nothing), so
+//! this module implements SHA-256 itself (`sha256_reader`) rather than
+//! adding a new dependency — this crate is not `Cargo.toml`-owned by this
+//! worker in any case.
 //!
-//! `prefix_key` is `sha256(model_hash || rendered_prefix_text)` — hashing
-//! in the *rendered* prompt text (not just the system prompt / tool list
+//! `prefix_key` is `sha256(model_fingerprint || rendered_prefix_text)` —
+//! hashing in the *rendered* prompt text (not just the system prompt / tool list
 //! separately) means the key is sensitive to chat-template version, system
 //! prompt wording, and tool ordering all at once, matching how `web.rs`'s
 //! `compute_prefix_len`/`resident_tokens` already treat the rendered
@@ -77,7 +85,7 @@ pub const VERSION: u32 = 1;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct Header {
-    pub model_hash: String,
+    pub model_fingerprint: String,
     pub prefix_key: String,
     pub tokens: Vec<u32>,
     pub n_layers: usize,
@@ -492,11 +500,26 @@ fn copy_to_f32(buf: &[u8]) -> Vec<f32> {
         .collect()
 }
 
-/// `sha256(model_hash || rendered_prefix_text)`, hex-encoded.
-pub fn prefix_key(model_hash: &str, rendered_prefix_text: &str) -> String {
+/// `sha256(model_fingerprint || rendered_prefix_text)`, hex-encoded.
+pub fn prefix_key(model_fingerprint: &str, rendered_prefix_text: &str) -> String {
     let mut h = Sha256::new();
-    h.update(model_hash.as_bytes());
+    h.update(model_fingerprint.as_bytes());
     h.update(rendered_prefix_text.as_bytes());
+    h.hex_digest()
+}
+
+/// Cheap model-identity fingerprint: `sha256(file_size_le_u64 ||
+/// header_bytes)`, where `header_bytes` is the GGUF header region (magic
+/// through the end of the tensor-info table — a few KB, from
+/// `gguf::GgufReader::header_bytes`/`data_section_offset` — contains every
+/// tensor's name/shape/dtype). Deliberately **not** a hash of the full
+/// (1.7GB+) file: cheap enough to recompute on every native `kv-export`
+/// run and every browser `load()`, unlike `sha256_reader`/
+/// `content_fingerprint` over the whole GGUF.
+pub fn gguf_header_fingerprint(file_size: u64, header_bytes: &[u8]) -> String {
+    let mut h = Sha256::new();
+    h.update(&file_size.to_le_bytes());
+    h.update(header_bytes);
     h.hex_digest()
 }
 

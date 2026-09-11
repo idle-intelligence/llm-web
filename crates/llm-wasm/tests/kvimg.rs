@@ -5,7 +5,7 @@ use llm_wasm::kvimg::{Dtype, Header, KvImage, KvImageError};
 
 fn tiny_header(n_layers: usize, n_kv_heads: usize, n_tokens: usize, head_dim: usize) -> Header {
     Header {
-        model_hash: "deadbeef".to_string(),
+        model_fingerprint: "deadbeef".to_string(),
         prefix_key: llm_wasm::kvimg::prefix_key("deadbeef", "<system>hi<tools/></system>"),
         tokens: (0..n_tokens as u32).collect(),
         n_layers,
@@ -208,7 +208,7 @@ fn q8_0_quantize_dequantize_roundtrip_error_bounds() {
 
 fn q8_0_header(n_layers: usize, n_kv_heads: usize, n_tokens: usize, head_dim: usize) -> Header {
     Header {
-        model_hash: "deadbeef".to_string(),
+        model_fingerprint: "deadbeef".to_string(),
         prefix_key: llm_wasm::kvimg::prefix_key("deadbeef", "<system>hi<tools/></system>"),
         tokens: (0..n_tokens as u32).collect(),
         n_layers,
