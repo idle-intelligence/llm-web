@@ -6,7 +6,7 @@
 // Uses ONLY Playwright's bundled Chromium, never the user's real browser.
 // Run: node scripts/headless/run.mjs [flags]
 // See scripts/headless/README.md for flags and examples.
-import { mkdir, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
@@ -35,6 +35,17 @@ const TOKENIZER = args.tokenizer ?? 'http://127.0.0.1:8001/hf/xLAM-2-3b-fc-r/tok
 const TEMPLATE = args.template ?? 'http://127.0.0.1:8001/hf/xLAM-2-3b-fc-r/tokenizer_config.json';
 const PROMPT = args.prompt ?? 'what is the weather in Paris?';
 const TOOLS_MODE = args.tools ?? 'demo';
+// A path to an MCP tools/list-shaped JSON file (e.g.
+// fixtures/sonos/tools-12.json) — passed to the page as an actual tools
+// array instead of the built-in demo/none modes; page-side canned tool
+// results are a generic {ok:true} for anything not one of the two demo
+// tools (see web/agent/index.html's toolCaller).
+const TOOLS_FILE = args['tools-file'] ?? null;
+// Debug-only A/B toggle for the naive-vs-pinned Q4 matmul kernel routing
+// (see gguf.rs's force_naive_kernel / web.rs's LlmEngine.setPrefillKernel)
+// — a numerical-divergence bisection aid, not a production flag.
+const PREFILL_KERNEL = args['prefill-kernel'] ?? null;
+const SYSTEM_PROMPT = args.system ?? null;
 const MAX_NEW = parseInt(args['max-new'] ?? '64', 10);
 const MAX_STEPS = parseInt(args['max-steps'] ?? '6', 10);
 const EXPECT = args.expect ? new RegExp(args.expect) : null;
@@ -43,6 +54,7 @@ const REPEAT = args.repeat ? parseInt(args.repeat, 10) : 1;
 const TIMEOUT_LOAD = parseInt(args['timeout-load'] ?? String(10 * 60 * 1000), 10);
 const TIMEOUT_RUN = parseInt(args['timeout-run'] ?? String(6 * 60 * 1000), 10);
 const JSON_PATH = args.json ?? null;
+const TOKENS_OUT_PATH = args['tokens-out'] ?? null;
 
 const PLAYWRIGHT_MODULE =
   process.env.PLAYWRIGHT_MODULE ??
@@ -126,7 +138,7 @@ async function checkWebGpuAdapter(page) {
   });
 }
 
-async function runOnce(page, { prompt, toolsMode, maxNewTokens, maxSteps, expect, timeoutLoad, timeoutRun }) {
+async function runOnce(page, { prompt, toolsMode, toolsArray, maxNewTokens, maxSteps, expect, timeoutLoad, timeoutRun, prefillKernel, systemPrompt }) {
   const loadStart = Date.now();
   const loadResult = await Promise.race([
     page.evaluate(
@@ -142,9 +154,15 @@ async function runOnce(page, { prompt, toolsMode, maxNewTokens, maxSteps, expect
   const runStart = Date.now();
   const transcript = await Promise.race([
     page.evaluate(
-      ({ prompt, toolsMode, maxNewTokens, maxSteps }) =>
-        window.__llm.run(prompt, { tools: toolsMode, maxNewTokens, maxSteps }),
-      { prompt, toolsMode, maxNewTokens, maxSteps }
+      ({ prompt, toolsMode, toolsArray, maxNewTokens, maxSteps, prefillKernel, systemPrompt }) =>
+        window.__llm.run(prompt, {
+          tools: toolsArray || toolsMode,
+          maxNewTokens,
+          maxSteps,
+          prefillKernel: prefillKernel || undefined,
+          systemPrompt: systemPrompt || undefined,
+        }),
+      { prompt, toolsMode, toolsArray, maxNewTokens, maxSteps, prefillKernel, systemPrompt }
     ),
     stopSignal.then(() => { throw new Error('gpu-debug-failure during run'); }),
     new Promise((_, rej) => setTimeout(() => rej(new Error('run timeout')), timeoutRun)),
@@ -164,6 +182,12 @@ async function runOnce(page, { prompt, toolsMode, maxNewTokens, maxSteps, expect
 async function main() {
   await mkdir(OUT_DIR, { recursive: true });
   await mkdir(path.dirname(CONSOLE_LOG_PATH), { recursive: true });
+
+  let toolsArray = null;
+  if (TOOLS_FILE) {
+    toolsArray = JSON.parse(await readFile(TOOLS_FILE, 'utf8'));
+    console.log(`Loaded ${toolsArray.length} tools from ${TOOLS_FILE}`);
+  }
 
   const browser = await chromium.launch({
     headless: true,
@@ -210,11 +234,14 @@ async function main() {
     const { loadResult, loadMs, transcript, runMs, pass, expectError } = await runOnce(page, {
       prompt: PROMPT,
       toolsMode: TOOLS_MODE,
+      toolsArray,
       maxNewTokens: MAX_NEW,
       maxSteps: MAX_STEPS,
       expect: EXPECT,
       timeoutLoad: TIMEOUT_LOAD,
       timeoutRun: TIMEOUT_RUN,
+      prefillKernel: PREFILL_KERNEL,
+      systemPrompt: SYSTEM_PROMPT,
     });
 
     report.loadMs = loadMs;
@@ -231,10 +258,19 @@ async function main() {
     for (const step of transcript.steps) {
       console.log(
         `  step ${step.index}: prompt=${step.promptTokens}tok prefill=${step.prefillMs?.toFixed(1)}ms ` +
-        `decode=${step.decodeMs?.toFixed(1)}ms generated=${step.tokens}tok`
+        `decode=${step.decodeMs?.toFixed(1)}ms generated=${step.tokens}tok ` +
+        `calls=${step.calls ? JSON.stringify(step.calls) : '(final)'}`
       );
     }
     if (expectError) console.log(`FAIL: ${expectError}`);
+
+    // For a native `llm-agent run --tokens <this file>` comparison — see
+    // scripts/headless/README.md and docs/BENCHMARKS.md's numerical
+    // bisection sessions.
+    if (TOKENS_OUT_PATH && transcript.steps[0]?.promptTokenIds) {
+      await writeFile(TOKENS_OUT_PATH, JSON.stringify(transcript.steps[0].promptTokenIds));
+      console.log(`Wrote step 0 prompt token ids (${transcript.steps[0].promptTokenIds.length}) to ${TOKENS_OUT_PATH}`);
+    }
 
     if (BENCH_N) {
       report.benchRuns = [];

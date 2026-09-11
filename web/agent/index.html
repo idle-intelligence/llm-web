@@ -89,7 +89,11 @@ const CANNED = {
 async function toolCaller(name, args) {
   await new Promise((r) => setTimeout(r, 150)); // pretend it's a real round trip
   const fn = CANNED[name];
-  if (!fn) throw new Error(`no canned tool: ${name}`);
+  // Any tool outside the two demo tools (e.g. a Sonos tool set passed via
+  // scripts/headless/run.mjs's --tools-file) gets a generic canned "ok" —
+  // this page has no real backend for those, and headless numerical
+  // bisection only needs the model's own output, not a real tool result.
+  if (!fn) return { ok: true, tool: name, args };
   return fn(args);
 }
 
@@ -150,6 +154,7 @@ const client = new LlmClient({
     } else if (msg.type === 'status') {
       if (msg.phase === 'idle') stopThinkingTimer();
       else startThinkingTimer(msg.phase);
+      if (msg.note) logLine(`[status] ${msg.phase}: ${msg.note}`);
     }
   },
 });
@@ -211,9 +216,12 @@ window.__llm = {
     return info;
   },
   async run(prompt, opts = {}) {
-    const { tools = 'demo', maxNewTokens = 256, maxSteps = 6 } = opts;
-    const toolList = tools === 'none' ? [] : TOOLS;
-    return client.run(prompt, toolList, { maxNewTokens, maxSteps }, logStep);
+    const { tools = 'demo', maxNewTokens = 256, maxSteps = 6, systemPrompt, prefillKernel } = opts;
+    // `tools` may be 'demo' | 'none' | an actual MCP tools/list array (see
+    // scripts/headless/run.mjs's --tools-file) — a real array is used
+    // as-is instead of the two built-in demo tools.
+    const toolList = Array.isArray(tools) ? tools : tools === 'none' ? [] : TOOLS;
+    return client.run(prompt, toolList, { maxNewTokens, maxSteps, systemPrompt, prefillKernel }, logStep);
   },
   reset() {
     client.reset();
