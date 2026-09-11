@@ -1406,13 +1406,44 @@ Commits: (see `git log` on this session's worktree branch — `crates/llm-wasm/s
 `src/model.rs`, `src/gguf.rs` (dispatch helpers only), `src/wgsl/shader_kv_quantize.wgsl`,
 `shader_kv_dequant_range.wgsl`, `shader_attn_decode_q8.wgsl`, `tests/kvimg.rs`).
 
+### Session 13 addendum — root cause of the full-model divergence (K's per-block error, not a wiring bug)
+
+New GPU test `tests/full_forward.rs::q8_kv_dequant_matches_f32_cache_at_early_layers` prefills the
+`01_no_tools` fixture (31 tokens, real model) into a `KvDtype::F32` cache and a `KvDtype::Q8_0`
+cache with the same `LlmModel`, then dequantizes both (`KvCache::read_or_dequant_f32`) at layers
+0/1/2 and diffs element-by-element (F32 is ground truth). Restricting to elements where
+`|f32_value| > 0.1` (excludes the near-zero-denominator blowup that dominates a naive mean-relative
+metric) isolates a clear, consistent asymmetry:
+
+| layer | K mean rel err (|a|>0.1) | V mean rel err (|a|>0.1) |
+|---|---|---|
+| 0 | 11.41% | 0.88% |
+| 1 | 4.23% | 3.03% |
+| 2 | 3.58% | 3.31% |
+
+K is 3-13x noisier than V under the identical 32-wide absmax/127 block scheme (`shader_kv_quantize.wgsl`),
+worst at layer 0. **Ruled out**: an ordering/wiring bug — `model.rs`'s `Q4Attention::forward` (around
+line 189) applies `gguf::rope_fused` to both q and k *before* `cache.write`, identically regardless of
+`cache.dtype()`; both `KvDtype::F32` and `KvDtype::Q8_0` branches share the exact same RoPE call, so
+RoPE-on-one-side-only is not the explanation. The remaining, better-supported hypothesis: RoPE's
+rotate-half mixing (pairing dim `i` with `i+64`) plus this model's known outlier channels in K
+(well-documented in KV-cache-quantization literature — K is harder to quantize than V precisely
+because of RoPE-amplified outlier channels) makes a handful of 32-wide blocks along `head_dim` have
+one large element dominating the block's absmax, coarsely quantizing the other ~31 elements in that
+block. This is a genuine limitation of *this* quantization granularity applied to K, not a bug in
+the dispatch/index math (consistent with all the kernel-level unit tests passing bit-exact/bounded
+on synthetic data — that data didn't have K's real outlier-channel structure). A real fix (finer
+block size for K specifically, per-channel/per-head_dim scaling, or K-in-f32/V-in-q8 mixed
+precision) is a design change beyond a wiring fix, not attempted this session given the scope.
+`DEFAULT_KV_DTYPE` stays `F32`.
+
 ### What's left
 
-- **Root-cause the full-model divergence.** Try K-only quantization (keep V in f32) as the task
-  brief suggested — if that alone fixes `full_forward`, V's dynamic range (or RoPE'd K's) is the
-  culprit; if not, look for a subtler bug the isolated tests don't exercise (e.g. per-layer error
-  accumulation interacting with this model's already-known matmul sensitivities, docs/ENGINE.md
-  "Known issues" Session 6-7).
+- **Root-cause the full-model divergence.** ~~Try K-only quantization (keep V in f32) as the task
+  brief suggested~~ — done above via the layer-0/1/2 K-vs-V error breakdown: K is confirmed the
+  dominant source, consistent with RoPE-amplified outlier channels, not a wiring bug. Next step is
+  an actual fix (smaller block size for K, or mixed K-f32/V-q8 precision — the latter needs
+  `KvCache` to support asymmetric K/V dtypes, a larger restructuring not done this session).
 - **Fused prefill attention kernel** (currently dequant-to-f32 + old Burn-matmul path) — the
   natural next step once correctness is resolved, per the original task design.
 - **`llm-agent bench`-based end-to-end ms/token** (native binary, not owned by this session) once

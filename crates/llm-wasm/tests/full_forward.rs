@@ -612,3 +612,99 @@ impl Xorshift {
         (x >> 32) as u32
     }
 }
+
+/// Session 13 diagnostic (docs/BENCHMARKS.md): `full_forward` shows total
+/// divergence (31/31 argmax mismatches, zero top-5 overlap) under
+/// `KvDtype::Q8_0` despite every kernel being individually correct on
+/// synthetic data. Isolate *where* real-model K/V first departs from the
+/// F32 cache's values by prefilling the 01 fixture (31 tokens) into a
+/// `KvDtype::F32` cache and a `KvDtype::Q8_0` cache with the same model,
+/// then comparing `read_or_dequant_f32` at layers 0/1/2: F32's output is
+/// the ground truth (no quantization involved), Q8_0's is the dequantized
+/// value actually fed to attention. Reports max/mean relative error and
+/// the fraction of elements exceeding 5% relative error, per layer/tensor.
+#[test]
+fn q8_kv_dequant_matches_f32_cache_at_early_layers() {
+    use llm_wasm::kv::{KvCache, KvDtype};
+
+    let Some(tokens) = load_tokens("01_no_tools") else {
+        return;
+    };
+
+    let device = WgpuDevice::default();
+    let Some(model) = load_model(&device) else {
+        return;
+    };
+
+    let cfg = model.config();
+    let head_dim = cfg.hidden_size / cfg.num_heads;
+    let max_ctx = 64usize;
+
+    let mut cache_f32 =
+        KvCache::new_with_dtype(cfg.num_layers, cfg.num_kv_heads, head_dim, max_ctx, model.device(), KvDtype::F32);
+    let mut cache_q8 =
+        KvCache::new_with_dtype(cfg.num_layers, cfg.num_kv_heads, head_dim, max_ctx, model.device(), KvDtype::Q8_0);
+
+    let _ = model.forward_hidden(&tokens, &mut cache_f32).unwrap();
+    let _ = model.forward_hidden(&tokens, &mut cache_q8).unwrap();
+
+    let kv_len = tokens.len();
+
+    fn compare(name: &str, layer: usize, head_dim: usize, kv_len: usize, f32_data: &[f32], q8_data: &[f32]) -> (f32, f64, f64) {
+        assert_eq!(f32_data.len(), q8_data.len());
+        let mut max_rel = 0f32;
+        let mut max_rel_idx = 0usize;
+        let mut sum_rel = 0f64;
+        let mut over_5pct = 0usize;
+        // "big-signal" stats: only elements where the F32 reference itself
+        // is non-negligible (rules out near-zero-denominator blowups
+        // dominating the mean and hiding whether large-magnitude elements
+        // are also wrong).
+        let mut big_n = 0usize;
+        let mut big_sum_rel = 0f64;
+        let mut big_max_rel = 0f32;
+        for (idx, (a, b)) in f32_data.iter().zip(q8_data.iter()).enumerate() {
+            let rel = (a - b).abs() / a.abs().max(1e-3);
+            if rel > max_rel {
+                max_rel = rel;
+                max_rel_idx = idx;
+            }
+            sum_rel += rel as f64;
+            if rel > 0.05 {
+                over_5pct += 1;
+            }
+            if a.abs() > 0.1 {
+                big_n += 1;
+                big_sum_rel += rel as f64;
+                big_max_rel = big_max_rel.max(rel);
+            }
+        }
+        let mean_rel = sum_rel / f32_data.len() as f64;
+        let frac_over = over_5pct as f64 / f32_data.len() as f64;
+        let big_mean_rel = if big_n > 0 { big_sum_rel / big_n as f64 } else { 0.0 };
+        let head = max_rel_idx / (kv_len * head_dim);
+        let rem = max_rel_idx % (kv_len * head_dim);
+        let row = rem / head_dim;
+        let dim = rem % head_dim;
+        eprintln!(
+            "layer {layer} {name}: max_rel={max_rel:.4} mean_rel={mean_rel:.6} frac>5%={frac_over:.4} (n={}) | |a|>0.1 subset: n={big_n} mean_rel={big_mean_rel:.6} max_rel={big_max_rel:.4} | worst elem @ (head={head},row={row},dim={dim}): f32={:.6} q8={:.6}",
+            f32_data.len(),
+            f32_data[max_rel_idx],
+            q8_data[max_rel_idx]
+        );
+        (max_rel, mean_rel, frac_over)
+    }
+
+    for layer in [0usize, 1, 2] {
+        let (k_f32, v_f32) = cache_f32.read_or_dequant_f32(layer, kv_len);
+        let (k_q8, v_q8) = cache_q8.read_or_dequant_f32(layer, kv_len);
+
+        let k_f32_data = k_f32.into_data().into_vec::<f32>().unwrap();
+        let v_f32_data = v_f32.into_data().into_vec::<f32>().unwrap();
+        let k_q8_data = k_q8.into_data().into_vec::<f32>().unwrap();
+        let v_q8_data = v_q8.into_data().into_vec::<f32>().unwrap();
+
+        compare("K", layer, head_dim, kv_len, &k_f32_data, &k_q8_data);
+        compare("V", layer, head_dim, kv_len, &v_f32_data, &v_q8_data);
+    }
+}
