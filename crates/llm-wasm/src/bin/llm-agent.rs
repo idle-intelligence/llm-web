@@ -13,8 +13,9 @@ use llm_wasm::agent::{Agent, FixtureCaller, Generator};
 use llm_wasm::eval::{self, ToolOrder, ToolSet};
 use llm_wasm::gguf::{q4_matmul, set_skip_matvec_for_bench, Q4ModelLoader, Q4Tensor};
 use llm_wasm::kv::KvCache;
+use llm_wasm::kvimg::{self, Dtype, Header, KvImage};
 use llm_wasm::model::LlmModel;
-use llm_wasm::template::ChatTemplate;
+use llm_wasm::template::{ChatTemplate, Message, Tool};
 use llm_wasm::tokenizer::Tokenizer;
 
 #[derive(Parser)]
@@ -137,6 +138,33 @@ enum Commands {
         #[arg(long, default_value_t = 12288)]
         max_ctx: usize,
     },
+    /// Build-time export of a prefix KV image (docs/ENGINE.md "Prefix KV
+    /// images"): renders the system+tools prefix exactly as the agent loop
+    /// does, prefills it natively, and writes `<out-dir>/<prefix_key>.kvimg`
+    /// (+ a human-readable `.json` sidecar) so any engine instance can
+    /// import it instead of running prefill token-by-token.
+    KvExport {
+        #[arg(long)]
+        gguf: Option<PathBuf>,
+        #[arg(long = "model-dir")]
+        model_dir: Option<PathBuf>,
+        /// Path to an MCP `tools/list`-shaped JSON array — e.g.
+        /// `fixtures/sonos/tools-12.json`, `fixtures/sonos/tools.json`, or
+        /// any other file with the same shape.
+        #[arg(long)]
+        tools: PathBuf,
+        #[arg(long, default_value = "You are a helpful assistant with access to tools.")]
+        system: String,
+        #[arg(long, default_value = "q8_0")]
+        dtype: String,
+        #[arg(long = "out-dir")]
+        out_dir: Option<PathBuf>,
+        /// `listing-first` (move `get_households_and_groups_and_players`
+        /// to the front if present, per docs/ENGINE.md "Known issues /
+        /// fixed") or `as-is` (`--tools` file's own order, unchanged).
+        #[arg(long = "tool-order", default_value = "listing-first")]
+        tool_order: String,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -202,6 +230,15 @@ fn main() -> anyhow::Result<()> {
             lengths,
             max_ctx,
         } => autotune_sweep(&gguf, &tokens, &lengths, max_ctx),
+        Commands::KvExport {
+            gguf,
+            model_dir,
+            tools,
+            system,
+            dtype,
+            out_dir,
+            tool_order,
+        } => kv_export(gguf, model_dir, &tools, &system, &dtype, out_dir, &tool_order),
     }
 }
 
@@ -793,6 +830,163 @@ fn today() -> String {
         .ok()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_else(|| "unknown-date".to_string())
+}
+
+/// Parse a `tools/list`-shaped JSON array (`{"name", "description",
+/// "inputSchema"}` per entry — MCP shape, same as `web.rs`'s `parse_tools`
+/// and `eval.rs`'s `load_mcp_tools`, duplicated here since this bin takes
+/// an arbitrary `--tools` file rather than one of the two fixed fixture
+/// files `eval.rs`'s loader is built around) and apply `--tool-order`.
+fn load_tools_generic(path: &std::path::Path, tool_order: &str) -> anyhow::Result<Vec<Tool>> {
+    let raw: Vec<serde_json::Value> = serde_json::from_str(
+        &std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("reading --tools {path:?}: {e}"))?,
+    )?;
+    let mut tools: Vec<Tool> = raw
+        .into_iter()
+        .map(|t| {
+            let name = t["name"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("tool entry missing string `name`: {t}"))?;
+            let description = t["description"].as_str().unwrap_or("");
+            Ok(Tool::from_mcp(name, description, t["inputSchema"].clone()))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+    match tool_order {
+        "as-is" => {}
+        "listing-first" => {
+            if let Some(pos) = tools
+                .iter()
+                .position(|t| t.function.name == "get_households_and_groups_and_players")
+            {
+                let listing = tools.remove(pos);
+                tools.insert(0, listing);
+            }
+        }
+        other => anyhow::bail!("--tool-order must be `listing-first` or `as-is`, got `{other}`"),
+    }
+    Ok(tools)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn kv_export(
+    gguf: Option<PathBuf>,
+    model_dir: Option<PathBuf>,
+    tools_path: &std::path::Path,
+    system: &str,
+    dtype_arg: &str,
+    out_dir: Option<PathBuf>,
+    tool_order: &str,
+) -> anyhow::Result<()> {
+    let gguf_path = gguf.unwrap_or_else(|| home_relative(DEFAULT_GGUF_SUFFIX));
+    let model_dir = model_dir.unwrap_or_else(|| home_relative(DEFAULT_MODEL_DIR_SUFFIX));
+    let out_dir = out_dir.unwrap_or_else(|| home_relative("Code/idle-intelligence/models/kv"));
+    std::fs::create_dir_all(&out_dir).map_err(|e| anyhow::anyhow!("creating --out-dir {out_dir:?}: {e}"))?;
+
+    let dtype = match dtype_arg {
+        "f32" => Dtype::F32,
+        "q8_0" => Dtype::Q8_0,
+        other => anyhow::bail!("--dtype must be `f32` or `q8_0`, got `{other}`"),
+    };
+
+    let t0 = std::time::Instant::now();
+    let tools = load_tools_generic(tools_path, tool_order)?;
+    println!("tools: {} ({tool_order})", tools.len());
+
+    // -- load model --
+    let device = WgpuDevice::default();
+    let t_load = std::time::Instant::now();
+    let file = File::open(&gguf_path).map_err(|e| anyhow::anyhow!("opening --gguf {gguf_path:?}: {e}"))?;
+    let reader = BufReader::new(file);
+    let mut loader = Q4ModelLoader::new(reader)?;
+
+    // Model-identity fingerprint: header bytes (magic through the
+    // tensor-info table — a few KB) + file size, NOT a hash of the full
+    // 1.7GB+ file (see kvimg.rs's "Hashing" module docs) — cheap enough to
+    // recompute on every run, so no on-disk cache is needed.
+    let file_len = loader.reader().file_len();
+    let header_bytes = loader.reader_mut().header_bytes()?;
+    let model_fingerprint = kvimg::gguf_header_fingerprint(file_len, &header_bytes);
+    eprintln!("model fingerprint: {model_fingerprint} ({:.1}s)", t0.elapsed().as_secs_f32());
+
+    let parts = loader.load_deferred(&device)?;
+    drop(loader);
+    let model = parts.finalize(&device)?;
+    eprintln!("model load: {:.2}s", t_load.elapsed().as_secs_f32());
+
+    // -- load tokenizer + chat template --
+    let tok_path = model_dir.join("tokenizer.json");
+    let cfg_path = model_dir.join("tokenizer_config.json");
+    let tokenizer = Tokenizer::from_json(&std::fs::read(&tok_path)?)
+        .map_err(|e| anyhow::anyhow!("loading tokenizer from {tok_path:?}: {e}"))?;
+    let cfg: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&cfg_path)?)?;
+    let template = ChatTemplate::from_tokenizer_config(&cfg)?;
+
+    // -- render the system+tools prefix: common leading tokens between two
+    // content-free probe utterances, same technique `web.rs`'s
+    // `compute_prefix_len`/`run_eval`'s `prefix_tokens` use, just with two
+    // probes instead of a real utterance + one probe (kv-export has no
+    // utterance of its own — the whole point is a prefix that's the same
+    // regardless of the user turn that follows it). --
+    let render = |u: &str| -> anyhow::Result<Vec<u32>> {
+        let messages = vec![Message::system(system), Message::user(u)];
+        let prompt = template.render_prompt(&messages, &tools, true)?;
+        tokenizer.encode(&prompt, false).map_err(|e| anyhow::anyhow!("{e}"))
+    };
+    let a = render("kv-export-probe-alpha")?;
+    let b = render("totally-different-probe-beta")?;
+    let prefix_len = a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count();
+    anyhow::ensure!(
+        prefix_len > 0,
+        "empty common prefix — system+tools rendering produced no shared leading tokens"
+    );
+    let prefix_tokens = a[..prefix_len].to_vec();
+    let prefix_text = tokenizer
+        .decode(&prefix_tokens, false)
+        .map_err(|e| anyhow::anyhow!("decoding prefix tokens: {e}"))?;
+    let prefix_key = kvimg::prefix_key(&model_fingerprint, &prefix_text);
+
+    // -- prefill natively --
+    let mut cache = model.new_cache(prefix_tokens.len());
+    let t_prefill = std::time::Instant::now();
+    let _hidden = model.forward_hidden(&prefix_tokens, &mut cache)?;
+    let prefill_s = t_prefill.elapsed().as_secs_f32();
+    let layers = cache.export_prefix(prefix_tokens.len());
+
+    let header = Header {
+        model_fingerprint: model_fingerprint.clone(),
+        prefix_key: prefix_key.clone(),
+        tokens: prefix_tokens.clone(),
+        n_layers: model.config().num_layers,
+        n_kv_heads: model.config().num_kv_heads,
+        head_dim: model.config().hidden_size / model.config().num_heads,
+        dtype: dtype.as_str().to_string(),
+        engine: format!("llm-wasm/{}", env!("CARGO_PKG_VERSION")),
+        created: today(),
+    };
+
+    let mut buf = Vec::new();
+    let layer_refs: Vec<(&[f32], &[f32])> = layers.iter().map(|(k, v)| (k.as_slice(), v.as_slice())).collect();
+    KvImage::write(&mut buf, &header, dtype, layer_refs)?;
+
+    let out_path = out_dir.join(format!("{prefix_key}.kvimg"));
+    std::fs::write(&out_path, &buf)?;
+    let sidecar_path = out_dir.join(format!("{prefix_key}.json"));
+    std::fs::write(&sidecar_path, serde_json::to_string_pretty(&header)?)?;
+
+    let total_s = t0.elapsed().as_secs_f32();
+    println!("prefix_key: {prefix_key}");
+    println!("tokens: {}", prefix_tokens.len());
+    println!(
+        "size: {} bytes ({:.1} MB), dtype={}",
+        buf.len(),
+        buf.len() as f64 / 1e6,
+        dtype.as_str()
+    );
+    println!("prefill: {prefill_s:.2}s, total: {total_s:.2}s");
+    println!("wrote: {}", out_path.display());
+    println!("wrote: {}", sidecar_path.display());
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
