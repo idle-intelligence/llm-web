@@ -13,6 +13,7 @@
  *                                                 // to the model as a tool-error result (docs/ENGINE.md "Agent loop"),
  *                                                 // not treated as a worker-fatal failure.
  *   {type:'reset'}                                // drop conversation, keep model
+ *   {type:'dumpPrefix', id, tools:[MCP tool objects], opts:{systemPrompt?}}  // debug/tooling, see handleDumpPrefix
  * worker -> page
  *   {type:'progress', loaded, total, shard}
  *   {type:'ready', info:{model, prefixTokens?}}
@@ -20,6 +21,7 @@
  *   {type:'token', id, text}                      // streaming — NOT emitted by this engine, see docs/ENGINE.md
  *   {type:'callTool', id, callId, name, args}
  *   {type:'status', id?, phase:'prefill'|'decode'|'idle'|'kv-image', note?}
+ *   {type:'prefixInputs', id, data:{tools, system, diet, prefixText, prefixTokens, modelFingerprint, prefixKey}}
  *   {type:'done', id, transcript:{steps, finalText, totalMs}}
  *   {type:'error', id?, message}
  *
@@ -125,6 +127,9 @@ self.onmessage = async (e) => {
         break;
       case 'toolResult':
         handleToolResult(msg);
+        break;
+      case 'dumpPrefix':
+        handleDumpPrefix(msg);
         break;
       case 'reset':
         if (busy) {
@@ -274,17 +279,17 @@ async function handleRun(msg) {
 
   try {
     self.postMessage({ type: 'status', id, phase: 'kv-image' });
-    const { imported } = await maybeImportKvImage(toolsJson, systemPrompt);
+    await maybeImportKvImage(toolsJson, systemPrompt);
 
     self.postMessage({ type: 'status', id, phase: 'prefill' });
+    // On a miss, `engine.start()` itself now exports+saves the freshly-
+    // prefilled prefix to OPFS internally, right after prefill and before
+    // decode (`web.rs::generate_attempt`'s `maybe_export_kv_prefix_to_opfs`)
+    // — robust against a later decode/tool-call failure this turn, unlike
+    // the JS-side fire-and-forget call this replaced (which only ran after
+    // the whole step, prefill+decode, had already resolved).
     let outcome = JSON.parse(await engine.start(utterance, toolsJson, JSON.stringify(opts || {})));
     self.postMessage({ type: 'status', id, phase: 'idle' });
-
-    if (!imported) {
-      // Fire-and-forget: don't block this run's response on a GPU readback
-      // + OPFS write for next time.
-      maybeExportKvImage(toolsJson, systemPrompt);
-    }
 
     while (true) {
       if (outcome.outcome === 'error') {
@@ -383,7 +388,16 @@ async function opfsWriteKvImage(key, bytes) {
   }
 }
 
-/** Check OPFS then network for a prefix KV image and import it if found and valid. */
+/**
+ * Check OPFS then network for a prefix KV image and import it if found and
+ * valid. Status text is deliberately honest about what actually happened —
+ * a coordinator finding (2026-09-11): a prior version's generic "checking
+ * kv image" note read the same whether the image hit or missed, which
+ * masked an 80s-prefill miss (mismatched key — the image had been
+ * exported from a fixture tools file + eval system prompt + listing-first
+ * order, not the live tools/list + page's own system prompt/order) as if
+ * nothing unusual had happened.
+ */
 async function maybeImportKvImage(toolsJson, systemPrompt) {
   let key;
   try {
@@ -392,7 +406,9 @@ async function maybeImportKvImage(toolsJson, systemPrompt) {
     console.warn('[llm-worker] prefixKey failed:', err.message || err);
     return { imported: false, key: null };
   }
+  console.log(`[llm-worker] prefix key: ${key}`);
 
+  const t0 = performance.now();
   let bytes = await opfsReadKvImage(key);
   let source = 'opfs';
   if (!bytes && kvBaseUrl) {
@@ -409,7 +425,11 @@ async function maybeImportKvImage(toolsJson, systemPrompt) {
     }
   }
   if (!bytes) {
-    self.postMessage({ type: 'status', phase: 'kv-image', note: `miss (${key})` });
+    self.postMessage({
+      type: 'status',
+      phase: 'kv-image',
+      note: `no KV image for this tool set (key ${key}); prefilling once, will be saved to browser storage for next time`,
+    });
     return { imported: false, key };
   }
 
@@ -419,33 +439,30 @@ async function maybeImportKvImage(toolsJson, systemPrompt) {
   } catch (err) {
     console.warn('[llm-worker] importKvImage failed:', err.message || err);
   }
+  const ms = Math.round(performance.now() - t0);
   if (ok) {
+    // Token count isn't returned by importKvImage; read it back from
+    // engine.info() (cacheLen reflects the just-imported prefix length).
+    let tokens = '?';
+    try {
+      tokens = JSON.parse(engine.info()).cacheLen ?? '?';
+    } catch {
+      // best-effort only
+    }
     self.postMessage({
       type: 'status',
       phase: 'kv-image',
-      note: `loaded ${(bytes.length / 1e6).toFixed(1)} MB from ${source} (${key})`,
+      note: `KV image loaded (${tokens} tokens, ${(bytes.length / 1e6).toFixed(1)} MB, ${ms} ms, from ${source}, key ${key})`,
     });
     if (source === 'network') await opfsWriteKvImage(key, bytes);
   } else {
-    self.postMessage({ type: 'status', phase: 'kv-image', note: `mismatch, ignoring (${key})` });
-  }
-  return { imported: ok, key };
-}
-
-/** Export the just-prefilled prefix and save it to OPFS for next time (fire-and-forget). */
-async function maybeExportKvImage(toolsJson, systemPrompt) {
-  try {
-    const bytes = await engine.exportKvImage(toolsJson, systemPrompt);
-    const key = engine.prefixKey(toolsJson, systemPrompt);
-    await opfsWriteKvImage(key, bytes);
     self.postMessage({
       type: 'status',
       phase: 'kv-image',
-      note: `exported ${(bytes.length / 1e6).toFixed(1)} MB to OPFS (${key})`,
+      note: `KV image found but did not match this model/tools/system (key ${key}); ignoring, prefilling instead`,
     });
-  } catch (err) {
-    console.warn('[llm-worker] kv image export failed:', err.message || err);
   }
+  return { imported: ok, key };
 }
 
 const DEFAULT_TOOL_TIMEOUT_MS = 30000;
@@ -477,4 +494,33 @@ function handleToolResult(msg) {
   // page never actually answered.
   if (msg.error) pending.resolve({ error: msg.error });
   else pending.resolve(msg.result);
+}
+
+/**
+ * `{type:'dumpPrefix', id, tools, opts}` -> `{type:'prefixInputs', id,
+ * data:{tools, system, diet, prefixText, prefixTokens, modelFingerprint,
+ * prefixKey}}`. Debug/tooling entry point (coordinator's "priority fix",
+ * 2026-09-11): dumps exactly the dieted tools JSON + system + rendered
+ * prefix text `engine.prefixKey`/`start()` actually use, so a caller can
+ * save `{system, tools}` from `data` and hand it to `bin/llm-agent.rs`'s
+ * `kv-export --tools <file> --system <system>` to reproduce this exact
+ * `prefixKey` byte for byte (`kv-export` doesn't diet its own `--tools`
+ * input at all — see `web.rs::prefix_inputs`'s doc comment). Does not
+ * require a run in progress; does require `load` to have completed.
+ */
+function handleDumpPrefix(msg) {
+  const { id, tools, opts } = msg;
+  if (!engine) {
+    self.postMessage({ type: 'error', id, message: 'engine not loaded — send {type:"load"} first' });
+    return;
+  }
+  const toolsJson = JSON.stringify(tools);
+  const systemPrompt = (opts && opts.systemPrompt) || DEFAULT_SYSTEM_PROMPT;
+  try {
+    const data = JSON.parse(engine.prefixInputs(toolsJson, systemPrompt));
+    console.log(`[llm-worker] prefix inputs: key=${data.prefixKey} tokens=${data.prefixTokens}`);
+    self.postMessage({ type: 'prefixInputs', id, data });
+  } catch (err) {
+    self.postMessage({ type: 'error', id, message: 'dumpPrefix failed: ' + (err.message || err) });
+  }
 }

@@ -58,9 +58,37 @@ export class LlmClient {
     this.worker.postMessage({ type: 'reset' });
   }
 
+  /**
+   * Debug/tooling entry point (coordinator's "priority fix", 2026-09-11):
+   * the exact dieted tools JSON + system + rendered prefix text
+   * `run(utterance, tools, opts)` would use to compute its prefix-KV-image
+   * cache key, without actually running a turn. Save `{system: data.system,
+   * tools: data.tools}` from the result to a file and hand it to
+   * `bin/llm-agent.rs`'s `kv-export --tools <file> --system <system>` to
+   * reproduce `data.prefixKey` byte for byte.
+   * @param {object[]} tools
+   * @param {object} [opts] - only `systemPrompt` is read
+   * @returns {Promise<{tools, system, diet, prefixText, prefixTokens, modelFingerprint, prefixKey}>}
+   */
+  dumpPrefixInputs(tools, opts) {
+    const id = String(this.nextRunId++);
+    return new Promise((resolve, reject) => {
+      this.pendingRuns.set(id, { resolve: (data) => resolve(data), reject, onStep: () => {}, _isPrefixDump: true });
+      this.worker.postMessage({ type: 'dumpPrefix', id, tools, opts: opts || {} });
+    });
+  }
+
   _handleMessage(msg) {
     this.onEvent(msg);
     switch (msg.type) {
+      case 'prefixInputs': {
+        const run = this.pendingRuns.get(msg.id);
+        if (run) {
+          run.resolve(msg.data);
+          this.pendingRuns.delete(msg.id);
+        }
+        break;
+      }
       case 'progress':
       case 'status':
         break; // surfaced via onEvent only

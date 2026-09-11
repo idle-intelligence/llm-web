@@ -55,6 +55,22 @@ const TIMEOUT_LOAD = parseInt(args['timeout-load'] ?? String(10 * 60 * 1000), 10
 const TIMEOUT_RUN = parseInt(args['timeout-run'] ?? String(6 * 60 * 1000), 10);
 const JSON_PATH = args.json ?? null;
 const TOKENS_OUT_PATH = args['tokens-out'] ?? null;
+// Debug/tooling entry point (coordinator's "priority fix", 2026-09-11):
+// loads the model, then dumps the exact dieted tools JSON + system +
+// rendered prefix text `--tools-file`/`--system` would use for a real
+// run's prefix-KV-image cache key, without actually running a turn — see
+// `web.rs::prefix_inputs`. Writes `{system, tools}` to this path, ready
+// for `bin/llm-agent.rs`'s `kv-export --tools <path> --system <system>`.
+const DUMP_PREFIX_PATH = args['dump-prefix'] ?? null;
+// Browser-path mini-eval gate (coordinator's ask, 2026-09-11): runs a
+// handful of `eval/utterances.json` cases through the real page (MCP-
+// shaped canned results via index.html's toolCaller fetching
+// fixtures/sonos/results/*.json), scoring each with a JS port of
+// eval/README.md's rules — minimal, not a byte-exact port of
+// crates/llm-wasm/src/eval.rs's scorer. Requires all selected cases to
+// pass; see `runMiniEvalGate`.
+const CASES_PATH = args.cases ?? null;
+const ONLY_IDS = args.only ? String(args.only).split(',').map((s) => s.trim()).filter(Boolean) : null;
 
 const PLAYWRIGHT_MODULE =
   process.env.PLAYWRIGHT_MODULE ??
@@ -179,6 +195,137 @@ async function runOnce(page, { prompt, toolsMode, toolsArray, maxNewTokens, maxS
   return { loadResult, loadMs, transcript, runMs, pass, expectError };
 }
 
+// ---------------------------------------------------------------------------
+// Browser-path mini-eval gate — minimal JS port of eval/README.md's
+// scoring rules (not a byte-exact port of crates/llm-wasm/src/eval.rs's
+// native scorer). `actualCalls` is the flattened, in-order list of
+// {name, args} across every `NeedTools` step of one transcript.
+// ---------------------------------------------------------------------------
+function isMutatingToolName(name) {
+  return !(name.startsWith('get_') || name.startsWith('list_'));
+}
+
+function argsSubsetMatch(actualArgs, expectedArgs) {
+  if (!expectedArgs) return true;
+  for (const [k, v] of Object.entries(expectedArgs)) {
+    if (JSON.stringify((actualArgs || {})[k]) !== JSON.stringify(v)) return false;
+  }
+  return true;
+}
+
+/** Returns { pass, reason }. */
+function scoreCase(caseDef, actualCalls) {
+  const { expected, accept } = caseDef;
+
+  if (accept === 'no_mutation') {
+    const mutated = actualCalls.find((c) => isMutatingToolName(c.name));
+    return mutated
+      ? { pass: false, reason: `unexpected mutating call ${mutated.name}` }
+      : { pass: true, reason: 'no mutating call, as expected' };
+  }
+  if (accept === 'any_play') {
+    const played = actualCalls.some((c) => c.name.startsWith('play_'));
+    return played ? { pass: true, reason: 'some play_* call made' } : { pass: false, reason: 'no play_* call made' };
+  }
+  if (accept === 'exact') {
+    if (actualCalls.length !== expected.length) {
+      return { pass: false, reason: `expected exactly ${expected.length} call(s), got ${actualCalls.length}` };
+    }
+    for (let i = 0; i < expected.length; i++) {
+      if (actualCalls[i].name !== expected[i].name || !argsSubsetMatch(actualCalls[i].args, expected[i].args)) {
+        return { pass: false, reason: `call ${i} mismatch: expected ${expected[i].name}, got ${actualCalls[i]?.name}` };
+      }
+    }
+    return { pass: true, reason: 'exact match' };
+  }
+
+  // subset (default): every expected call must appear, in order, among
+  // actualCalls; extra *read* calls in between are free, but an
+  // unexpected mutating call where a specific mutating call was expected
+  // next is not.
+  let ai = 0;
+  for (const exp of expected) {
+    let found = false;
+    while (ai < actualCalls.length) {
+      const c = actualCalls[ai++];
+      if (c.name === exp.name && argsSubsetMatch(c.args, exp.args)) {
+        found = true;
+        break;
+      }
+      if (isMutatingToolName(exp.name) && isMutatingToolName(c.name)) {
+        return { pass: false, reason: `expected mutating call ${exp.name}, got ${c.name} instead` };
+      }
+    }
+    if (!found) return { pass: false, reason: `expected call ${exp.name} never happened` };
+  }
+  return { pass: true, reason: 'all expected calls matched, in order' };
+}
+
+async function runMiniEvalGate(page, { casesPath, onlyIds, toolsArray, maxNewTokens, maxSteps, timeoutLoad, timeoutRun, systemPrompt }) {
+  const allCases = JSON.parse(await readFile(casesPath, 'utf8'));
+  const cases = onlyIds ? allCases.filter((c) => onlyIds.includes(c.id)) : allCases;
+  if (onlyIds && cases.length !== onlyIds.length) {
+    const missing = onlyIds.filter((id) => !cases.some((c) => c.id === id));
+    throw new Error(`--only named case id(s) not found in ${casesPath}: ${missing.join(', ')}`);
+  }
+
+  console.log(`\n=== mini-eval gate: ${cases.length} case(s) ===`);
+
+  const loadStart = Date.now();
+  await Promise.race([
+    page.evaluate(
+      ({ gguf, tokenizer, template }) =>
+        window.__llm.load({ id: 'headless', shards: [gguf], tokenizerUrl: tokenizer, templateUrl: template }),
+      { gguf: GGUF, tokenizer: TOKENIZER, template: TEMPLATE }
+    ),
+    stopSignal.then(() => { throw new Error('gpu-debug-failure during load'); }),
+    new Promise((_, rej) => setTimeout(() => rej(new Error('load timeout')), timeoutLoad)),
+  ]);
+  console.log(`Model loaded in ${Date.now() - loadStart}ms`);
+
+  const results = [];
+  for (const caseDef of cases) {
+    await page.evaluate(() => window.__llm.reset());
+    const start = Date.now();
+    let transcript;
+    let errorMessage = null;
+    try {
+      transcript = await Promise.race([
+        page.evaluate(
+          ({ utterance, toolsArray, maxNewTokens, maxSteps, systemPrompt }) =>
+            window.__llm.run(utterance, { tools: toolsArray, maxNewTokens, maxSteps, systemPrompt: systemPrompt || undefined }),
+          { utterance: caseDef.utterance, toolsArray, maxNewTokens, maxSteps, systemPrompt }
+        ),
+        stopSignal.then(() => { throw new Error('gpu-debug-failure during run'); }),
+        new Promise((_, rej) => setTimeout(() => rej(new Error('run timeout')), timeoutRun)),
+      ]);
+    } catch (err) {
+      errorMessage = err.message || String(err);
+    }
+    const wallMs = Date.now() - start;
+
+    let scored = { pass: false, reason: errorMessage ? `run failed: ${errorMessage}` : 'no transcript' };
+    let actualCalls = [];
+    if (transcript) {
+      actualCalls = transcript.steps.flatMap((s) => s.calls || []);
+      scored = scoreCase(caseDef, actualCalls);
+    }
+    results.push({ id: caseDef.id, ...scored, wallMs, steps: transcript?.steps?.length ?? 0, actualCalls });
+
+    const stepSummary = (transcript?.steps || [])
+      .map((s) => `${s.calls ? s.calls.map((c) => c.name).join('+') : 'final'}(${s.prefillMs?.toFixed(0)}/${s.decodeMs?.toFixed(0)}ms)`)
+      .join(' -> ');
+    console.log(
+      `  [${scored.pass ? 'PASS' : 'FAIL'}] ${caseDef.id} "${caseDef.utterance}" — ${wallMs}ms, ` +
+      `${transcript?.steps?.length ?? 0} step(s): ${stepSummary || '(none)'} — ${scored.reason}`
+    );
+  }
+
+  const passCount = results.filter((r) => r.pass).length;
+  console.log(`\nmini-eval gate: ${passCount}/${results.length} passed`);
+  return { results, passCount, total: results.length };
+}
+
 async function main() {
   await mkdir(OUT_DIR, { recursive: true });
   await mkdir(path.dirname(CONSOLE_LOG_PATH), { recursive: true });
@@ -228,6 +375,58 @@ async function main() {
     record('worker-created', w.url());
     w.on('console', (msg) => record('worker-console', msg.text()));
   });
+
+  if (DUMP_PREFIX_PATH) {
+    try {
+      console.log(`Loading model: ${GGUF}`);
+      await Promise.race([
+        page.evaluate(
+          ({ gguf, tokenizer, template }) =>
+            window.__llm.load({ id: 'headless', shards: [gguf], tokenizerUrl: tokenizer, templateUrl: template }),
+          { gguf: GGUF, tokenizer: TOKENIZER, template: TEMPLATE }
+        ),
+        stopSignal.then(() => { throw new Error('gpu-debug-failure during load'); }),
+        new Promise((_, rej) => setTimeout(() => rej(new Error('load timeout')), TIMEOUT_LOAD)),
+      ]);
+      const data = await page.evaluate(
+        ({ toolsArray, toolsMode, systemPrompt }) =>
+          window.__llm.dumpPrefixInputs({ tools: toolsArray || toolsMode, systemPrompt }),
+        { toolsArray, toolsMode: TOOLS_MODE, systemPrompt: SYSTEM_PROMPT }
+      );
+      await writeFile(DUMP_PREFIX_PATH, JSON.stringify({ system: data.system, tools: data.tools }, null, 2));
+      console.log(`prefix key: ${data.prefixKey} (${data.prefixTokens} tokens, diet=${data.diet})`);
+      console.log(`Wrote prefix inputs to ${DUMP_PREFIX_PATH}`);
+      report.pass = true;
+      report.dumpPrefix = data;
+    } catch (err) {
+      console.error('dump-prefix failed:', err);
+      report.error = String(err);
+    }
+    await finish(browser, report);
+    return;
+  }
+
+  if (CASES_PATH) {
+    try {
+      const gate = await runMiniEvalGate(page, {
+        casesPath: CASES_PATH,
+        onlyIds: ONLY_IDS,
+        toolsArray,
+        maxNewTokens: MAX_NEW,
+        maxSteps: MAX_STEPS,
+        timeoutLoad: TIMEOUT_LOAD,
+        timeoutRun: TIMEOUT_RUN,
+        systemPrompt: SYSTEM_PROMPT,
+      });
+      report.miniEvalGate = gate;
+      report.pass = gate.passCount === gate.total;
+    } catch (err) {
+      console.error('mini-eval gate failed:', err);
+      report.error = String(err);
+    }
+    await finish(browser, report);
+    return;
+  }
 
   try {
     console.log(`Loading model: ${GGUF}`);

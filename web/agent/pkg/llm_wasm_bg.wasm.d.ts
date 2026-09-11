@@ -9,6 +9,7 @@ export const llmengine_importKvImage: (a: number, b: number, c: number, d: numbe
 export const llmengine_info: (a: number) => [number, number];
 export const llmengine_load: (a: number, b: number, c: number, d: number, e: number, f: any) => any;
 export const llmengine_new: () => number;
+export const llmengine_prefixInputs: (a: number, b: number, c: number, d: number, e: number) => [number, number, number, number];
 export const llmengine_prefixKey: (a: number, b: number, c: number, d: number, e: number) => [number, number, number, number];
 export const llmengine_provideToolResults: (a: number, b: number, c: number) => any;
 export const llmengine_reset: (a: number) => void;
@@ -18,7 +19,7 @@ export const llmengine_start: (a: number, b: number, c: number, d: number, e: nu
 export const start: () => void;
 export const wasm_bindgen__convert__closures_____invoke__h2d808c2d349e4bb9: (a: number, b: number, c: any) => [number, number];
 export const wasm_bindgen__convert__closures_____invoke__h39f7e6a28896bbe3: (a: number, b: number, c: any, d: any) => void;
-export const wasm_bindgen__convert__closures_____invoke__hb2da000e6071c27b: (a: number, b: number, c: any) => void;
+export const wasm_bindgen__convert__closures_____invoke__h453dd913ed002526: (a: number, b: number, c: any) => void;
 export const __wbindgen_malloc: (a: number, b: number) => number;
 export const __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;
 export const __wbindgen_exn_store: (a: number) => void;

@@ -43,7 +43,7 @@
     <option value="demo" selected>demo (get_weather, set_thermostat)</option>
     <option value="none">none (plain chat)</option>
   </select>
-  <p><button id="run-btn" disabled>Run</button> <button id="reset-btn" disabled>Reset conversation</button></p>
+  <p><button id="run-btn" disabled>Run</button> <button id="reset-btn" disabled>Reset conversation</button> <button id="dump-prefix-btn" disabled>Export prefix inputs</button></p>
 </fieldset>
 
 <fieldset>
@@ -86,15 +86,50 @@ const CANNED = {
   set_thermostat: (args) => ({ room: args.room, temperature: args.temperature, ok: true }),
 };
 
+// Real Sonos fixture results (fixtures/sonos/results/*.json), served
+// through this page's own dev server via the `fixtures/` symlink
+// (web/agent/fixtures -> ../../fixtures) — used when a Sonos tool set is
+// passed via scripts/headless/run.mjs's --tools-file, since those fixtures
+// carry the real groupId/playerId/householdId values the id rule
+// (grammar.rs's IdValues) needs to harvest for id-taking tools like
+// `pause`/`set_group_volume` to ever become callable.
+const SONOS_RESULTS_BASE = './fixtures/sonos/results/';
+const sonosResultCache = new Map();
+async function fetchSonosResult(name) {
+  if (sonosResultCache.has(name)) return sonosResultCache.get(name);
+  let data = null;
+  try {
+    const res = await fetch(`${SONOS_RESULTS_BASE}${name}.json`, { cache: 'no-store' });
+    if (res.ok) data = await res.json();
+  } catch {
+    // no fixture for this tool — fall through to the generic fallback below
+  }
+  sonosResultCache.set(name, data);
+  return data;
+}
+
+// Wrap a canned/fallback JS value as the shape a real MCP `tools/call`
+// result actually has: `{"content":[{"type":"text","text":"<pretty JSON>"}]}`,
+// mirroring `agent.rs::FixtureCaller`'s `as_mcp_result` (docs/ENGINE.md
+// "Agent loop" / "The id rule"). A bare parsed value here — what this page
+// returned before this fix — is exactly the shape mismatch that let the id
+// rule silently starve every id-taking tool in a real browser session
+// while native fixture-driven evals passed (see docs/ENGINE.md's
+// grammar.rs "content/text" fix).
+function asMcpResult(value) {
+  return { content: [{ type: 'text', text: JSON.stringify(value, null, 2) }] };
+}
+
 async function toolCaller(name, args) {
   await new Promise((r) => setTimeout(r, 150)); // pretend it's a real round trip
   const fn = CANNED[name];
-  // Any tool outside the two demo tools (e.g. a Sonos tool set passed via
-  // scripts/headless/run.mjs's --tools-file) gets a generic canned "ok" —
-  // this page has no real backend for those, and headless numerical
-  // bisection only needs the model's own output, not a real tool result.
-  if (!fn) return { ok: true, tool: name, args };
-  return fn(args);
+  if (fn) return asMcpResult(fn(args));
+  const fixture = await fetchSonosResult(name);
+  if (fixture) return asMcpResult(fixture);
+  // No canned fn and no fixture file for this tool name — generic
+  // acknowledgement, still MCP-shaped so the page never hands the engine a
+  // bare-object result.
+  return asMcpResult({ ok: true, tool: name, args });
 }
 
 window.__llmLog = [];
@@ -174,6 +209,7 @@ document.getElementById('load-btn').addEventListener('click', async () => {
     logLine(`ready: ${JSON.stringify(info)}`);
     document.getElementById('run-btn').disabled = false;
     document.getElementById('reset-btn').disabled = false;
+    document.getElementById('dump-prefix-btn').disabled = false;
   } catch (err) {
     document.getElementById('status').textContent = `Load failed: ${err.message || err}`;
     logLine(`load error: ${err.message || err}`);
@@ -202,6 +238,30 @@ document.getElementById('reset-btn').addEventListener('click', () => {
   logLine('--- conversation reset ---');
 });
 
+// Debug/tooling (coordinator's "priority fix", 2026-09-11): dumps the
+// exact dieted tools JSON + system + rendered prefix text this page's next
+// `run()` would use for its prefix-KV-image cache key — save
+// `{system, tools}` from the downloaded file and hand it to
+// `bin/llm-agent.rs`'s `kv-export --tools <file> --system <system>` to
+// reproduce the key exactly, even when the live tools/list differs from
+// whatever fixture a human might otherwise reach for.
+document.getElementById('dump-prefix-btn').addEventListener('click', async () => {
+  const toolsMode = document.getElementById('tools-select').value;
+  const toolList = toolsMode === 'none' ? [] : TOOLS;
+  try {
+    const data = await client.dumpPrefixInputs(toolList, {});
+    logLine(`prefix key: ${data.prefixKey} (${data.prefixTokens} tokens, diet=${data.diet})`);
+    const blob = new Blob([JSON.stringify({ system: data.system, tools: data.tools }, null, 2)], { type: 'application/json' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `prefix-inputs-${data.prefixKey || 'unknown'}.json`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+  } catch (err) {
+    logLine(`! prefix inputs error: ${err.message || err}`);
+  }
+});
+
 // ---------------------------------------------------------------------------
 // window.__llm: page automation surface for scripts/headless/run.mjs (and
 // any other external driver). Thin wrapper over the same `client` the human
@@ -216,6 +276,7 @@ window.__llm = {
     window.__llm.state.info = info;
     document.getElementById('run-btn').disabled = false;
     document.getElementById('reset-btn').disabled = false;
+    document.getElementById('dump-prefix-btn').disabled = false;
     return info;
   },
   async run(prompt, opts = {}) {
@@ -228,6 +289,11 @@ window.__llm = {
   },
   reset() {
     client.reset();
+  },
+  async dumpPrefixInputs(opts = {}) {
+    const { tools = 'demo', systemPrompt } = opts;
+    const toolList = Array.isArray(tools) ? tools : tools === 'none' ? [] : TOOLS;
+    return client.dumpPrefixInputs(toolList, { systemPrompt });
   },
 };
 </script>

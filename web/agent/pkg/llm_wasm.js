@@ -141,6 +141,47 @@ export class LlmEngine {
         return this;
     }
     /**
+     * Debug/tooling entry point (coordinator's "priority fix", 2026-09-11):
+     * dumps the *exact* dieted tools JSON + system + rendered prefix text
+     * this engine would use to compute `prefixKey(tools_json, system)` —
+     * so a caller (the demo page's "export prefix inputs" button, or
+     * `scripts/headless/run.mjs --dump-prefix`) can save `{"tools":
+     * <dieted raw JSON>, "system": ...}` to a file and hand it straight to
+     * `bin/llm-agent.rs`'s `kv-export --tools <file> --system <system>`,
+     * reproducing this exact `prefixKey`/`prefixText` byte for byte.
+     * `kv-export` doesn't diet its own `--tools` input at all
+     * (`load_tools_generic`), so this is the only way to get the two
+     * sides to agree when the page's live `tools_json` differs from
+     * whatever fixture a human might otherwise reach for — see
+     * `docs/ENGINE.md` "Prefix KV images" for the mismatch this fixes.
+     * Errors under the same conditions as `prefixKey`.
+     * @param {string} tools_json
+     * @param {string} system
+     * @returns {string}
+     */
+    prefixInputs(tools_json, system) {
+        let deferred4_0;
+        let deferred4_1;
+        try {
+            const ptr0 = passStringToWasm0(tools_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            const len0 = WASM_VECTOR_LEN;
+            const ptr1 = passStringToWasm0(system, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            const len1 = WASM_VECTOR_LEN;
+            const ret = wasm.llmengine_prefixInputs(this.__wbg_ptr, ptr0, len0, ptr1, len1);
+            var ptr3 = ret[0];
+            var len3 = ret[1];
+            if (ret[3]) {
+                ptr3 = 0; len3 = 0;
+                throw takeFromExternrefTable0(ret[2]);
+            }
+            deferred4_0 = ptr3;
+            deferred4_1 = len3;
+            return getStringFromWasm0(ptr3, len3);
+        } finally {
+            wasm.__wbindgen_free(deferred4_0, deferred4_1, 1);
+        }
+    }
+    /**
      * Prefix-KV-image cache key for `tools_json`/`system` under the
      * currently loaded model (`docs/ENGINE.md` "Prefix KV images"):
      * `sha256(model_fingerprint || rendered_prefix_text)`, computed the same way
@@ -337,6 +378,10 @@ function __wbg_get_imports() {
             const ret = arg0.call(arg1, arg2, arg3, arg4);
             return ret;
         }, arguments); },
+        __wbg_close_5a622b4cb725a7ba: function(arg0) {
+            const ret = arg0.close();
+            return ret;
+        },
         __wbg_copyBufferToBuffer_55e9540007aef863: function() { return handleError(function (arg0, arg1, arg2, arg3, arg4) {
             arg0.copyBufferToBuffer(arg1, arg2, arg3, arg4);
         }, arguments); },
@@ -375,6 +420,10 @@ function __wbg_get_imports() {
             const ret = arg0.createShaderModule(arg1);
             return ret;
         },
+        __wbg_createWritable_48e9fe4d9f57480d: function(arg0) {
+            const ret = arg0.createWritable();
+            return ret;
+        },
         __wbg_dispatchWorkgroupsIndirect_cdb624732570d2ab: function(arg0, arg1, arg2) {
             arg0.dispatchWorkgroupsIndirect(arg1, arg2);
         },
@@ -409,6 +458,14 @@ function __wbg_get_imports() {
         },
         __wbg_getBindGroupLayout_9fc232d022bf8cca: function(arg0, arg1) {
             const ret = arg0.getBindGroupLayout(arg1 >>> 0);
+            return ret;
+        },
+        __wbg_getDirectory_31689baa30c0e94c: function(arg0) {
+            const ret = arg0.getDirectory();
+            return ret;
+        },
+        __wbg_getFileHandle_fbeae17e3423535f: function(arg0, arg1, arg2, arg3) {
+            const ret = arg0.getFileHandle(getStringFromWasm0(arg1, arg2), arg3);
             return ret;
         },
         __wbg_getMappedRange_9f13d158ba3946fd: function() { return handleError(function (arg0, arg1, arg2) {
@@ -767,6 +824,9 @@ function __wbg_get_imports() {
         __wbg_set_count_39e1b3c03c19b528: function(arg0, arg1) {
             arg0.count = arg1 >>> 0;
         },
+        __wbg_set_create_389985224a53c83d: function(arg0, arg1) {
+            arg0.create = arg1 !== 0;
+        },
         __wbg_set_end_of_pass_write_index_786588764311c9aa: function(arg0, arg1) {
             arg0.endOfPassWriteIndex = arg1 >>> 0;
         },
@@ -923,6 +983,10 @@ function __wbg_get_imports() {
             const ret = typeof window === 'undefined' ? null : window;
             return isLikeNone(ret) ? 0 : addToExternrefTable0(ret);
         },
+        __wbg_storage_acdb07065231b40b: function(arg0) {
+            const ret = arg0.storage;
+            return ret;
+        },
         __wbg_submit_fc5b9a1154201a58: function(arg0, arg1) {
             arg0.submit(arg1);
         },
@@ -955,13 +1019,17 @@ function __wbg_get_imports() {
         __wbg_writeBuffer_7d54524c36f1c7e2: function() { return handleError(function (arg0, arg1, arg2, arg3, arg4, arg5) {
             arg0.writeBuffer(arg1, arg2, arg3, arg4, arg5);
         }, arguments); },
+        __wbg_write_cf0a33f74a3ab40b: function() { return handleError(function (arg0, arg1, arg2) {
+            const ret = arg0.write(getArrayU8FromWasm0(arg1, arg2));
+            return ret;
+        }, arguments); },
         __wbindgen_generic_0000000000000001: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 3962, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
-            const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__hb2da000e6071c27b);
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 3967, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h453dd913ed002526);
             return ret;
         },
         __wbindgen_generic_0000000000000002: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 4099, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 4104, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h2d808c2d349e4bb9);
             return ret;
         },
@@ -1003,8 +1071,8 @@ function __wbg_get_imports() {
     };
 }
 
-function wasm_bindgen__convert__closures_____invoke__hb2da000e6071c27b(arg0, arg1, arg2) {
-    wasm.wasm_bindgen__convert__closures_____invoke__hb2da000e6071c27b(arg0, arg1, arg2);
+function wasm_bindgen__convert__closures_____invoke__h453dd913ed002526(arg0, arg1, arg2) {
+    wasm.wasm_bindgen__convert__closures_____invoke__h453dd913ed002526(arg0, arg1, arg2);
 }
 
 function wasm_bindgen__convert__closures_____invoke__h2d808c2d349e4bb9(arg0, arg1, arg2) {

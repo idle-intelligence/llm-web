@@ -75,6 +75,23 @@ export class LlmEngine {
      */
     constructor();
     /**
+     * Debug/tooling entry point (coordinator's "priority fix", 2026-09-11):
+     * dumps the *exact* dieted tools JSON + system + rendered prefix text
+     * this engine would use to compute `prefixKey(tools_json, system)` —
+     * so a caller (the demo page's "export prefix inputs" button, or
+     * `scripts/headless/run.mjs --dump-prefix`) can save `{"tools":
+     * <dieted raw JSON>, "system": ...}` to a file and hand it straight to
+     * `bin/llm-agent.rs`'s `kv-export --tools <file> --system <system>`,
+     * reproducing this exact `prefixKey`/`prefixText` byte for byte.
+     * `kv-export` doesn't diet its own `--tools` input at all
+     * (`load_tools_generic`), so this is the only way to get the two
+     * sides to agree when the page's live `tools_json` differs from
+     * whatever fixture a human might otherwise reach for — see
+     * `docs/ENGINE.md` "Prefix KV images" for the mismatch this fixes.
+     * Errors under the same conditions as `prefixKey`.
+     */
+    prefixInputs(tools_json: string, system: string): string;
+    /**
      * Prefix-KV-image cache key for `tools_json`/`system` under the
      * currently loaded model (`docs/ENGINE.md` "Prefix KV images"):
      * `sha256(model_fingerprint || rendered_prefix_text)`, computed the same way
@@ -152,6 +169,7 @@ export interface InitOutput {
     readonly llmengine_info: (a: number) => [number, number];
     readonly llmengine_load: (a: number, b: number, c: number, d: number, e: number, f: any) => any;
     readonly llmengine_new: () => number;
+    readonly llmengine_prefixInputs: (a: number, b: number, c: number, d: number, e: number) => [number, number, number, number];
     readonly llmengine_prefixKey: (a: number, b: number, c: number, d: number, e: number) => [number, number, number, number];
     readonly llmengine_provideToolResults: (a: number, b: number, c: number) => any;
     readonly llmengine_reset: (a: number) => void;
@@ -161,7 +179,7 @@ export interface InitOutput {
     readonly start: () => void;
     readonly wasm_bindgen__convert__closures_____invoke__h2d808c2d349e4bb9: (a: number, b: number, c: any) => [number, number];
     readonly wasm_bindgen__convert__closures_____invoke__h39f7e6a28896bbe3: (a: number, b: number, c: any, d: any) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__hb2da000e6071c27b: (a: number, b: number, c: any) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__h453dd913ed002526: (a: number, b: number, c: any) => void;
     readonly __wbindgen_malloc: (a: number, b: number) => number;
     readonly __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;
     readonly __wbindgen_exn_store: (a: number) => void;

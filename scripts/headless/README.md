@@ -65,6 +65,9 @@ servers.
 | `--timeout-run` | `360000` (6 min) | ms to wait for `run()` |
 | `--json <path>` | (none) | write a JSON report (chromium version, adapter info, load ms, steps, tokens, text, tok/s, gpu errors, pass/fail) |
 | `--out <path>` | `scripts/headless/out/console.log` | full console log path |
+| `--dump-prefix <path>` | (none) | load the model, then write `{system, tools}` — the exact dieted tools JSON + system this run would use for its prefix-KV-image cache key (`web.rs::prefix_inputs`) — to `<path>` and exit, no run. Feed the file straight to `bin/llm-agent.rs`'s `kv-export --tools <path> --system <system>` to reproduce the key exactly. |
+| `--cases <path>` | (none) | browser-path mini-eval gate: run every case in an `eval/utterances.json`-shaped file (or just `--only`'s subset) through the real page, MCP-shaped canned results from `fixtures/sonos/results/*.json` via `index.html`'s toolCaller, scored with a minimal JS port of `eval/README.md`'s rules. Exits 1 unless every selected case passes. Combine with `--tools-file`. |
+| `--only <id,id,...>` | (none) | with `--cases`, restrict the gate to these case ids |
 
 `PLAYWRIGHT_MODULE` env var overrides where the `playwright` module is
 resolved from (default: the install in `dusty-games-platform`'s
