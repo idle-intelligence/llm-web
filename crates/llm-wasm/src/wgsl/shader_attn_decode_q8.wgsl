@@ -87,7 +87,10 @@ fn main(
 
     // Phase A: raw scores for this thread's strided keys, tracking a
     // running max.
-    var local_max: f32 = -3.4028235e38;
+    // -1e30: a sentinel far below any attention score. Do NOT use
+    // -3.4028235e38 (f32::MIN as Rust prints it): Tint rejects it as
+    // not representable in f32, while native Naga accepts it.
+    var local_max: f32 = -1e30;
     var key: u32 = tid;
     loop {
         if (key >= kv_len) {
