@@ -8,13 +8,15 @@
  *
  * page -> worker
  *   {type:'load', model:{id, shards:[url...], tokenizerUrl, templateUrl}}   // templateUrl: tokenizer_config.json
- *   {type:'run', id, utterance, tools:[MCP tool objects], opts:{maxSteps:6, maxNewTokens:256, temperature:0, toolTimeoutMs:30000, systemPrompt?, prefillKernel?:'naive'|'pinned'}}
- *   {type:'toolResult', id, callId, result}      // or {type:'toolResult', id, callId, error}
+ *   {type:'run', id, utterance, tools:[MCP tool objects], opts:{maxSteps:6, maxNewTokens:256, temperature:0, toolTimeoutMs:30000, systemPrompt?, prefillKernel?:'naive'|'pinned', constrained?:true, diet?:true}}
+ *   {type:'toolResult', id, callId, result}      // or {type:'toolResult', id, callId, error} — an `error` is fed back
+ *                                                 // to the model as a tool-error result (docs/ENGINE.md "Agent loop"),
+ *                                                 // not treated as a worker-fatal failure.
  *   {type:'reset'}                                // drop conversation, keep model
  * worker -> page
  *   {type:'progress', loaded, total, shard}
  *   {type:'ready', info:{model, prefixTokens?}}
- *   {type:'step', id, step:{index, promptTokens, promptTokenIds, text, calls:[{name,args}]|null, prefillMs, decodeMs, tokens}}
+ *   {type:'step', id, step:{index, promptTokens, promptTokenIds, text, calls:[{name,args}]|null, prefillMs, decodeMs, tokens, modelSteps, forcedTokens, retries, toolErrors}}
  *   {type:'token', id, text}                      // streaming — NOT emitted by this engine, see docs/ENGINE.md
  *   {type:'callTool', id, callId, name, args}
  *   {type:'status', id?, phase:'prefill'|'decode'|'idle'|'kv-image', note?}
@@ -299,6 +301,10 @@ async function handleRun(msg) {
         prefillMs: outcome.step.prefillMs,
         decodeMs: outcome.step.decodeMs,
         tokens: outcome.step.tokens,
+        modelSteps: outcome.step.modelSteps,
+        forcedTokens: outcome.step.forcedTokens,
+        retries: outcome.step.retries,
+        toolErrors: outcome.step.toolErrors,
       };
       steps.push(step);
       self.postMessage({ type: 'step', id, step });
@@ -463,6 +469,12 @@ function handleToolResult(msg) {
   const pending = pendingToolCalls.get(msg.callId);
   if (!pending) return;
   pendingToolCalls.delete(msg.callId);
-  if (msg.error) pending.reject(new Error(msg.error));
+  // A page-reported tool error is fed back to the model as a normal
+  // `{"error": ...}` result (docs/ENGINE.md "Agent loop" — `engine`'s
+  // `provideToolResults` handles the retry/consecutive-error-cap policy),
+  // not a worker-fatal rejection — only `callToolFromWorker`'s own timeout
+  // below still aborts the run, since that's a worker-side failure the
+  // page never actually answered.
+  if (msg.error) pending.resolve({ error: msg.error });
   else pending.resolve(msg.result);
 }

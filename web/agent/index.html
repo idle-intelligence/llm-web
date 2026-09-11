@@ -109,9 +109,12 @@ function logLine(text) {
 }
 function logStep(step) {
   const callsText = step.calls ? step.calls.map((c) => `${c.name}(${JSON.stringify(c.args)})`).join(', ') : '(final answer)';
+  const forcedShare = step.tokens ? ((100 * (step.forcedTokens || 0)) / step.tokens).toFixed(0) : '0';
   const text =
     `step ${step.index}: ${callsText} — prompt=${step.promptTokens} tok, ` +
-    `prefill=${step.prefillMs.toFixed(1)}ms, decode=${step.decodeMs.toFixed(1)}ms, generated=${step.tokens} tok\n` +
+    `prefill=${step.prefillMs.toFixed(1)}ms, decode=${step.decodeMs.toFixed(1)}ms, generated=${step.tokens} tok ` +
+    `(${step.modelSteps ?? step.tokens} model steps, ${forcedShare}% forced), ` +
+    `retries=${step.retries || 0}, toolErrors=${step.toolErrors || 0}\n` +
     `  raw: ${step.text}`;
   window.__llmLog.push(text);
   const div = document.createElement('div');

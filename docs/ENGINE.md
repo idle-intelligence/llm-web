@@ -451,10 +451,32 @@ against real WebGPU `maxStorageBufferBindingSize` on M2/Chrome.
 - `await engine.start(utterance: string, toolsJson: string, optsJson: string): Promise<string>` —
   begins a turn; `toolsJson` is a JSON array of MCP `tools/list` entries
   (`{"name","description","inputSchema"}`), `optsJson` is `{"maxNewTokens"?, "maxSteps"?,
-  "systemPrompt"?}` (all optional). Returns a JSON **string** (not `serde-wasm-bindgen`, to avoid
-  adding that dependency for a shape this simple):
-  `{"outcome":"needTools","calls":[{"call_id","name","arguments"}...],"step":{"promptTokens","text","prefillMs","decodeMs","tokens"}}`,
+  "systemPrompt"?, "constrained"?, "diet"?}` (all optional; `constrained`/`diet` default `true`).
+  Returns a JSON **string** (not `serde-wasm-bindgen`, to avoid adding that dependency for a shape
+  this simple):
+  `{"outcome":"needTools","calls":[{"call_id","name","arguments"}...],"step":{"promptTokens","text","prefillMs","decodeMs","tokens","modelSteps","forcedTokens","retries","toolErrors"}}`,
   `{"outcome":"final","text":...,"step":{...}}`, or `{"outcome":"error","message":...}`.
+  **Mirrors `agent.rs::Agent`'s behaviour** (`docs/ENGINE.md` "Agent loop" / "Schema-constrained
+  decoding" — this was `web.rs`'s TODO, now done): `LlmEngine::run_step` builds a fresh
+  `Grammar::for_tools` every step from the current `tools` + an `IdValues` accumulated across the
+  whole conversation from every tool result (`provideToolResults`), wraps it in a
+  `GrammarConstraint`, and drives `LlmEngine::generate_attempt`'s decode loop through the same
+  jump-forward semantics as `model.rs::LlmModel::decode_with_constraint` (batched `forward_hidden`
+  for forced runs of at least `JUMP_MIN_TOKENS = 8`, masked-argmax otherwise) — on by default
+  (`opts.constrained`). An empty tool-call array, unparsable `[...]` JSON, or a call naming a tool
+  outside `tools` doesn't become an assistant turn: retry 1 forces constrained decoding on (if not
+  already), retry 2 appends a generic nudge (`"Respond with a tool call from the list or a final
+  answer."`) as a `user` message, and exhausting 2 retries returns `"outcome":"error"` —
+  retries don't consume `maxSteps`. `provideToolResults` checks each result with
+  `tools::tool_error_message` (an MCP `isError: true` result or a top-level `error` field) and
+  feeds an error back as `{"error": "<msg>"}` via `tools::format_tool_error` instead of the normal
+  tool-result shape; 3 consecutive tool errors gives up with `"outcome":"error"` instead of
+  looping. `start()`/the KV-image entry points (`prefixKey`/`importKvImage`/`exportKvImage`) run
+  raw MCP tool lists through `schemadiet::diet_tools(_, DietLevel::Level1)` before `Tool::from_mcp`
+  when `opts.diet` (default `true`) is on — all four entry points use the same `self.diet` flag so
+  the rendered/cached prefix stays consistent between `start()` and the KV-image path. `step`'s
+  `modelSteps`/`forcedTokens` mirror `model.rs::GenerateStats` (a jump-forward run of `k` tokens is
+  1 model step, not `k`); `retries`/`toolErrors` mirror `agent.rs::Step`'s same-named fields.
 - `await engine.provideToolResults(resultsJson: string): Promise<string>` — `resultsJson` is
   `[{"call_id","result"}...]`, keyed by the `call_id`s from the prior `needTools` outcome; same
   return shape as `start`.

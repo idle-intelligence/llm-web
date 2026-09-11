@@ -46,19 +46,48 @@ use burn::backend::wgpu::WgpuDevice;
 
 use crate::agent::PendingToolCall;
 use crate::gguf::Q4ModelLoader;
+use crate::grammar::{self, Constraint, Grammar, GrammarConstraint, IdValues, TokenVocab};
 use crate::kv::KvCache;
 use crate::kvimg::{self, Dtype, Header, KvImage};
 use crate::model::LlmModel;
-use crate::sample::greedy;
+use crate::sample::{greedy, greedy_masked};
+use crate::schemadiet::{diet_tools, DietLevel};
 use crate::template::{ChatTemplate, Message, Tool, ToolCallEntry, ToolCallFunction};
 use crate::tokenizer::Tokenizer;
-use crate::tools::{format_tool_result, parse_output, ParsedOutput};
+use crate::tools::{format_tool_error, format_tool_result, parse_output, tool_error_message, ParsedOutput};
 
 /// Default context length: sized (per `kv.rs`'s doc comment) for the 34-tool
 /// Sonos prompt plus conversation headroom.
 const DEFAULT_MAX_CTX: usize = 12288;
 const DEFAULT_MAX_NEW_TOKENS: usize = 256;
 const DEFAULT_MAX_STEPS: usize = 6;
+
+/// Per-step cap on malformed-output retries (empty tool-call array,
+/// unparsable `[...]` JSON, or a call naming a tool outside the current
+/// `tools` set) — mirrors `agent.rs::DEFAULT_MAX_RETRIES`. See
+/// `docs/ENGINE.md` "Agent loop" for the retry policy `run_step` mirrors.
+const MAX_RETRIES: usize = 2;
+
+/// A generic, non-committal nudge appended as a `user` message when a model
+/// output is malformed/empty/unknown-tool twice in a row — mirrors
+/// `agent.rs::RETRY_NOTE`.
+const RETRY_NOTE: &str = "Respond with a tool call from the list or a final answer.";
+
+/// Number of consecutive tool-error results `run_step` will feed back to
+/// the model before giving up instead of trying again — mirrors
+/// `agent.rs::MAX_CONSECUTIVE_TOOL_ERRORS`.
+const MAX_CONSECUTIVE_TOOL_ERRORS: usize = 2;
+
+/// Diet level applied to raw MCP tool lists before `Tool::from_mcp` when
+/// `LlmEngine`'s diet flag is on (the default) — mirrors
+/// `agent.rs::AGENT_DIET_LEVEL`.
+const ENGINE_DIET_LEVEL: DietLevel = DietLevel::Level1;
+
+/// A forced-run length below this is decoded one token at a time via
+/// masked argmax instead of the batched jump-forward path — mirrors
+/// `model.rs::JUMP_MIN_TOKENS` (kept as a separate constant here since
+/// that one isn't `pub`; see docs/ENGINE.md "Session 12 speed addendum").
+const JUMP_MIN_TOKENS: usize = 8;
 
 /// Device initialized by `initWgpuDevice()` — used by every `LlmEngine`.
 static WGPU_DEVICE: OnceLock<WgpuDevice> = OnceLock::new();
@@ -192,6 +221,24 @@ pub struct LlmEngine {
     /// Cached (tools set, common prefix token length) — recomputed only
     /// when `tools` changes between `start()` calls.
     prefix_cache: Option<(Vec<Tool>, usize)>,
+    /// Consecutive tool-error results fed back so far this turn (reset by
+    /// `start`/`reset`) — see `provide_tool_results`.
+    consecutive_tool_errors: usize,
+
+    /// Whether to constrain generation to `grammar.rs`'s tool-call schema
+    /// (see `docs/ENGINE.md` "Schema-constrained decoding"). On by
+    /// default — set via `opts.constrained`.
+    constrained: bool,
+    /// Whether `start()`/the KV-image entry points run raw MCP tool lists
+    /// through `schemadiet::diet_tools` before `Tool::from_mcp`. On by
+    /// default — set via `opts.diet`.
+    diet: bool,
+    /// Id-shaped strings harvested from every tool result seen so far this
+    /// conversation (see `docs/ENGINE.md` "The id rule"). Reset in
+    /// `start`/`reset`.
+    id_values: IdValues,
+    /// Built lazily on first constrained step and cached.
+    token_vocab: Option<TokenVocab>,
 }
 
 #[wasm_bindgen]
@@ -229,6 +276,11 @@ impl LlmEngine {
             pending_calls: Vec::new(),
             step_index: 0,
             prefix_cache: None,
+            consecutive_tool_errors: 0,
+            constrained: true,
+            diet: true,
+            id_values: IdValues::new(),
+            token_vocab: None,
         }
     }
 
@@ -350,11 +402,13 @@ impl LlmEngine {
     /// when the step completes (see module docs).
     #[wasm_bindgen(js_name = start)]
     pub async fn start(&mut self, utterance: String, tools_json: String, opts_json: String) -> Result<String, JsError> {
-        self.tools = parse_tools(&tools_json)?;
         apply_opts(self, &opts_json)?;
+        self.tools = parse_tools_dieted(&tools_json, self.diet)?;
         self.messages = vec![Message::system(&self.system_prompt), Message::user(&utterance)];
         self.step_index = 0;
         self.pending_calls.clear();
+        self.consecutive_tool_errors = 0;
+        self.id_values = IdValues::new();
 
         match self.compute_prefix_len(&utterance) {
             Ok(len) => self.prefix_cache = Some((self.tools.clone(), len)),
@@ -374,7 +428,21 @@ impl LlmEngine {
             .map_err(|e| JsError::new(&format!("invalid results_json: {e}")))?;
         for r in results {
             if let Some(pending) = self.pending_calls.iter().find(|c| c.call_id == r.call_id) {
-                self.messages.push(format_tool_result(&pending.name, &r.result));
+                if let Some(error_message) = tool_error_message(&r.result) {
+                    self.consecutive_tool_errors += 1;
+                    if self.consecutive_tool_errors > MAX_CONSECUTIVE_TOOL_ERRORS {
+                        self.pending_calls.clear();
+                        return Ok(error_json(&format!(
+                            "{} consecutive tool errors (giving up after {}): {error_message}",
+                            self.consecutive_tool_errors, MAX_CONSECUTIVE_TOOL_ERRORS
+                        )));
+                    }
+                    self.messages.push(format_tool_error(&pending.name, &error_message));
+                } else {
+                    self.consecutive_tool_errors = 0;
+                    self.id_values.collect_from_result(&r.result);
+                    self.messages.push(format_tool_result(&pending.name, &r.result));
+                }
             }
         }
         self.pending_calls.clear();
@@ -391,6 +459,8 @@ impl LlmEngine {
         self.step_index = 0;
         self.prefix_cache = None;
         self.resident_tokens.clear();
+        self.consecutive_tool_errors = 0;
+        self.id_values = IdValues::new();
         if let Some(cache) = self.cache.as_mut() {
             cache.restore(0);
         }
@@ -417,7 +487,7 @@ impl LlmEngine {
     /// malformed.
     #[wasm_bindgen(js_name = prefixKey)]
     pub fn prefix_key(&self, tools_json: String, system: String) -> Result<String, JsError> {
-        let tools = parse_tools(&tools_json)?;
+        let tools = parse_tools_dieted(&tools_json, self.diet)?;
         let model_fingerprint = self
             .model_fingerprint
             .as_ref()
@@ -445,7 +515,7 @@ impl LlmEngine {
     /// no GPU readback, so no async/await is needed on this path.
     #[wasm_bindgen(js_name = importKvImage)]
     pub fn import_kv_image(&mut self, bytes: &[u8], tools_json: String, system: String) -> Result<bool, JsError> {
-        let tools = parse_tools(&tools_json)?;
+        let tools = parse_tools_dieted(&tools_json, self.diet)?;
         let model_fingerprint = self
             .model_fingerprint
             .as_ref()
@@ -515,7 +585,7 @@ impl LlmEngine {
     /// docs).
     #[wasm_bindgen(js_name = exportKvImage)]
     pub async fn export_kv_image(&self, tools_json: String, system: String) -> Result<Vec<u8>, JsError> {
-        let tools = parse_tools(&tools_json)?;
+        let tools = parse_tools_dieted(&tools_json, self.diet)?;
         let model_fingerprint = self
             .model_fingerprint
             .as_ref()
@@ -606,6 +676,13 @@ struct OptsIn {
     max_steps: Option<usize>,
     #[serde(rename = "systemPrompt")]
     system_prompt: Option<String>,
+    /// Schema-constrained decoding (`docs/ENGINE.md` "Schema-constrained
+    /// decoding"). Defaults to on (`LlmEngine::new`'s `constrained: true`)
+    /// when omitted.
+    constrained: Option<bool>,
+    /// Tool-schema token diet applied before `Tool::from_mcp` (`docs/
+    /// ENGINE.md` "Tool-schema token diet"). Defaults to on when omitted.
+    diet: Option<bool>,
 }
 
 fn apply_opts(engine: &mut LlmEngine, opts_json: &str) -> Result<(), JsError> {
@@ -623,13 +700,30 @@ fn apply_opts(engine: &mut LlmEngine, opts_json: &str) -> Result<(), JsError> {
     if let Some(s) = opts.system_prompt {
         engine.system_prompt = s;
     }
+    if let Some(b) = opts.constrained {
+        engine.constrained = b;
+    }
+    if let Some(b) = opts.diet {
+        engine.diet = b;
+    }
     Ok(())
 }
 
-fn parse_tools(tools_json: &str) -> Result<Vec<Tool>, JsError> {
+/// Build `Tool`s from raw MCP `tools/list` entries, optionally running them
+/// through `schemadiet::diet_tools` first — mirrors
+/// `agent.rs::tools_from_mcp`. Entries missing `name`/`description`/
+/// `inputSchema` are skipped rather than erroring.
+fn parse_tools_dieted(tools_json: &str, diet: bool) -> Result<Vec<Tool>, JsError> {
     let raw: Vec<serde_json::Value> =
         serde_json::from_str(tools_json).map_err(|e| JsError::new(&format!("invalid tools_json: {e}")))?;
-    raw.into_iter()
+    let dieted;
+    let raw = if diet {
+        dieted = diet_tools(&raw, ENGINE_DIET_LEVEL);
+        &dieted
+    } else {
+        &raw
+    };
+    raw.iter()
         .map(|t| {
             let name = t
                 .get("name")
@@ -640,6 +734,21 @@ fn parse_tools(tools_json: &str) -> Result<Vec<Tool>, JsError> {
             Ok(Tool::from_mcp(name, description, schema))
         })
         .collect()
+}
+
+/// One [`LlmEngine::generate_attempt`] round's output, before `run_step`
+/// decides whether it's valid or needs a retry — mirrors
+/// `agent.rs::AttemptOutput`. `parsed` is `Err` for a parse failure
+/// (retryable), not a hard error.
+struct AttemptOutput {
+    prompt_tokens: Vec<u32>,
+    generated_text: String,
+    parsed: Result<ParsedOutput, String>,
+    prefill_ms: f64,
+    decode_ms: f64,
+    tokens_generated: usize,
+    model_steps: usize,
+    forced_tokens: usize,
 }
 
 fn error_json(message: &str) -> String {
@@ -687,6 +796,17 @@ impl LlmEngine {
     /// One render -> encode -> (restore prefix ->) prefill -> decode ->
     /// parse round. See module docs for why this can't go through
     /// `Agent::step_inner`.
+    ///
+    /// Wraps [`LlmEngine::generate_attempt`] with `agent.rs::step_inner`'s
+    /// malformed-output retry policy (see `docs/ENGINE.md` "Agent loop" —
+    /// "what web.rs must mirror" (1)): an empty tool-call array, unparsable
+    /// `[...]` JSON, or a call naming a tool outside `self.tools` does not
+    /// become an assistant turn — instead attempt 1 forces
+    /// schema-constrained decoding on (if not already), attempt 2 appends
+    /// `RETRY_NOTE` as a `user` message, and exhausting `MAX_RETRIES` gives
+    /// up with an `"outcome":"error"` payload. Retries don't consume
+    /// `step_index`'s budget (already charged above, once per `run_step`
+    /// call).
     async fn run_step(&mut self) -> Result<String, JsError> {
         if self.step_index >= self.max_steps {
             return Ok(error_json(&format!(
@@ -696,6 +816,127 @@ impl LlmEngine {
         }
         self.step_index += 1;
 
+        let mut retries = 0usize;
+        loop {
+            let force_constrained = retries == 1 && !self.constrained && !self.tools.is_empty();
+            let attempt = self.generate_attempt(force_constrained).await?;
+
+            let invalid = match &attempt.parsed {
+                Err(_) => true,
+                Ok(ParsedOutput::ToolCalls(calls)) => {
+                    calls.is_empty()
+                        || calls
+                            .iter()
+                            .any(|c| !self.tools.iter().any(|t| t.function.name == c.name))
+                }
+                Ok(ParsedOutput::Text(_)) => false,
+            };
+
+            if invalid {
+                if retries < MAX_RETRIES {
+                    retries += 1;
+                    if retries == 2 {
+                        self.messages.push(Message::user(RETRY_NOTE));
+                    }
+                    continue;
+                }
+                return Ok(error_json("model produced no valid call"));
+            }
+
+            let AttemptOutput {
+                prompt_tokens,
+                generated_text,
+                parsed,
+                prefill_ms,
+                decode_ms,
+                tokens_generated,
+                model_steps,
+                forced_tokens,
+            } = attempt;
+            let parsed = parsed.expect("checked valid above");
+            let tool_errors = self.consecutive_tool_errors;
+
+            return match parsed {
+                ParsedOutput::ToolCalls(calls) => {
+                    let pending: Vec<PendingToolCall> = calls
+                        .iter()
+                        .enumerate()
+                        .map(|(i, c)| PendingToolCall {
+                            call_id: format!("call_{i}"),
+                            name: c.name.clone(),
+                            arguments: c.arguments.clone(),
+                        })
+                        .collect();
+                    let entries: Vec<ToolCallEntry> = pending
+                        .iter()
+                        .map(|c| ToolCallEntry {
+                            id: Some(c.call_id.clone()),
+                            kind: "function".to_string(),
+                            function: ToolCallFunction {
+                                name: c.name.clone(),
+                                arguments: c.arguments.clone(),
+                            },
+                        })
+                        .collect();
+                    self.messages.push(Message::assistant_tool_calls(entries));
+                    self.pending_calls = pending.clone();
+
+                    Ok(serde_json::json!({
+                        "outcome": "needTools",
+                        "calls": pending.iter().map(|c| serde_json::json!({
+                            "call_id": c.call_id, "name": c.name, "arguments": c.arguments,
+                        })).collect::<Vec<_>>(),
+                        "step": {
+                            "promptTokens": prompt_tokens.len(),
+                            "promptTokenIds": prompt_tokens,
+                            "text": generated_text,
+                            "prefillMs": prefill_ms,
+                            "decodeMs": decode_ms,
+                            "tokens": tokens_generated,
+                            "modelSteps": model_steps,
+                            "forcedTokens": forced_tokens,
+                            "retries": retries,
+                            "toolErrors": tool_errors,
+                        },
+                    })
+                    .to_string())
+                }
+                ParsedOutput::Text(text) => Ok(serde_json::json!({
+                    "outcome": "final",
+                    "text": text,
+                    "step": {
+                        "promptTokens": prompt_tokens.len(),
+                        "promptTokenIds": prompt_tokens,
+                        "text": generated_text,
+                        "prefillMs": prefill_ms,
+                        "decodeMs": decode_ms,
+                        "tokens": tokens_generated,
+                        "modelSteps": model_steps,
+                        "forcedTokens": forced_tokens,
+                        "retries": retries,
+                        "toolErrors": tool_errors,
+                    },
+                })
+                .to_string()),
+            };
+        }
+    }
+
+    /// One render -> encode -> (restore prefix ->) prefill -> constrained
+    /// decode -> parse round — the async, WebGPU-backed shape of
+    /// `agent.rs::Agent::generate_attempt` (see `docs/ENGINE.md`
+    /// "Schema-constrained decoding", "web.rs's job"): builds a
+    /// `Grammar::for_tools` from `self.tools` + the running `self.id_values`
+    /// when constrained decoding is on (`self.constrained` or
+    /// `force_constrained`), drives it through the decode loop with the
+    /// same jump-forward semantics as `model.rs::LlmModel::decode_with_constraint`
+    /// (batched `forward_hidden` for forced runs of at least
+    /// `JUMP_MIN_TOKENS`, masked-argmax otherwise), and reports the
+    /// model-step/forced-token breakdown. A parse failure is returned as
+    /// `Ok(AttemptOutput{parsed: Err(_), ..})`, not `Err`, so `run_step`'s
+    /// retry loop can decide whether to retry — only render/encode/
+    /// GPU/model failures propagate as `Err`.
+    async fn generate_attempt(&mut self, force_constrained: bool) -> Result<AttemptOutput, JsError> {
         let template = self.template.as_ref().ok_or_else(|| JsError::new("model not loaded"))?;
         let tokenizer = self.tokenizer.as_ref().ok_or_else(|| JsError::new("model not loaded"))?;
 
@@ -720,6 +961,27 @@ impl LlmEngine {
         } else {
             0
         };
+
+        // Build this step's schema constraint (if `self.constrained`, or
+        // this attempt forces it on) from the current tool set + every id
+        // harvested from tool results so far — mirrors
+        // `agent.rs::Agent::generate_attempt`.
+        let use_constrained = self.constrained || force_constrained;
+        let grammar_tools: Vec<grammar::Tool> = if use_constrained {
+            self.tools
+                .iter()
+                .map(|t| grammar::Tool::from_schema(&t.function.name, &t.function.parameters))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let grammar_for_step = use_constrained.then(|| Grammar::for_tools(&grammar_tools, &self.id_values));
+        if use_constrained && self.token_vocab.is_none() {
+            self.token_vocab = Some(TokenVocab::from_tokenizer(tokenizer));
+        }
+        let mut constraint_impl: Option<GrammarConstraint> = grammar_for_step
+            .as_ref()
+            .map(|g| GrammarConstraint::new(g, tokenizer, self.token_vocab.as_ref().expect("built above")));
 
         let model = self.model.as_ref().ok_or_else(|| JsError::new("model not loaded"))?;
         let cache = self.cache.as_mut().ok_or_else(|| JsError::new("model not loaded"))?;
@@ -771,10 +1033,55 @@ impl LlmEngine {
 
         let stop_ids = tokenizer.eos_ids();
         let mut out_ids = Vec::with_capacity(self.max_new_tokens);
+        let mut model_steps = 0usize;
+        let mut forced_tokens = 0usize;
         let decode_start = now_ms();
-        for _ in 0..self.max_new_tokens {
-            let next = greedy(&logits_vec);
+        while out_ids.len() < self.max_new_tokens {
+            let forced = constraint_impl
+                .as_ref()
+                .and_then(Constraint::forced_run)
+                .unwrap_or_default();
+
+            if forced.len() >= JUMP_MIN_TOKENS {
+                let take = forced.len().min(self.max_new_tokens - out_ids.len());
+                let run = forced[..take].to_vec();
+                let hidden = model
+                    .forward_hidden(&run, cache)
+                    .map_err(|e| JsError::new(&format!("forward pass failed: {e}")))?;
+                for &t in &run {
+                    if let Some(c) = constraint_impl.as_mut() {
+                        c.advance(t);
+                    }
+                }
+                self.resident_tokens.extend_from_slice(&run);
+                out_ids.extend_from_slice(&run);
+                model_steps += 1;
+                forced_tokens += run.len();
+                if take < forced.len() {
+                    // Hit max_new_tokens mid-run: stop without sampling further.
+                    break;
+                }
+                let last = hidden.narrow(1, run.len() - 1, 1);
+                let logits = model.lm_head(last);
+                let data = logits
+                    .into_data_async()
+                    .await
+                    .map_err(|e| JsError::new(&format!("GPU readback failed: {e}")))?;
+                logits_vec = data
+                    .into_vec()
+                    .map_err(|e| JsError::new(&format!("failed to read back f32 logits: {e:?}")))?;
+                continue;
+            }
+
+            let next = match constraint_impl.as_ref().and_then(Constraint::allowed) {
+                Some(mask) => greedy_masked(&logits_vec, mask),
+                None => greedy(&logits_vec),
+            };
             out_ids.push(next);
+            model_steps += 1;
+            if let Some(c) = constraint_impl.as_mut() {
+                c.advance(next);
+            }
             if stop_ids.contains(&next) {
                 break;
             }
@@ -796,66 +1103,18 @@ impl LlmEngine {
         let generated_text = tokenizer
             .decode(&out_ids, false)
             .map_err(|e| JsError::new(&format!("failed to decode generated tokens: {e}")))?;
-        let parsed = match parse_output(&generated_text) {
-            Ok(p) => p,
-            Err(e) => return Ok(error_json(&format!("failed to parse model output: {e}"))),
-        };
+        let parsed = parse_output(&generated_text).map_err(|e| e.to_string());
 
-        match parsed {
-            ParsedOutput::ToolCalls(calls) => {
-                let pending: Vec<PendingToolCall> = calls
-                    .iter()
-                    .enumerate()
-                    .map(|(i, c)| PendingToolCall {
-                        call_id: format!("call_{i}"),
-                        name: c.name.clone(),
-                        arguments: c.arguments.clone(),
-                    })
-                    .collect();
-                let entries: Vec<ToolCallEntry> = pending
-                    .iter()
-                    .map(|c| ToolCallEntry {
-                        id: Some(c.call_id.clone()),
-                        kind: "function".to_string(),
-                        function: ToolCallFunction {
-                            name: c.name.clone(),
-                            arguments: c.arguments.clone(),
-                        },
-                    })
-                    .collect();
-                self.messages.push(Message::assistant_tool_calls(entries));
-                self.pending_calls = pending.clone();
-
-                Ok(serde_json::json!({
-                    "outcome": "needTools",
-                    "calls": pending.iter().map(|c| serde_json::json!({
-                        "call_id": c.call_id, "name": c.name, "arguments": c.arguments,
-                    })).collect::<Vec<_>>(),
-                    "step": {
-                        "promptTokens": prompt_tokens.len(),
-                        "promptTokenIds": prompt_tokens,
-                        "text": generated_text,
-                        "prefillMs": prefill_ms,
-                        "decodeMs": decode_ms,
-                        "tokens": out_ids.len(),
-                    },
-                })
-                .to_string())
-            }
-            ParsedOutput::Text(text) => Ok(serde_json::json!({
-                "outcome": "final",
-                "text": text,
-                "step": {
-                    "promptTokens": prompt_tokens.len(),
-                    "promptTokenIds": prompt_tokens,
-                    "text": generated_text,
-                    "prefillMs": prefill_ms,
-                    "decodeMs": decode_ms,
-                    "tokens": out_ids.len(),
-                },
-            })
-            .to_string()),
-        }
+        Ok(AttemptOutput {
+            prompt_tokens,
+            generated_text,
+            parsed,
+            prefill_ms,
+            decode_ms,
+            tokens_generated: out_ids.len(),
+            model_steps,
+            forced_tokens,
+        })
     }
 }
 
