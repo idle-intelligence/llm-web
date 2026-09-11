@@ -9,13 +9,13 @@
 //! window, tied lm_head instead of an independent `text_linear`).
 
 use anyhow::Result;
-use burn::backend::wgpu::{Wgpu, WgpuDevice};
+use burn::backend::wgpu::{into_contiguous, CubeTensor, Wgpu, WgpuDevice, WgpuRuntime};
 use burn::tensor::activation::softmax;
-use burn::tensor::{Int, Tensor};
+use burn::tensor::{DType, Int, Tensor, TensorPrimitive};
 
 use crate::gguf::{EmbeddingStore, Q4Linear};
 use crate::grammar::Constraint;
-use crate::kv::KvCache;
+use crate::kv::{KvCache, KvDtype};
 use crate::LlmConfig;
 
 // ---------------------------------------------------------------------------
@@ -192,18 +192,79 @@ impl Q4Attention {
         let q = q.permute([0, 2, 1, 3]);
         let k = k.permute([0, 2, 1, 3]);
 
-        let (k_all, v_all) = cache.append(layer_idx, k, v);
+        cache.write(layer_idx, k, v);
         let kv_len = offset + t;
 
-        let n_rep = self.n_heads / self.n_kv_heads;
-        let k_all = repeat_kv(k_all, n_rep);
-        let v_all = repeat_kv(v_all, n_rep);
-
-        let out = attention_scores_and_values(q, k_all, v_all, t, kv_len, offset, self.scale);
+        // Session 13 (docs/BENCHMARKS.md): decode (t==1) against a
+        // Q8_0-backed cache takes the fused kernel that reads K/V directly
+        // out of the quantized cache (`gguf::attn_decode_q8_dispatch`,
+        // `wgsl/shader_attn_decode_q8.wgsl`) — no dequant-to-f32 round trip,
+        // no repeat_kv materialization, no Burn matmul/`pv_matmul` chunking
+        // workaround. Prefill (t>1), and decode against an F32-backed
+        // cache, keep the existing Burn-matmul attention path — see
+        // `kv.rs`'s module doc comment for why prefill isn't fused yet.
+        let out = if t == 1 && cache.dtype() == KvDtype::Q8_0 {
+            attn_decode_q8(&q, cache, layer_idx, self.n_heads, self.n_kv_heads, self.head_dim, kv_len, self.scale)
+        } else {
+            let n_rep = self.n_heads / self.n_kv_heads;
+            let (k_all, v_all) = cache.read_or_dequant_f32(layer_idx, kv_len);
+            let k_all = repeat_kv(k_all, n_rep);
+            let v_all = repeat_kv(v_all, n_rep);
+            attention_scores_and_values(q, k_all, v_all, t, kv_len, offset, self.scale)
+        };
         let out = out.permute([0, 2, 1, 3]).reshape([b, t, self.n_heads * self.head_dim]);
 
         self.o_proj.forward(out)
     }
+}
+
+/// Session 13 (docs/BENCHMARKS.md): decode-time (t==1) fused QK^T ->
+/// softmax -> PV over a `KvDtype::Q8_0` cache. `q`: `[1, n_heads, 1,
+/// head_dim]` (already RoPE'd). Returns `[1, n_heads, 1, head_dim]`
+/// (matches `attention_scores_and_values`'s output shape so both branches
+/// of `Q4Attention::forward` feed the same permute/reshape). Reuses one
+/// thread-local scratch buffer (`n_heads * max_ctx` f32) across calls,
+/// resized only when a larger cache is used — mirrors `gguf.rs`'s
+/// `DEQUANT_SCRATCH` pattern.
+#[allow(clippy::too_many_arguments)]
+fn attn_decode_q8(
+    q: &Tensor<Wgpu, 4>,
+    cache: &KvCache,
+    layer_idx: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    kv_len: usize,
+    scale: f32,
+) -> Tensor<Wgpu, 4> {
+    thread_local! {
+        static ATTN_SCRATCH: std::cell::RefCell<Option<(cubecl::server::Handle, usize)>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    let q_cube: CubeTensor<WgpuRuntime> = into_contiguous(q.clone().into_primitive().tensor());
+    let client = q_cube.client.clone();
+    let device = q_cube.device.clone();
+    let max_ctx = cache.max_ctx();
+    let (k_scales, k_words, v_scales, v_words) = cache.q8_layer(layer_idx);
+
+    let needed = n_heads * max_ctx;
+    let scratch = ATTN_SCRATCH.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let reuse = matches!(&*slot, Some((_, cap)) if *cap >= needed);
+        if !reuse {
+            *slot = Some((client.empty(needed * 4), needed));
+        }
+        slot.as_ref().unwrap().0.clone()
+    });
+
+    let out_handle = crate::gguf::attn_decode_q8_dispatch(
+        &client, &q_cube.handle, k_scales, k_words, v_scales, v_words, &scratch, n_heads, n_kv_heads, head_dim, kv_len,
+        max_ctx, scale,
+    );
+    let shape = burn::prelude::Shape::from(vec![1, n_heads, 1, head_dim]);
+    let cube_tensor = CubeTensor::new_contiguous(client, device, shape, out_handle, DType::F32);
+    Tensor::from_primitive(TensorPrimitive::Float(cube_tensor))
 }
 
 /// Repeat each of `n_kv_heads` KV heads `n_rep` times along the head axis
@@ -896,5 +957,97 @@ mod debug_tests {
         // ~1.9e-6 (well under 5e-6), consistent with float32 ULP-scale
         // reassociation noise, not a formula bug.
         assert!(max_abs_diff < 5e-6, "silu_mul_fused diverges by {max_abs_diff}");
+    }
+}
+
+#[cfg(all(test, feature = "wgpu"))]
+mod bench_q8 {
+    use super::*;
+    use crate::kv::{KvCache, KvDtype};
+
+    /// Session 13 (docs/BENCHMARKS.md): isolates the changed code path —
+    /// one layer's decode-time (T=1) attention (cache write + QK^T/softmax/
+    /// PV) — at a given `kv_len`, `KvDtype::F32` (old Burn-matmul path) vs
+    /// `KvDtype::Q8_0` (new fused kernel). Everything else in a real
+    /// decode step (q/k/v/o Q4 matmuls, RMSNorm, MLP) is unchanged by this
+    /// session's work and not included; multiplying by `num_layers=36`
+    /// gives an estimate of the KV-cache-attributable share of decode
+    /// time, not a full end-to-end ms/token number (see `llm-agent bench`
+    /// for that, native-only, not run here since this crate doesn't own
+    /// that binary this session). Each iteration re-writes the same row
+    /// (cache length held fixed at `kv_len`) rather than growing the
+    /// cache, so the bench measures steady-state cost at that `kv_len`,
+    /// not `max_ctx` accumulation. Run with: `cargo test --release
+    /// --features wgpu --lib model::bench_q8::bench_decode_attention_layer
+    /// -- --ignored --nocapture`
+    fn bench_one(kv_len: usize, dtype: KvDtype, iters: usize) -> f64 {
+        let device = WgpuDevice::default();
+        let n_heads = 16;
+        let n_kv_heads = 2;
+        let head_dim = 128;
+        let scale = (head_dim as f32).powf(-0.5);
+        let max_ctx = kv_len + 8;
+
+        let mut cache = KvCache::new_with_dtype(1, n_kv_heads, head_dim, max_ctx, &device, dtype);
+        let bulk_shape = [1, n_kv_heads, kv_len - 1, head_dim];
+        let k_bulk = Tensor::<Wgpu, 4>::zeros(bulk_shape, &device);
+        let v_bulk = Tensor::<Wgpu, 4>::zeros(bulk_shape, &device);
+        cache.write(0, k_bulk, v_bulk);
+        cache.advance(kv_len - 1);
+        let offset = cache.len();
+
+        let q = Tensor::<Wgpu, 4>::zeros([1, n_heads, 1, head_dim], &device);
+        let k_new = Tensor::<Wgpu, 4>::zeros([1, n_kv_heads, 1, head_dim], &device);
+        let v_new = Tensor::<Wgpu, 4>::zeros([1, n_kv_heads, 1, head_dim], &device);
+
+        // Warm up (first dispatch of each kernel shape pays a one-time
+        // pipeline-compilation cost — docs/BENCHMARKS.md Session 11).
+        for _ in 0..3 {
+            cache.write(0, k_new.clone(), v_new.clone());
+            let kv_len_now = offset + 1;
+            let out = if dtype == KvDtype::Q8_0 {
+                attn_decode_q8(&q, &cache, 0, n_heads, n_kv_heads, head_dim, kv_len_now, scale)
+            } else {
+                let n_rep = n_heads / n_kv_heads;
+                let (k_all, v_all) = cache.read_or_dequant_f32(0, kv_len_now);
+                let k_all = repeat_kv(k_all, n_rep);
+                let v_all = repeat_kv(v_all, n_rep);
+                attention_scores_and_values(q.clone(), k_all, v_all, 1, kv_len_now, offset, scale)
+            };
+            let _ = out.into_data().into_vec::<f32>().unwrap();
+        }
+
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            cache.write(0, k_new.clone(), v_new.clone());
+            let kv_len_now = offset + 1;
+            let out = if dtype == KvDtype::Q8_0 {
+                attn_decode_q8(&q, &cache, 0, n_heads, n_kv_heads, head_dim, kv_len_now, scale)
+            } else {
+                let n_rep = n_heads / n_kv_heads;
+                let (k_all, v_all) = cache.read_or_dequant_f32(0, kv_len_now);
+                let k_all = repeat_kv(k_all, n_rep);
+                let v_all = repeat_kv(v_all, n_rep);
+                attention_scores_and_values(q.clone(), k_all, v_all, 1, kv_len_now, offset, scale)
+            };
+            let _ = out.into_data().into_vec::<f32>().unwrap();
+        }
+        t0.elapsed().as_secs_f64() * 1000.0 / iters as f64
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_decode_attention_layer() {
+        let num_layers = 36;
+        for &kv_len in &[2300usize, 8000] {
+            let f32_ms = bench_one(kv_len, KvDtype::F32, 20);
+            let q8_ms = bench_one(kv_len, KvDtype::Q8_0, 20);
+            println!(
+                "kv_len={kv_len}: F32={f32_ms:.4} ms/layer-step, Q8_0={q8_ms:.4} ms/layer-step \
+                 (x{num_layers} layers, attention-only estimate: F32~{:.2}ms Q8_0~{:.2}ms)",
+                f32_ms * num_layers as f64,
+                q8_ms * num_layers as f64
+            );
+        }
     }
 }

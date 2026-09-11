@@ -1331,3 +1331,89 @@ pre-fix constrained wall time (63.3s vs 98.2s mean total; still above the
 54.2s unconstrained baseline — `JUMP_MIN_TOKENS` narrows but doesn't close
 that gap, since the fix's own removal of id-value forcing means less gets
 jump-forwarded overall than the pre-fix (buggy) run did).
+## Session 13 — q8_0 KV cache (kv.rs, gguf.rs kernels, model.rs decode attention)
+
+Design: `KvCache` gained a `KvDtype::{F32, Q8_0}` storage mode (`kv.rs`). `Q8_0` holds K/V as raw
+cubecl buffers (not Burn tensors), per layer `scales: [n_kv_heads, max_ctx, head_dim/32]` f32 +
+`words: [n_kv_heads, max_ctx, head_dim/4]` u32 — the same block convention as `kvimg.rs`'s
+`dtype: "q8_0"` image format, just resident on GPU. New kernels: `shader_kv_quantize.wgsl` (write
+new rows), `shader_kv_dequant_range.wgsl` (dequant a `[0, kv_len)` range for the prefill fallback
+path), `shader_attn_decode_q8.wgsl` (fused decode-time QK^T -> softmax -> PV reading q8_0 K/V
+directly, no dequant-to-f32 step, one workgroup per query head, GQA-aware). Prefill (M>1) still
+dequantizes the needed range once per layer and runs the existing Burn-matmul attention path.
+
+### Tests (`tests/kvimg.rs`, `cargo test --release --features wgpu --test kvimg`)
+
+All 13 pass:
+
+| test | result |
+|---|---|
+| `q8_append_roundtrip_error_bound` (T=1 writes) | error <= per-block `absmax/127` bound |
+| `q8_bulk_write_matches_row_by_row` (T=31 bulk vs 31x T=1) | bit-identical (max_diff=0) |
+| `import_prefix_q8_bit_identical_to_write` | bit-identical roundtrip |
+| `q8_decode_attention_matches_f64_reference` (kv_len 31/2225/5000) | max_rel 1.7e-4 / 2.4e-4 / 5.2e-5 (<=1e-3 target) |
+| `export_import_prefix_bit_exact_then_append_matches` (F32 mode) | unchanged, still passes |
+| `q8_0_quantize_dequantize_roundtrip_error_bounds`, `q8_0_file_roundtrip_write_read`, etc. (pre-existing, `kvimg.rs`'s own format tests) | unaffected, pass |
+
+Two WGSL bugs found and fixed during this session: (1) mixed `read`/`read_write` storage-buffer
+access modes across bindings in the same dispatch triggered a wgpu validation error ("conflicting
+usages") — fixed by declaring every binding `read_write`, matching every pre-existing kernel in
+this codebase; (2) `signed` is a WGSL reserved identifier, breaking shader compilation — renamed
+to `sval`.
+
+### `tests/full_forward.rs` — the real-model regression
+
+Every kernel above is correct in isolation, but setting `DEFAULT_KV_DTYPE = Q8_0` and running the
+actual model regresses badly: `test_forward_01_no_tools` went from 8/31 argmax mismatches (the
+pre-existing `KvDtype::F32` baseline) to **31/31**, and `test_forward_02_tools_single` /
+`test_forward_03_tools_multiturn` went from passing to **zero top-5 overlap** with the reference
+at the last position (e.g. 03: our top1 `(220, 20.15)` vs reference top1 `(58, 32.0)`). No token
+flipped near-tied — these are large logit swings, not borderline noise.
+
+Diagnosis: the per-block quantization error is small and bounded (~2.1% mean relative, measured
+on synthetic K/V-shaped data — `q8_0_quantize_dequantize_roundtrip_error_bounds`), and every
+isolated kernel test above confirms the q8_0 math itself is exact to its documented bound. But
+applied to *every* K/V value at *every* layer from token 0 onward (not just the newest row), this
+compounds across 36 residual transformer layers into much larger end-to-end divergence than the
+isolated tests predicted — and greedy decoding has no error correction, so one flipped high-logit
+token early in a sequence propagates. **Not yet root-caused to K vs V specifically** — the task
+brief's suggested next diagnostic (quantize K only, keep V in f32) was not implemented this
+session; see "what's left" below.
+
+Given this, `DEFAULT_KV_DTYPE` stays `F32` (reverted from an initial `Q8_0` default after this
+regression surfaced) — `KvDtype::Q8_0` is fully implemented, kernel-tested, and available via
+`KvCache::new_with_dtype` for continued investigation, but is not shipped as the production
+default this session.
+
+### Bench — decode-time attention only, F32 vs Q8_0 (idle GPU, `cargo test --release --features
+wgpu --lib model::bench_q8::bench_decode_attention_layer -- --ignored --nocapture`)
+
+Isolates the changed code path (one layer's decode-time cache write + QK^T/softmax/PV) at a given
+`kv_len`; `x36` extrapolation is an attention-only estimate, not a measured end-to-end ms/token
+(q/k/v/o Q4 matmuls, RMSNorm, MLP are unchanged and not included — no `llm-agent bench` run this
+session since that binary isn't owned here):
+
+| kv_len | F32 ms/layer-step | Q8_0 ms/layer-step | speedup | F32 x36 (est.) | Q8_0 x36 (est.) |
+|---|---|---|---|---|---|
+| 2300 | 3.059 | 1.487 | 2.06x | 110.1 ms | 53.5 ms |
+| 8000 | 5.132 | 3.016 | 1.70x | 184.7 ms | 108.6 ms |
+
+Memory: at `max_ctx=12288` this model's f32 cache is ~906MB; `Q8_0` (3.556x smaller, measured in
+`kvimg.rs`'s own size test) would be ~255MB — not realized in production this session since the
+default stays `F32` pending the correctness fix above.
+
+Commits: (see `git log` on this session's worktree branch — `crates/llm-wasm/src/kv.rs`,
+`src/model.rs`, `src/gguf.rs` (dispatch helpers only), `src/wgsl/shader_kv_quantize.wgsl`,
+`shader_kv_dequant_range.wgsl`, `shader_attn_decode_q8.wgsl`, `tests/kvimg.rs`).
+
+### What's left
+
+- **Root-cause the full-model divergence.** Try K-only quantization (keep V in f32) as the task
+  brief suggested — if that alone fixes `full_forward`, V's dynamic range (or RoPE'd K's) is the
+  culprit; if not, look for a subtler bug the isolated tests don't exercise (e.g. per-layer error
+  accumulation interacting with this model's already-known matmul sensitivities, docs/ENGINE.md
+  "Known issues" Session 6-7).
+- **Fused prefill attention kernel** (currently dequant-to-f32 + old Burn-matmul path) — the
+  natural next step once correctness is resolved, per the original task design.
+- **`llm-agent bench`-based end-to-end ms/token** (native binary, not owned by this session) once
+  `Q8_0` is safe to flip on, for a real (not attention-only-estimated) decode ms/token number.

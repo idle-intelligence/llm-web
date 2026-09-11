@@ -1292,10 +1292,63 @@ is a synchronous GPU readback; a WASM caller must not use it directly (deadlocks
 should add an `into_data_async` variant before calling it from `web.rs`.
 
 `import_prefix(&mut self, layers, n_tokens)`: one `slice_assign` per layer per tensor (bulk write
-for all `n_tokens` rows at once), using the same placeholder-swap discipline `append` uses (see
+for all `n_tokens` rows at once), using the same placeholder-swap discipline `write` uses (see
 its doc comment / D1 in `docs/BENCHMARKS.md`) so cubecl mutates the existing buffer in place
 instead of copying the whole `max_ctx`-sized tensor. Sets `len = n_tokens` directly, so
 `snapshot()` reflects the imported prefix with no further calls needed.
+
+#### KV cache storage dtype (Session 13, docs/BENCHMARKS.md)
+
+`KvCache` now holds K/V in one of two storage modes (`KvDtype`), chosen at construction
+(`KvCache::new` uses `DEFAULT_KV_DTYPE = KvDtype::F32` — still `F32`, see the correctness note
+below; `KvCache::new_with_dtype` picks explicitly):
+
+- `KvDtype::F32` (**default**) — the original design: one `[1, n_kv_heads, max_ctx, head_dim]`
+  Burn tensor per layer per K/V. ~906MB at this model's `max_ctx=12288`.
+- `KvDtype::Q8_0` (opt-in, not yet the default) — K/V held as raw cubecl GPU buffers, not Burn
+  tensors: per layer, `scales: [n_kv_heads, max_ctx, head_dim/32]` f32 and
+  `words: [n_kv_heads, max_ctx, head_dim/4]`
+  u32 (one absmax/127 scale + 32 packed-i8 values, 4-per-u32, per 32-element block along
+  `head_dim`) — the same on-disk convention `kvimg.rs`'s `dtype: "q8_0"` image format already
+  used, just resident on GPU instead of round-tripped through a file. ~255MB at `max_ctx=12288`
+  (~3.55x smaller than `F32`).
+
+**Correctness status**: every `Q8_0` kernel is unit-tested correct in isolation (quantize/dequant
+round trip within its `absmax/127` per-block bound, a bulk `T=31` write matches 31 separate `T=1`
+writes bit-for-bit, the fused decode kernel matches an f64 CPU reference to <=2.5e-4 relative
+error at `kv_len` in `{31, 2225, 5000}` — all in `tests/kvimg.rs`), but running the real model
+end-to-end (`tests/full_forward.rs`) with `Q8_0` as the cache diverges badly: every prefill
+position's argmax disagreed with the F32 reference (vs. 8/31 under `F32`), and last-position
+top-5 had zero overlap with the reference. Small per-block quantization error, applied to every
+K/V value at every layer from token 0, compounds across 36 residual layers into much larger
+divergence than the isolated tests predicted. Not yet root-caused to K vs V specifically (the
+task brief's suggested next diagnostic — quantize K only, keep V in f32 — isn't implemented yet).
+`DEFAULT_KV_DTYPE` stays `F32` until this is resolved; see `docs/BENCHMARKS.md` Session 13.
+
+`write` (renamed from `append` — it no longer returns the read-back prefix tensors, see
+`read_or_dequant_f32`/`q8_layer` below) quantizes new rows on the GPU in `Q8_0` mode
+(`gguf::kv_quantize_dispatch`, `wgsl/shader_kv_quantize.wgsl`) — no CPU round trip, one dispatch
+each for K and V. `read_or_dequant_f32(layer, kv_len)` is the dtype-agnostic read path used by the
+prefill (`M>1`) attention branch: a plain `narrow` in `F32` mode, a GPU dequant-range dispatch
+(`gguf::kv_dequant_range_dispatch`, `wgsl/shader_kv_dequant_range.wgsl`) into a fresh f32 tensor in
+`Q8_0` mode. `q8_layer(layer)` exposes the raw `(k_scales, k_words, v_scales, v_words)` handles
+for the decode-time (`M=1`) fused attention kernel (`model.rs`'s `attn_decode_q8`,
+`gguf::attn_decode_q8_dispatch`, `wgsl/shader_attn_decode_q8.wgsl`) to bind directly — QK^T,
+softmax, and PV all read K/V straight out of the quantized cache, accumulating in f32, with no
+dequant-to-f32 step at all. Prefill still takes the old Burn-matmul attention path (dequantizing
+the needed K/V range once per layer per forward first) — a fused prefill kernel is a later step.
+
+`export_prefix`/`import_prefix` keep their `Vec<f32>` signatures regardless of storage dtype (so
+`kvimg.rs`/`web.rs` need no changes for this): in `Q8_0` mode `export_prefix` dequantizes via
+`read_or_dequant_f32` before the readback, and `import_prefix` quantizes the uploaded f32 data via
+the same `kv_quantize_dispatch` kernel `write` uses. `export_prefix_q8`/`import_prefix_q8` are the
+new no-dequant counterparts (`Q8_0` mode only) that move already-quantized bytes directly — the
+path a future `kvimg.rs`/`web.rs` change would use to import a `dtype: "q8_0"` prefix image
+without ever materializing f32, per the task brief's step 1. `import_prefix_q8` currently does a
+CPU read-modify-write of each buffer (readback the full per-layer buffer, patch rows `[0,
+n_tokens)`, re-upload) rather than a partial GPU-side write — correctness first, since this runs
+once per session/prefix load, not per token; cubecl's `ComputeClient` has no partial-buffer-write
+primitive to target directly (only `create_from_slice`/`empty`).
 
 ### Where this plugs in (wired up)
 

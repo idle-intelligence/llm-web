@@ -2095,3 +2095,187 @@ impl<R: Read + Seek> Q4ModelLoader<R> {
         })
     }
 }
+
+// ---------------------------------------------------------------------------
+// KV cache q8_0 kernels (Session 13, docs/BENCHMARKS.md) — dispatch helpers
+// only. `kv.rs` owns `KvCache`'s q8_0 buffer layout and lifecycle; `model.rs`
+// owns the decode-time attention call site. See the three WGSL files' own
+// header comments for the per-kernel algorithm.
+// ---------------------------------------------------------------------------
+
+struct KvQuantizeKernel;
+
+impl KernelSource for KvQuantizeKernel {
+    fn source(&self) -> SourceTemplate {
+        SourceTemplate::new(include_str!("wgsl/shader_kv_quantize.wgsl"))
+    }
+
+    fn id(&self) -> KernelId {
+        KernelId::new::<Self>()
+    }
+}
+
+struct KvDequantRangeKernel;
+
+impl KernelSource for KvDequantRangeKernel {
+    fn source(&self) -> SourceTemplate {
+        SourceTemplate::new(include_str!("wgsl/shader_kv_dequant_range.wgsl"))
+    }
+
+    fn id(&self) -> KernelId {
+        KernelId::new::<Self>()
+    }
+}
+
+struct AttnDecodeQ8Kernel;
+
+impl KernelSource for AttnDecodeQ8Kernel {
+    fn source(&self) -> SourceTemplate {
+        SourceTemplate::new(include_str!("wgsl/shader_attn_decode_q8.wgsl"))
+    }
+
+    fn id(&self) -> KernelId {
+        KernelId::new::<Self>()
+    }
+}
+
+/// Quantize `t` new K or V rows (`input`: f32 handle, contiguous
+/// `[n_kv_heads, t, head_dim]`) into `scales`/`words` at row offset
+/// `dest_offset` — see `shader_kv_quantize.wgsl`'s header for the layout.
+/// No-op if `t == 0`.
+#[allow(clippy::too_many_arguments)]
+pub fn kv_quantize_dispatch(
+    client: &cubecl::client::ComputeClient<WgpuRuntime>,
+    input: Handle,
+    scales: &Handle,
+    words: &Handle,
+    n_kv_heads: usize,
+    t: usize,
+    head_dim: usize,
+    max_ctx: usize,
+    dest_offset: usize,
+) {
+    let blocks_per_row = head_dim / 32;
+    let total_blocks = n_kv_heads * t * blocks_per_row;
+    if total_blocks == 0 {
+        return;
+    }
+    let info: [u32; 5] = [
+        n_kv_heads as u32,
+        t as u32,
+        head_dim as u32,
+        max_ctx as u32,
+        dest_offset as u32,
+    ];
+    let info_bytes: Vec<u8> = info.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let info_handle = client.create_from_slice(&info_bytes);
+    let bindings = Bindings::new()
+        .with_buffer(input.binding())
+        .with_buffer(scales.clone().binding())
+        .with_buffer(words.clone().binding())
+        .with_buffer(info_handle.binding());
+    let wg = (total_blocks as u32).div_ceil(64);
+    let kernel: Box<dyn CubeTask<AutoCompiler>> =
+        Box::new(SourceKernel::new(KvQuantizeKernel, CubeDim::new_1d(64)));
+    client
+        .launch(kernel, CubeCount::new_1d(wg), bindings)
+        .expect("kv quantize kernel launch failed");
+}
+
+/// Dequantize rows `[0, kv_len)` of one layer's q8_0 K or V buffer to a
+/// fresh f32 handle, contiguous `[n_kv_heads, kv_len, head_dim]` (the
+/// prefill fallback path's scratch tensor source, and `KvCache::export_prefix`
+/// in q8_0 mode). Returns a zeroed/uninitialized-beyond-`kv_len` handle
+/// sized for `kv_len` rows exactly (not `max_ctx`).
+pub fn kv_dequant_range_dispatch(
+    client: &cubecl::client::ComputeClient<WgpuRuntime>,
+    scales: &Handle,
+    words: &Handle,
+    n_kv_heads: usize,
+    kv_len: usize,
+    head_dim: usize,
+    max_ctx: usize,
+) -> Handle {
+    let blocks_per_row = head_dim / 32;
+    let total_blocks = n_kv_heads * kv_len * blocks_per_row;
+    let output = client.empty(n_kv_heads * kv_len * head_dim * 4);
+    if total_blocks == 0 {
+        return output;
+    }
+    let info: [u32; 4] = [
+        n_kv_heads as u32,
+        kv_len as u32,
+        head_dim as u32,
+        max_ctx as u32,
+    ];
+    let info_bytes: Vec<u8> = info.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let info_handle = client.create_from_slice(&info_bytes);
+    let bindings = Bindings::new()
+        .with_buffer(scales.clone().binding())
+        .with_buffer(words.clone().binding())
+        .with_buffer(output.clone().binding())
+        .with_buffer(info_handle.binding());
+    let wg = (total_blocks as u32).div_ceil(64);
+    let kernel: Box<dyn CubeTask<AutoCompiler>> =
+        Box::new(SourceKernel::new(KvDequantRangeKernel, CubeDim::new_1d(64)));
+    client
+        .launch(kernel, CubeCount::new_1d(wg), bindings)
+        .expect("kv dequant range kernel launch failed");
+    output
+}
+
+/// Fused decode-time (M=1) attention over a q8_0 KV cache: QK^T -> stable
+/// softmax -> PV in one dispatch, `n_heads` workgroups (one per query head).
+/// `q`: f32 handle `[n_heads, head_dim]` (already RoPE'd, batch/seq axes
+/// squeezed). `scratch` must have capacity >= `n_heads * max_ctx` f32
+/// (reused across calls by the caller — see `model.rs`'s scratch cache).
+/// Requires `head_dim == 128` (the kernel's fixed workgroup size — see
+/// `shader_attn_decode_q8.wgsl`'s header). Returns a fresh f32 handle
+/// `[n_heads, head_dim]`.
+#[allow(clippy::too_many_arguments)]
+pub fn attn_decode_q8_dispatch(
+    client: &cubecl::client::ComputeClient<WgpuRuntime>,
+    q: &Handle,
+    k_scales: &Handle,
+    k_words: &Handle,
+    v_scales: &Handle,
+    v_words: &Handle,
+    scratch: &Handle,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    kv_len: usize,
+    max_ctx: usize,
+    attn_scale: f32,
+) -> Handle {
+    assert_eq!(
+        head_dim, 128,
+        "attn_decode_q8 kernel's workgroup size is fixed at 128 == head_dim"
+    );
+    let output = client.empty(n_heads * head_dim * 4);
+    let info: [u32; 6] = [
+        n_heads as u32,
+        n_kv_heads as u32,
+        head_dim as u32,
+        kv_len as u32,
+        max_ctx as u32,
+        attn_scale.to_bits(),
+    ];
+    let info_bytes: Vec<u8> = info.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let info_handle = client.create_from_slice(&info_bytes);
+    let bindings = Bindings::new()
+        .with_buffer(q.clone().binding())
+        .with_buffer(k_scales.clone().binding())
+        .with_buffer(k_words.clone().binding())
+        .with_buffer(v_scales.clone().binding())
+        .with_buffer(v_words.clone().binding())
+        .with_buffer(scratch.clone().binding())
+        .with_buffer(output.clone().binding())
+        .with_buffer(info_handle.binding());
+    let kernel: Box<dyn CubeTask<AutoCompiler>> =
+        Box::new(SourceKernel::new(AttnDecodeQ8Kernel, CubeDim::new_1d(128)));
+    client
+        .launch(kernel, CubeCount::new_1d(n_heads as u32), bindings)
+        .expect("attn decode q8 kernel launch failed");
+    output
+}

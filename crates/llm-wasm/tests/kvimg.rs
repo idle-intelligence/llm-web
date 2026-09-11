@@ -151,8 +151,8 @@ impl XorShift64 {
     }
     /// K/V-shaped value: mostly |x| < 10, rare outliers up to 100.
     fn next_kv_value(&mut self) -> f32 {
-        let sign = if self.next_u64() % 2 == 0 { 1.0 } else { -1.0 };
-        let outlier = self.next_u64() % 200 == 0; // ~0.5% outlier rate
+        let sign = if self.next_u64().is_multiple_of(2) { 1.0 } else { -1.0 };
+        let outlier = self.next_u64().is_multiple_of(200); // ~0.5% outlier rate
         let mag = if outlier {
             10.0 + self.next_f32() * 90.0
         } else {
@@ -222,7 +222,7 @@ fn q8_0_header(n_layers: usize, n_kv_heads: usize, n_tokens: usize, head_dim: us
 
 #[test]
 fn q8_0_file_roundtrip_write_read() {
-    let mut rng = XorShift64(0xA11CE_B0B_1234_5678);
+    let mut rng = XorShift64(0xA11C_EB0B_1234_5678);
     let n_layers = 3;
     let n_kv_heads = 2;
     let n_tokens = 17;
@@ -322,7 +322,7 @@ fn v1_f32_images_still_read() {
 mod gpu {
     use burn::backend::wgpu::{Wgpu, WgpuDevice};
     use burn::tensor::Tensor;
-    use llm_wasm::kv::KvCache;
+    use llm_wasm::kv::{KvCache, KvDtype};
 
     /// Only run when the GPU is free — this crate's other worker owns
     /// `full_forward`/`llm-agent` GPU usage; poll `pgrep -fl
@@ -334,6 +334,10 @@ mod gpu {
     /// in Burn's public API at HEAD).
     #[test]
     fn export_import_prefix_bit_exact_then_append_matches() {
+        // Explicit `KvDtype::F32`: this test's `head_dim=4` isn't a
+        // multiple of 32, so it can't exercise the (now-default)
+        // `KvDtype::Q8_0` mode — see the `q8_*` tests below for that mode's
+        // coverage (Session 13, docs/BENCHMARKS.md).
         let device = WgpuDevice::default();
         let num_layers = 2;
         let n_kv_heads = 2;
@@ -341,7 +345,7 @@ mod gpu {
         let max_ctx = 16;
         let n_tokens = 5;
 
-        let mut src = KvCache::new(num_layers, n_kv_heads, head_dim, max_ctx, &device);
+        let mut src = KvCache::new_with_dtype(num_layers, n_kv_heads, head_dim, max_ctx, &device, KvDtype::F32);
         for pos in 0..n_tokens {
             for layer in 0..num_layers {
                 let shape = [1, n_kv_heads, 1, head_dim];
@@ -360,14 +364,14 @@ mod gpu {
                     burn::tensor::TensorData::new(v_vals, shape),
                     &device,
                 );
-                src.append(layer, k, v);
+                src.write(layer, k, v);
             }
             src.advance(1);
         }
 
         let exported = src.export_prefix(n_tokens);
 
-        let mut dst = KvCache::new(num_layers, n_kv_heads, head_dim, max_ctx, &device);
+        let mut dst = KvCache::new_with_dtype(num_layers, n_kv_heads, head_dim, max_ctx, &device, KvDtype::F32);
         dst.import_prefix(&exported, n_tokens);
         assert_eq!(dst.len(), n_tokens);
 
@@ -396,13 +400,13 @@ mod gpu {
                 burn::tensor::TensorData::new(v_vals.clone(), shape),
                 &device,
             );
-            src.append(layer, k_src, v_src);
+            src.write(layer, k_src, v_src);
 
             let k_dst =
                 Tensor::<Wgpu, 4>::from_data(burn::tensor::TensorData::new(k_vals, shape), &device);
             let v_dst =
                 Tensor::<Wgpu, 4>::from_data(burn::tensor::TensorData::new(v_vals, shape), &device);
-            dst.append(layer, k_dst, v_dst);
+            dst.write(layer, k_dst, v_dst);
         }
         src.advance(1);
         dst.advance(1);
@@ -413,5 +417,262 @@ mod gpu {
             src_final, dst_final,
             "post-import append must match a never-imported cache"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Session 13 (docs/BENCHMARKS.md): KvDtype::Q8_0 tests.
+    // -----------------------------------------------------------------
+
+    struct Lcg(u64);
+    impl Lcg {
+        fn next_f32(&mut self) -> f32 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((self.0 >> 40) as f32 / (1u32 << 24) as f32) - 0.5
+        }
+    }
+
+    /// q8 roundtrip on random rows: write via `KvCache` (Q8_0 mode),
+    /// dequantize back via `read_or_dequant_f32`, and check every value is
+    /// within its block's `absmax/127` quantization step of the original —
+    /// the same bound `kvimg.rs`'s `q8_0_quantize_dequantize_roundtrip_error_bounds`
+    /// checks for the file-format encoder.
+    #[test]
+    fn q8_append_roundtrip_error_bound() {
+        let device = WgpuDevice::default();
+        let n_kv_heads = 2;
+        let head_dim = 128;
+        let max_ctx = 64;
+        let n_tokens = 17;
+
+        let mut cache = KvCache::new_with_dtype(1, n_kv_heads, head_dim, max_ctx, &device, KvDtype::Q8_0);
+        let mut rng = Lcg(42);
+        let mut original = vec![0f32; n_kv_heads * n_tokens * head_dim];
+        for pos in 0..n_tokens {
+            let shape = [1, n_kv_heads, 1, head_dim];
+            let mut row = vec![0f32; n_kv_heads * head_dim];
+            for h in 0..n_kv_heads {
+                for d in 0..head_dim {
+                    let x = rng.next_f32() * 20.0;
+                    row[h * head_dim + d] = x;
+                    original[(h * n_tokens + pos) * head_dim + d] = x;
+                }
+            }
+            let k = Tensor::<Wgpu, 4>::from_data(burn::tensor::TensorData::new(row.clone(), shape), &device);
+            let v = Tensor::<Wgpu, 4>::from_data(burn::tensor::TensorData::new(row, shape), &device);
+            cache.write(0, k, v);
+            cache.advance(1);
+        }
+
+        let (k_deq, _v_deq) = cache.read_or_dequant_f32(0, n_tokens);
+        let dequantized = k_deq.into_data().into_vec::<f32>().unwrap();
+        assert_eq!(dequantized.len(), original.len());
+
+        for h in 0..n_kv_heads {
+            for pos in 0..n_tokens {
+                for block in 0..(head_dim / 32) {
+                    let base = (h * n_tokens + pos) * head_dim + block * 32;
+                    let block_vals = &original[base..base + 32];
+                    let absmax = block_vals.iter().fold(0f32, |m, &x| m.max(x.abs()));
+                    let bound = absmax / 127.0;
+                    for d in 0..32 {
+                        let err = (dequantized[base + d] - original[base + d]).abs();
+                        assert!(
+                            err <= bound + 1e-6,
+                            "q8 roundtrip error {err} exceeds bound {bound} at h={h} pos={pos} d={d}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Diagnostic added while chasing a full_forward regression: does a
+    /// single bulk `write` of `T=31` rows (prefill's shape) quantize
+    /// identically to 31 separate `T=1` `write` calls (decode's shape,
+    /// already covered by `q8_append_roundtrip_error_bound`)? If this
+    /// fails but the T=1 test above passes, the bug is specifically in
+    /// `shader_kv_quantize.wgsl`'s multi-row indexing.
+    #[test]
+    fn q8_bulk_write_matches_row_by_row() {
+        let device = WgpuDevice::default();
+        let n_kv_heads = 2;
+        let head_dim = 128;
+        let max_ctx = 64;
+        let t = 31;
+
+        let mut rng = Lcg(99);
+        let mut rows: Vec<Vec<f32>> = Vec::new();
+        for _ in 0..t {
+            rows.push((0..(n_kv_heads * head_dim)).map(|_| rng.next_f32() * 20.0).collect());
+        }
+
+        // Bulk: one write of all T rows at once (prefill shape).
+        let mut bulk_flat = vec![0f32; n_kv_heads * t * head_dim];
+        for (pos, row) in rows.iter().enumerate() {
+            for h in 0..n_kv_heads {
+                bulk_flat[(h * t + pos) * head_dim..(h * t + pos) * head_dim + head_dim]
+                    .copy_from_slice(&row[h * head_dim..h * head_dim + head_dim]);
+            }
+        }
+        let mut bulk_cache = KvCache::new_with_dtype(1, n_kv_heads, head_dim, max_ctx, &device, KvDtype::Q8_0);
+        let bulk_shape = [1, n_kv_heads, t, head_dim];
+        let k_bulk = Tensor::<Wgpu, 4>::from_data(burn::tensor::TensorData::new(bulk_flat, bulk_shape), &device);
+        bulk_cache.write(0, k_bulk, Tensor::<Wgpu, 4>::zeros(bulk_shape, &device));
+        bulk_cache.advance(t);
+
+        // Row-by-row: T=1 writes (decode shape), same source data.
+        let mut row_cache = KvCache::new_with_dtype(1, n_kv_heads, head_dim, max_ctx, &device, KvDtype::Q8_0);
+        for row in &rows {
+            let shape = [1, n_kv_heads, 1, head_dim];
+            let k = Tensor::<Wgpu, 4>::from_data(burn::tensor::TensorData::new(row.clone(), shape), &device);
+            let v = Tensor::<Wgpu, 4>::zeros(shape, &device);
+            row_cache.write(0, k, v);
+            row_cache.advance(1);
+        }
+
+        let (bulk_k, _) = bulk_cache.read_or_dequant_f32(0, t);
+        let (row_k, _) = row_cache.read_or_dequant_f32(0, t);
+        let bulk_data = bulk_k.into_data().into_vec::<f32>().unwrap();
+        let row_data = row_k.into_data().into_vec::<f32>().unwrap();
+
+        let mut max_diff = 0f32;
+        for (a, b) in bulk_data.iter().zip(row_data.iter()) {
+            max_diff = max_diff.max((a - b).abs());
+        }
+        println!("q8_bulk_write_matches_row_by_row: max_diff={max_diff}");
+        assert_eq!(bulk_data, row_data, "bulk (T={t}) write must dequantize identically to T=1 writes");
+    }
+
+    /// `import_prefix` from a q8_0 image must be bit-identical to `write`ing
+    /// the same (already-quantized) rows directly — checked here by round
+    /// tripping through `export_prefix_q8`/`import_prefix_q8` (no dequant
+    /// step, per Session 13's design) and comparing to a fresh cache built
+    /// by `write`ing the same source rows.
+    #[test]
+    fn import_prefix_q8_bit_identical_to_write() {
+        let device = WgpuDevice::default();
+        let num_layers = 2;
+        let n_kv_heads = 2;
+        let head_dim = 128;
+        let max_ctx = 64;
+        let n_tokens = 9;
+
+        let mut src = KvCache::new_with_dtype(num_layers, n_kv_heads, head_dim, max_ctx, &device, KvDtype::Q8_0);
+        let mut rng = Lcg(7);
+        for _pos in 0..n_tokens {
+            for layer in 0..num_layers {
+                let shape = [1, n_kv_heads, 1, head_dim];
+                let k_vals: Vec<f32> = (0..(n_kv_heads * head_dim)).map(|_| rng.next_f32() * 15.0).collect();
+                let v_vals: Vec<f32> = (0..(n_kv_heads * head_dim)).map(|_| rng.next_f32() * 15.0).collect();
+                let k = Tensor::<Wgpu, 4>::from_data(burn::tensor::TensorData::new(k_vals, shape), &device);
+                let v = Tensor::<Wgpu, 4>::from_data(burn::tensor::TensorData::new(v_vals, shape), &device);
+                src.write(layer, k, v);
+            }
+            src.advance(1);
+        }
+
+        let exported = src.export_prefix_q8(n_tokens);
+        let mut dst = KvCache::new_with_dtype(num_layers, n_kv_heads, head_dim, max_ctx, &device, KvDtype::Q8_0);
+        dst.import_prefix_q8(&exported, n_tokens);
+        assert_eq!(dst.len(), n_tokens);
+
+        let reexported = dst.export_prefix_q8(n_tokens);
+        for layer in 0..num_layers {
+            assert_eq!(exported[layer].k_scales, reexported[layer].k_scales, "layer {layer} k_scales");
+            assert_eq!(exported[layer].k_words, reexported[layer].k_words, "layer {layer} k_words");
+            assert_eq!(exported[layer].v_scales, reexported[layer].v_scales, "layer {layer} v_scales");
+            assert_eq!(exported[layer].v_words, reexported[layer].v_words, "layer {layer} v_words");
+        }
+    }
+
+    /// Decode-time (M=1) fused q8_0 attention (`gguf::attn_decode_q8_dispatch`)
+    /// vs a CPU f64 reference computed on the *same* (already-quantized,
+    /// then dequantized-back) K/V — isolates the kernel's own math from
+    /// quantization error, per the task brief's "vs the f32 path <= 1e-3
+    /// rel" requirement. GQA: `n_heads=4`, `n_kv_heads=2` (kv_head =
+    /// h / n_rep, matching `model.rs::repeat_kv`'s head order).
+    #[test]
+    fn q8_decode_attention_matches_f64_reference() {
+        use burn::backend::wgpu::WgpuRuntime;
+        use cubecl::Runtime;
+
+        let device = WgpuDevice::default();
+        let n_heads = 4;
+        let n_kv_heads = 2;
+        let n_rep = n_heads / n_kv_heads;
+        let head_dim = 128;
+        let max_ctx = 6000;
+
+        for &kv_len in &[31usize, 2225, 5000] {
+            let mut cache = KvCache::new_with_dtype(1, n_kv_heads, head_dim, max_ctx, &device, KvDtype::Q8_0);
+            let mut rng = Lcg(1000 + kv_len as u64);
+            for _pos in 0..kv_len {
+                let shape = [1, n_kv_heads, 1, head_dim];
+                let k_vals: Vec<f32> = (0..(n_kv_heads * head_dim)).map(|_| rng.next_f32() * 6.0).collect();
+                let v_vals: Vec<f32> = (0..(n_kv_heads * head_dim)).map(|_| rng.next_f32() * 6.0).collect();
+                let k = Tensor::<Wgpu, 4>::from_data(burn::tensor::TensorData::new(k_vals, shape), &device);
+                let v = Tensor::<Wgpu, 4>::from_data(burn::tensor::TensorData::new(v_vals, shape), &device);
+                cache.write(0, k, v);
+                cache.advance(1);
+            }
+
+            let mut q = vec![0f32; n_heads * head_dim];
+            for x in q.iter_mut() {
+                *x = rng.next_f32() * 4.0;
+            }
+
+            let (k_deq, v_deq) = cache.read_or_dequant_f32(0, kv_len);
+            let k_deq = k_deq.into_data().into_vec::<f32>().unwrap();
+            let v_deq = v_deq.into_data().into_vec::<f32>().unwrap();
+
+            let scale = (head_dim as f32).powf(-0.5);
+            let mut reference = vec![0f32; n_heads * head_dim];
+            for h in 0..n_heads {
+                let kv_head = h / n_rep;
+                let mut scores = vec![0f64; kv_len];
+                for j in 0..kv_len {
+                    let mut dot = 0f64;
+                    for d in 0..head_dim {
+                        dot += q[h * head_dim + d] as f64 * k_deq[(kv_head * kv_len + j) * head_dim + d] as f64;
+                    }
+                    scores[j] = dot * scale as f64;
+                }
+                let m = scores.iter().cloned().fold(f64::MIN, f64::max);
+                let exps: Vec<f64> = scores.iter().map(|s| (s - m).exp()).collect();
+                let sum: f64 = exps.iter().sum();
+                for d in 0..head_dim {
+                    let mut acc = 0f64;
+                    for (j, &e) in exps.iter().enumerate() {
+                        acc += (e / sum) * v_deq[(kv_head * kv_len + j) * head_dim + d] as f64;
+                    }
+                    reference[h * head_dim + d] = acc as f32;
+                }
+            }
+
+            let client = WgpuRuntime::client(&device);
+            let q_bytes: Vec<u8> = q.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let q_handle = client.create_from_slice(&q_bytes);
+            let scratch = client.empty(n_heads * max_ctx * 4);
+            let (ks, kw, vs, vw) = cache.q8_layer(0);
+            let out_handle = llm_wasm::gguf::attn_decode_q8_dispatch(
+                &client, &q_handle, ks, kw, vs, vw, &scratch, n_heads, n_kv_heads, head_dim, kv_len, max_ctx, scale,
+            );
+            let out_bytes = client.read_one(out_handle);
+            let out: Vec<f32> = out_bytes
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+
+            let mut max_rel = 0f32;
+            for (a, b) in out.iter().zip(reference.iter()) {
+                let denom = b.abs().max(1e-6);
+                max_rel = max_rel.max((a - b).abs() / denom);
+            }
+            println!("q8_decode_attention kv_len={kv_len}: max_rel={max_rel}");
+            assert!(
+                max_rel <= 1e-3,
+                "kv_len={kv_len}: fused q8 decode attention diverges from f64 reference by {max_rel} (rel)"
+            );
+        }
     }
 }
