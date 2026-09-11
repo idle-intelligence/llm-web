@@ -20,22 +20,25 @@
 //!
 //! ## Prefix caching
 //!
-//! The rendered prompt for every turn in a conversation with the same
-//! `tools` set shares an identical *token* prefix: system message + tool
-//! schema preamble, which the xLAM-2 chat template renders before the user
-//! turn (see `template.rs`). Re-running the full prefill for that prefix on
-//! every step wastes most of prefill's cost once a conversation has more
-//! than a couple of tools. `Agent` computes this prefix's token length once
-//! per distinct `tools` set (comparing two renders — the actual utterance
-//! plus a throwaway probe utterance under the same tools — and taking their
-//! common leading run of token ids) and passes it to
-//! [`Generator::generate_with_cached_prefix`] on every step, so a concrete
-//! `Generator` backed by a real model can `KvCache::restore()` to that
-//! length and prefill only the new suffix instead of the whole prompt (see
-//! `kv.rs`'s `snapshot`/`restore`, which this trait method is designed to
-//! be implemented against). `FixtureGenerator`'s default implementation
-//! just ignores the hint and regenerates from the full prompt, since it
-//! has no cache to restore.
+//! Every step's rendered prompt is almost entirely a prefix of the
+//! previous step's: not just the constant system + tool-schema preamble
+//! (see `template.rs`), but the whole conversation tail up to that point —
+//! prior tool calls, tool results, everything. `Agent` tracks
+//! `resident_tokens`, its belief about what the `Generator`'s KV cache
+//! physically holds right now (the last rendered prompt plus whatever of
+//! its generation was actually forwarded — see that field's doc comment),
+//! and on every `generate_attempt` call computes the longest run of
+//! leading tokens the new prompt shares with it (`common_prefix_len`) as
+//! the `prefix_len` hint passed to
+//! [`Generator::generate_with_cached_prefix`]. A concrete `Generator`
+//! backed by a real model can then `KvCache::restore()` to that length and
+//! prefill only the new suffix instead of the whole prompt (see `kv.rs`'s
+//! `snapshot`/`restore`, which this trait method is designed to be
+//! implemented against) — genuinely new tokens only, not the whole
+//! conversation tail re-prefilled from the constant prefix every step (see
+//! `tests/resident_reuse.rs`, which quantifies the difference).
+//! `FixtureGenerator`'s default implementation just ignores the hint and
+//! regenerates from the full prompt, since it has no cache to restore.
 
 use crate::grammar::{self, Constraint, Grammar, GrammarConstraint, IdValues, TokenVocab};
 use crate::schemadiet::{diet_tools, DietLevel};
@@ -386,9 +389,15 @@ pub struct Agent<G: Generator, C: ToolCaller> {
     /// `start`/`reset`, and whenever a non-error tool result arrives) —
     /// see `provide_tool_results`.
     consecutive_tool_errors: usize,
-    /// Cached (tools set, common prefix token length), recomputed only when
-    /// `tools` changes between `start` calls — see module docs.
-    prefix_cache: Option<(Vec<Tool>, usize)>,
+    /// Token ids the `Generator`'s KV cache actually holds, in order — the
+    /// full sequence of the last rendered prompt plus whatever of its
+    /// generation was forwarded into the cache (every generated token
+    /// except a trailing stop id, which ends the decode loop before it's
+    /// ever fed through a forward pass — see module docs and
+    /// `generate_attempt`). Not cleared by `reset`/`start`: it's a belief
+    /// about the *Generator's* physical cache state, which outlives an
+    /// `Agent`-level conversation reset — see `reset`'s doc comment.
+    resident_tokens: Vec<u32>,
 
     /// Whether to constrain generation to `grammar.rs`'s tool-call schema
     /// (see [`Agent::set_constrained`]). Off by default so existing
@@ -443,7 +452,7 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
             step_index: 0,
             pending_calls: Vec::new(),
             consecutive_tool_errors: 0,
-            prefix_cache: None,
+            resident_tokens: Vec::new(),
             constrained: false,
             id_values: IdValues::new(),
             token_vocab: None,
@@ -490,8 +499,10 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
     }
 
     /// Drop any in-progress conversation state (e.g. after an `Error`
-    /// outcome, or to abandon a turn). Does not touch the KV-cache prefix
-    /// cache, which is keyed by `tools` and safe to keep across turns.
+    /// outcome, or to abandon a turn). Does not touch `resident_tokens`:
+    /// it tracks the `Generator`'s physical KV cache, not `Agent`'s own
+    /// conversation state, and is still a valid (if now-stale) prefix to
+    /// diff the next turn's render against — see `generate_attempt`.
     pub fn reset(&mut self) {
         self.messages.clear();
         self.tools.clear();
@@ -516,16 +527,6 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
         self.id_values = IdValues::new();
         self.successful_calls_this_turn.clear();
         self.calls_made_this_turn.clear();
-
-        match self.prefix_len_for(&self.tools, utterance) {
-            Ok(len) => self.prefix_cache = Some((self.tools.clone(), len)),
-            Err(e) => {
-                return StepOutcome::Error {
-                    message: format!("failed to compute prefix cache length: {e}"),
-                    step: None,
-                }
-            }
-        }
 
         self.step_inner()
     }
@@ -809,12 +810,13 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
             .encode(&prompt, false)
             .map_err(|e| format!("failed to encode prompt: {e}"))?;
 
-        let prefix_len = self
-            .prefix_cache
-            .as_ref()
-            .filter(|(cached_tools, _)| cached_tools == &self.tools)
-            .map(|(_, len)| (*len).min(prompt_tokens.len()))
-            .unwrap_or(0);
+        // Longest run of leading tokens `prompt_tokens` shares with what's
+        // actually resident in the `Generator`'s KV cache right now (see
+        // `resident_tokens`'s doc comment) — a prefix of *both* sequences
+        // by construction, and never longer than `resident_tokens`, so
+        // it's always safe to pass as `prefix_len`'s "already resident"
+        // hint below.
+        let prefix_len = common_prefix_len(&self.resident_tokens, &prompt_tokens);
 
         // Build this step's schema constraint (if `constrained`, or this
         // attempt forces it on) from the current tool set + every id
@@ -890,6 +892,21 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
             .map_err(|e| format!("failed to decode generated tokens: {e}"))?;
         let parsed = parse_output(&generated_text).map_err(|e| e.to_string());
 
+        // Record what's now actually resident in the `Generator`'s cache:
+        // this attempt's prompt, plus every generated token that was fed
+        // through a forward pass — i.e. all of `out_ids` except a trailing
+        // stop id, which ends the decode loop before it's ever forwarded
+        // (see `resident_tokens`'s doc comment). Updated unconditionally,
+        // even for an attempt `step_inner` goes on to discard as invalid —
+        // the physical cache holds these tokens regardless of whether the
+        // output parsed.
+        self.resident_tokens = prompt_tokens.clone();
+        let forwarded = match out_ids.last() {
+            Some(last) if self.tokenizer.eos_ids().contains(last) => &out_ids[..out_ids.len() - 1],
+            _ => &out_ids[..],
+        };
+        self.resident_tokens.extend_from_slice(forwarded);
+
         Ok(AttemptOutput {
             prompt_tokens,
             generated_text,
@@ -902,22 +919,6 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
             forced_tokens,
             id_rule_relaxed,
         })
-    }
-
-    /// Common leading token-id run between rendering `utterance` and a
-    /// throwaway probe utterance under the same `tools` — see module docs.
-    fn prefix_len_for(&self, tools: &[Tool], utterance: &str) -> Result<usize> {
-        let a = self.render_and_encode(tools, utterance)?;
-        // A probe utterance chosen to diverge from any real first word;
-        // only its token-level divergence point from `a` matters.
-        let b = self.render_and_encode(tools, "\u{0}prefix-cache-probe\u{0}")?;
-        Ok(a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count())
-    }
-
-    fn render_and_encode(&self, tools: &[Tool], utterance: &str) -> Result<Vec<u32>> {
-        let messages = vec![Message::system(&self.system_prompt), Message::user(utterance)];
-        let prompt = self.template.render_prompt(&messages, tools, true)?;
-        self.tokenizer.encode(&prompt, false)
     }
 
     /// Run the agent loop for one user `utterance`, executing tool calls
@@ -990,6 +991,13 @@ fn tools_from_mcp(raw_tools: &[Value], diet: bool) -> Vec<Tool> {
             ))
         })
         .collect()
+}
+
+/// Longest run of leading token ids shared by `a` and `b` — a prefix of
+/// both sequences by construction. Used to find how much of `resident_tokens`
+/// still applies to a freshly rendered prompt (see `generate_attempt`).
+fn common_prefix_len(a: &[u32], b: &[u32]) -> usize {
+    a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
 }
 
 fn pending_calls_from(calls: &[ToolCall]) -> Vec<PendingToolCall> {

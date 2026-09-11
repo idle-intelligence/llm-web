@@ -597,27 +597,35 @@ file's Browser section.
 
 ### Prefix cache
 
-Same idea as `agent.rs`'s (see its module docs): `LlmEngine` renders the actual utterance plus a
-throwaway probe utterance under the same `tools` set, finds their common leading token run, and
-caches that length keyed by the `tools` list (`Tool` derives `PartialEq`, so a 12-34-entry
-`Vec<Tool>` comparison is cheap). Before prefilling, it checks the cached length against
-`resident_tokens` (the exact token sequence currently written into the `KvCache`, tracked
-position-for-position in `web.rs`) — only trusting the cache when the resident prefix's tokens
-actually match the new prompt's leading tokens, falling back to a full prefill
-(`effective_prefix = 0`) otherwise. Measured on the real tokenizer/template with the 12-tool
-Sonos fixture (`fixtures/sonos/tools-12.json`) and system prompt `"You are a helpful home
-assistant with access to Sonos speaker controls."` (see
-`crates/llm-wasm/tests/agent.rs::prefix_is_stable_across_utterances_for_same_tools`):
+Both `Agent` (native) and `LlmEngine` (`web.rs`) track `resident_tokens`: the exact token sequence
+currently written into the KV cache, position-for-position — the last rendered prompt plus
+whatever of its generation was actually forwarded through the model (every generated token except
+a trailing stop id, which ends the decode loop *before* it's ever fed through a forward pass, so
+it never enters the cache). On every step, before prefilling, both compute `common_prefix_len`
+between `resident_tokens` and the newly rendered prompt's tokens — the longest run of leading
+tokens the two share, which is a prefix of both by construction and never longer than
+`resident_tokens` — and pass that length as the "already resident" hint (`Agent` to
+`Generator::generate_constrained`'s `prefix_len` argument; `LlmEngine` directly to
+`KvCache::restore()`), prefilling only the remainder.
 
-```
-utterance A ("pause the kitchen"):                2225 tokens
-utterance B ("what's playing in the living room"): 2229 tokens
-common prefix:                                     2218 tokens
-```
+This reuses far more than just the constant system+tools preamble: within one multi-step agent
+turn, each step's prompt is almost entirely a prefix of the *previous* step's prompt-plus-
+generation — prior tool calls and tool results included — not just the tools-set-constant part.
+Restoring only to the constant prefix (what this cache used to do, keyed by `tools` and computed
+once via a throwaway probe render) re-prefills that entire growing conversation tail on every
+non-first step. `crates/llm-wasm/tests/resident_reuse.rs` quantifies the difference on the real
+tokenizer/template against a 3-step tool-call turn built from the 12-tool Sonos fixture
+(`fixtures/sonos/tools-12.json`): restoring to just the constant prefix costs 1233 tokens of
+prefill across the three steps; restoring to the longest common prefix with `resident_tokens`
+costs 769 — a 37.6% reduction, concentrated in the later steps (step 2 alone: 807 tokens under the
+old scheme vs. 377 under the new one, more than half saved) as the conversation tail — and the gap
+between the two schemes — grows.
 
-i.e. ~99.7% of the rendered prompt for two different utterances under the same tools is the
-constant system+tools preamble — prefilling that once per tools-set change instead of per turn is
-the entire point of this cache.
+The re-rendered assistant tool-call turn `Agent`/`LlmEngine` append to `messages` after a tool-call
+step (built from the parsed `ToolCallEntry`/`ToolCallFunction`, via `template.rs`'s `py_tojson`) is
+byte-identical to what the model actually generated for that turn — also verified in
+`resident_reuse.rs` — so the common-prefix match isn't cut short there; the only points where it
+actually degrades are genuine content changes (a different tool call, a different tool result).
 
 ### The three local dev servers
 
@@ -1378,7 +1386,7 @@ header handy; either is just an opaque string to this format. `prefix_key`
 (`sha256(model_fingerprint || rendered_prefix_text)` — hashing the *rendered* prompt, not the
 system prompt and tool list separately, means the key is
 sensitive to chat-template version, system-prompt wording, and tool ordering all at once, matching
-how `web.rs`'s `compute_prefix_len`/`resident_tokens` already treat the rendered prompt as the
+how `web.rs`'s `resident_tokens`/`common_prefix_len` already treat the rendered prompt as the
 unit of comparison), `tokens` (the prefix's token ids, for a resident-tokens equality check before
 trusting an import — same check `web.rs`'s `run_step` already does for its in-session prefix
 cache), `n_layers`/`n_kv_heads`/`head_dim`/`dtype`/`engine`/`created`.

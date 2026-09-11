@@ -218,9 +218,6 @@ pub struct LlmEngine {
     tools: Vec<Tool>,
     pending_calls: Vec<PendingToolCall>,
     step_index: usize,
-    /// Cached (tools set, common prefix token length) — recomputed only
-    /// when `tools` changes between `start()` calls.
-    prefix_cache: Option<(Vec<Tool>, usize)>,
     /// Consecutive tool-error results fed back so far this turn (reset by
     /// `start`/`reset`) — see `provide_tool_results`.
     consecutive_tool_errors: usize,
@@ -291,7 +288,6 @@ impl LlmEngine {
             tools: Vec::new(),
             pending_calls: Vec::new(),
             step_index: 0,
-            prefix_cache: None,
             consecutive_tool_errors: 0,
             constrained: true,
             diet: true,
@@ -431,11 +427,6 @@ impl LlmEngine {
         self.successful_calls_this_turn.clear();
         self.calls_made_this_turn.clear();
 
-        match self.compute_prefix_len(&utterance) {
-            Ok(len) => self.prefix_cache = Some((self.tools.clone(), len)),
-            Err(e) => return Ok(error_json(&format!("failed to compute prefix cache length: {e}"))),
-        }
-
         self.run_step().await
     }
 
@@ -482,7 +473,6 @@ impl LlmEngine {
         self.tools.clear();
         self.pending_calls.clear();
         self.step_index = 0;
-        self.prefix_cache = None;
         self.resident_tokens.clear();
         self.consecutive_tool_errors = 0;
         self.id_values = IdValues::new();
@@ -848,27 +838,19 @@ struct AttemptOutput {
     id_rule_relaxed: bool,
 }
 
+/// Longest run of leading token ids shared by `a` and `b` — a prefix of
+/// both sequences by construction. Used to find how much of
+/// `LlmEngine::resident_tokens` still applies to a freshly rendered
+/// prompt (see `LlmEngine::generate_attempt`).
+fn common_prefix_len(a: &[u32], b: &[u32]) -> usize {
+    a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
+}
+
 fn error_json(message: &str) -> String {
     serde_json::json!({ "outcome": "error", "message": message }).to_string()
 }
 
 impl LlmEngine {
-    /// Common leading token-id run between rendering `utterance` and a
-    /// throwaway probe utterance under the current `self.tools` — same
-    /// method `agent.rs`'s `Agent::prefix_len_for` uses natively.
-    fn compute_prefix_len(&self, utterance: &str) -> anyhow::Result<usize> {
-        let template = self.template.as_ref().ok_or_else(|| anyhow::anyhow!("model not loaded"))?;
-        let tokenizer = self.tokenizer.as_ref().ok_or_else(|| anyhow::anyhow!("model not loaded"))?;
-        let render = |u: &str| -> anyhow::Result<Vec<u32>> {
-            let messages = vec![Message::system(&self.system_prompt), Message::user(u)];
-            let prompt = template.render_prompt(&messages, &self.tools, true)?;
-            tokenizer.encode(&prompt, false)
-        };
-        let a = render(utterance)?;
-        let b = render("\u{0}prefix-cache-probe\u{0}")?;
-        Ok(a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count())
-    }
-
     /// The system+tools prefix `bin/llm-agent.rs`'s `kv-export` subcommand
     /// exports images for: common leading token-id run between two
     /// content-free probe utterances rendered under `tools`/`system` (not
@@ -1140,20 +1122,16 @@ impl LlmEngine {
             .encode(&prompt, false)
             .map_err(|e| JsError::new(&format!("failed to encode prompt: {e}")))?;
 
-        let prefix_len = self
-            .prefix_cache
-            .as_ref()
-            .filter(|(cached_tools, _)| cached_tools == &self.tools)
-            .map(|(_, len)| (*len).min(prompt_tokens.len()))
-            .unwrap_or(0);
-        let effective_prefix = if prefix_len > 0
-            && prefix_len <= self.resident_tokens.len()
-            && self.resident_tokens[..prefix_len] == prompt_tokens[..prefix_len]
-        {
-            prefix_len
-        } else {
-            0
-        };
+        // Longest run of leading tokens this step's prompt shares with
+        // what's actually resident in the KV cache right now — not just
+        // the constant system+tools preamble, but as much of the
+        // conversation tail (prior tool calls/results) as still matches
+        // (see `resident_tokens`'s doc comment and `tests/resident_reuse.rs`,
+        // which quantifies the difference against restoring to just the
+        // constant prefix). By construction this is a prefix of both
+        // sequences and never longer than `resident_tokens`, so it's
+        // always safe to `cache.restore()` to.
+        let effective_prefix = common_prefix_len(&self.resident_tokens, &prompt_tokens);
 
         // Build this step's schema constraint (if `self.constrained`, or
         // this attempt forces it on) from the current tool set + every id
