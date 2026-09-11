@@ -243,3 +243,54 @@ fn resident_reuse_savings_across_steps() {
         "expected the longest-common-prefix restore to save tokens across steps 1..3"
     );
 }
+
+/// The degenerate case `agent.rs::generate_attempt`/`web.rs::generate_attempt`
+/// both now guard against (the s02 "List all my speakers." browser-gate
+/// bug fixed alongside this test, introduced by the longest-common-prefix
+/// restore this module quantifies the savings of): the repeat-guard /
+/// forced-text-answer retry path re-renders the exact same prompt a
+/// previous step already prefilled in full, so
+/// `common_prefix_len(resident, prompt_tokens)` equals `prompt_tokens.len()`
+/// — the whole prompt, not just a prefix of it. Restoring the cache to
+/// that length and prefilling the (empty) remainder would leave no
+/// last-position logit to sample from. Both loops instead step the
+/// restore point back one token so there's always exactly one token — the
+/// prompt's last — left to prefill.
+#[test]
+fn fully_cached_prompt_prefills_exactly_one_token() {
+    let Some((template, tokenizer)) = load_parts() else {
+        return;
+    };
+    let tools = tools_12();
+    let messages = vec![
+        Message::system("You are a helpful home assistant with access to Sonos speaker controls."),
+        Message::user("List all my speakers."),
+    ];
+    let prompt = template.render_prompt(&messages, &tools, true).unwrap();
+    let prompt_tokens = tokenizer.encode(&prompt, false).unwrap();
+    assert!(!prompt_tokens.is_empty());
+
+    // Resident cache already holds exactly this prompt (the re-render on
+    // the repeat-guard / forced-text-answer path).
+    let resident = prompt_tokens.clone();
+    let common_with_resident = common_prefix_len(&resident, &prompt_tokens);
+    assert_eq!(
+        common_with_resident,
+        prompt_tokens.len(),
+        "resident cache should cover the whole re-rendered prompt in this scenario"
+    );
+
+    // The fix: clamp the restore point back one token when the common
+    // prefix would otherwise cover the whole prompt (mirrors
+    // `agent.rs::generate_attempt`'s `prefix_len` clamp and
+    // `web.rs::generate_attempt`'s `effective_prefix` clamp).
+    let mut effective_prefix = common_with_resident;
+    if effective_prefix == prompt_tokens.len() {
+        effective_prefix -= 1;
+    }
+    let prefill_len = prompt_tokens.len() - effective_prefix;
+    assert_eq!(
+        prefill_len, 1,
+        "fully-cached prompt must prefill exactly its final token, not 0 and not the whole prompt"
+    );
+}

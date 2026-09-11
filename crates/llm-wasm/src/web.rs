@@ -1131,7 +1131,19 @@ impl LlmEngine {
         // constant prefix). By construction this is a prefix of both
         // sequences and never longer than `resident_tokens`, so it's
         // always safe to `cache.restore()` to.
-        let effective_prefix = common_prefix_len(&self.resident_tokens, &prompt_tokens);
+        let mut effective_prefix = common_prefix_len(&self.resident_tokens, &prompt_tokens);
+        // The repeat-guard / forced-text-answer retry paths re-render the
+        // exact same prompt a step already prefilled, so the common prefix
+        // can cover the *whole* prompt, leaving no new suffix to prefill.
+        // Step back one token so there's always at least the final token
+        // to run forward — generation needs a last-position logit to
+        // sample from regardless of whether anything is actually "new".
+        if prompt_tokens.is_empty() {
+            return Err(JsError::new("empty prompt: nothing to prefill"));
+        }
+        if effective_prefix == prompt_tokens.len() {
+            effective_prefix -= 1;
+        }
 
         // Build this step's schema constraint (if `self.constrained`, or
         // this attempt forces it on) from the current tool set + every id
@@ -1178,10 +1190,9 @@ impl LlmEngine {
         let model = self.model.as_ref().ok_or_else(|| JsError::new("model not loaded"))?;
         let cache = self.cache.as_mut().ok_or_else(|| JsError::new("model not loaded"))?;
         cache.restore(effective_prefix);
+        // Guaranteed non-empty: `effective_prefix` is clamped above to
+        // leave at least the prompt's final token unforwarded.
         let suffix = &prompt_tokens[effective_prefix..];
-        if suffix.is_empty() {
-            return Err(JsError::new("prompt fully cached with no new tokens to prefill"));
-        }
         self.resident_tokens.truncate(effective_prefix);
 
         let prefill_start = now_ms();

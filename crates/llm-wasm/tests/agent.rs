@@ -1,6 +1,6 @@
 //! Agent loop tests (phase 1a).
 
-use llm_wasm::agent::{Agent, FixtureCaller, FixtureGenerator, StepOutcome, ToolCaller};
+use llm_wasm::agent::{Agent, FixtureCaller, FixtureGenerator, Generator, StepOutcome, ToolCaller};
 use llm_wasm::template::{ChatTemplate, Tool};
 use llm_wasm::tokenizer::Tokenizer;
 use llm_wasm::tools::ParsedOutput;
@@ -47,6 +47,50 @@ fn load_agent_parts() -> Option<(ChatTemplate, Tokenizer)> {
     let template = ChatTemplate::from_tokenizer_config(&cfg).unwrap();
     let tokenizer = Tokenizer::from_json(&std::fs::read(&tok_path).unwrap()).unwrap();
     Some((template, tokenizer))
+}
+
+/// Like `FixtureGenerator`, but actually enforces the contract a real
+/// KV-cache-backed `Generator` does around `prefix_len`: erroring if handed
+/// a `prefix_len` covering the *whole* prompt (no new tokens to prefill),
+/// exactly as `web.rs::generate_attempt`'s `cache.restore`/prefill would
+/// before its fix. Used to give `agent.rs::generate_attempt`'s `prefix_len`
+/// clamp (mirroring `web.rs`'s `effective_prefix` clamp) real regression
+/// coverage — `FixtureGenerator`'s default `generate_with_cached_prefix`
+/// ignores the hint entirely, so it can't catch this.
+struct FullyCachedGuardGenerator {
+    script: Vec<Vec<u32>>,
+    next: usize,
+}
+
+impl FullyCachedGuardGenerator {
+    fn new(script: Vec<Vec<u32>>) -> Self {
+        Self { script, next: 0 }
+    }
+}
+
+impl Generator for FullyCachedGuardGenerator {
+    fn generate(&mut self, prompt_ids: &[u32], max_new_tokens: usize, stop_ids: &[u32]) -> anyhow::Result<Vec<u32>> {
+        self.generate_with_cached_prefix(prompt_ids, 0, max_new_tokens, stop_ids)
+    }
+
+    fn generate_with_cached_prefix(
+        &mut self,
+        prompt_ids: &[u32],
+        prefix_len: usize,
+        _max_new_tokens: usize,
+        _stop_ids: &[u32],
+    ) -> anyhow::Result<Vec<u32>> {
+        if prefix_len >= prompt_ids.len() {
+            anyhow::bail!("prompt fully cached with no new tokens to prefill");
+        }
+        let out = self
+            .script
+            .get(self.next)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("FullyCachedGuardGenerator script exhausted after {} call(s)", self.next))?;
+        self.next += 1;
+        Ok(out)
+    }
 }
 
 /// Encode a model turn's raw text (as the model would emit it, i.e. ending
@@ -593,6 +637,59 @@ fn repeats_exhausting_retries_force_a_text_only_answer() {
             assert!(step.forced_text_answer);
         }
         other => panic!("expected Final via the forced text-only answer, got: {other:?}"),
+    }
+}
+
+/// Regression test for the browser-gate bug (case s02 "List all my
+/// speakers.", 2026-09-11, `Error: prompt fully cached with no new tokens
+/// to prefill`, introduced by `07e439b`'s longest-common-prefix restore):
+/// the repeat-guard's first retry re-renders the exact same prompt the
+/// previous attempt just generated from, so the common prefix with what's
+/// now resident (that prompt plus the repeat it produced) covers the
+/// *whole* prompt. `generate_attempt` must clamp its `prefix_len` hint
+/// back one token instead of handing a real `Generator` a hint with no new
+/// tokens to prefill — verified here with `FullyCachedGuardGenerator`,
+/// which errors exactly as the real KV-cache-backed one used to. The turn
+/// still completes `Final`, exhausting retries into a forced text-only
+/// answer, with a non-empty final text.
+#[test]
+fn fully_cached_repeat_guard_step_does_not_error() {
+    let Some((template, tokenizer)) = load_agent_parts() else {
+        return;
+    };
+
+    let listing_turn = script_tokens(
+        &tokenizer,
+        r#"[{"name": "get_households_and_groups_and_players", "arguments": {}}]<|im_end|>"#,
+    );
+    let forced_answer = script_tokens(&tokenizer, "You already have that information.<|im_end|>");
+
+    let generator = FullyCachedGuardGenerator::new(vec![
+        listing_turn.clone(),
+        listing_turn.clone(),
+        listing_turn.clone(),
+        listing_turn,
+        forced_answer,
+    ]);
+    let caller = FixtureCaller::new(results_dir());
+    let mut agent = Agent::new(template, tokenizer, generator, caller, "sys", 64);
+
+    let outcome = agent.start("what's playing?", &tools_12());
+    let StepOutcome::NeedTools { calls, .. } = outcome else {
+        panic!("expected first call to succeed, got {outcome:?}");
+    };
+
+    let result: Value = serde_json::from_str(
+        &std::fs::read_to_string(results_dir().join("get_households_and_groups_and_players.json")).unwrap(),
+    )
+    .unwrap();
+    let outcome2 = agent.provide_tool_results(vec![(calls[0].call_id.clone(), result)]);
+    match outcome2 {
+        StepOutcome::Final { text, step } => {
+            assert!(!text.is_empty());
+            assert!(step.forced_text_answer || step.repeat_guard);
+        }
+        other => panic!("expected Final, got: {other:?}"),
     }
 }
 

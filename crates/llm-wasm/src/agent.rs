@@ -816,7 +816,20 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
         // by construction, and never longer than `resident_tokens`, so
         // it's always safe to pass as `prefix_len`'s "already resident"
         // hint below.
-        let prefix_len = common_prefix_len(&self.resident_tokens, &prompt_tokens);
+        let mut prefix_len = common_prefix_len(&self.resident_tokens, &prompt_tokens);
+        // The repeat-guard / forced-text-answer retry paths re-render the
+        // exact same prompt a previous step already prefilled, so the
+        // common prefix can cover the *whole* prompt. Step back one token
+        // so `Generator::generate_constrained` always has at least the
+        // final token to prefill — generation needs a last-position logit
+        // to sample from regardless of whether anything is actually "new"
+        // (mirrors `web.rs::generate_attempt`'s `effective_prefix` clamp).
+        if prompt_tokens.is_empty() {
+            return Err("empty prompt: nothing to prefill".to_string());
+        }
+        if prefix_len == prompt_tokens.len() {
+            prefix_len -= 1;
+        }
 
         // Build this step's schema constraint (if `constrained`, or this
         // attempt forces it on) from the current tool set + every id
