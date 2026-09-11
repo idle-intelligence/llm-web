@@ -47,6 +47,7 @@ use burn::backend::wgpu::WgpuDevice;
 use crate::agent::PendingToolCall;
 use crate::gguf::Q4ModelLoader;
 use crate::kv::KvCache;
+use crate::kvimg::{self, Dtype, Header, KvImage};
 use crate::model::LlmModel;
 use crate::sample::greedy;
 use crate::template::{ChatTemplate, Message, Tool, ToolCallEntry, ToolCallFunction};
@@ -174,6 +175,12 @@ pub struct LlmEngine {
     tokenizer: Option<Tokenizer>,
     template: Option<ChatTemplate>,
 
+    /// sha256 of the loaded GGUF's bytes, as computed by the caller and
+    /// passed to `load()` — see `prefix_key`/`import_kv_image`/
+    /// `export_kv_image` and `docs/ENGINE.md` "Prefix KV images" for why
+    /// this is computed in JS (`crypto.subtle.digest`) rather than in wasm.
+    model_fingerprint: Option<String>,
+
     system_prompt: String,
     max_new_tokens: usize,
     max_steps: usize,
@@ -213,6 +220,7 @@ impl LlmEngine {
             resident_tokens: Vec::new(),
             tokenizer: None,
             template: None,
+            model_fingerprint: None,
             system_prompt: "You are a helpful assistant with access to tools.".to_string(),
             max_new_tokens: DEFAULT_MAX_NEW_TOKENS,
             max_steps: DEFAULT_MAX_STEPS,
@@ -277,13 +285,26 @@ impl LlmEngine {
 
         report("parsing-gguf", 0, 3);
         let shards = std::mem::take(&mut self.shard_bufs);
-        let parts = {
+        let (model_fingerprint, parts) = {
             let mut loader = Q4ModelLoader::from_shards(shards)
                 .map_err(|e| JsError::new(&format!("failed to open GGUF: {e}")))?;
-            loader
+            // Model-identity fingerprint from the header bytes already
+            // resident in `loader` (magic through the tensor-info table —
+            // a few KB) + file size, NOT a hash of the whole (1.7GB+) GGUF
+            // — see `kvimg.rs`'s "Hashing" module docs. No `crypto.subtle`
+            // call from JS and no extra pass over the shard bytes needed.
+            let file_len = loader.reader().file_len();
+            let header_bytes = loader
+                .reader_mut()
+                .header_bytes()
+                .map_err(|e| JsError::new(&format!("failed to read GGUF header for fingerprint: {e}")))?;
+            let model_fingerprint = kvimg::gguf_header_fingerprint(file_len, &header_bytes);
+
+            let parts = loader
                 .load_deferred(&self.device)
-                .map_err(|e| JsError::new(&format!("failed to load model: {e}")))?
+                .map_err(|e| JsError::new(&format!("failed to load model: {e}")))?;
             // loader (and shard bytes) dropped here before GPU finalize.
+            (model_fingerprint, parts)
         };
 
         report("finalizing-gpu", 1, 3);
@@ -304,6 +325,7 @@ impl LlmEngine {
         self.resident_tokens.clear();
         self.tokenizer = Some(tokenizer);
         self.template = Some(template);
+        self.model_fingerprint = Some(model_fingerprint);
 
         report("ready", 3, 3);
         Ok(())
@@ -372,6 +394,175 @@ impl LlmEngine {
         if let Some(cache) = self.cache.as_mut() {
             cache.restore(0);
         }
+    }
+
+    /// Debug A/B toggle for a browser-only numerical-divergence bisection
+    /// (see `gguf.rs`'s `force_naive_kernel`): `"naive"` forces the naive
+    /// per-element Q4 matmul kernel for every prefill matmul regardless of
+    /// M; anything else (including `"pinned"`, the default) restores
+    /// production `ForceKernel::Auto` routing. Not used by any production
+    /// code path.
+    #[wasm_bindgen(js_name = setPrefillKernel)]
+    pub fn set_prefill_kernel(&self, kernel: String) {
+        crate::gguf::set_force_naive_kernel(kernel == "naive");
+    }
+
+    /// Prefix-KV-image cache key for `tools_json`/`system` under the
+    /// currently loaded model (`docs/ENGINE.md` "Prefix KV images"):
+    /// `sha256(model_fingerprint || rendered_prefix_text)`, computed the same way
+    /// `bin/llm-agent.rs`'s `kv-export` subcommand computes it when writing
+    /// an image, so a worker can `fetch(<modelBase>/kv/<key>.kvimg)` before
+    /// its first prefill of a given tool set. Errors if the model isn't
+    /// loaded yet (no `model_fingerprint`/tokenizer/template) or `tools_json` is
+    /// malformed.
+    #[wasm_bindgen(js_name = prefixKey)]
+    pub fn prefix_key(&self, tools_json: String, system: String) -> Result<String, JsError> {
+        let tools = parse_tools(&tools_json)?;
+        let model_fingerprint = self
+            .model_fingerprint
+            .as_ref()
+            .ok_or_else(|| JsError::new("model not loaded"))?;
+        let tokenizer = self.tokenizer.as_ref().ok_or_else(|| JsError::new("model not loaded"))?;
+        let prefix_tokens = self
+            .render_kv_prefix_tokens(&tools, &system)
+            .map_err(|e| JsError::new(&format!("failed to render prefix: {e}")))?;
+        let prefix_text = tokenizer
+            .decode(&prefix_tokens, false)
+            .map_err(|e| JsError::new(&format!("failed to decode prefix tokens: {e}")))?;
+        Ok(kvimg::prefix_key(model_fingerprint, &prefix_text))
+    }
+
+    /// Import a prefix KV image (`bytes`, a full `.kvimg` file as fetched
+    /// from `<modelBase>/kv/<prefix_key>.kvimg` or OPFS) in place of
+    /// running prefill for `tools_json`/`system`'s system+tools preamble.
+    /// Validates `header.model_fingerprint`, `header.prefix_key`, and
+    /// `header.tokens` against what this engine/model/tools/system would
+    /// actually render (same match discipline `run_step`'s
+    /// `effective_prefix` check already applies to `resident_tokens`) —
+    /// returns `Ok(false)` on any mismatch (caller falls back to normal
+    /// prefill) rather than importing a wrong prefix. Synchronous:
+    /// `KvCache::import_prefix` only writes (`from_data`/`slice_assign`),
+    /// no GPU readback, so no async/await is needed on this path.
+    #[wasm_bindgen(js_name = importKvImage)]
+    pub fn import_kv_image(&mut self, bytes: &[u8], tools_json: String, system: String) -> Result<bool, JsError> {
+        let tools = parse_tools(&tools_json)?;
+        let model_fingerprint = self
+            .model_fingerprint
+            .as_ref()
+            .ok_or_else(|| JsError::new("model not loaded"))?
+            .clone();
+        let model = self.model.as_ref().ok_or_else(|| JsError::new("model not loaded"))?;
+
+        let (header, data_offset) =
+            KvImage::read_header(bytes).map_err(|e| JsError::new(&format!("bad kv image: {e}")))?;
+        if header.model_fingerprint != model_fingerprint {
+            wasm_log("[llm] kv image model_fingerprint mismatch — ignoring");
+            return Ok(false);
+        }
+
+        let expected_tokens = self
+            .render_kv_prefix_tokens(&tools, &system)
+            .map_err(|e| JsError::new(&format!("failed to render prefix: {e}")))?;
+        if header.tokens != expected_tokens {
+            wasm_log("[llm] kv image tokens mismatch — ignoring");
+            return Ok(false);
+        }
+        let tokenizer = self.tokenizer.as_ref().ok_or_else(|| JsError::new("model not loaded"))?;
+        let prefix_text = tokenizer
+            .decode(&expected_tokens, false)
+            .map_err(|e| JsError::new(&format!("failed to decode prefix tokens: {e}")))?;
+        let expected_key = kvimg::prefix_key(&model_fingerprint, &prefix_text);
+        if header.prefix_key != expected_key {
+            wasm_log("[llm] kv image prefix_key mismatch — ignoring");
+            return Ok(false);
+        }
+
+        let cfg = model.config();
+        let expected_head_dim = cfg.hidden_size / cfg.num_heads;
+        if header.n_layers != cfg.num_layers || header.n_kv_heads != cfg.num_kv_heads || header.head_dim != expected_head_dim
+        {
+            wasm_log("[llm] kv image shape mismatch — ignoring");
+            return Ok(false);
+        }
+
+        let mut layers = Vec::with_capacity(header.n_layers);
+        for layer in 0..header.n_layers {
+            let (k, v) = KvImage::layer_f32(bytes, &header, data_offset, layer)
+                .map_err(|e| JsError::new(&format!("failed to decode kv image layer {layer}: {e}")))?;
+            layers.push((k, v));
+        }
+
+        let cache = self.cache.as_mut().ok_or_else(|| JsError::new("model not loaded"))?;
+        cache.import_prefix(&layers, header.tokens.len());
+        self.resident_tokens = header.tokens.clone();
+        wasm_log(&format!(
+            "[llm] imported kv image: {} tokens, {} bytes",
+            header.tokens.len(),
+            bytes.len()
+        ));
+        Ok(true)
+    }
+
+    /// Export the current cache's system+tools prefix (for `tools_json`/
+    /// `system`) as a `.kvimg` byte buffer — the counterpart to
+    /// `import_kv_image`, called on a cache *miss* after the first prefill
+    /// of a tool set so the worker can save the image to OPFS for next
+    /// time. Errors (rather than exporting garbage) if `resident_tokens`
+    /// doesn't currently cover the rendered prefix — call this only after
+    /// a `start()`/step whose prefill included the full system+tools
+    /// preamble. `dtype` is always `q8_0` (the format `docs/ENGINE.md`
+    /// recommends for a one-time browser download — see kvimg.rs module
+    /// docs).
+    #[wasm_bindgen(js_name = exportKvImage)]
+    pub async fn export_kv_image(&self, tools_json: String, system: String) -> Result<Vec<u8>, JsError> {
+        let tools = parse_tools(&tools_json)?;
+        let model_fingerprint = self
+            .model_fingerprint
+            .as_ref()
+            .ok_or_else(|| JsError::new("model not loaded"))?
+            .clone();
+        let model = self.model.as_ref().ok_or_else(|| JsError::new("model not loaded"))?;
+        let cache = self.cache.as_ref().ok_or_else(|| JsError::new("model not loaded"))?;
+        let tokenizer = self.tokenizer.as_ref().ok_or_else(|| JsError::new("model not loaded"))?;
+
+        let prefix_tokens = self
+            .render_kv_prefix_tokens(&tools, &system)
+            .map_err(|e| JsError::new(&format!("failed to render prefix: {e}")))?;
+        let n_tokens = prefix_tokens.len();
+        if n_tokens == 0
+            || n_tokens > self.resident_tokens.len()
+            || self.resident_tokens[..n_tokens] != prefix_tokens[..]
+        {
+            return Err(JsError::new(
+                "current resident tokens do not cover the rendered system+tools prefix — \
+                 call exportKvImage only right after a prefill that included it",
+            ));
+        }
+
+        let prefix_text = tokenizer
+            .decode(&prefix_tokens, false)
+            .map_err(|e| JsError::new(&format!("failed to decode prefix tokens: {e}")))?;
+        let prefix_key = kvimg::prefix_key(&model_fingerprint, &prefix_text);
+
+        let layers = cache.export_prefix_async(n_tokens).await;
+        let cfg = model.config();
+        let header = Header {
+            model_fingerprint,
+            prefix_key,
+            tokens: prefix_tokens,
+            n_layers: cfg.num_layers,
+            n_kv_heads: cfg.num_kv_heads,
+            head_dim: cfg.hidden_size / cfg.num_heads,
+            dtype: Dtype::Q8_0.as_str().to_string(),
+            engine: format!("llm-wasm/{}", env!("CARGO_PKG_VERSION")),
+            created: js_sys::Date::new_0().to_iso_string().as_string().unwrap_or_default(),
+        };
+
+        let mut buf = Vec::new();
+        let layer_refs: Vec<(&[f32], &[f32])> = layers.iter().map(|(k, v)| (k.as_slice(), v.as_slice())).collect();
+        KvImage::write(&mut buf, &header, Dtype::Q8_0, layer_refs)
+            .map_err(|e| JsError::new(&format!("failed to write kv image: {e}")))?;
+        Ok(buf)
     }
 
     /// JSON string with basic model/device info, for the page's status line.
@@ -472,6 +663,27 @@ impl LlmEngine {
         Ok(a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count())
     }
 
+    /// The system+tools prefix `bin/llm-agent.rs`'s `kv-export` subcommand
+    /// exports images for: common leading token-id run between two
+    /// content-free probe utterances rendered under `tools`/`system` (not
+    /// `self.tools`/`self.system_prompt` — a caller checking a prefix
+    /// image before `start()` doesn't have those set yet). **Must** use the
+    /// exact same two probe strings `kv-export` uses, or the two sides
+    /// compute different `prefix_key`s for the same actual prefix.
+    fn render_kv_prefix_tokens(&self, tools: &[Tool], system: &str) -> anyhow::Result<Vec<u32>> {
+        let template = self.template.as_ref().ok_or_else(|| anyhow::anyhow!("model not loaded"))?;
+        let tokenizer = self.tokenizer.as_ref().ok_or_else(|| anyhow::anyhow!("model not loaded"))?;
+        let render = |u: &str| -> anyhow::Result<Vec<u32>> {
+            let messages = vec![Message::system(system), Message::user(u)];
+            let prompt = template.render_prompt(&messages, tools, true)?;
+            tokenizer.encode(&prompt, false)
+        };
+        let a = render("kv-export-probe-alpha")?;
+        let b = render("totally-different-probe-beta")?;
+        let prefix_len = a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count();
+        Ok(a[..prefix_len].to_vec())
+    }
+
     /// One render -> encode -> (restore prefix ->) prefill -> decode ->
     /// parse round. See module docs for why this can't go through
     /// `Agent::step_inner`.
@@ -540,6 +752,23 @@ impl LlmEngine {
             .map_err(|e| JsError::new(&format!("failed to read back f32 logits: {e:?}")))?;
         let prefill_ms = now_ms() - prefill_start;
 
+        // Debug aid for a browser-only numerical-divergence bisection
+        // (compare against `llm-agent run`'s greedy output on the same
+        // token ids natively) — top-5 (id, logit) at the first decode
+        // position of this step's prefill. Cheap (one sort over vocab_size
+        // once per step), left on unconditionally since it's diagnostic
+        // output, not a hot loop.
+        {
+            let mut top: Vec<(usize, f32)> = logits_vec.iter().copied().enumerate().collect();
+            top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            let top5: Vec<String> = top.iter().take(5).map(|(id, v)| format!("({id},{v:.4})")).collect();
+            wasm_log(&format!(
+                "[llm] step {} prefill top5 logits: [{}]",
+                self.step_index - 1,
+                top5.join(", ")
+            ));
+        }
+
         let stop_ids = tokenizer.eos_ids();
         let mut out_ids = Vec::with_capacity(self.max_new_tokens);
         let decode_start = now_ms();
@@ -604,6 +833,7 @@ impl LlmEngine {
                     })).collect::<Vec<_>>(),
                     "step": {
                         "promptTokens": prompt_tokens.len(),
+                        "promptTokenIds": prompt_tokens,
                         "text": generated_text,
                         "prefillMs": prefill_ms,
                         "decodeMs": decode_ms,
@@ -617,6 +847,7 @@ impl LlmEngine {
                 "text": text,
                 "step": {
                     "promptTokens": prompt_tokens.len(),
+                    "promptTokenIds": prompt_tokens,
                     "text": generated_text,
                     "prefillMs": prefill_ms,
                     "decodeMs": decode_ms,
