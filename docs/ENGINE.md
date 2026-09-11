@@ -1061,6 +1061,34 @@ validator would be stricter. `advance()` on a token the mask didn't allow
 is a documented no-op (state unchanged) rather than a panic, since it's the
 sampler's job to respect the mask, not this module's job to trust it did.
 
+**Session 12 addendum: don't force into a multi-candidate `QuotedChoice`.**
+`forced_bytes`' "exactly one legal next byte" test forces a
+multi-candidate id's *shared prefix* too (e.g. all three device ids in
+`fixtures/sonos/results` start `RINCON_`, so those 7 bytes are
+unambiguous right up to the point the candidates diverge). `forced_run`
+then re-encodes that isolated substring with the real tokenizer to get
+the ids fed into the KV cache — but BPE segmentation isn't
+prefix-invariant, so `Tokenizer::encode("RINCON_", ...)` alone can land on
+a different token boundary than the model's own tokenization of the
+*full* candidate string ever produces mid-generation. That off-boundary
+KV commit biased the very next masked-decode step toward the wrong
+candidate in practice (`docs/BENCHMARKS.md` session 12 addendum:
+`RINCON_KITCHEN01:1` picked over the correct `RINCON_LIVING01:2` in four
+`constrained43` cases). Fix: `Pos::quoted_choice()` lets `forced_bytes`
+recognize when the DFA position is inside a `QuotedChoice`'s content
+(`QPhase::InContent`) that started with more than one candidate, and it
+now stops unconditionally right at the opening quote in that case —
+never forcing into the content, not even a byte that's currently
+unambiguous. Per-token masked decoding (`GrammarState::allowed`,
+unchanged) picks up from there; it already restricts to exactly the
+tokens that are prefix-compatible with *some* live candidate, so no
+token-boundary distortion is introduced. Also added `model::JUMP_MIN_TOKENS`
+(8): a forced run shorter than this is decoded one token at a time via
+masked argmax instead of the batched jump-forward path, since a short
+run's forced-run computation overhead (DFA walk + tokenizer
+encode/decode round trip) isn't worth the batching win — exact either
+way, purely a speed knob.
+
 ## Agent loop (`src/agent.rs`)
 
 **Malformed-output retry policy.** A live browser run surfaced the model

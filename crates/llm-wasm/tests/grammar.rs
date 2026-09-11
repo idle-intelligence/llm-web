@@ -4,7 +4,7 @@
 //! chunk text into BPE tokens. Tests that need real vocab ids ((a), (g))
 //! load the real tokenizer via `LLM_MODEL_DIR` and skip if it's absent.
 
-use llm_wasm::grammar::{tools_from_json, Grammar, GrammarState, IdValues, TokenVocab};
+use llm_wasm::grammar::{tools_from_json, Constraint, Grammar, GrammarConstraint, GrammarState, IdValues, TokenVocab};
 use llm_wasm::tokenizer::Tokenizer;
 use serde_json::Value;
 use std::path::PathBuf;
@@ -201,4 +201,76 @@ fn mask_time_per_step() {
         vocab.len(),
         n
     );
+}
+
+// (h) Session 12 fix: `forced_run` re-encodes whatever `forced_bytes`
+// walked in isolation (`Tokenizer::encode` on just that substring), which
+// can land on a token boundary the model's own left-to-right generation
+// never produces mid-string (BPE merges aren't prefix-invariant). Forcing
+// the three ids' shared `RINCON_` prefix that way is exactly what made
+// constrained decoding pick `RINCON_KITCHEN01:1` over the intended
+// `RINCON_LIVING01:2` in `constrained43`'s s08/m02/m09/s11 (see
+// `docs/BENCHMARKS.md` session 12 addendum). With >1 live id, nothing past
+// the opening quote should ever be forced — masked per-token decoding
+// (test below) picks the id instead.
+#[test]
+fn forced_run_does_not_force_past_quote_for_multi_candidate_id() {
+    let Some(tokenizer) = load_tokenizer() else {
+        return;
+    };
+    let vocab = TokenVocab::from_tokenizer(&tokenizer);
+    let tools = sonos_tools();
+    let grammar = Grammar::for_tools(
+        &tools,
+        &ids(&["RINCON_KITCHEN01:1", "RINCON_LIVING01:2", "RINCON_BEDROOM01:3"]),
+    );
+    let mut constraint = GrammarConstraint::new(&grammar, &tokenizer, &vocab);
+
+    let prefix = tokenizer
+        .encode("[{\"name\": \"pause\", \"arguments\": {\"group_id\": \"", false)
+        .expect("encode prefix up to the id value's opening quote");
+    for &t in &prefix {
+        constraint.advance(t);
+    }
+
+    assert!(
+        constraint.forced_run().is_none(),
+        "with 3 live ids sharing the `RINCON_` prefix, nothing should be forced right after the opening quote"
+    );
+}
+
+// (i) Token healing: every live id must still be reachable one *natural*
+// BPE token at a time via masked decoding alone (no forcing) — i.e. the
+// mask admits, at every position along the tokenizer's own segmentation of
+// the *full* call (not a re-encoding of an isolated shared-prefix
+// substring), the token the model would actually produce.
+#[test]
+fn multi_candidate_id_reachable_token_by_token_for_every_alternative() {
+    let Some(tokenizer) = load_tokenizer() else {
+        return;
+    };
+    let vocab = TokenVocab::from_tokenizer(&tokenizer);
+    let tools = sonos_tools();
+    let id_values = ids(&["RINCON_KITCHEN01:1", "RINCON_LIVING01:2", "RINCON_BEDROOM01:3"]);
+
+    for candidate in ["RINCON_KITCHEN01:1", "RINCON_LIVING01:2", "RINCON_BEDROOM01:3"] {
+        let grammar = Grammar::for_tools(&tools, &id_values);
+        let mut state = GrammarState::new(&grammar);
+
+        let text = format!("[{{\"name\": \"pause\", \"arguments\": {{\"group_id\": \"{candidate}\"}}}}]");
+        let token_ids = tokenizer.encode(&text, false).expect("encode full call");
+
+        for &tok in &token_ids {
+            let mask = state.allowed(&vocab);
+            assert!(
+                mask.is_allowed(tok as usize),
+                "{candidate}: token {tok} rejected mid-generation of its own natural tokenization"
+            );
+            state.advance(tok, &vocab);
+        }
+        assert!(
+            state.is_complete(),
+            "{candidate}: state should be complete after the full call"
+        );
+    }
 }

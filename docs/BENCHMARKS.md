@@ -1239,3 +1239,95 @@ a `lang` field (`dbcb431`). A fair before/after would need a fresh
 not have GPU budget for alongside the concurrent Chromium job — flagged as
 a follow-up rather than reported as a number that isn't actually
 comparable.
+
+### Session 12 addendum — id-choice forced-boundary bug (`grammar.rs`) + `JUMP_MIN_TOKENS`
+
+The 43.3% number above is now explained: constrained decoding was
+*regressing* four id-choice cases relative to unconstrained (53.3% on
+`eval/results/2026-09-11-12-base43-listing-first-native.md`, the clean
+like-for-like unconstrained rerun on the same 43-case set) —
+`constrained43BROKE` s08 ("Pause the music."), m02 ("Turn the living room
+down to 20."), m09 ("Unmute the living room."), s11 ("Set the living room
+to 35."), all four picking `RINCON_KITCHEN01:1` where unconstrained picked
+the correct `RINCON_LIVING01:2` (`eval/results/2026-09-11-12-constrained43-listing-first-native.md`).
+
+**Root cause.** `GrammarConstraint::forced_bytes` walks the grammar's
+byte-level DFA and forces every byte with "exactly one legal
+continuation" — for a `group_id` value with 3 live candidates
+(`RINCON_KITCHEN01:1`/`RINCON_LIVING01:2`/`RINCON_BEDROOM01:3`) that
+includes their shared 7-byte prefix `RINCON_` (unambiguous: no other byte
+is legal there until the candidates diverge on the 8th). `forced_run` then
+re-encodes that isolated 7-byte string with the real tokenizer
+(`Tokenizer::encode("RINCON_", ...)`) to get the ids fed through the KV
+cache. BPE segmentation isn't prefix-invariant, so the tokenization of
+`"RINCON_"` alone can differ from where the model's own tokenization of
+the *full* string `"RINCON_LIVING01:2"` would have split — the forced run
+commits the model to a token boundary it never actually produces
+mid-generation. The very next masked-decode step then samples from an
+off-distribution KV state, and empirically landed on the kitchen id in all
+four cases (confirmed by fixing exactly this and rerunning: see below).
+
+**Fix** (`crates/llm-wasm/src/grammar.rs`): added `Pos::quoted_choice()`
+to identify when the DFA position is inside a `QuotedChoice`'s content
+(tool name / property key / enum / id value); `forced_bytes` now stops
+unconditionally at the opening quote whenever that `QuotedChoice` started
+with more than one candidate, never forcing into its content even when
+the byte walk still reports "exactly one legal byte" for a shared prefix.
+Ordinary masked per-token decoding (`GrammarState::allowed`, unchanged)
+takes over from there — it already restricts to exactly the tokens
+prefix-compatible with *some* live candidate, with no synthetic boundary.
+Verified two ways: `tests/grammar.rs`'s `forced_run_does_not_force_past_quote_for_multi_candidate_id`
+(forcing a 3-candidate id no longer produces a run) and
+`multi_candidate_id_reachable_token_by_token_for_every_alternative` (every
+one of the 3 ids is reachable via the mask using the tokenizer's *natural*
+segmentation of its full literal, not a re-encoding of an isolated
+prefix) — both CPU-only (tokenizer, no GPU). `tests/constrained.rs` gained
+four fixture-driven GPU regression cases
+(`constrained_fix_{s08,m02,m09,s11}_*`) that run the real model through
+`Agent` end to end on the exact broken utterances and assert the living
+room id is produced — all four pass.
+
+**Speed.** Added `model::JUMP_MIN_TOKENS = 8`: a forced run shorter than
+this is now decoded one token at a time via masked argmax
+(`decode_with_constraint`) instead of taking the batched jump-forward
+prefill path — exact either way since the mask already forces the same
+token, but for a short run the jump-forward path's own overhead (the
+forced-run tokenizer encode/decode round trip) isn't worth it. This also
+means the fix above (no forcing into multi-candidate ids at all) doesn't
+regress speed by falling back to many tiny forced runs elsewhere.
+`tests/constrained.rs` fixtures 02/03's forced-token share dropped from
+65-68% (pre-`JUMP_MIN_TOKENS`, table above) to ~39-40% as a result — the
+test's assertion was loosened from a stale ">= 50% forced" floor
+(calibrated to the old force-everything-unambiguous policy) to "> 0
+forced" (`decode_with_constraint` is still exercised; the meaningful
+invariant is jump-forward firing at all, not a specific percentage tied to
+policy that just changed on purpose).
+
+**Rerun**: `llm-agent eval --tools 12 --tool-order listing-first
+--constrained --label constrained43-fix`
+(`eval/results/2026-09-11-12-constrained43-fix-listing-first-native.md`):
+
+| run | correct | mean total s |
+|---|---|---|
+| unconstrained baseline (`base43`) | 53.3% (30 scored, 13 skipped) | 54.165 |
+| constrained, pre-fix (`constrained43`) | 43.3% (30 scored, 13 skipped) | 98.193 |
+| constrained, post-fix (`constrained43-fix`) | **76.7%** (30 scored, 13 skipped) | **63.325** |
+
+All four target cases fixed (all now produce `RINCON_LIVING01:2`):
+
+| case | pre-fix | post-fix |
+|---|---|---|
+| s08 "Pause the music." | `pause({group_id: RINCON_KITCHEN01:1})` — wrong | `pause({group_id: RINCON_LIVING01:2})` — correct |
+| m02 "Turn the living room down to 20." | `set_group_volume` on kitchen — wrong | `set_group_volume({group_id: RINCON_LIVING01:2, volume: 20})` — correct |
+| m09 "Unmute the living room." | `set_group_mute` on kitchen — wrong | `set_group_mute({group_id: RINCON_LIVING01:2, muted: false})` — correct |
+| s11 "Set the living room to 35." | `set_group_volume` on kitchen — wrong | `set_group_volume({group_id: RINCON_LIVING01:2, volume: 35})` — correct |
+
+The correct% gain (43.3% -> 76.7%) is larger than just those 4 cases
+because the fix removes a systematic bias toward whichever id happens to
+sort first after a shared prefix, which also affected id choices beyond
+the four cases originally flagged. Post-fix constrained now clears the
+unconstrained baseline (76.7% vs 53.3%) while remaining well under the
+pre-fix constrained wall time (63.3s vs 98.2s mean total; still above the
+54.2s unconstrained baseline — `JUMP_MIN_TOKENS` narrows but doesn't close
+that gap, since the fix's own removal of id-value forcing means less gets
+jump-forwarded overall than the pre-fix (buggy) run did).

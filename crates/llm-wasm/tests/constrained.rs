@@ -13,9 +13,13 @@
 use std::path::Path;
 
 use burn::backend::wgpu::WgpuDevice;
+use llm_wasm::agent::{Agent, FixtureCaller, GenerateOutput, Generator};
+use llm_wasm::eval::{self, ToolOrder, ToolSet};
 use llm_wasm::gguf::Q4ModelLoader;
 use llm_wasm::grammar::{tools_from_json, Constraint, Grammar, GrammarConstraint, IdValues, TokenVocab};
+use llm_wasm::kv::KvCache;
 use llm_wasm::model::LlmModel;
+use llm_wasm::template::ChatTemplate;
 use llm_wasm::tokenizer::Tokenizer;
 use serde_json::Value;
 
@@ -151,10 +155,15 @@ fn run_constrained_case(fixture: &str, id_values: IdValues, max_ctx: usize) {
         &ref_greedy[..n],
         "{fixture}: constrained decode diverged from the reference greedy output"
     );
+    // The old >= 50% floor predates `model::JUMP_MIN_TOKENS` (session 12
+    // speed addendum, `docs/BENCHMARKS.md`): runs shorter than 8 tokens
+    // are now deliberately decoded via masked argmax instead of the
+    // batched jump-forward path, so the forced fraction on these short
+    // fixtures dropped (measured ~39-40%, still comfortably > 0). The
+    // meaningful invariant is just that jump-forward fires at all.
     assert!(
-        stats.forced_tokens * 2 >= stats.total_tokens,
-        "{fixture}: expected forced tokens to be >= 50% of total ({}/{})",
-        stats.forced_tokens,
+        stats.forced_tokens > 0,
+        "{fixture}: expected at least some forced tokens, got 0/{}",
         stats.total_tokens
     );
 }
@@ -215,4 +224,178 @@ fn forced_run_after_leading_bracket_covers_json_scaffolding() {
     let run = constraint.forced_run().expect("the `name\":` key literal after `[{\"` should be forced");
     let text = tokenizer.decode(&run, false).expect("decode forced run");
     assert_eq!(text, "name\":");
+}
+
+// ---------------------------------------------------------------------
+// Session 12 fix regression: constrained decoding on the 4 utterances
+// that `constrained43` (docs/BENCHMARKS.md session 12 addendum) showed
+// picking `RINCON_KITCHEN01:1` instead of the intended
+// `RINCON_LIVING01:2` — root-caused to `GrammarConstraint::forced_bytes`
+// forcing the ids' shared `RINCON_` prefix and re-encoding it in
+// isolation, landing on a token boundary the model's own generation never
+// produces mid-string. Runs each case through the real `Agent` +
+// `NativeGenerator`-equivalent `TestGenerator` below (mirrors
+// `bin/llm-agent.rs`'s eval harness exactly, minus prefix-cache reuse)
+// against `eval/utterances.json`'s fixture, using the households fixture
+// as `get_households_and_groups_and_players`'s canned result the same way
+// `eval::run_case` does.
+// ---------------------------------------------------------------------
+
+/// A `Generator` that drives the real model directly (no prefix-cache
+/// reuse — each call restores the cache to empty and re-prefills from
+/// scratch; correctness test, not a speed one).
+struct TestGenerator {
+    model: LlmModel,
+    cache: KvCache,
+}
+
+impl TestGenerator {
+    fn new(model: LlmModel, max_ctx: usize) -> Self {
+        let cache = model.new_cache(max_ctx);
+        Self { model, cache }
+    }
+}
+
+impl Generator for TestGenerator {
+    fn generate(&mut self, prompt_ids: &[u32], max_new_tokens: usize, stop_ids: &[u32]) -> anyhow::Result<Vec<u32>> {
+        self.cache.restore(0);
+        self.model.generate(prompt_ids, max_new_tokens, stop_ids, &mut self.cache)
+    }
+
+    fn generate_constrained(
+        &mut self,
+        prompt_ids: &[u32],
+        _prefix_len: usize,
+        max_new_tokens: usize,
+        stop_ids: &[u32],
+        constraint: Option<&mut dyn Constraint>,
+    ) -> anyhow::Result<GenerateOutput> {
+        self.cache.restore(0);
+        let hidden = self.model.forward_hidden(prompt_ids, &mut self.cache)?;
+        let last = hidden.narrow(1, prompt_ids.len() - 1, 1);
+        let logits = self.model.lm_head(last);
+        let logits_vec = llm_wasm::model::logits_to_vec(logits)?;
+        let (ids, stats) =
+            self.model
+                .decode_with_constraint(logits_vec, max_new_tokens, stop_ids, &mut self.cache, constraint)?;
+        Ok(GenerateOutput {
+            ids,
+            model_steps: stats.model_steps,
+            forced_tokens: stats.forced_tokens,
+        })
+    }
+}
+
+fn eval_root() -> String {
+    format!("{}/../../eval", env!("CARGO_MANIFEST_DIR"))
+}
+
+/// Runs one `eval/utterances.json` case (by id) constrained, through a
+/// real `Agent` + `TestGenerator`, and returns the scored result.
+fn run_eval_case_constrained(case_id: &str) -> Option<eval::CaseResult> {
+    let tokenizer = load_tokenizer()?;
+    let cfg_path = format!("{}/tokenizer_config.json", tokenizer_model_dir());
+    if !Path::new(&cfg_path).exists() {
+        eprintln!("skipping: {cfg_path} not found");
+        return None;
+    }
+    let cfg: Value = serde_json::from_str(&std::fs::read_to_string(&cfg_path).unwrap()).unwrap();
+    let template = ChatTemplate::from_tokenizer_config(&cfg).expect("chat template");
+
+    let device = WgpuDevice::default();
+    let model = load_model(&device)?;
+
+    let sonos_fixtures_dir = format!("{}/sonos", fixtures_dir());
+    let all_tools = eval::load_all_tools(&sonos_fixtures_dir).expect("load tools.json");
+    let tools =
+        eval::select_tools_ordered(&all_tools, ToolSet::Twelve, ToolOrder::ListingFirst, &sonos_fixtures_dir)
+            .expect("select 12-tool listing-first order");
+    let cases = eval::load_cases(format!("{}/utterances.json", eval_root())).expect("load eval/utterances.json");
+    let case = cases
+        .into_iter()
+        .find(|c| c.id == case_id)
+        .unwrap_or_else(|| panic!("no eval case with id {case_id}"));
+
+    let generator = TestGenerator::new(model, 12288);
+    let results_dir = format!("{}/sonos/results", fixtures_dir());
+    let caller = FixtureCaller::new(&results_dir);
+    let mut agent = Agent::new(
+        template,
+        tokenizer,
+        generator,
+        caller,
+        "You are a helpful home assistant with access to Sonos speaker controls.",
+        64,
+    );
+    agent.set_max_steps(6);
+    agent.set_constrained(true);
+
+    let mut caller = FixtureCaller::new(&results_dir);
+    let result = eval::run_case(&mut agent, &tools, &case, &mut caller);
+    eprintln!(
+        "{case_id}: correct={} calls={:?} reason={}",
+        result.correct, result.calls_made, result.reason
+    );
+    Some(result)
+}
+
+/// s08 "Pause the music." — constrained decoding must call `pause` on the
+/// living room group, not the kitchen (the only PLAYING group in the
+/// canned household fixture is the living room; `RINCON_KITCHEN01:1` is
+/// the bug's wrong pick).
+#[test]
+fn constrained_fix_s08_pause_targets_living_room() {
+    let Some(result) = run_eval_case_constrained("s08") else {
+        return;
+    };
+    assert!(
+        result
+            .calls_made
+            .iter()
+            .any(|c| c.name == "pause" && c.arguments == serde_json::json!({"group_id": "RINCON_LIVING01:2"})),
+        "expected pause({{group_id: RINCON_LIVING01:2}}), got {:?}",
+        result.calls_made
+    );
+}
+
+/// m02 "Turn the living room down to 20."
+#[test]
+fn constrained_fix_m02_set_volume_targets_living_room() {
+    let Some(result) = run_eval_case_constrained("m02") else {
+        return;
+    };
+    assert!(
+        result.calls_made.iter().any(|c| c.name == "set_group_volume"
+            && c.arguments == serde_json::json!({"group_id": "RINCON_LIVING01:2", "volume": 20})),
+        "expected set_group_volume({{group_id: RINCON_LIVING01:2, volume: 20}}), got {:?}",
+        result.calls_made
+    );
+}
+
+/// m09 "Unmute the living room."
+#[test]
+fn constrained_fix_m09_unmute_targets_living_room() {
+    let Some(result) = run_eval_case_constrained("m09") else {
+        return;
+    };
+    assert!(
+        result.calls_made.iter().any(|c| c.name == "set_group_mute"
+            && c.arguments == serde_json::json!({"group_id": "RINCON_LIVING01:2", "muted": false})),
+        "expected set_group_mute({{group_id: RINCON_LIVING01:2, muted: false}}), got {:?}",
+        result.calls_made
+    );
+}
+
+/// s11 "Set the living room to 35."
+#[test]
+fn constrained_fix_s11_set_volume_targets_living_room() {
+    let Some(result) = run_eval_case_constrained("s11") else {
+        return;
+    };
+    assert!(
+        result.calls_made.iter().any(|c| c.name == "set_group_volume"
+            && c.arguments == serde_json::json!({"group_id": "RINCON_LIVING01:2", "volume": 35})),
+        "expected set_group_volume({{group_id: RINCON_LIVING01:2, volume: 35}}), got {:?}",
+        result.calls_made
+    );
 }

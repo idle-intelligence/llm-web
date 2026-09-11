@@ -496,6 +496,26 @@ enum Pos<'g> {
 
 const WS: [u8; 4] = [b' ', b'\t', b'\n', b'\r'];
 
+impl<'g> Pos<'g> {
+    /// The `QuotedChoice` this position is inside, if any — every `Pos`
+    /// variant that carries one wraps it directly (tool name, key names,
+    /// enum/id values, enum-array elements). Used by `forced_bytes` to
+    /// tell "genuinely only one candidate left" apart from "several
+    /// candidates share this prefix and haven't diverged yet" (see that
+    /// function's doc comment).
+    fn quoted_choice(&self) -> Option<QuotedChoice<'g>> {
+        match *self {
+            Pos::NameKey(qc)
+            | Pos::ToolNameVal(qc)
+            | Pos::ArgsKey(_, qc)
+            | Pos::PropKey(_, _, qc)
+            | Pos::ValStrEnum(_, _, _, qc) => Some(qc),
+            Pos::ValArrElem(_, _, _, _, ElemState::Enum(qc)) => Some(qc),
+            _ => None,
+        }
+    }
+}
+
 impl Grammar {
     fn step<'g>(&'g self, pos: Pos<'g>, b: u8) -> Option<Pos<'g>> {
         match pos {
@@ -1155,6 +1175,33 @@ impl<'g> GrammarConstraint<'g> {
         let mut pos = self.state.pos;
         let mut out = Vec::new();
         loop {
+            // Never force byte-level literal *into* a `QuotedChoice`'s
+            // content while more than one candidate is still live for it
+            // — even when the byte-DFA below finds "exactly one legal next
+            // byte" at every position of the shared prefix (e.g. the
+            // `RINCON_` seven bytes common to every device id), forcing
+            // that prefix re-encodes it in isolation
+            // (`forced_run`/`Tokenizer::encode("RINCON_", ...)`), which can
+            // land on a token boundary the model never actually produces
+            // mid-generation (its natural tokenization of the *full*
+            // candidate string may split differently — BPE merges aren't
+            // prefix-invariant). That off-distribution KV state then
+            // biases the very next masked-decode step toward whichever
+            // candidate the tokenizer's own artifacts happen to favor,
+            // independent of what the model actually meant — this is what
+            // broke the four id-choice cases in `constrained43` (session 12
+            // eval addendum, `docs/BENCHMARKS.md`). So: stop the forced
+            // run right at the opening quote of any multi-candidate
+            // `QuotedChoice` and hand off to ordinary per-token masked
+            // decoding (`GrammarState::allowed`), which already restricts
+            // to exactly the tokens that are prefix-compatible with *some*
+            // live candidate — no token-boundary distortion, since the
+            // model is choosing tokens the same way it always does.
+            if let Some(qc) = pos.quoted_choice() {
+                if qc.candidates.len() > 1 && matches!(qc.phase, QPhase::InContent(_)) {
+                    break;
+                }
+            }
             let mut found: Option<(u8, Pos<'g>)> = None;
             let mut count = 0u32;
             for b in 0u16..256 {

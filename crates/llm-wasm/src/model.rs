@@ -424,6 +424,16 @@ impl Q4TransformerBlock {
 /// The complete Qwen2 decoder. `lm_head` is tied to `embed`'s Q4 buffer (same
 /// GPU handle, shared via `Q4Tensor::clone` at load time — docs/MODELS.md §2:
 /// no independent `output.weight` tensor exists in this GGUF).
+/// A forced run shorter than this many tokens is decoded one token at a
+/// time via ordinary masked argmax instead of the batched jump-forward
+/// prefill path (`LlmModel::decode_with_constraint`) — exact either way,
+/// since the mask already forces the same token(s); below this length the
+/// batched path's own overhead (the forced-run's tokenizer encode/decode
+/// round trip in `GrammarConstraint::forced_run`) isn't worth it. `8` is a
+/// starting value, not derived from a model (session 12 speed addendum,
+/// `docs/BENCHMARKS.md`).
+const JUMP_MIN_TOKENS: usize = 8;
+
 pub struct LlmModel {
     embed: EmbeddingStore,
     layers: Vec<Q4TransformerBlock>,
@@ -593,7 +603,15 @@ impl LlmModel {
 
         while out.len() < max_new {
             let forced = constraint.as_deref().and_then(Constraint::forced_run).unwrap_or_default();
-            if !forced.is_empty() {
+            // Below `JUMP_MIN_TOKENS`, a masked-argmax single step is exact
+            // and free (the mask already allows exactly the tokens the
+            // forced run would have picked), so the batched-prefill path
+            // below buys nothing worth its own overhead (the forced-run
+            // computation itself: DFA walk + tokenizer encode/decode
+            // round trip) for a run this short — only take it once it's
+            // long enough to actually save forward passes (session 12
+            // speed addendum, `docs/BENCHMARKS.md`).
+            if forced.len() >= JUMP_MIN_TOKENS {
                 let take = forced.len().min(max_new - out.len());
                 let run = &forced[..take];
                 let hidden = self.forward_hidden(run, cache)?;
