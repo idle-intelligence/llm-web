@@ -11,7 +11,7 @@
 use anyhow::Result;
 use burn::backend::wgpu::{into_contiguous, CubeTensor, Wgpu, WgpuDevice, WgpuRuntime};
 use burn::tensor::activation::softmax;
-use burn::tensor::{DType, Int, Tensor, TensorPrimitive};
+use burn::tensor::{Bool, DType, Int, Tensor, TensorData, TensorPrimitive};
 
 use crate::gguf::{EmbeddingStore, Q4Linear};
 use crate::grammar::Constraint;
@@ -99,6 +99,97 @@ fn apply_rope(x: Tensor<Wgpu, 4>, cos: Tensor<Wgpu, 4>, sin: Tensor<Wgpu, 4>) ->
 }
 
 // ---------------------------------------------------------------------------
+// ForwardSpec — caller-supplied positions and attention topology
+// ---------------------------------------------------------------------------
+
+/// Per-call overrides of the two things a decoder-only LM normally hard-codes:
+/// "my position is my index" and "I attend to everything before me".
+///
+/// Added for `llm-life`, which uses the model as a cellular-automaton update
+/// rule: one forward pass carries many independent cells, so RoPE positions
+/// restart (or collapse to a constant) per cell and attention follows a 2D
+/// stencil instead of a causal chain. Both fields are `None` by default and
+/// that reproduces the previous behavior exactly — positions
+/// `offset..offset+T`, causal mask.
+#[derive(Clone, Default)]
+pub struct ForwardSpec {
+    /// Absolute RoPE position of each token in this call; length must equal
+    /// the token count. `None` = `offset..offset+T`.
+    pub positions: Option<Vec<u32>>,
+    /// `[T, kv_len]`, `true` where the attention score must be masked OUT.
+    /// Stored pre-inverted (not as "allowed") because every layer reuses this
+    /// one tensor and the inversion would otherwise be paid per layer.
+    pub mask_out: Option<Tensor<Wgpu, 2, Bool>>,
+}
+
+impl ForwardSpec {
+    /// True when this spec asks for nothing, i.e. the fast paths (fused RoPE,
+    /// fused decode attention) are still valid.
+    pub fn is_default(&self) -> bool {
+        self.positions.is_none() && self.mask_out.is_none()
+    }
+
+    pub fn with_positions(mut self, positions: Vec<u32>) -> Self {
+        self.positions = Some(positions);
+        self
+    }
+
+    /// `allowed` is row-major `[T, kv_len]`, `true` where query `i` may attend
+    /// to key `j`. Every row must allow at least one key — a fully masked row
+    /// softmaxes to NaN.
+    pub fn with_allowed(
+        mut self,
+        allowed: &[bool],
+        t: usize,
+        kv_len: usize,
+        device: &WgpuDevice,
+    ) -> Self {
+        assert_eq!(allowed.len(), t * kv_len, "allowed mask is not [T, kv_len]");
+        let masked_out: Vec<bool> = allowed.iter().map(|&a| !a).collect();
+        self.mask_out = Some(Tensor::<Wgpu, 2, Bool>::from_data(
+            TensorData::new(masked_out, [t, kv_len]),
+            device,
+        ));
+        self
+    }
+}
+
+/// `x * cos + rotate_half(x) * sin` over `[1, T, H, Dh]` with `cos`/`sin`
+/// broadcast as `[1, T, 1, Dh]`.
+fn apply_rope_rows(
+    x: Tensor<Wgpu, 4>,
+    cos: &Tensor<Wgpu, 4>,
+    sin: &Tensor<Wgpu, 4>,
+) -> Tensor<Wgpu, 4> {
+    let half = x.dims()[3] / 2;
+    let x1 = x.clone().narrow(3, 0, half);
+    let x2 = x.clone().narrow(3, half, half);
+    let rotated = Tensor::cat(vec![x2.mul_scalar(-1.0), x1], 3);
+    x * cos.clone() + rotated * sin.clone()
+}
+
+/// RoPE at caller-supplied absolute positions. `gguf::rope_fused` bakes
+/// `pos = offset + row` into its kernel, so arbitrary positions take this
+/// pure-Burn path instead: gather the cos/sin rows by index, then apply.
+/// Same layout as `rope_fused`: q `[1, T, H, Dh]`, k `[1, T, Hkv, Dh]`.
+fn rope_positions(
+    q: Tensor<Wgpu, 4>,
+    k: Tensor<Wgpu, 4>,
+    rope: &RoPE,
+    positions: &[u32],
+) -> (Tensor<Wgpu, 4>, Tensor<Wgpu, 4>) {
+    let device = q.device();
+    let t = positions.len();
+    let dh = q.dims()[3];
+    assert_eq!(q.dims()[1], t, "positions length must equal the token count");
+    let idx: Vec<i64> = positions.iter().map(|&p| p as i64).collect();
+    let idx = Tensor::<Wgpu, 1, Int>::from_data(TensorData::new(idx, [t]), &device);
+    let cos = rope.cos.clone().select(0, idx.clone()).reshape([1, t, 1, dh]);
+    let sin = rope.sin.clone().select(0, idx).reshape([1, t, 1, dh]);
+    (apply_rope_rows(q, &cos, &sin), apply_rope_rows(k, &cos, &sin))
+}
+
+// ---------------------------------------------------------------------------
 // RmsNorm wrapper
 // ---------------------------------------------------------------------------
 
@@ -169,6 +260,7 @@ impl Q4Attention {
         cache: &mut KvCache,
         layer_idx: usize,
         offset: usize,
+        spec: &ForwardSpec,
     ) -> Tensor<Wgpu, 3> {
         let [b, t, _] = x.dims();
         assert_eq!(b, 1, "batch size 1 only (single-session MCP agent)");
@@ -188,7 +280,10 @@ impl Q4Attention {
             .reshape([b, t, self.n_kv_heads, self.head_dim])
             .permute([0, 2, 1, 3]);
 
-        let (q, k) = crate::gguf::rope_fused(q, k, &rope.cos, &rope.sin, offset);
+        let (q, k) = match &spec.positions {
+            Some(positions) => rope_positions(q, k, rope, positions),
+            None => crate::gguf::rope_fused(q, k, &rope.cos, &rope.sin, offset),
+        };
         let q = q.permute([0, 2, 1, 3]);
         let k = k.permute([0, 2, 1, 3]);
 
@@ -207,7 +302,21 @@ impl Q4Attention {
         // for A/B against the Burn-matmul path. Prefill (t>1) always keeps
         // the existing Burn-matmul attention path — see `kv.rs`'s module
         // doc comment for why prefill isn't fused yet.
-        let out = if t == 1 && cache.dtype() == KvDtype::Q8_0 {
+        // A `ForwardSpec` mask replaces the causal mask entirely, so neither
+        // fused decode kernel (both of which assume "attend to all of
+        // kv_len") is valid; those paths stay on the default spec.
+        let out = if let Some(mask_out) = &spec.mask_out {
+            let n_rep = self.n_heads / self.n_kv_heads;
+            let (k_all, v_all) = cache.read_or_dequant_f32(layer_idx, kv_len);
+            let k_all = repeat_kv(k_all, n_rep);
+            let v_all = repeat_kv(v_all, n_rep);
+            assert_eq!(
+                mask_out.dims(),
+                [t, kv_len],
+                "ForwardSpec mask must be [T, kv_len]"
+            );
+            attention_with_mask(q, k_all, v_all, t, mask_out, self.scale)
+        } else if t == 1 && cache.dtype() == KvDtype::Q8_0 {
             attn_decode_q8(&q, cache, layer_idx, self.n_heads, self.n_kv_heads, self.head_dim, kv_len, self.scale)
         } else if t == 1 && cache.dtype() == KvDtype::F32 && FUSED_DECODE_ATTN && kv_len <= FUSED_DECODE_ATTN_MAX_KV_LEN {
             attn_decode_f32(&q, cache, layer_idx, self.n_heads, self.n_kv_heads, self.head_dim, kv_len, self.scale)
@@ -445,6 +554,40 @@ fn attention_scores_and_values(
     Tensor::cat(chunks, 2)
 }
 
+/// QK^T -> caller-supplied mask -> softmax -> PV, chunked over the query
+/// dimension only.
+///
+/// Unlike `attention_scores_and_values`, the key range is never truncated to
+/// the causal prefix: a stencil mask deliberately lets a query attend to keys
+/// *after* it (a CA cell's south and east neighbors come later in row-major
+/// order), so every query chunk sees all `kv_len` keys and the mask alone
+/// decides. `mask_out` is `[T, kv_len]`, `true` = masked out.
+fn attention_with_mask(
+    q: Tensor<Wgpu, 4>,
+    k_all: Tensor<Wgpu, 4>,
+    v_all: Tensor<Wgpu, 4>,
+    t: usize,
+    mask_out: &Tensor<Wgpu, 2, Bool>,
+    scale: f32,
+) -> Tensor<Wgpu, 4> {
+    let kt = k_all.swap_dims(2, 3);
+    let mut chunks = Vec::with_capacity(t.div_ceil(ATTN_QUERY_CHUNK));
+    let mut start = 0usize;
+    while start < t {
+        let len = ATTN_QUERY_CHUNK.min(t - start);
+        let scores = q.clone().narrow(2, start, len).matmul(kt.clone()) * scale;
+        let m = mask_out.clone().narrow(0, start, len).unsqueeze::<4>();
+        let probs = softmax(scores.mask_fill(m, f32::NEG_INFINITY), 3);
+        chunks.push(pv_matmul(probs, v_all.clone()));
+        start += len;
+    }
+    if chunks.len() == 1 {
+        chunks.pop().unwrap()
+    } else {
+        Tensor::cat(chunks, 2)
+    }
+}
+
 fn repeat_kv(x: Tensor<Wgpu, 4>, n_rep: usize) -> Tensor<Wgpu, 4> {
     if n_rep == 1 {
         return x;
@@ -543,10 +686,16 @@ impl Q4TransformerBlock {
         cache: &mut KvCache,
         layer_idx: usize,
         offset: usize,
+        spec: &ForwardSpec,
     ) -> Tensor<Wgpu, 3> {
-        let attn_out = self
-            .attention
-            .forward(self.attention_norm.forward(x.clone()), rope, cache, layer_idx, offset);
+        let attn_out = self.attention.forward(
+            self.attention_norm.forward(x.clone()),
+            rope,
+            cache,
+            layer_idx,
+            offset,
+            spec,
+        );
         let x = x + attn_out;
         let ffn_out = self.ffn.forward(self.ffn_norm.forward(x.clone()));
         x + ffn_out
@@ -646,10 +795,29 @@ impl LlmModel {
     /// `lm_head` to avoid materializing `T x 151936` logits when only a few
     /// positions are needed, e.g. prefill's last-token generation step).
     pub fn forward_hidden(&self, token_ids: &[u32], cache: &mut KvCache) -> Result<Tensor<Wgpu, 3>> {
+        self.forward_hidden_spec(token_ids, cache, &ForwardSpec::default())
+    }
+
+    /// `forward_hidden` with caller-supplied RoPE positions and/or attention
+    /// mask — see [`ForwardSpec`]. With the default spec this is
+    /// bit-identical to `forward_hidden` (it is the same code path).
+    pub fn forward_hidden_spec(
+        &self,
+        token_ids: &[u32],
+        cache: &mut KvCache,
+        spec: &ForwardSpec,
+    ) -> Result<Tensor<Wgpu, 3>> {
+        if let Some(positions) = &spec.positions {
+            assert_eq!(
+                positions.len(),
+                token_ids.len(),
+                "ForwardSpec positions must be one per token"
+            );
+        }
         let offset = cache.len();
         let mut x = self.embed_tokens(token_ids)?;
         for (i, layer) in self.layers.iter().enumerate() {
-            x = layer.forward(x, &self.rope, cache, i, offset);
+            x = layer.forward(x, &self.rope, cache, i, offset, spec);
         }
         cache.advance(token_ids.len());
         Ok(self.out_norm.forward(x))
@@ -660,6 +828,45 @@ impl LlmModel {
     /// (the 151936-wide head is 0.6MB/row of f32 output).
     pub fn lm_head(&self, hidden: Tensor<Wgpu, 3>) -> Tensor<Wgpu, 3> {
         self.lm_head.forward(hidden)
+    }
+
+    /// Dequantized `[K, hidden]` rows of the tied embedding matrix — the
+    /// weight of a **sliced lm-head** over just `token_ids`.
+    ///
+    /// `llm-life` (CONCEPT.md §1) reads p(alive) from two logits (`0`/`1`) at
+    /// every one of thousands of positions; the full head would materialize
+    /// `T x 151936` floats to read two columns. The rows come from the same
+    /// Q4 buffer `lm_head` is tied to (docs/MODELS.md §2: no independent
+    /// `output.weight` exists), so this is the same projection, sliced.
+    /// Build it once per generation and reuse it across positions.
+    pub fn head_slice(&self, token_ids: &[u32]) -> Result<Tensor<Wgpu, 2>> {
+        let hidden = self.config.hidden_size;
+        let mut data = vec![0.0f32; token_ids.len() * hidden];
+        for (i, &id) in token_ids.iter().enumerate() {
+            self.embed
+                .embed_id_add_cpu(id, &mut data[i * hidden..(i + 1) * hidden])?;
+        }
+        Ok(Tensor::<Wgpu, 1>::from_floats(data.as_slice(), &self.device)
+            .reshape([token_ids.len(), hidden]))
+    }
+
+    /// `hidden` `[1, T, hidden]` projected onto a `head_slice` `[K, hidden]`
+    /// -> `[1, T, K]`, for **every** position (that is the point: all-position
+    /// logits are affordable once the head is K-wide instead of 151936-wide).
+    ///
+    /// Broadcast-multiply-and-sum rather than `matmul`: at K=2 the output
+    /// width is tiny while the contraction is `hidden`, which is the shape
+    /// regime where this backend's matmul kernel was found to be silently
+    /// wrong (see `PV_KV_CHUNK`'s doc comment). The elementwise path costs
+    /// `T*K*hidden` floats of scratch, which at K=2 is cheaper than the
+    /// full-width logits it replaces.
+    pub fn lm_head_sliced(&self, hidden: Tensor<Wgpu, 3>, head: &Tensor<Wgpu, 2>) -> Tensor<Wgpu, 3> {
+        let [_, t, d] = hidden.dims();
+        let k = head.dims()[0];
+        assert_eq!(head.dims()[1], d, "head slice width must be hidden_size");
+        let h = hidden.reshape([1, t, 1, d]);
+        let w = head.clone().reshape([1, 1, k, d]);
+        (h * w).sum_dim(3).reshape([1, t, k])
     }
 
     /// Convenience: full forward + full-width logits for every position.
@@ -807,6 +1014,17 @@ pub struct GenerateStats {
 pub fn logits_to_vec(logits: Tensor<Wgpu, 3>) -> Result<Vec<f32>> {
     logits
         .into_data()
+        .into_vec::<f32>()
+        .map_err(|e| anyhow::anyhow!("failed to read back f32 logits: {e:?}"))
+}
+
+/// Async counterpart of [`logits_to_vec`]. **WASM callers must use this** —
+/// `into_data()` deadlocks the browser (crate-level WASM constraints).
+pub async fn logits_to_vec_async(logits: Tensor<Wgpu, 3>) -> Result<Vec<f32>> {
+    logits
+        .into_data_async()
+        .await
+        .map_err(|e| anyhow::anyhow!("async logits readback failed: {e:?}"))?
         .into_vec::<f32>()
         .map_err(|e| anyhow::anyhow!("failed to read back f32 logits: {e:?}"))
 }
