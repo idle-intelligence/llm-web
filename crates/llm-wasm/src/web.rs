@@ -188,6 +188,15 @@ pub async fn init_wgpu_device() -> Result<(), JsError> {
     Ok(())
 }
 
+/// The `WgpuDevice` [`init_wgpu_device`] created, or `None` if it has not
+/// been called yet. Any other crate building on this engine (llm-life) must
+/// use *this* device: a fresh `WgpuDevice::default()` spins up a second,
+/// uninitialized runtime whose readback path panics in the browser
+/// ("Failed to read tensor data synchronously").
+pub fn wgpu_device() -> Option<WgpuDevice> {
+    WGPU_DEVICE.get().cloned()
+}
+
 /// Browser-facing agent engine. Single entry point a Web Worker calls —
 /// see `web/agent/worker.js` for the message protocol built on it.
 #[wasm_bindgen]
