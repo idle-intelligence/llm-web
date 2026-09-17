@@ -174,3 +174,18 @@ fn well_formed_minimal_gguf_opens_successfully() {
     let result = GgufReader::open(Cursor::new(bytes));
     assert!(result.is_ok(), "well-formed minimal GGUF must still open: {:?}", result.err());
 }
+
+/// Regression for llm-life's first load of `Qwen/Qwen2.5-0.5B-Instruct-GGUF`
+/// q4_0: the file's `output.weight` is Q8_0, and a header parse that bailed
+/// on the dtype code made the whole model unloadable even though this crate
+/// never reads that tensor (its lm_head is tied to `token_embd.weight`).
+/// Q8_0 must parse and size correctly; loading one as a weight must still
+/// fail.
+#[test]
+fn q8_0_tensors_parse_and_size_but_do_not_load() {
+    use llm_wasm::gguf::GgmlDtype;
+    // 32-element block = f16 scale + 32 i8 quants.
+    assert_eq!(GgmlDtype::Q8_0.byte_size(32).unwrap(), 34);
+    assert_eq!(GgmlDtype::Q8_0.byte_size(896 * 151936).unwrap(), 896 * 151936 / 32 * 34);
+    assert_eq!(GgmlDtype::Q8_0.name(), "Q8_0");
+}

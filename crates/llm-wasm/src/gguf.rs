@@ -249,6 +249,15 @@ pub enum GgmlDtype {
     F32,
     F16,
     Q4_0,
+    /// Recognized for header parsing and bounds validation only — no kernel
+    /// reads Q8_0 *weights*. Official Q4_0 GGUFs are not uniformly Q4_0:
+    /// llama.cpp emits `output.weight` as Q8_0 (seen in
+    /// `Qwen/Qwen2.5-0.5B-Instruct-GGUF`), and a header parse that bails on
+    /// it makes the whole file unloadable even though this crate never reads
+    /// that tensor — its lm_head is tied to `token_embd.weight`
+    /// (docs/MODELS.md §2). Anything that actually tries to load a Q8_0
+    /// tensor still fails, via the `!= Q4_0` checks below.
+    Q8_0,
 }
 
 impl GgmlDtype {
@@ -257,6 +266,7 @@ impl GgmlDtype {
             0 => Ok(Self::F32),
             1 => Ok(Self::F16),
             2 => Ok(Self::Q4_0),
+            8 => Ok(Self::Q8_0),
             other => bail!("Unsupported GGML dtype code: {other}"),
         }
     }
@@ -269,6 +279,11 @@ impl GgmlDtype {
                 let num_blocks = num_elements / 32;
                 num_blocks.checked_mul(18)
             }
+            // 32-element blocks: f16 scale + 32 i8 quants.
+            Self::Q8_0 => {
+                let num_blocks = num_elements / 32;
+                num_blocks.checked_mul(34)
+            }
         }
         .context("tensor size overflow")
     }
@@ -278,6 +293,7 @@ impl GgmlDtype {
             Self::F32 => "F32",
             Self::F16 => "F16",
             Self::Q4_0 => "Q4_0",
+            Self::Q8_0 => "Q8_0",
         }
     }
 }
@@ -2166,7 +2182,10 @@ impl<R: Read + Seek> Q4ModelLoader<R> {
                 .chunks_exact(2)
                 .map(|b| f16_to_f32(u16::from_le_bytes([b[0], b[1]])))
                 .collect(),
-            GgmlDtype::Q4_0 => bail!("Cannot load Q4_0 tensor '{name}' as a dense f32 vector"),
+            GgmlDtype::Q4_0 | GgmlDtype::Q8_0 => bail!(
+                "Cannot load {} tensor '{name}' as a dense f32 vector",
+                info.dtype().name()
+            ),
         };
         Ok(data)
     }
