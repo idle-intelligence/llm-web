@@ -1523,7 +1523,7 @@ fn q4_matmul_dispatch(input: Tensor<Wgpu, 3>, weights: &Q4Tensor, force: ForceKe
         // The vec4 staging loads need K and N to be multiples of 8; every
         // projection of every model this crate loads satisfies that (they
         // are multiples of 64), and anything else falls through to cubek.
-        if TILED_PREFILL_MATMUL && k % 8 == 0 && n % 8 == 0 {
+        if TILED_PREFILL_MATMUL && k.is_multiple_of(8) && n.is_multiple_of(8) {
             // `shader_matmul_tiled_f32.wgsl` needs no M bucketing (it is not
             // autotuned) and no M chunking (it has no large-M failure mode),
             // so the whole M goes in one dispatch and the dequantized
