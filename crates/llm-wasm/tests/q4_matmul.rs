@@ -659,3 +659,49 @@ fn test_scratch_matmul_padding_is_numerically_inert() {
         println!("M={m:5} padded_to={padded_m:5}: max_diff={max_diff:.3e}");
     }
 }
+
+/// What the prefill GEMM actually achieves, with no readback per call and
+/// no dequant amortization question: one warm-up, then `iters` back-to-back
+/// `q4_matmul` calls at llm-life's Qwen2.5-0.5B FFN shapes, with a single
+/// readback at the end to sync. This is the number that decides whether the
+/// remaining gap to the 5 s / 20 s forward gates is the GEMM kernel or the
+/// pipeline around it.
+///
+/// `cargo test --release --test q4_matmul -- --ignored --nocapture
+/// bench_prefill_gemm_shapes`
+#[test]
+#[ignore]
+fn bench_prefill_gemm_shapes() {
+    let device = device();
+    for (label, m, k, n) in [
+        ("ffn_gate/up", 4164usize, 896usize, 4864usize),
+        ("ffn_down", 4164, 4864, 896),
+        ("attn_q/o", 4164, 896, 896),
+        ("square_2048", 2048, 2048, 2048),
+    ] {
+        let (q4_bytes, _) = random_q4(n, k, 0xABCD ^ (k as u64));
+        let weights = Q4Tensor::from_q4_bytes(&q4_bytes, [n, k], &device).expect("upload");
+        let input = random_input(m, k, 0x1234);
+        let input_t: Tensor<Wgpu, 3> =
+            Tensor::<Wgpu, 1>::from_floats(input.as_slice(), &device).reshape([1, m, k]);
+
+        let _ = q4_matmul(input_t.clone(), &weights)
+            .into_data()
+            .into_vec::<f32>()
+            .unwrap();
+
+        let iters = 10;
+        let t0 = std::time::Instant::now();
+        let mut last = None;
+        for _ in 0..iters {
+            last = Some(q4_matmul(input_t.clone(), &weights));
+        }
+        let _ = last.unwrap().into_data().into_vec::<f32>().unwrap();
+        let dt = t0.elapsed().as_secs_f64() / iters as f64;
+        println!(
+            "{label:>12} M={m} K={k} N={n}: {:.2} ms/call, {:.0} GFLOP/s",
+            dt * 1000.0,
+            2.0 * m as f64 * n as f64 * k as f64 / dt / 1e9
+        );
+    }
+}
