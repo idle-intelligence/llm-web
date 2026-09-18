@@ -17,7 +17,10 @@ use burn::backend::Wgpu;
 use burn::module::{Param, ParamId};
 use burn::tensor::{Tensor, TensorData};
 use llm_wasm::gguf::{EmbeddingStore, Q4Linear, Q4Tensor};
-use llm_wasm::model::{ForwardSpec, LlmModel, Q4Attention, Q4FeedForward, Q4TransformerBlock, RmsNormLayer, RoPE};
+use llm_wasm::model::{
+    ForwardSpec, LlmModel, Q4Attention, Q4FeedForward, Q4TransformerBlock, RmsNormLayer, RoPE,
+    SparseMask,
+};
 use llm_wasm::LlmConfig;
 
 const LAYERS: usize = 2;
@@ -277,4 +280,81 @@ fn sliced_head_matches_the_full_head_at_every_position() {
     }
     println!("sliced vs full head: max_rel_diff={worst:.3e}");
     assert!(worst < 1e-3, "sliced head diverged from the full head by rel {worst}");
+}
+
+/// The sparse attention kernel (`wgsl/shader_attn_sparse.wgsl`) must agree
+/// with the dense `mask_out` path on one and the same mask. The dense path
+/// is the oracle: it is the one `tests/full_forward.rs` and every llm-life
+/// number published so far were produced through, so the kernel is only
+/// allowed to be faster, not different.
+///
+/// The mask is llm-life variant B's shape at toy scale — a causal text
+/// prefix, then one token per cell of a 3x3 grid, each cell attending to the
+/// prefix, to itself and to its (up to 8) grid neighbours — because that is
+/// the topology the kernel exists for: a long shared prefix range plus a
+/// short explicit key list, with 4 query heads over 2 KV heads exercising
+/// the kernel's own GQA mapping (the dense path instead materializes
+/// `repeat_kv`).
+#[test]
+fn sparse_attention_matches_the_dense_mask() {
+    let device = WgpuDevice::default();
+    let model = tiny_model(0x5A125E, &device);
+
+    const W: usize = 3;
+    const P: usize = 5;
+    let n = W * W;
+    let t = P + n;
+    let ids: Vec<u32> = (0..t).map(|i| ((i * 37 + 11) % VOCAB) as u32).collect();
+
+    let mut allowed = vec![false; t * t];
+    for i in 0..P {
+        for j in 0..=i {
+            allowed[i * t + j] = true;
+        }
+    }
+    for c in 0..n {
+        let (cx, cy) = ((c % W) as isize, (c / W) as isize);
+        let row = (P + c) * t;
+        allowed[row..row + P].fill(true);
+        for dy in -1isize..=1 {
+            for dx in -1isize..=1 {
+                let (x, y) = (cx + dx, cy + dy);
+                if (0..W as isize).contains(&x) && (0..W as isize).contains(&y) {
+                    allowed[row + P + (y as usize) * W + x as usize] = true;
+                }
+            }
+        }
+    }
+
+    // Bag positions, exactly as variant B runs it: constant over the grid.
+    let mut positions: Vec<u32> = (0..P as u32).collect();
+    positions.extend(std::iter::repeat_n(P as u32, n));
+
+    let dense = ForwardSpec::default()
+        .with_positions(positions.clone())
+        .with_allowed(&allowed, t, t, &device);
+    let sparse = ForwardSpec::default()
+        .with_positions(positions)
+        .with_sparse(SparseMask::from_allowed(&allowed, t, t, &device));
+
+    let run = |spec: &ForwardSpec| {
+        let mut cache = model.new_cache(MAX_SEQ);
+        hidden_to_vec(model.forward_hidden_spec(&ids, &mut cache, spec).unwrap())
+    };
+    let a = run(&dense);
+    let b = run(&sparse);
+    let d = max_abs_diff(&a, &b);
+    let scale = a.iter().fold(0f32, |m, v| m.max(v.abs()));
+    println!("sparse vs dense mask: max_abs_diff={d:.3e} (max |hidden| = {scale:.3e})");
+    assert!(d < 1e-3, "sparse attention diverged from the dense mask by {d}");
+
+    // And it is not passing by being ignored: the sparse path must still
+    // react to the mask it was handed.
+    let mut closed = allowed.clone();
+    closed[(t - 1) * t] = false;
+    let spec = ForwardSpec::default().with_sparse(SparseMask::from_allowed(&closed, t, t, &device));
+    assert!(
+        max_abs_diff(&b, &run(&spec)) > 1e-5,
+        "closing a key left the sparse path's output unchanged"
+    );
 }

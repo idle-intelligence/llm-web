@@ -2263,6 +2263,94 @@ impl KernelSource for AttnDecodeF32Kernel {
     }
 }
 
+struct AttnSparseKernel;
+
+impl KernelSource for AttnSparseKernel {
+    fn source(&self) -> SourceTemplate {
+        SourceTemplate::new(include_str!("wgsl/shader_attn_sparse.wgsl"))
+    }
+
+    fn id(&self) -> KernelId {
+        KernelId::new::<Self>()
+    }
+}
+
+/// Largest `prefix_len + n_keys` any single query may have in the sparse
+/// attention kernel: its scores and gathered key indices live in workgroup
+/// memory (`shader_attn_sparse.wgsl`'s `sc`/`kidx`), which is what keeps the
+/// kernel from ever allocating a `T x kv_len` buffer. Masks that exceed it
+/// must use the dense `ForwardSpec::mask_out` path.
+pub const MAX_SPARSE_KEYS: usize = 512;
+
+/// Largest `head_dim` the sparse attention kernel's workgroup `q` cache
+/// holds (`q_sh`). Covers every model this crate loads (64 for
+/// Qwen2.5-0.5B, 128 for Qwen2.5-3B).
+pub const MAX_SPARSE_HEAD_DIM: usize = 256;
+
+/// WebGPU caps each dispatch dimension at 65535 workgroups; the sparse
+/// kernel spends dimension x on the query index.
+pub const MAX_SPARSE_QUERIES: usize = 65535;
+
+/// Sparse-mask prefill attention — see `wgsl/shader_attn_sparse.wgsl`.
+/// `q`: contiguous `[n_heads, t, head_dim]` (already RoPE'd). `meta`:
+/// `[t, 2]` u32 `(prefix_len, n_explicit_keys)`. `keys`: `[t, max_keys]`
+/// u32. Returns a `[n_heads, t, head_dim]` f32 handle.
+#[allow(clippy::too_many_arguments)]
+pub fn attn_sparse_dispatch(
+    client: &cubecl::client::ComputeClient<WgpuRuntime>,
+    q: &Handle,
+    k_cache: &Handle,
+    v_cache: &Handle,
+    meta: &Handle,
+    keys: &Handle,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    t: usize,
+    max_ctx: usize,
+    max_keys: usize,
+    attn_scale: f32,
+) -> Handle {
+    assert!(
+        head_dim <= MAX_SPARSE_HEAD_DIM,
+        "sparse attention kernel holds head_dim <= {MAX_SPARSE_HEAD_DIM} in workgroup memory, got {head_dim}"
+    );
+    assert!(
+        t <= MAX_SPARSE_QUERIES,
+        "sparse attention dispatches one workgroup per query; {t} exceeds WebGPU's {MAX_SPARSE_QUERIES} per-dimension cap"
+    );
+    let output = client.empty(n_heads * t * head_dim * 4);
+    let info: [u32; 7] = [
+        n_heads as u32,
+        n_kv_heads as u32,
+        head_dim as u32,
+        t as u32,
+        max_ctx as u32,
+        max_keys as u32,
+        attn_scale.to_bits(),
+    ];
+    let info_bytes: Vec<u8> = info.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let info_handle = client.create_from_slice(&info_bytes);
+    let bindings = Bindings::new()
+        .with_buffer(q.clone().binding())
+        .with_buffer(k_cache.clone().binding())
+        .with_buffer(v_cache.clone().binding())
+        .with_buffer(meta.clone().binding())
+        .with_buffer(keys.clone().binding())
+        .with_buffer(output.clone().binding())
+        .with_buffer(info_handle.binding());
+    let kernel: Box<dyn CubeTask<AutoCompiler>> =
+        Box::new(SourceKernel::new(AttnSparseKernel, CubeDim::new_1d(64)));
+    client
+        .launch(
+            kernel,
+            CubeCount::new_2d(t as u32, n_heads as u32),
+            bindings,
+        )
+        .expect("sparse attention kernel launch failed");
+    output
+}
+
 /// Quantize `t` new K or V rows (`input`: f32 handle, contiguous
 /// `[n_kv_heads, t, head_dim]`) into `scales`/`words` at row offset
 /// `dest_offset` — see `shader_kv_quantize.wgsl`'s header for the layout.

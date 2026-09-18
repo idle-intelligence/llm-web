@@ -13,6 +13,9 @@ use burn::backend::wgpu::{into_contiguous, CubeTensor, Wgpu, WgpuDevice, WgpuRun
 use burn::tensor::activation::softmax;
 use burn::tensor::{Bool, DType, Int, Tensor, TensorData, TensorPrimitive};
 
+use cubecl::server::Handle;
+use cubecl::Runtime;
+
 use crate::gguf::{EmbeddingStore, Q4Linear};
 use crate::grammar::Constraint;
 use crate::kv::{KvCache, KvDtype};
@@ -111,6 +114,127 @@ fn apply_rope(x: Tensor<Wgpu, 4>, cos: Tensor<Wgpu, 4>, sin: Tensor<Wgpu, 4>) ->
 /// stencil instead of a causal chain. Both fields are `None` by default and
 /// that reproduces the previous behavior exactly — positions
 /// `offset..offset+T`, causal mask.
+/// A sparse attention topology: query `i` attends to the contiguous key
+/// range `[0, prefix_len[i])` plus `n_keys[i]` explicit key indices taken
+/// from row `i` of `keys` (row stride `max_keys`).
+///
+/// This is the same information a dense `[T, kv_len]` bool mask carries, in
+/// the form the stencil actually has it — and in a form that does not cost
+/// `T * kv_len` bytes to build or to hold. At `llm-life`'s 128x128 grid the
+/// dense mask alone is a 271 MB `Vec<bool>` plus the same again on the GPU,
+/// before any attention work happens; this is 16452 * (2 + 9) u32.
+///
+/// The three vectors are uploaded once here, not once per layer: all 24
+/// layers of one forward read the same two buffers.
+///
+/// Consumed by `wgsl/shader_attn_sparse.wgsl` — see that file for the
+/// kernel's limits (`gguf::MAX_SPARSE_KEYS`, `MAX_SPARSE_HEAD_DIM`,
+/// `MAX_SPARSE_QUERIES`). `ForwardSpec` may carry both this and `mask_out`;
+/// the sparse path wins where it applies and the dense mask stays as the
+/// fallback and as the test oracle (`tests/stencil.rs`).
+#[derive(Clone)]
+pub struct SparseMask {
+    meta: Handle,
+    keys: Handle,
+    t: usize,
+    kv_len: usize,
+    max_keys: usize,
+}
+
+impl SparseMask {
+    /// `prefix_len` and `n_keys` are one entry per query; `keys` is
+    /// row-major `[t, max_keys]` (entries past `n_keys[i]` are never read,
+    /// so they may be anything). Panics on a mask the kernel cannot run:
+    /// an empty row (softmax over no keys is NaN), an out-of-range key, or
+    /// a row with more than `gguf::MAX_SPARSE_KEYS` attended keys.
+    pub fn new(
+        prefix_len: &[u32],
+        n_keys: &[u32],
+        keys: &[u32],
+        max_keys: usize,
+        kv_len: usize,
+        device: &WgpuDevice,
+    ) -> Self {
+        let t = prefix_len.len();
+        assert_eq!(n_keys.len(), t, "n_keys must be one per query");
+        assert_eq!(keys.len(), t * max_keys, "keys must be [t, max_keys]");
+        let mut meta = Vec::with_capacity(t * 2);
+        for i in 0..t {
+            let total = prefix_len[i] as usize + n_keys[i] as usize;
+            assert!(total > 0, "query {i} attends to no key (softmax would be NaN)");
+            assert!(
+                total <= crate::gguf::MAX_SPARSE_KEYS,
+                "query {i} attends to {total} keys, kernel limit is {}",
+                crate::gguf::MAX_SPARSE_KEYS
+            );
+            assert!(prefix_len[i] as usize <= kv_len, "query {i}'s prefix exceeds kv_len");
+            assert!(n_keys[i] as usize <= max_keys, "query {i} has more keys than max_keys");
+            for j in 0..n_keys[i] as usize {
+                assert!(
+                    (keys[i * max_keys + j] as usize) < kv_len,
+                    "query {i} key {j} is out of range"
+                );
+            }
+            meta.push(prefix_len[i]);
+            meta.push(n_keys[i]);
+        }
+        let client = WgpuRuntime::client(device);
+        let meta_bytes: Vec<u8> = meta.iter().flat_map(|v| v.to_le_bytes()).collect();
+        // A zero-length storage buffer is not bindable; `max_keys == 0`
+        // (a mask that is nothing but prefix ranges) still needs one word.
+        let keys_bytes: Vec<u8> = if keys.is_empty() {
+            vec![0u8; 4]
+        } else {
+            keys.iter().flat_map(|v| v.to_le_bytes()).collect()
+        };
+        Self {
+            meta: client.create_from_slice(&meta_bytes),
+            keys: client.create_from_slice(&keys_bytes),
+            t,
+            kv_len,
+            max_keys,
+        }
+    }
+
+    /// Build from the same row-major `[t, kv_len]` "may attend" mask
+    /// `ForwardSpec::with_allowed` takes, choosing the longest leading run
+    /// of allowed keys as the prefix range and listing the rest explicitly.
+    /// This is the bridge the tests use to check the kernel against the
+    /// dense path on one and the same mask; production callers build the
+    /// sparse form directly and never materialize `allowed`.
+    pub fn from_allowed(allowed: &[bool], t: usize, kv_len: usize, device: &WgpuDevice) -> Self {
+        assert_eq!(allowed.len(), t * kv_len, "allowed mask is not [t, kv_len]");
+        let mut prefix_len = Vec::with_capacity(t);
+        let mut rows: Vec<Vec<u32>> = Vec::with_capacity(t);
+        for i in 0..t {
+            let row = &allowed[i * kv_len..(i + 1) * kv_len];
+            let p = row.iter().take_while(|&&a| a).count();
+            prefix_len.push(p as u32);
+            rows.push(
+                (p..kv_len)
+                    .filter(|&j| row[j])
+                    .map(|j| j as u32)
+                    .collect(),
+            );
+        }
+        let max_keys = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+        let n_keys: Vec<u32> = rows.iter().map(|r| r.len() as u32).collect();
+        let mut keys = vec![0u32; t * max_keys];
+        for (i, r) in rows.iter().enumerate() {
+            keys[i * max_keys..i * max_keys + r.len()].copy_from_slice(r);
+        }
+        Self::new(&prefix_len, &n_keys, &keys, max_keys, kv_len, device)
+    }
+
+    pub fn t(&self) -> usize {
+        self.t
+    }
+
+    pub fn kv_len(&self) -> usize {
+        self.kv_len
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct ForwardSpec {
     /// Absolute RoPE position of each token in this call; length must equal
@@ -120,13 +244,21 @@ pub struct ForwardSpec {
     /// Stored pre-inverted (not as "allowed") because every layer reuses this
     /// one tensor and the inversion would otherwise be paid per layer.
     pub mask_out: Option<Tensor<Wgpu, 2, Bool>>,
+    /// The same topology in sparse form — see [`SparseMask`]. Takes
+    /// precedence over `mask_out` wherever the fused kernel applies.
+    pub sparse: Option<SparseMask>,
 }
 
 impl ForwardSpec {
     /// True when this spec asks for nothing, i.e. the fast paths (fused RoPE,
     /// fused decode attention) are still valid.
     pub fn is_default(&self) -> bool {
-        self.positions.is_none() && self.mask_out.is_none()
+        self.positions.is_none() && self.mask_out.is_none() && self.sparse.is_none()
+    }
+
+    pub fn with_sparse(mut self, sparse: SparseMask) -> Self {
+        self.sparse = Some(sparse);
+        self
     }
 
     pub fn with_positions(mut self, positions: Vec<u32>) -> Self {
@@ -265,9 +397,14 @@ impl Q4Attention {
         let [b, t, _] = x.dims();
         assert_eq!(b, 1, "batch size 1 only (single-session MCP agent)");
 
-        let q = self.q_proj.forward(x.clone());
-        let k = self.k_proj.forward(x.clone());
-        let v = self.v_proj.forward(x);
+        let dev = x.device();
+        let (q, k, v) = crate::profile::scope("attn.qkv_proj", &dev, || {
+            (
+                self.q_proj.forward(x.clone()),
+                self.k_proj.forward(x.clone()),
+                self.v_proj.forward(x.clone()),
+            )
+        });
 
         // F1 (docs/BENCHMARKS.md Session 9): apply fused RoPE in the
         // natural [1, T, H, Dh] reshape() layout (one dispatch for both q
@@ -280,14 +417,14 @@ impl Q4Attention {
             .reshape([b, t, self.n_kv_heads, self.head_dim])
             .permute([0, 2, 1, 3]);
 
-        let (q, k) = match &spec.positions {
+        let (q, k) = crate::profile::scope("attn.rope", &dev, || match &spec.positions {
             Some(positions) => rope_positions(q, k, rope, positions),
             None => crate::gguf::rope_fused(q, k, &rope.cos, &rope.sin, offset),
-        };
+        });
         let q = q.permute([0, 2, 1, 3]);
         let k = k.permute([0, 2, 1, 3]);
 
-        cache.write(layer_idx, k, v);
+        crate::profile::scope("attn.cache_write", &dev, || cache.write(layer_idx, k, v));
         let kv_len = offset + t;
 
         // Session 13 (docs/BENCHMARKS.md): decode (t==1) against a
@@ -305,17 +442,39 @@ impl Q4Attention {
         // A `ForwardSpec` mask replaces the causal mask entirely, so neither
         // fused decode kernel (both of which assume "attend to all of
         // kv_len") is valid; those paths stay on the default spec.
-        let out = if let Some(mask_out) = &spec.mask_out {
+        let out = if let Some(sparse) = spec.sparse.as_ref().filter(|s| {
+            cache.dtype() == KvDtype::F32
+                && s.t == t
+                && s.kv_len == kv_len
+                && self.head_dim <= crate::gguf::MAX_SPARSE_HEAD_DIM
+                && t <= crate::gguf::MAX_SPARSE_QUERIES
+        }) {
+            crate::profile::scope("attn.sparse", &dev, || {
+                attn_sparse(
+                    &q,
+                    cache,
+                    layer_idx,
+                    sparse,
+                    self.n_heads,
+                    self.n_kv_heads,
+                    self.head_dim,
+                    self.scale,
+                )
+            })
+        } else if let Some(mask_out) = &spec.mask_out {
             let n_rep = self.n_heads / self.n_kv_heads;
-            let (k_all, v_all) = cache.read_or_dequant_f32(layer_idx, kv_len);
-            let k_all = repeat_kv(k_all, n_rep);
-            let v_all = repeat_kv(v_all, n_rep);
+            let (k_all, v_all) = crate::profile::scope("attn.kv_read_repeat", &dev, || {
+                let (k_all, v_all) = cache.read_or_dequant_f32(layer_idx, kv_len);
+                (repeat_kv(k_all, n_rep), repeat_kv(v_all, n_rep))
+            });
             assert_eq!(
                 mask_out.dims(),
                 [t, kv_len],
                 "ForwardSpec mask must be [T, kv_len]"
             );
-            attention_with_mask(q, k_all, v_all, t, mask_out, self.scale)
+            crate::profile::scope("attn.dense_masked", &dev, || {
+                attention_with_mask(q, k_all, v_all, t, mask_out, self.scale)
+            })
         } else if t == 1 && cache.dtype() == KvDtype::Q8_0 {
             attn_decode_q8(&q, cache, layer_idx, self.n_heads, self.n_kv_heads, self.head_dim, kv_len, self.scale)
         } else if t == 1 && cache.dtype() == KvDtype::F32 && FUSED_DECODE_ATTN && kv_len <= FUSED_DECODE_ATTN_MAX_KV_LEN {
@@ -329,7 +488,7 @@ impl Q4Attention {
         };
         let out = out.permute([0, 2, 1, 3]).reshape([b, t, self.n_heads * self.head_dim]);
 
-        self.o_proj.forward(out)
+        crate::profile::scope("attn.o_proj", &dev, || self.o_proj.forward(out))
     }
 }
 
@@ -447,6 +606,48 @@ fn attn_decode_f32(
         &client, &q_cube.handle, &k_cache, &v_cache, &scratch, n_heads, n_kv_heads, head_dim, kv_len, max_ctx, scale,
     );
     let shape = burn::prelude::Shape::from(vec![1, n_heads, 1, head_dim]);
+    let cube_tensor = CubeTensor::new_contiguous(client, device, shape, out_handle, DType::F32);
+    Tensor::from_primitive(TensorPrimitive::Float(cube_tensor))
+}
+
+/// Prefill-time sparse attention through `wgsl/shader_attn_sparse.wgsl`:
+/// QK^T -> softmax -> PV where each query reads only the keys its
+/// [`SparseMask`] names. `q`: `[1, n_heads, T, head_dim]` (already RoPE'd).
+/// Returns `[1, n_heads, T, head_dim]` — the same shape
+/// `attention_with_mask` returns, so the caller's permute/reshape is
+/// unchanged. GQA is handled inside the kernel (no `repeat_kv`), and K/V
+/// are read straight out of the F32 cache (no `read_or_dequant_f32`).
+#[allow(clippy::too_many_arguments)]
+fn attn_sparse(
+    q: &Tensor<Wgpu, 4>,
+    cache: &KvCache,
+    layer_idx: usize,
+    sparse: &SparseMask,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    scale: f32,
+) -> Tensor<Wgpu, 4> {
+    let q_cube: CubeTensor<WgpuRuntime> = into_contiguous(q.clone().into_primitive().tensor());
+    let client = q_cube.client.clone();
+    let device = q_cube.device.clone();
+    let (k_cache, v_cache) = cache.f32_layer(layer_idx);
+    let out_handle = crate::gguf::attn_sparse_dispatch(
+        &client,
+        &q_cube.handle,
+        &k_cache,
+        &v_cache,
+        &sparse.meta,
+        &sparse.keys,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        sparse.t,
+        cache.max_ctx(),
+        sparse.max_keys,
+        scale,
+    );
+    let shape = burn::prelude::Shape::from(vec![1, n_heads, sparse.t, head_dim]);
     let cube_tensor = CubeTensor::new_contiguous(client, device, shape, out_handle, DType::F32);
     Tensor::from_primitive(TensorPrimitive::Float(cube_tensor))
 }
@@ -688,16 +889,12 @@ impl Q4TransformerBlock {
         offset: usize,
         spec: &ForwardSpec,
     ) -> Tensor<Wgpu, 3> {
-        let attn_out = self.attention.forward(
-            self.attention_norm.forward(x.clone()),
-            rope,
-            cache,
-            layer_idx,
-            offset,
-            spec,
-        );
+        let dev = x.device();
+        let normed = crate::profile::scope("norm", &dev, || self.attention_norm.forward(x.clone()));
+        let attn_out = self.attention.forward(normed, rope, cache, layer_idx, offset, spec);
         let x = x + attn_out;
-        let ffn_out = self.ffn.forward(self.ffn_norm.forward(x.clone()));
+        let normed = crate::profile::scope("norm", &dev, || self.ffn_norm.forward(x.clone()));
+        let ffn_out = crate::profile::scope("ffn", &dev, || self.ffn.forward(normed));
         x + ffn_out
     }
 }
@@ -815,12 +1012,14 @@ impl LlmModel {
             );
         }
         let offset = cache.len();
-        let mut x = self.embed_tokens(token_ids)?;
+        let mut x = crate::profile::scope("embed", &self.device, || self.embed_tokens(token_ids))?;
         for (i, layer) in self.layers.iter().enumerate() {
             x = layer.forward(x, &self.rope, cache, i, offset, spec);
         }
         cache.advance(token_ids.len());
-        Ok(self.out_norm.forward(x))
+        Ok(crate::profile::scope("out_norm", &self.device, || {
+            self.out_norm.forward(x)
+        }))
     }
 
     /// lm_head over hidden states `[1, T, hidden]` -> logits `[1, T, vocab]`.
