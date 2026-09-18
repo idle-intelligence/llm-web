@@ -1118,6 +1118,15 @@ const DEQUANT_WG: u32 = 256;
 /// naive kernel.
 const SCRATCH_MATMUL_MIN_M: usize = 129;
 
+/// Route the scratch-dequant prefill matmul through
+/// `wgsl/shader_matmul_tiled_f32.wgsl` instead of `cubek_matmul`. Kept as a
+/// const, not a runtime flag, so the cubek path (with Session 11/15's
+/// strategy table, `pad_m_bucket` and `scratch_matmul_chunked`) stays
+/// compiled in and reachable by flipping this one bool — same A/B pattern
+/// as `model.rs`'s `FUSED_DECODE_ATTN`. `tests/q4_matmul.rs` asserts the two
+/// agree.
+const TILED_PREFILL_MATMUL: bool = true;
+
 /// The tied lm_head (`token_embd.weight`, [151936, 2048]) is never routed
 /// through the scratch-dequant+matmul path: its dequantized scratch buffer
 /// would be 151936 * 2048 * 4 = ~1.16GB, and it's only ever run on a
@@ -1499,7 +1508,7 @@ fn q4_matmul_dispatch(input: Tensor<Wgpu, 3>, weights: &Q4Tensor, force: ForceKe
             client.clone(),
             device.clone(),
             burn::prelude::Shape::from(vec![1, k, n]),
-            w_handle,
+            w_handle.clone(),
             DType::F32,
         );
         let x = Tensor::from_primitive(TensorPrimitive::Float(cube_input.clone()));
@@ -1511,6 +1520,25 @@ fn q4_matmul_dispatch(input: Tensor<Wgpu, 3>, weights: &Q4Tensor, force: ForceKe
         // are zeros, which don't affect the real rows' matmul output
         // (each output row is an independent dot product over K), and are
         // sliced off below before any downstream op sees them.
+        // The vec4 staging loads need K and N to be multiples of 8; every
+        // projection of every model this crate loads satisfies that (they
+        // are multiples of 64), and anything else falls through to cubek.
+        if TILED_PREFILL_MATMUL && k % 8 == 0 && n % 8 == 0 {
+            // `shader_matmul_tiled_f32.wgsl` needs no M bucketing (it is not
+            // autotuned) and no M chunking (it has no large-M failure mode),
+            // so the whole M goes in one dispatch and the dequantized
+            // weight is read once instead of once per 2048-row chunk.
+            let out_handle = matmul_tiled_f32(&client, &cube_input.handle, &w_handle, b * m, n, k);
+            let out = CubeTensor::new_contiguous(
+                client,
+                device,
+                burn::prelude::Shape::from(vec![b, m, n]),
+                out_handle,
+                DType::F32,
+            );
+            return Tensor::from_primitive(TensorPrimitive::Float(out));
+        }
+
         let padded_m = pad_m_bucket(m);
         let x_padded = if padded_m == m {
             x
@@ -2261,6 +2289,50 @@ impl KernelSource for AttnDecodeF32Kernel {
     fn id(&self) -> KernelId {
         KernelId::new::<Self>()
     }
+}
+
+struct MatmulTiledF32Kernel;
+
+impl KernelSource for MatmulTiledF32Kernel {
+    fn source(&self) -> SourceTemplate {
+        SourceTemplate::new(include_str!("wgsl/shader_matmul_tiled_f32.wgsl"))
+    }
+
+    fn id(&self) -> KernelId {
+        KernelId::new::<Self>()
+    }
+}
+
+/// `c[m, n] = a[m, k] . b[k, n]`, all contiguous row-major f32, through
+/// `wgsl/shader_matmul_tiled_f32.wgsl`. See that file for why this exists
+/// alongside `cubek_matmul`.
+fn matmul_tiled_f32(
+    client: &cubecl::client::ComputeClient<WgpuRuntime>,
+    a: &Handle,
+    b: &Handle,
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Handle {
+    let output = client.empty(m * n * 4);
+    let info: [u32; 3] = [m as u32, n as u32, k as u32];
+    let info_bytes: Vec<u8> = info.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let info_handle = client.create_from_slice(&info_bytes);
+    let bindings = Bindings::new()
+        .with_buffer(a.clone().binding())
+        .with_buffer(b.clone().binding())
+        .with_buffer(output.clone().binding())
+        .with_buffer(info_handle.binding());
+    let kernel: Box<dyn CubeTask<AutoCompiler>> =
+        Box::new(SourceKernel::new(MatmulTiledF32Kernel, CubeDim::new_2d(16, 16)));
+    client
+        .launch(
+            kernel,
+            CubeCount::new_2d(n.div_ceil(128) as u32, m.div_ceil(128) as u32),
+            bindings,
+        )
+        .expect("tiled f32 matmul kernel launch failed");
+    output
 }
 
 struct AttnSparseKernel;

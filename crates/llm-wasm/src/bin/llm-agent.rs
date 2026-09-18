@@ -438,7 +438,16 @@ fn prefill_sweep(lengths: &str, reps: usize) -> anyhow::Result<()> {
         .split(',')
         .map(|s| s.trim().parse::<usize>().expect("lengths must be comma-separated integers"))
         .collect();
-    let shapes: &[(usize, usize, &str)] = &[(2048, 2048, "attn(2048x2048)"), (2048, 11008, "ffn_gate(2048x11008)")];
+    // xLAM-2-3b-fc-r's two dominant shapes, then Qwen2.5-0.5B's three
+    // (llm-life runs that model, and its K is 896 — a regime the Session 15
+    // sweep never sampled).
+    let shapes: &[(usize, usize, &str)] = &[
+        (2048, 2048, "attn(2048x2048)"),
+        (2048, 11008, "ffn_gate(2048x11008)"),
+        (896, 896, "q05b_attn(896x896)"),
+        (896, 4864, "q05b_ffn_gate(896x4864)"),
+        (4864, 896, "q05b_ffn_down(4864x896)"),
+    ];
 
     for &(k, n, label) in shapes {
         let bytes = random_q4_bytes(n, k, 0x5EED ^ (k as u64) ^ ((n as u64) << 20));

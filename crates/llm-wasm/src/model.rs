@@ -846,10 +846,16 @@ impl Q4FeedForward {
     /// F2 (docs/BENCHMARKS.md Session 9): `gguf::silu_mul_fused` replaces
     /// Burn's separate `silu` + `mul` chain with one dispatch.
     fn forward(&self, x: Tensor<Wgpu, 3>) -> Tensor<Wgpu, 3> {
-        let gate = self.gate_proj.forward(x.clone());
-        let up = self.up_proj.forward(x);
-        let fused = crate::gguf::silu_mul_fused(gate, up);
-        self.down_proj.forward(fused)
+        let dev = x.device();
+        let gate = crate::profile::scope("ffn.gate_up", &dev, || {
+            let gate = self.gate_proj.forward(x.clone());
+            let up = self.up_proj.forward(x.clone());
+            (gate, up)
+        });
+        let fused = crate::profile::scope("ffn.silu_mul", &dev, || {
+            crate::gguf::silu_mul_fused(gate.0, gate.1)
+        });
+        crate::profile::scope("ffn.down", &dev, || self.down_proj.forward(fused))
     }
 }
 
