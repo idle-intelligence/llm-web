@@ -108,7 +108,11 @@ pub fn f16_to_f32(bits: u16) -> f32 {
         if mantissa == 0 {
             f32::from_bits(sign << 31)
         } else {
-            // Denormalized
+            // Denormalized: value is `mantissa * 2^-24`. Shifting left `s`
+            // times to set bit 10 gives `1.xxx * 2^10 * 2^(-24-s)`, i.e. an
+            // f32 exponent of `127 - 14 - s`. `e = s + 1`, so the bias is
+            // `13 + e` — it was `14 + e` until llm-life's Q8_0 work, which
+            // made every subnormal f16 scale come out exactly 2x too small.
             let mut e = 1u32;
             let mut m = mantissa;
             while (m & 0x400) == 0 {
@@ -116,7 +120,7 @@ pub fn f16_to_f32(bits: u16) -> f32 {
                 e += 1;
             }
             m &= 0x3FF;
-            let f32_exp = 127u32.wrapping_sub(15 + e - 1);
+            let f32_exp = 127u32.wrapping_sub(13 + e);
             f32::from_bits((sign << 31) | (f32_exp << 23) | (m << 13))
         }
     } else if exponent == 31 {
@@ -126,6 +130,89 @@ pub fn f16_to_f32(bits: u16) -> f32 {
         // Normalized
         let f32_exp = (exponent as i32 - 15 + 127) as u32;
         f32::from_bits((sign << 31) | (f32_exp << 23) | (mantissa << 13))
+    }
+}
+
+/// Convert f32 to IEEE 754 half-precision (f16) bits, round-to-nearest-even.
+/// The inverse of [`f16_to_f32`], needed by [`quantize_q4_0`] (GGUF stores a
+/// Q4_0 block's scale as f16).
+pub fn f32_to_f16(v: f32) -> u16 {
+    let bits = v.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exp = ((bits >> 23) & 0xFF) as i32;
+    let mantissa = bits & 0x7F_FFFF;
+
+    if exp == 0xFF {
+        // Inf / NaN: keep NaN non-zero-mantissa.
+        let m = if mantissa != 0 { 0x200 } else { 0 };
+        return sign | 0x7C00 | m;
+    }
+    let e = exp - 127 + 15;
+    if e >= 0x1F {
+        return sign | 0x7C00; // overflow -> inf
+    }
+    if e <= 0 {
+        if e < -10 {
+            return sign; // underflow -> zero
+        }
+        // Subnormal: shift the implicit 1 back in.
+        let m = mantissa | 0x80_0000;
+        let shift = (14 - e) as u32;
+        let half = (m >> shift) as u16;
+        let round = ((m >> (shift - 1)) & 1) as u16;
+        return sign | (half + round);
+    }
+    let half = ((e as u32) << 10) as u16 | (mantissa >> 13) as u16;
+    // Round to nearest even on the 13 dropped mantissa bits.
+    let round = if (mantissa & 0x1FFF) > 0x1000
+        || ((mantissa & 0x1FFF) == 0x1000 && (mantissa >> 13) & 1 == 1)
+    {
+        1
+    } else {
+        0
+    };
+    sign | (half + round)
+}
+
+/// Quantize `values` (a multiple of 32 elements) into GGUF's on-disk Q4_0
+/// block layout: per 32 elements, an f16 scale followed by 16 bytes pairing
+/// element `j` (low nibble) with element `j + 16` (high nibble). Matches
+/// llama.cpp's `quantize_row_q4_0_ref`.
+pub fn quantize_q4_0(values: &[f32]) -> Vec<u8> {
+    assert!(
+        values.len().is_multiple_of(32),
+        "Q4_0 needs a multiple of 32 elements, got {}",
+        values.len()
+    );
+    let mut out = vec![0u8; values.len() / 32 * 18];
+    for (blk, chunk) in values.chunks_exact(32).enumerate() {
+        let mut amax = 0.0f32;
+        let mut max = 0.0f32;
+        for &x in chunk {
+            if x.abs() > amax {
+                amax = x.abs();
+                max = x;
+            }
+        }
+        let d = max / -8.0;
+        let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+        let bo = blk * 18;
+        out[bo..bo + 2].copy_from_slice(&f32_to_f16(d).to_le_bytes());
+        for j in 0..16 {
+            let lo = ((chunk[j] * id + 8.5) as i32).clamp(0, 15) as u8;
+            let hi = ((chunk[j + 16] * id + 8.5) as i32).clamp(0, 15) as u8;
+            out[bo + 2 + j] = lo | (hi << 4);
+        }
+    }
+    out
+}
+
+/// Dequantize one 32-element Q8_0 block (f16 scale + 32 i8 quants) into
+/// `out`, adding to what is already there.
+fn dequant_q8_0_block_add(block: &[u8], out: &mut [f32]) {
+    let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+    for j in 0..32 {
+        out[j] += (block[2 + j] as i8) as f32 * d;
     }
 }
 
@@ -249,14 +336,17 @@ pub enum GgmlDtype {
     F32,
     F16,
     Q4_0,
-    /// Recognized for header parsing and bounds validation only — no kernel
-    /// reads Q8_0 *weights*. Official Q4_0 GGUFs are not uniformly Q4_0:
+    /// No kernel reads Q8_0 *weights*; it is dequantized on the CPU where it
+    /// is supported at all. Official Q4_0 GGUFs are not uniformly Q4_0:
     /// llama.cpp emits `output.weight` as Q8_0 (seen in
     /// `Qwen/Qwen2.5-0.5B-Instruct-GGUF`), and a header parse that bails on
     /// it makes the whole file unloadable even though this crate never reads
     /// that tensor — its lm_head is tied to `token_embd.weight`
-    /// (docs/MODELS.md §2). Anything that actually tries to load a Q8_0
-    /// tensor still fails, via the `!= Q4_0` checks below.
+    /// (docs/MODELS.md §2). Community *base*-model GGUFs
+    /// (`QuantFactory/Qwen2.5-0.5B-GGUF`) go further and keep
+    /// `token_embd.weight` itself at Q8_0, which `EmbeddingStore` and
+    /// `Q4ModelParts::finalize` handle. Every other tensor still fails via
+    /// the `!= Q4_0` checks below.
     Q8_0,
 }
 
@@ -1879,18 +1969,43 @@ pub fn silu_mul_fused(gate: Tensor<Wgpu, 3>, up: Tensor<Wgpu, 3>) -> Tensor<Wgpu
 /// vocab — see module doc comment).
 pub struct EmbeddingStore {
     cpu_bytes: Vec<u8>,
+    /// `Q4_0` or `Q8_0`. Community base-model GGUFs (e.g.
+    /// `QuantFactory/Qwen2.5-0.5B-GGUF`) keep `token_embd.weight` at Q8_0
+    /// even in a "Q4_0" build, so the CPU row dequant handles both block
+    /// layouts exactly.
+    dtype: GgmlDtype,
     vocab_size: usize,
     dim: usize,
 }
 
 impl EmbeddingStore {
-    /// Create from raw Q4 bytes.
+    /// Create from raw Q4_0 bytes.
     pub fn new(cpu_bytes: Vec<u8>, vocab_size: usize, dim: usize) -> Self {
+        Self::new_with_dtype(cpu_bytes, GgmlDtype::Q4_0, vocab_size, dim)
+    }
+
+    /// Create from raw Q4_0 or Q8_0 bytes.
+    pub fn new_with_dtype(
+        cpu_bytes: Vec<u8>,
+        dtype: GgmlDtype,
+        vocab_size: usize,
+        dim: usize,
+    ) -> Self {
+        assert!(
+            matches!(dtype, GgmlDtype::Q4_0 | GgmlDtype::Q8_0),
+            "EmbeddingStore supports Q4_0 and Q8_0, got {}",
+            dtype.name()
+        );
         Self {
             cpu_bytes,
+            dtype,
             vocab_size,
             dim,
         }
+    }
+
+    pub fn dtype(&self) -> GgmlDtype {
+        self.dtype
     }
 
     pub fn vocab_size(&self) -> usize {
@@ -1922,9 +2037,23 @@ impl EmbeddingStore {
         );
         assert_eq!(out_buf.len(), self.dim);
         let blocks_per_row = self.dim / 32;
-        let bytes_per_row = blocks_per_row * 18;
+        let block_bytes = match self.dtype {
+            GgmlDtype::Q8_0 => 34,
+            _ => 18,
+        };
+        let bytes_per_row = blocks_per_row * block_bytes;
         let row_offset = (id as usize) * bytes_per_row;
         let row_bytes = &self.cpu_bytes[row_offset..row_offset + bytes_per_row];
+
+        if self.dtype == GgmlDtype::Q8_0 {
+            for block in 0..blocks_per_row {
+                dequant_q8_0_block_add(
+                    &row_bytes[block * 34..block * 34 + 34],
+                    &mut out_buf[block * 32..block * 32 + 32],
+                );
+            }
+            return Ok(());
+        }
 
         for block in 0..blocks_per_row {
             let bo = block * 18;
@@ -1953,6 +2082,8 @@ pub struct Q4ModelParts {
     pub rope: RoPE,
     pub out_norm: RmsNormLayer,
     pub token_embd_bytes: Vec<u8>,
+    /// `Q4_0` or `Q8_0` — the block layout `token_embd_bytes` is in.
+    pub token_embd_dtype: GgmlDtype,
     pub vocab_size: usize,
     pub hidden_size: usize,
     pub config: LlmConfig,
@@ -1966,14 +2097,45 @@ impl Q4ModelParts {
     /// embedding table (via CPU-side `EmbeddingStore`, for input lookups)
     /// and the lm_head weight (via `Q4Linear`, tied — no separate
     /// `output.weight` tensor exists in this GGUF, docs/MODELS.md §2).
+    /// A Q8_0 `token_embd.weight` (what community base-model GGUFs ship, e.g.
+    /// `QuantFactory/Qwen2.5-0.5B-GGUF`) is kept exact on the CPU side and
+    /// **re-quantized to Q4_0 for the GPU tied head only** — no kernel in
+    /// this crate reads Q8_0 weights. That makes the full-width `lm_head`
+    /// lossy on such a model; the sliced head (`LlmModel::head_slice`, which
+    /// llm-life reads p(alive) from) goes through `EmbeddingStore` and is
+    /// exact.
     pub fn finalize(self, device: &WgpuDevice) -> Result<LlmModel> {
+        let q4_bytes = match self.token_embd_dtype {
+            GgmlDtype::Q4_0 => None,
+            GgmlDtype::Q8_0 => {
+                tracing::info!(
+                    "token_embd.weight is Q8_0: re-quantizing to Q4_0 for the GPU tied lm_head \
+                     (the CPU embedding path stays exact Q8_0)"
+                );
+                let n = self.vocab_size * self.hidden_size;
+                let mut f = vec![0.0f32; n];
+                for blk in 0..n / 32 {
+                    dequant_q8_0_block_add(
+                        &self.token_embd_bytes[blk * 34..blk * 34 + 34],
+                        &mut f[blk * 32..blk * 32 + 32],
+                    );
+                }
+                Some(quantize_q4_0(&f))
+            }
+            other => bail!("token_embd.weight must be Q4_0 or Q8_0, got {}", other.name()),
+        };
         let embed_gpu = Q4Tensor::from_q4_bytes(
-            &self.token_embd_bytes,
+            q4_bytes.as_deref().unwrap_or(&self.token_embd_bytes),
             [self.vocab_size, self.hidden_size],
             device,
         )?;
         let lm_head = Q4Linear::new(embed_gpu, None);
-        let embed_store = EmbeddingStore::new(self.token_embd_bytes, self.vocab_size, self.hidden_size);
+        let embed_store = EmbeddingStore::new_with_dtype(
+            self.token_embd_bytes,
+            self.token_embd_dtype,
+            self.vocab_size,
+            self.hidden_size,
+        );
 
         Ok(LlmModel::new(
             embed_store,
@@ -2060,8 +2222,8 @@ impl<R: Read + Seek> Q4ModelLoader<R> {
             .context("Tensor 'token_embd.weight' not found")?
             .clone();
         ensure!(
-            embd_info.dtype() == GgmlDtype::Q4_0,
-            "Expected Q4_0 for 'token_embd.weight', got {:?}",
+            matches!(embd_info.dtype(), GgmlDtype::Q4_0 | GgmlDtype::Q8_0),
+            "Expected Q4_0 or Q8_0 for 'token_embd.weight', got {:?}",
             embd_info.dtype()
         );
         let embd_shape = reverse_gguf_dims(embd_info.shape());
@@ -2074,6 +2236,7 @@ impl<R: Read + Seek> Q4ModelLoader<R> {
             rope,
             out_norm,
             token_embd_bytes,
+            token_embd_dtype: embd_info.dtype(),
             vocab_size: embd_shape[0],
             hidden_size: embd_shape[1],
             config,
