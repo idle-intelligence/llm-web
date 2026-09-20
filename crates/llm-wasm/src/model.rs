@@ -8,7 +8,7 @@
 //! 2-matrix gating, rotate-half RoPE instead of interleaved-pair, no sliding
 //! window, tied lm_head instead of an independent `text_linear`).
 
-use anyhow::Result;
+use anyhow::{ensure, Result};
 use burn::backend::wgpu::{into_contiguous, CubeTensor, Wgpu, WgpuDevice, WgpuRuntime};
 use burn::tensor::activation::softmax;
 use burn::tensor::{Bool, DType, Int, Tensor, TensorData, TensorPrimitive};
@@ -358,6 +358,11 @@ pub struct Q4Attention {
     n_kv_heads: usize,
     head_dim: usize,
     scale: f32,
+    /// Optional runtime LoRA delta for this layer's q/k/v/o projections
+    /// (`crate::lora`). `None` (the default) means this attention layer is
+    /// byte-for-byte the base model — no adapter loaded, no extra ops on
+    /// the forward path.
+    lora: Option<crate::lora::LoraLayer>,
 }
 
 impl Q4Attention {
@@ -379,7 +384,14 @@ impl Q4Attention {
             n_kv_heads,
             head_dim,
             scale: (head_dim as f32).powf(-0.5),
+            lora: None,
         }
+    }
+
+    /// Install (or clear, with `None`) this layer's runtime LoRA delta —
+    /// see `LlmModel::apply_lora`.
+    pub fn set_lora(&mut self, lora: Option<crate::lora::LoraLayer>) {
+        self.lora = lora;
     }
 
     /// `x`: `[1, T, hidden]`. `cache`/`layer_idx`/`offset` give the absolute
@@ -399,11 +411,19 @@ impl Q4Attention {
 
         let dev = x.device();
         let (q, k, v) = crate::profile::scope("attn.qkv_proj", &dev, || {
-            (
-                self.q_proj.forward(x.clone()),
-                self.k_proj.forward(x.clone()),
-                self.v_proj.forward(x.clone()),
-            )
+            let mut q = self.q_proj.forward(x.clone());
+            let mut k = self.k_proj.forward(x.clone());
+            let mut v = self.v_proj.forward(x.clone());
+            // Runtime LoRA: y = W_q4 * x + scale * B * (A * x) (see
+            // `crate::lora`'s module doc). Rank 8 makes each of these three
+            // extra matmul pairs negligible next to the Q4 matvec/matmul
+            // they ride alongside.
+            if let Some(lora) = &self.lora {
+                q = q + lora.q.delta(x.clone());
+                k = k + lora.k.delta(x.clone());
+                v = v + lora.v.delta(x.clone());
+            }
+            (q, k, v)
         });
 
         // F1 (docs/BENCHMARKS.md Session 9): apply fused RoPE in the
@@ -488,7 +508,13 @@ impl Q4Attention {
         };
         let out = out.permute([0, 2, 1, 3]).reshape([b, t, self.n_heads * self.head_dim]);
 
-        crate::profile::scope("attn.o_proj", &dev, || self.o_proj.forward(out))
+        crate::profile::scope("attn.o_proj", &dev, || {
+            let o = self.o_proj.forward(out.clone());
+            match &self.lora {
+                Some(lora) => o + lora.o.delta(out),
+                None => o,
+            }
+        })
     }
 }
 
@@ -956,6 +982,23 @@ impl LlmModel {
 
     pub fn config(&self) -> &LlmConfig {
         &self.config
+    }
+
+    /// Install a runtime LoRA adapter (`crate::lora`) on every transformer
+    /// layer's attention block. The adapter's own layer count must match
+    /// this model's; loading a second adapter replaces the first (each
+    /// `Q4Attention::set_lora` call overwrites, doesn't stack).
+    pub fn apply_lora(&mut self, adapter: crate::lora::LoraAdapter) -> Result<()> {
+        ensure!(
+            adapter.layers.len() == self.layers.len(),
+            "LoRA adapter has {} layers, model has {}",
+            adapter.layers.len(),
+            self.layers.len()
+        );
+        for (layer, lora) in self.layers.iter_mut().zip(adapter.layers.into_iter()) {
+            layer.attention.set_lora(Some(lora));
+        }
+        Ok(())
     }
 
     pub fn device(&self) -> &WgpuDevice {

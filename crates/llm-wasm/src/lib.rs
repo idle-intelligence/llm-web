@@ -11,6 +11,9 @@ pub mod gguf;
 pub mod model;
 
 #[cfg(feature = "wgpu")]
+pub mod lora;
+
+#[cfg(feature = "wgpu")]
 pub mod kv;
 
 #[cfg(feature = "wgpu")]

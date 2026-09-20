@@ -411,6 +411,26 @@ impl LlmEngine {
         Ok(())
     }
 
+    /// Load a runtime LoRA adapter (`crate::lora`'s LLMLIFE2 format) onto
+    /// the already-`load()`-ed model, applying its q/k/v/o deltas on every
+    /// subsequent forward. Call after `load()`; replaces any previously
+    /// loaded adapter (does not stack). No Q4 kernel or GGUF weight is
+    /// touched — the base model is unaffected if this is never called.
+    #[wasm_bindgen(js_name = loadAdapter)]
+    pub fn load_adapter(&mut self, bytes: &[u8]) -> Result<(), JsError> {
+        let model = self
+            .model
+            .as_mut()
+            .ok_or_else(|| JsError::new("loadAdapter: no model loaded, call load() first"))?;
+        let adapter = crate::lora::LoraAdapter::from_bytes(bytes, model.config().num_layers, &self.device)
+            .map_err(|e| JsError::new(&format!("failed to parse LoRA adapter: {e}")))?;
+        model
+            .apply_lora(adapter)
+            .map_err(|e| JsError::new(&format!("failed to apply LoRA adapter: {e}")))?;
+        wasm_log(&format!("[llm] LoRA adapter applied ({} bytes)", bytes.len()));
+        Ok(())
+    }
+
     /// Set the system prompt used by subsequent `start()` calls.
     #[wasm_bindgen(js_name = setSystemPrompt)]
     pub fn set_system_prompt(&mut self, system_prompt: String) {
