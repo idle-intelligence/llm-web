@@ -7,7 +7,7 @@ lives in commit messages and inline WGSL/Rust comments, not here.
 
 - Apple M2, 16 GB unified memory, macOS (Darwin 25.3.0)
 - `CARGO_BUILD_JOBS=4`, release profile, `--features native,wgpu`
-- Model: xLAM-2-3b-fc-r, Q4_0 GGUF (`/Users/tc/Code/idle-intelligence/models/gguf/xlam-2-3b-fc-r/xLAM-2-3b-fc-r-q4_0.gguf`)
+- Model: xLAM-2-3b-fc-r, Q4_0 GGUF (`<models>/gguf/xlam-2-3b-fc-r/xLAM-2-3b-fc-r-q4_0.gguf`)
 - Prefill fixture: `fixtures/reference/rendered/02_tools_single.tokens.json` (2225 tokens)
 - Command: `./target/release/llm-agent bench --gguf <path> --tokens <fixture> --decode-steps N`
   (loads the model once, times a full prefill then N greedy decode steps, forcing a
@@ -417,7 +417,7 @@ attempted (see "not attempted" below). Commands:
 cargo test --release --features wgpu --test q4_matmul
 cargo test --release --features wgpu --test full_forward -- --test-threads=1
 cargo run --release --features wgpu --bin llm-agent -- bench \
-  --gguf /Users/tc/Code/idle-intelligence/models/gguf/xlam-2-3b-fc-r/xLAM-2-3b-fc-r-q4_0.gguf \
+  --gguf <models>/gguf/xlam-2-3b-fc-r/xLAM-2-3b-fc-r-q4_0.gguf \
   --tokens fixtures/reference/rendered/02_tools_single.tokens.json --decode-steps 32
 ```
 

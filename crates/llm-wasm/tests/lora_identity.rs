@@ -4,10 +4,10 @@
 //! model (complementing `lora::tests`' pure-format unit tests, which never
 //! touch the GPU).
 //!
-//! Env vars (default matches this machine's checkout, same convention as
+//! Env vars (default is relative to the repo root, same convention as
 //! `tests/full_forward.rs`):
 //! - `LLM_MODEL_DIR` -> GGUF directory, default
-//!   `/Users/tc/Code/idle-intelligence/models/gguf/xlam-2-3b-fc-r`
+//!   `./models/gguf/xlam-2-3b-fc-r`
 //! - `LLM_MODEL_FILE` -> GGUF filename within that directory, default
 //!   `xLAM-2-3b-fc-r-q4_0.gguf`
 //!
@@ -25,7 +25,7 @@ use llm_wasm::model::logits_to_vec;
 
 fn model_path() -> String {
     let dir = std::env::var("LLM_MODEL_DIR")
-        .unwrap_or_else(|_| "/Users/tc/Code/idle-intelligence/models/gguf/xlam-2-3b-fc-r".to_string());
+        .unwrap_or_else(|_| "./models/gguf/xlam-2-3b-fc-r".to_string());
     let file = std::env::var("LLM_MODEL_FILE").unwrap_or_else(|_| "xLAM-2-3b-fc-r-q4_0.gguf".to_string());
     format!("{dir}/{file}")
 }

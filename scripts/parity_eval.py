@@ -39,14 +39,19 @@ import time
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-REPO_ROOT = "/Users/tc/Code/idle-intelligence/llm-web"
+# REPO_ROOT defaults to this script's checkout; LLM_MODELS_DIR defaults to
+# `./models` next to it (see scripts/README.md).
+REPO_ROOT = os.environ.get(
+    "LLM_REPO_ROOT", os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
+MODELS_DIR = os.environ.get("LLM_MODELS_DIR", os.path.join(REPO_ROOT, "models"))
 SONOS_DIR = os.path.join(REPO_ROOT, "fixtures/sonos")
 UTTERANCES_PATH = os.path.join(REPO_ROOT, "eval/utterances.json")
-MODEL_DIR = "/Users/tc/Code/idle-intelligence/models/hf/xLAM-2-3b-fc-r"
-GGUF_PATH = "/Users/tc/Code/idle-intelligence/models/gguf/xlam-2-3b-fc-r/xLAM-2-3b-fc-r-q4_0.gguf"
+MODEL_DIR = os.path.join(MODELS_DIR, "hf/xLAM-2-3b-fc-r")
+GGUF_PATH = os.path.join(MODELS_DIR, "gguf/xlam-2-3b-fc-r/xLAM-2-3b-fc-r-q4_0.gguf")
 LLM_AGENT_BIN = os.path.join(REPO_ROOT, "target/release/llm-agent")
 
-OUT_DIR = "/Users/tc/.claude/jobs/ae1e446d/tmp/parity"
+OUT_DIR = os.environ.get("LLM_PARITY_OUT_DIR", os.path.join(REPO_ROOT, "tmp/parity"))
 
 DEFAULT_SYSTEM = "You are a helpful home assistant with access to Sonos speaker controls."
 CASE_IDS = ["s01", "s02", "s06", "s08", "s09", "m01", "m04", "m07"]

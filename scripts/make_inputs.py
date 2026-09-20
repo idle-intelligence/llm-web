@@ -28,7 +28,9 @@ copied from the existing 02/03 input files' "messages" key as-is. Only the
 import json
 import os
 
-REPO_ROOT = "/Users/tc/Code/idle-intelligence/llm-web"
+REPO_ROOT = os.environ.get(
+    "LLM_REPO_ROOT", os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
 INPUTS_DIR = os.path.join(REPO_ROOT, "fixtures/reference/inputs")
 SONOS_DIR = os.path.join(REPO_ROOT, "fixtures/sonos")
 

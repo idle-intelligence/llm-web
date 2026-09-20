@@ -72,17 +72,21 @@ const DUMP_PREFIX_PATH = args['dump-prefix'] ?? null;
 const CASES_PATH = args.cases ?? null;
 const ONLY_IDS = args.only ? String(args.only).split(',').map((s) => s.trim()).filter(Boolean) : null;
 
-const PLAYWRIGHT_MODULE =
-  process.env.PLAYWRIGHT_MODULE ??
-  '/Users/tc/Code/dusty-bytes/dusty-games-platform/node_modules/playwright/index.mjs';
+// This repo does not `npm install` Playwright itself; point PLAYWRIGHT_MODULE
+// at a local Playwright install's `index.mjs` (e.g. a sibling project's
+// `node_modules/playwright/index.mjs`), or install it locally and set this
+// to `playwright`.
+const PLAYWRIGHT_MODULE = process.env.PLAYWRIGHT_MODULE ?? 'playwright';
 const { chromium } = await import(PLAYWRIGHT_MODULE);
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const OUT_DIR = path.join(__dirname, 'out');
 const CONSOLE_LOG_PATH = args.out ?? path.join(OUT_DIR, 'console.log');
 
-const EXECUTABLE_PATH =
-  '/Users/tc/Library/Caches/ms-playwright/chromium-1229/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing';
+// Defaults to Playwright's own bundled Chromium (whatever `playwright
+// install` downloaded, under its cache dir). Override with
+// LLM_PLAYWRIGHT_EXECUTABLE for a specific Chrome/Chromium binary.
+const EXECUTABLE_PATH = process.env.LLM_PLAYWRIGHT_EXECUTABLE ?? undefined;
 
 const LAUNCH_ARGS = [
   '--enable-unsafe-webgpu',

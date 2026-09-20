@@ -61,12 +61,17 @@ from gguf import GGUFReader
 from gguf.quants import dequantize
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-MODEL_DIR = "/Users/tc/Code/idle-intelligence/models/hf/xLAM-2-3b-fc-r"
-GGUF_PATH = "/Users/tc/Code/idle-intelligence/models/gguf/xlam-2-3b-fc-r/xLAM-2-3b-fc-r-q4_0.gguf"
-REPO_ROOT = "/Users/tc/Code/idle-intelligence/llm-web"
+# REPO_ROOT defaults to this script's checkout; LLM_MODELS_DIR defaults to
+# `./models` next to it (see scripts/README.md).
+REPO_ROOT = os.environ.get(
+    "LLM_REPO_ROOT", os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
+MODELS_DIR = os.environ.get("LLM_MODELS_DIR", os.path.join(REPO_ROOT, "models"))
+MODEL_DIR = os.path.join(MODELS_DIR, "hf/xLAM-2-3b-fc-r")
+GGUF_PATH = os.path.join(MODELS_DIR, "gguf/xlam-2-3b-fc-r/xLAM-2-3b-fc-r-q4_0.gguf")
 INPUTS_DIR = os.path.join(REPO_ROOT, "fixtures/reference/inputs")
 LOGITS_JSON_DIR = os.path.join(REPO_ROOT, "fixtures/reference/logits")
-LOGITS_NPY_DIR = "/Users/tc/Code/idle-intelligence/models/reference/xlam-2-3b-fc-r"
+LOGITS_NPY_DIR = os.path.join(MODELS_DIR, "reference/xlam-2-3b-fc-r")
 
 NUM_LAYERS = 36
 HIDDEN_LAYER_IDS = [0, 9, 18, 27, 35]

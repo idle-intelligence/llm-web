@@ -6,7 +6,7 @@ venv mon ami. Python 3.12 (torch has no 3.14 wheels yet on this machine;
 ## Setup
 
 ```
-cd /Users/tc/Code/idle-intelligence/llm-web
+cd <repo-root>
 /opt/homebrew/bin/python3.12 -m venv scripts/.venv
 scripts/.venv/bin/pip install -r scripts/requirements.txt
 ```
@@ -44,7 +44,7 @@ decode) for each, writes:
   token id per position, top-5 (id, logit) at the last position, and the
   greedy-decoded (`do_sample=False`) first 32 generated tokens as text +
   ids.
-- `/Users/tc/Code/idle-intelligence/models/reference/xlam-2-3b-fc-r/<name>.logits.npy`
+- `<models>/reference/xlam-2-3b-fc-r/<name>.logits.npy`
   — full-sequence float32 `[seq_len, vocab_size]` forward-pass logits.
   Outside the repo: multi-hundred MB, not committed.
 
@@ -89,7 +89,7 @@ prefix-cache machinery entirely.
 via `make_inputs.mcp_to_function_tools`), renders with
 `apply_chat_template(add_generation_prompt=True)`, tokenizes the same way
 `export_reference.py` does (`tokenizer(rendered, add_special_tokens=False)`),
-writes tokens to `/Users/tc/.claude/jobs/ae1e446d/tmp/parity/<id>.tokens.json`,
+writes tokens to `<repo-root>/tmp/parity/<id>.tokens.json (override with LLM_PARITY_OUT_DIR)`,
 then runs one HF bf16 MPS greedy `generate()` per case (one model load for
 all cases), writing `<id>.hf.json`. Frees the model (`del` + `gc.collect()` +
 `torch.mps.empty_cache()`) before returning.
@@ -118,7 +118,7 @@ quantisation noise from port bugs: it loads
 `Salesforce/xLAM-2-3b-fc-r` in plain float32 on CPU, then overwrites every
 parameter in place with the exact Q4_0-dequantised (Q6_K for
 `token_embd.weight`) values read straight out of
-`/Users/tc/Code/idle-intelligence/models/gguf/xlam-2-3b-fc-r/xLAM-2-3b-fc-r-q4_0.gguf`
+`<models>/gguf/xlam-2-3b-fc-r/xLAM-2-3b-fc-r-q4_0.gguf`
 via the `gguf` package's `GGUFReader` + `gguf.quants.dequantize`. The
 resulting model's forward pass should track the Rust port far more closely
 than the bf16 reference does — any remaining discrepancy vs. the Rust port

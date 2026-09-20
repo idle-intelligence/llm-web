@@ -1,11 +1,11 @@
 //! Full forward-pass tests against PyTorch reference logits (C2/C3
 //! checkpoints).
 //!
-//! Env vars (defaults match this machine's checkout):
+//! Env vars (defaults are relative to the repo root):
 //! - `LLM_MODEL_DIR` -> GGUF directory, default
-//!   `/Users/tc/Code/idle-intelligence/models/gguf/xlam-2-3b-fc-r`
+//!   `./models/gguf/xlam-2-3b-fc-r`
 //! - `LLM_REF_DIR` -> reference `.logits.npy` directory, default
-//!   `/Users/tc/Code/idle-intelligence/models/reference/xlam-2-3b-fc-r`
+//!   `./models/reference/xlam-2-3b-fc-r`
 //!
 //! Tests skip (print + return) instead of failing when the GGUF or
 //! reference files aren't present, per the task brief.
@@ -24,12 +24,12 @@ use llm_wasm::model::LlmModel;
 
 fn model_dir() -> String {
     std::env::var("LLM_MODEL_DIR")
-        .unwrap_or_else(|_| "/Users/tc/Code/idle-intelligence/models/gguf/xlam-2-3b-fc-r".to_string())
+        .unwrap_or_else(|_| "./models/gguf/xlam-2-3b-fc-r".to_string())
 }
 
 fn ref_dir() -> String {
     std::env::var("LLM_REF_DIR").unwrap_or_else(|_| {
-        "/Users/tc/Code/idle-intelligence/models/reference/xlam-2-3b-fc-r".to_string()
+        "./models/reference/xlam-2-3b-fc-r".to_string()
     })
 }
 

@@ -27,12 +27,12 @@ const N_GENERATE: usize = 16;
 
 fn model_dir() -> String {
     std::env::var("LLM_MODEL_DIR")
-        .unwrap_or_else(|_| "/Users/tc/Code/idle-intelligence/models/gguf/xlam-2-3b-fc-r".to_string())
+        .unwrap_or_else(|_| "./models/gguf/xlam-2-3b-fc-r".to_string())
 }
 
 fn hf_dir() -> String {
     std::env::var("LLM_HF_DIR")
-        .unwrap_or_else(|_| "/Users/tc/Code/idle-intelligence/models/hf/xLAM-2-3b-fc-r".to_string())
+        .unwrap_or_else(|_| "./models/hf/xLAM-2-3b-fc-r".to_string())
 }
 
 fn fixtures_dir() -> String {

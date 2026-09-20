@@ -37,5 +37,5 @@
 
 - commit: 94e4aaa
 - machine: Apple M2, 16 GB unified memory, macOS (Darwin 25.3.0)
-- gguf: /Users/tc/Code/idle-intelligence/models/gguf/xlam-2-3b-fc-r/xLAM-2-3b-fc-r-q4_0.gguf
-- model-dir: /Users/tc/Code/idle-intelligence/models/hf/xLAM-2-3b-fc-r
+- gguf: <models>/gguf/xlam-2-3b-fc-r/xLAM-2-3b-fc-r-q4_0.gguf
+- model-dir: <models>/hf/xLAM-2-3b-fc-r

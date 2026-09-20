@@ -37,6 +37,6 @@
 
 - commit: 7aab8ca
 - machine: Apple M2, 16 GB unified memory, macOS (Darwin 25.3.0)
-- gguf: /Users/tc/Code/idle-intelligence/models/gguf/xlam-2-3b-fc-r/xLAM-2-3b-fc-r-q4_0.gguf
-- model-dir: /Users/tc/Code/idle-intelligence/models/hf/xLAM-2-3b-fc-r
+- gguf: <models>/gguf/xlam-2-3b-fc-r/xLAM-2-3b-fc-r-q4_0.gguf
+- model-dir: <models>/hf/xLAM-2-3b-fc-r
 - NOTE: a concurrent `cargo test --release --features wgpu --test full_forward --test q4_matmul` job (another worker) began GPU-side execution (`full_forward-*` test binary, confirmed via `pgrep`) partway through this run, contending for the GPU. decode_tok_s here (mean 1.61) is well below the uncontended 34-tool baseline (2.84-2.95 tok/s, 2026-09-10-summary.md); prefill_s and total_s are inflated for the same reason. These numbers are not a clean kernels-v2 baseline for decode/prefill throughput comparisons — treat correctness (calls made, correct%) as reliable, timings as contention-degraded.

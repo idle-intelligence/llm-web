@@ -10,7 +10,7 @@ fn model_dir() -> PathBuf {
     std::env::var("LLM_MODEL_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
-            PathBuf::from("/Users/tc/Code/idle-intelligence/models/hf/xLAM-2-3b-fc-r")
+            PathBuf::from("./models/hf/xLAM-2-3b-fc-r")
         })
 }
 

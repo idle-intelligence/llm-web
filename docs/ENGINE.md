@@ -1,6 +1,6 @@
 # ENGINE.md — what stt-wasm transfers to a Qwen2 decoder
 
-Audit of `/Users/tc/Code/idle-intelligence/stt-web/crates/stt-wasm` (read-only, not modified) as
+Audit of the sibling `stt-web` repo's `crates/stt-wasm` (read-only, not modified) as
 a starting point for a Qwen2.5-3B-style decoder (xLAM-2-3b-fc-r: GQA + q/k/v bias, RoPE, RMSNorm,
 SwiGLU, tied embeddings, 151k vocab) driving MCP tool calls in-browser.
 

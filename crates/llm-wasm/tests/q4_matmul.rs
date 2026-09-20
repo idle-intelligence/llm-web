@@ -321,7 +321,7 @@ fn test_q4_matvec_coalesced_shapes() {
 #[test]
 fn test_q4_matmul_real_gguf_token_embd() {
     let model_dir = std::env::var("LLM_MODEL_DIR").unwrap_or_else(|_| {
-        "/Users/tc/Code/idle-intelligence/models/gguf/xlam-2-3b-fc-r".to_string()
+        "./models/gguf/xlam-2-3b-fc-r".to_string()
     });
     let path = format!("{model_dir}/xLAM-2-3b-fc-r-q4_0.gguf");
     if !std::path::Path::new(&path).exists() {
@@ -402,7 +402,7 @@ fn test_q4_matmul_real_gguf_token_embd() {
 
 fn model_dir() -> String {
     std::env::var("LLM_MODEL_DIR")
-        .unwrap_or_else(|_| "/Users/tc/Code/idle-intelligence/models/gguf/xlam-2-3b-fc-r".to_string())
+        .unwrap_or_else(|_| "./models/gguf/xlam-2-3b-fc-r".to_string())
 }
 
 /// Full CPU dequant of a raw Q4_0 `[n, k]` tensor's on-disk bytes into a

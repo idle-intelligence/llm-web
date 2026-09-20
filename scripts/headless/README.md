@@ -20,9 +20,11 @@ rather than being wired to one model.
 - The page must expose `window.__llm = { load, run, reset, state }` (see
   `web/agent/index.html`) — `run.mjs` drives the page through that surface,
   not through DOM clicks, so any page implementing the same contract works.
-- Playwright's Chromium under `~/Library/Caches/ms-playwright` (this repo
-  does not `npm install` Playwright — the module is borrowed via
-  `PLAYWRIGHT_MODULE`, see below).
+- Playwright's bundled Chromium (this repo does not `npm install` Playwright
+  itself — the module is borrowed via `PLAYWRIGHT_MODULE`, e.g. a sibling
+  project's `node_modules/playwright/index.mjs`, or install it locally and
+  set `PLAYWRIGHT_MODULE=playwright`). Override the browser binary with
+  `LLM_PLAYWRIGHT_EXECUTABLE` if you don't want Playwright's own download.
 
 ## `window.__llm` contract
 
