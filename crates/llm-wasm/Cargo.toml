@@ -13,6 +13,11 @@ name = "llm-agent"
 path = "src/bin/llm-agent.rs"
 required-features = ["native"]
 
+[[bin]]
+name = "lora-eval"
+path = "src/bin/lora_eval.rs"
+required-features = ["native"]
+
 [package.metadata.wasm-pack.profile.release]
 wasm-opt = false
 
