@@ -1,0 +1,922 @@
+[
+  {
+    "id": "s01",
+    "utterance": "What's playing right now?",
+    "kind": "single",
+    "expected": [
+      {
+        "name": "get_now_playing",
+        "args": {
+          "group_id": "RINCON_LIVING01:2"
+        }
+      }
+    ],
+    "accept": "subset",
+    "tools12_ok": true,
+    "notes": "No room named; the only currently PLAYING group in the canned household is Living Room, so that's the canonical target. A model may legitimately call get_households_and_groups_and_players first to find it — that read is free."
+  },
+  {
+    "id": "s02",
+    "utterance": "List all my speakers.",
+    "kind": "single",
+    "expected": [
+      {
+        "name": "get_households_and_groups_and_players",
+        "args": {}
+      }
+    ],
+    "accept": "exact",
+    "tools12_ok": true,
+    "notes": "Single no-arg discovery call; nothing else is needed or sensible before it."
+  },
+  {
+    "id": "s03",
+    "utterance": "What are my Sonos favourites?",
+    "kind": "single",
+    "expected": [
+      {
+        "name": "get_sonos_favorites",
+        "args": {
+          "household_id": "Sonos_ABC123XYZ"
+        }
+      }
+    ],
+    "accept": "subset",
+    "tools12_ok": true,
+    "notes": "Only one household in the fixture, so household_id is effectively fixed context."
+  },
+  {
+    "id": "s04",
+    "utterance": "What Sonos playlists do I have saved?",
+    "kind": "single",
+    "expected": [
+      {
+        "name": "get_sonos_playlists",
+        "args": {
+          "household_id": "Sonos_ABC123XYZ"
+        }
+      }
+    ],
+    "accept": "subset",
+    "tools12_ok": false,
+    "notes": "get_sonos_playlists is not in the 12-tool subset."
+  },
+  {
+    "id": "s05",
+    "utterance": "What music services are set up on my Sonos?",
+    "kind": "single",
+    "expected": [
+      {
+        "name": "get_registered_music_services",
+        "args": {
+          "household_id": "Sonos_ABC123XYZ"
+        }
+      }
+    ],
+    "accept": "subset",
+    "tools12_ok": false,
+    "notes": "get_registered_music_services is not in the 12-tool subset."
+  },
+  {
+    "id": "s06",
+    "utterance": "Skip to the next song.",
+    "kind": "single",
+    "expected": [
+      {
+        "name": "skip_to_next_track",
+        "args": {
+          "group_id": "RINCON_LIVING01:2"
+        }
+      }
+    ],
+    "accept": "subset",
+    "tools12_ok": true,
+    "notes": "No room named; defaults to the only actively playing group (Living Room)."
+  },
+  {
+    "id": "s07",
+    "utterance": "Go back to the previous track.",
+    "kind": "single",
+    "expected": [
+      {
+        "name": "skip_to_previous_track",
+        "args": {
+          "group_id": "RINCON_LIVING01:2"
+        }
+      }
+    ],
+    "accept": "subset",
+    "tools12_ok": true,
+    "notes": "Same default-group reasoning as s06."
+  },
+  {
+    "id": "s08",
+    "utterance": "Pause the music.",
+    "kind": "single",
+    "expected": [
+      {
+        "name": "pause",
+        "args": {
+          "group_id": "RINCON_LIVING01:2"
+        }
+      }
+    ],
+    "accept": "subset",
+    "tools12_ok": true,
+    "notes": "pause is stateless per its description ('always execute when asked') so no need to check playback state first."
+  },
+  {
+    "id": "s09",
+    "utterance": "Resume playback.",
+    "kind": "single",
+    "expected": [
+      {
+        "name": "resume",
+        "args": {
+          "group_id": "RINCON_LIVING01:2"
+        }
+      }
+    ],
+    "accept": "subset",
+    "tools12_ok": true,
+    "notes": "Mirrors s08 for resume."
+  },
+  {
+    "id": "s10",
+    "utterance": "Are shuffle and repeat on right now?",
+    "kind": "single",
+    "expected": [
+      {
+        "name": "get_shuffle_repeat_crossfade",
+        "args": {
+          "group_id": "RINCON_LIVING01:2"
+        }
+      }
+    ],
+    "accept": "subset",
+    "tools12_ok": false,
+    "notes": "get_shuffle_repeat_crossfade is not in the 12-tool subset."
+  },
+  {
+    "id": "m01",
+    "utterance": "Pause the kitchen.",
+    "kind": "multi",
+    "expected": [
+      {
+        "name": "get_households_and_groups_and_players",
+        "args": {}
+      },
+      {
+        "name": "pause",
+        "args": {
+          "group_id": "RINCON_KITCHEN01:1"
+        }
+      }
+    ],
+    "accept": "subset",
+    "tools12_ok": true,
+    "notes": "Named room requires resolving 'kitchen' to its group id first."
+  },
+  {
+    "id": "m02",
+    "utterance": "Turn the living room down to 20.",
+    "kind": "multi",
+    "expected": [
+      {
+        "name": "get_households_and_groups_and_players",
+        "args": {}
+      },
+      {
+        "name": "set_group_volume",
+        "args": {
+          "group_id": "RINCON_LIVING01:2",
+          "volume": 20
+        }
+      }
+    ],
+    "accept": "subset",
+    "tools12_ok": true,
+    "notes": "\"down to\" is an absolute target, not a delta, so set_group_volume (not adjust_group_volume) is correct."
+  },
+  {
+    "id": "m03",
+    "utterance": "Mute the bedroom.",
+    "kind": "multi",
+    "expected": [
+      {
+        "name": "get_households_and_groups_and_players",
+        "args": {}
+      },
+      {
+        "name": "set_group_mute",
+        "args": {
+          "group_id": "RINCON_BEDROOM01:3",
+          "muted": true
+        }
+      }
+    ],
+    "accept": "subset",
+    "tools12_ok": true,
+    "notes": "muted is required by the schema even though the user only said 'mute' (true is implied but must still be passed explicitly)."
+  },
+  {
+    "id": "m04",
+    "utterance": "Skip this song in the kitchen.",
+    "kind": "multi",
+    "expected": [
+      {
+        "name": "get_households_and_groups_and_players",
+        "args": {}
+      },
+      {
+        "name": "skip_to_next_track",
+        "args": {
+          "group_id": "RINCON_KITCHEN01:1"
+        }
+      }
+    ],
+    "accept": "subset",
+    "tools12_ok": true,
+    "notes": "Named room requires the lookup."
+  },
+  {
+    "id": "m05",
+    "utterance": "Play my Jazz Vibes favourite in the living room.",
+    "kind": "multi",
+    "expected": [
+      {
+        "name": "get_households_and_groups_and_players",
+        "args": {}
+      },
+      {
+        "name": "get_sonos_favorites",
+        "args": {
+          "household_id": "Sonos_ABC123XYZ"
+        }
+      },
+      {
+        "name": "play_sonos_favorite",
+        "args": {
+          "group_id": "RINCON_LIVING01:2",
+          "favorite_id": "FV:1",
+          "shuffle": false
+        }
+      }
+    ],
+    "accept": "subset",
+    "tools12_ok": true,
+    "notes": "shuffle is required by play_sonos_favorite's schema even though the user never mentioned shuffling — the model must default it to false, which is easy to get wrong (some models omit required-but-unmentioned booleans)."
+  },
+  {
+    "id": "m06",
+    "utterance": "Group the bedroom with the kitchen.",
+    "kind": "multi",
+    "expected": [
+      {
+        "name": "get_households_and_groups_and_players",
+        "args": {}
+      },
+      {
+        "name": "add_players_to_group",
+        "args": {
+          "group_id": "RINCON_KITCHEN01:1",
+          "player_ids": [
+            "RINCON_BEDROOM01"
+          ]
+        }
+      }
+    ],
+    "accept": "subset",
+    "tools12_ok": false,
+    "notes": "add_players_to_group is not in the 12-tool subset. Also tests whether the model picks the kitchen's existing group_id as the destination (adding the bedroom player into it) rather than inventing a new group or reversing which side is the 'group_id' vs the 'player_ids'."
+  },
+  {
+    "id": "m07",
+    "utterance": "What's the volume in the bedroom?",
+    "kind": "multi",
+    "expected": [
+      {
+        "name": "get_households_and_groups_and_players",
+        "args": {}
+      },
+      {
+        "name": "get_group_volume",
+        "args": {
+          "group_id": "RINCON_BEDROOM01:3"
+        }
+      }
+    ],
+    "accept": "subset",
+    "tools12_ok": true,
+    "notes": "A read-only multi-step case: both calls are reads, so there is no mutating call to check — correctness here means the second call happened with the right group_id."
+  },
+  {
+    "id": "m08",
+    "utterance": "Turn up the kitchen volume by 10.",
+    "kind": "multi",
+    "expected": [
+      {
+        "name": "get_households_and_groups_and_players",
+        "args": {}
+      },
+      {
+        "name": "adjust_group_volume",
+        "args": {
+          "group_id": "RINCON_KITCHEN01:1",
+          "volume_delta": 10
+        }
+      }
+    ],
+    "accept": "subset",
+    "tools12_ok": true,
+    "notes": "A relative delta ('by 10') should map to adjust_group_volume, not set_group_volume — tests the set vs. adjust distinction in the opposite direction from m02."
+  },
+  {
+    "id": "m09",
+    "utterance": "Unmute the living room.",
+    "kind": "multi",
+    "expected": [
+      {
+        "name": "get_households_and_groups_and_players",
+        "args": {}
+      },
+      {
+        "name": "set_group_mute",
+        "args": {
+          "group_id": "RINCON_LIVING01:2",
+          "muted": false
+        }
+      }
+    ],
+    "accept": "subset",
+    "tools12_ok": true,
+    "notes": "Mirrors m03 with muted: false."
+  },
+  {
+    "id": "m10",
+    "utterance": "Move the music from the living room to just the bedroom.",
+    "kind": "multi",
+    "expected": [
+      {
+        "name": "get_households_and_groups_and_players",
+        "args": {}
+      },
+      {
+        "name": "move_audio_to_players",
+        "args": {
+          "source_group_id": "RINCON_LIVING01:2",
+          "destination_player_ids": [
+            "RINCON_BEDROOM01"
+          ]
+        }
+      }
+    ],
+    "accept": "subset",
+    "tools12_ok": false,
+    "notes": "move_audio_to_players is not in the 12-tool subset. Its first argument is named source_group_id rather than group_id like every other group-scoped tool — an easy field-name slip."
+  },
+  {
+    "id": "m11",
+    "utterance": "Play music by Nirvana in the kitchen.",
+    "kind": "multi",
+    "expected": [
+      {
+        "name": "get_households_and_groups_and_players",
+        "args": {}
+      },
+      {
+        "name": "play_artist",
+        "args": {
+          "group_id": "RINCON_KITCHEN01:1",
+          "artist": "Nirvana",
+          "shuffle": false
+        }
+      }
+    ],
+    "accept": "subset",
+    "tools12_ok": true,
+    "notes": "music_service is required by play_artist's schema but not determined by the utterance; the scorer's subset-args matching (expected keys must match, extra keys in the actual call ignored — see eval/README.md's Scoring rules) means the model may include any music_service value without being penalized. shuffle defaults to false per m05's pattern for a required-but-unmentioned boolean."
+  },
+  {
+    "id": "m12",
+    "utterance": "Ungroup the kitchen.",
+    "kind": "multi",
+    "expected": [
+      {
+        "name": "get_households_and_groups_and_players",
+        "args": {}
+      },
+      {
+        "name": "remove_players_from_group",
+        "args": {
+          "group_id": "RINCON_KITCHEN01:1",
+          "player_ids": [
+            "RINCON_KITCHEN02"
+          ]
+        }
+      }
+    ],
+    "accept": "subset",
+    "tools12_ok": false,
+    "notes": "remove_players_from_group is not in the 12-tool subset. The fixture Kitchen group has two players (RINCON_KITCHEN01, RINCON_KITCHEN02) so 'ungroup' is unambiguous: remove the non-coordinator player RINCON_KITCHEN02, leaving RINCON_KITCHEN01 as the group's sole (coordinator) player."
+  },
+  {
+    "id": "s11",
+    "utterance": "Set the living room to 35.",
+    "kind": "single",
+    "expected": [
+      {
+        "name": "get_households_and_groups_and_players",
+        "args": {}
+      },
+      {
+        "name": "set_group_volume",
+        "args": {
+          "group_id": "RINCON_LIVING01:2",
+          "volume": 35
+        }
+      }
+    ],
+    "accept": "subset",
+    "tools12_ok": true,
+    "notes": "Named-room volume set by explicit number; the lookup resolves 'living room' to its group id."
+  },
+  {
+    "id": "s12",
+    "utterance": "Mute just the Kitchen Surround speaker.",
+    "kind": "single",
+    "expected": [
+      {
+        "name": "get_households_and_groups_and_players",
+        "args": {}
+      },
+      {
+        "name": "set_player_mute",
+        "args": {
+          "player_id": "RINCON_KITCHEN02",
+          "muted": true
+        }
+      }
+    ],
+    "accept": "subset",
+    "tools12_ok": false,
+    "notes": "Player-level mute (contrast with s13's group-level mute) — naming the individual speaker ('Kitchen Surround') rather than the room should route to set_player_mute/player_id, not set_group_mute/group_id. set_player_mute is not in the 12-tool subset."
+  },
+  {
+    "id": "s13",
+    "utterance": "Unmute the kitchen.",
+    "kind": "single",
+    "expected": [
+      {
+        "name": "get_households_and_groups_and_players",
+        "args": {}
+      },
+      {
+        "name": "set_group_mute",
+        "args": {
+          "group_id": "RINCON_KITCHEN01:1",
+          "muted": false
+        }
+      }
+    ],
+    "accept": "subset",
+    "tools12_ok": true,
+    "notes": "Room name (not an individual speaker) routes to set_group_mute/group_id — contrast with s12's player-level mute."
+  },
+  {
+    "id": "s14",
+    "utterance": "What's on in the bedroom?",
+    "kind": "single",
+    "expected": [
+      {
+        "name": "get_households_and_groups_and_players",
+        "args": {}
+      },
+      {
+        "name": "get_now_playing",
+        "args": {
+          "group_id": "RINCON_BEDROOM01:3"
+        }
+      }
+    ],
+    "accept": "subset",
+    "tools12_ok": true,
+    "notes": "Bedroom is IDLE in the canned household; the correct call is still get_now_playing on the bedroom's group id, regardless of playback state."
+  },
+  {
+    "id": "s15",
+    "utterance": "Is anything playing?",
+    "kind": "single",
+    "expected": [
+      {
+        "name": "get_households_and_groups_and_players",
+        "args": {}
+      },
+      {
+        "name": "get_now_playing",
+        "args": {
+          "group_id": "RINCON_LIVING01:2"
+        }
+      }
+    ],
+    "accept": "subset",
+    "tools12_ok": true,
+    "notes": "No room named; Living Room is the only PLAYING group in the canned household, so it's the canonical target, mirroring s01."
+  },
+  {
+    "id": "s16",
+    "utterance": "Turn it down a bit.",
+    "kind": "single",
+    "expected": [
+      {
+        "name": "get_households_and_groups_and_players",
+        "args": {}
+      },
+      {
+        "name": "adjust_group_volume",
+        "args": {
+          "group_id": "RINCON_LIVING01:2",
+          "volume_delta": -10
+        }
+      }
+    ],
+    "accept": "subset",
+    "tools12_ok": true,
+    "notes": "No room named — the playing group (Living Room) is the canonical target, same as s01/s15. Delta convention (see eval/README.md): an unquantified 'a bit'/'a little' nudge is ±10; this case is the 'down' direction."
+  },
+  {
+    "id": "s17",
+    "utterance": "Next track in the kitchen.",
+    "kind": "single",
+    "expected": [
+      {
+        "name": "get_households_and_groups_and_players",
+        "args": {}
+      },
+      {
+        "name": "skip_to_next_track",
+        "args": {
+          "group_id": "RINCON_KITCHEN01:1"
+        }
+      }
+    ],
+    "accept": "subset",
+    "tools12_ok": true,
+    "notes": "Named-room skip, mirrors m04's pattern but phrased as a single terse command."
+  },
+  {
+    "id": "m13",
+    "utterance": "Play my Morning News favourite in the kitchen.",
+    "kind": "multi",
+    "expected": [
+      {
+        "name": "get_households_and_groups_and_players",
+        "args": {}
+      },
+      {
+        "name": "get_sonos_favorites",
+        "args": {
+          "household_id": "Sonos_ABC123XYZ"
+        }
+      },
+      {
+        "name": "play_sonos_favorite",
+        "args": {
+          "group_id": "RINCON_KITCHEN01:1",
+          "favorite_id": "FV:2",
+          "shuffle": false
+        }
+      }
+    ],
+    "accept": "subset",
+    "tools12_ok": true,
+    "notes": "Same pattern as m05 (Jazz Vibes/living room) but with the 'Morning News' favourite (FV:2) in the kitchen, to check the model doesn't hardcode m05's ids."
+  },
+  {
+    "id": "m14",
+    "utterance": "Play my Road Trip playlist in the bedroom.",
+    "kind": "multi",
+    "expected": [
+      {
+        "name": "get_households_and_groups_and_players",
+        "args": {}
+      },
+      {
+        "name": "get_sonos_playlists",
+        "args": {
+          "household_id": "Sonos_ABC123XYZ"
+        }
+      },
+      {
+        "name": "play_sonos_playlist",
+        "args": {
+          "group_id": "RINCON_BEDROOM01:3",
+          "playlist_id": "PL:2",
+          "shuffle": false
+        }
+      }
+    ],
+    "accept": "subset",
+    "tools12_ok": false,
+    "notes": "Sonos playlist by name, not a music-service playlist (play_playlist). get_sonos_playlists and play_sonos_playlist are both outside the 12-tool subset."
+  },
+  {
+    "id": "m15",
+    "utterance": "Play BBC Radio 1 in the kitchen.",
+    "kind": "multi",
+    "expected": [
+      {
+        "name": "get_households_and_groups_and_players",
+        "args": {}
+      },
+      {
+        "name": "play_radio",
+        "args": {
+          "group_id": "RINCON_KITCHEN01:1",
+          "radio_name": "BBC Radio 1"
+        }
+      }
+    ],
+    "accept": "subset",
+    "tools12_ok": false,
+    "notes": "A named live broadcast station routes to play_radio (radio_name), not play_station, which is for algorithmic/seeded stations (see m-cases below). play_radio is not in the 12-tool subset."
+  },
+  {
+    "id": "m16",
+    "utterance": "Play Bohemian Rhapsody by Queen in the bedroom.",
+    "kind": "multi",
+    "expected": [
+      {
+        "name": "get_households_and_groups_and_players",
+        "args": {}
+      },
+      {
+        "name": "play_track",
+        "args": {
+          "group_id": "RINCON_BEDROOM01:3",
+          "track": "Bohemian Rhapsody",
+          "artist": "Queen"
+        }
+      }
+    ],
+    "accept": "subset",
+    "tools12_ok": false,
+    "notes": "A specific track named by title and artist routes to play_track, not play_station's track-seeded radio (contrast with a 'Bohemian Rhapsody radio' phrasing, which would seed play_station instead). play_track is not in the 12-tool subset."
+  },
+  {
+    "id": "m17",
+    "utterance": "Shuffle the album Kid A by Radiohead in the living room.",
+    "kind": "multi",
+    "expected": [
+      {
+        "name": "get_households_and_groups_and_players",
+        "args": {}
+      },
+      {
+        "name": "play_album",
+        "args": {
+          "group_id": "RINCON_LIVING01:2",
+          "album": "Kid A",
+          "artist": "Radiohead",
+          "shuffle": true
+        }
+      }
+    ],
+    "accept": "subset",
+    "tools12_ok": false,
+    "notes": "shuffle:true must come from play_album's own shuffle argument (per its schema note), not a separate set_shuffle_repeat_crossfade call. play_album is not in the 12-tool subset."
+  },
+  {
+    "id": "m18",
+    "utterance": "Play jazz in the kitchen and the bedroom.",
+    "kind": "multi",
+    "expected": [
+      {
+        "name": "get_households_and_groups_and_players",
+        "args": {}
+      },
+      {
+        "name": "add_players_to_group",
+        "args": {
+          "group_id": "RINCON_KITCHEN01:1",
+          "player_ids": [
+            "RINCON_BEDROOM01"
+          ]
+        }
+      },
+      {
+        "name": "play_station",
+        "args": {
+          "group_id": "RINCON_KITCHEN01:1",
+          "station_name": "jazz"
+        }
+      }
+    ],
+    "accept": "subset",
+    "tools12_ok": false,
+    "notes": "Accepted sequence: group the two rooms first (kitchen's existing group id absorbs the bedroom player, per add_players_to_group's own guidance to use the larger/coordinator group as the target), then play a genre-seeded station on the combined group. A fresh get_households_and_groups_and_players call between add_players_to_group and play_station (per that tool's 'always call it again' note) is a free read under accept:subset and not required, since the fixture's group id doesn't change. Neither add_players_to_group nor play_station is in the 12-tool subset."
+  },
+  {
+    "id": "m19",
+    "utterance": "Switch the music from the kitchen to the living room.",
+    "kind": "multi",
+    "expected": [
+      {
+        "name": "get_households_and_groups_and_players",
+        "args": {}
+      },
+      {
+        "name": "move_audio_to_players",
+        "args": {
+          "source_group_id": "RINCON_KITCHEN01:1",
+          "destination_player_ids": [
+            "RINCON_LIVING01",
+            "RINCON_LIVING02"
+          ]
+        }
+      }
+    ],
+    "accept": "subset",
+    "tools12_ok": false,
+    "notes": "Same tool as m10 (kitchen/living room instead of living room/bedroom) with a different destination player set (both Living Room players). Checks the model doesn't hardcode m10's args."
+  },
+  {
+    "id": "m20",
+    "utterance": "Stop everything.",
+    "kind": "multi",
+    "expected": [
+      {
+        "name": "get_households_and_groups_and_players",
+        "args": {}
+      },
+      {
+        "name": "pause",
+        "args": {
+          "group_id": "RINCON_LIVING01:2"
+        }
+      }
+    ],
+    "accept": "subset",
+    "tools12_ok": true,
+    "notes": "'Everything' means every group actually playing, not every group that exists: only Living Room is PLAYING in the canned household (Kitchen is PAUSED, Bedroom is IDLE), so this resolves to a single pause call, not one per group."
+  },
+  {
+    "id": "m21",
+    "utterance": "Pause the garage.",
+    "kind": "multi",
+    "expected": [],
+    "accept": "no_mutation",
+    "tools12_ok": true,
+    "notes": "No 'Garage' room/group/player exists in the canned household. Expect no mutating tool call (the model should say it can't find that room, not guess an id). accept:'no_mutation' is a new accept mode not yet scored by the current harness — see eval/README.md."
+  },
+  {
+    "id": "m22",
+    "utterance": "Play something.",
+    "kind": "multi",
+    "expected": [],
+    "accept": "any_play",
+    "tools12_ok": true,
+    "notes": "Fully ambiguous request — no room, artist, track, station, or playlist named. Any single play_* call (with any target group and any content) should be accepted; there is no one canonical expected sequence. accept:'any_play' is a new accept mode not yet scored by the current harness — see eval/README.md."
+  },
+  {
+    "id": "m23",
+    "utterance": "Pause the kitchen and turn up the bedroom.",
+    "kind": "multi",
+    "expected": [
+      {
+        "name": "get_households_and_groups_and_players",
+        "args": {}
+      },
+      {
+        "name": "pause",
+        "args": {
+          "group_id": "RINCON_KITCHEN01:1"
+        }
+      },
+      {
+        "name": "adjust_group_volume",
+        "args": {
+          "group_id": "RINCON_BEDROOM01:3",
+          "volume_delta": 10
+        }
+      }
+    ],
+    "accept": "subset",
+    "tools12_ok": true,
+    "notes": "Two rooms, two different actions in one utterance — tests that the model doesn't apply one action to both rooms. Volume delta uses the same ±10 'a bit' convention as s16 (this is the 'up' direction, unquantified)."
+  },
+  {
+    "id": "m24",
+    "utterance": "Pause the kitchn.",
+    "kind": "multi",
+    "expected": [
+      {
+        "name": "get_households_and_groups_and_players",
+        "args": {}
+      },
+      {
+        "name": "pause",
+        "args": {
+          "group_id": "RINCON_KITCHEN01:1"
+        }
+      }
+    ],
+    "accept": "subset",
+    "tools12_ok": true,
+    "notes": "Typo'd room name ('kitchn') should still fuzzy-match to Kitchen rather than being treated as an unknown room."
+  },
+  {
+    "id": "m25",
+    "utterance": "Mets pause dans la cuisine.",
+    "kind": "multi",
+    "lang": "fr",
+    "expected": [
+      {
+        "name": "get_households_and_groups_and_players",
+        "args": {}
+      },
+      {
+        "name": "pause",
+        "args": {
+          "group_id": "RINCON_KITCHEN01:1"
+        }
+      }
+    ],
+    "accept": "subset",
+    "tools12_ok": true,
+    "notes": "French for 'Pause the kitchen.' Tests multilingual room-name and intent resolution; expected calls are identical to an equivalent English case (cf. m01)."
+  },
+  {
+    "id": "m26",
+    "utterance": "Monte le son du salon.",
+    "kind": "multi",
+    "lang": "fr",
+    "expected": [
+      {
+        "name": "get_households_and_groups_and_players",
+        "args": {}
+      },
+      {
+        "name": "adjust_group_volume",
+        "args": {
+          "group_id": "RINCON_LIVING01:2",
+          "volume_delta": 10
+        }
+      }
+    ],
+    "accept": "subset",
+    "tools12_ok": true,
+    "notes": "French for 'Turn up the living room's volume', unquantified. Uses the same ±10 'a bit' delta convention as s16/m23 ('salon' = living room)."
+  },
+  {
+    "id": "m27",
+    "utterance": "Play nirvana on BLOUPBLIP.",
+    "kind": "multi",
+    "expected": [
+      {
+        "name": "get_households_and_groups_and_players",
+        "args": {}
+      },
+      {
+        "name": "play_artist",
+        "args": {
+          "group_id": "RINCON_KITCHEN01:1",
+          "artist": "Nirvana",
+          "shuffle": false
+        }
+      }
+    ],
+    "accept": "subset",
+    "tools12_ok": true,
+    "notes": "Same pattern as m11 but with a real speaker name ('BLOUPBLIP') that has no match in the fixture household; the expected call uses the fixture's kitchen group id (RINCON_KITCHEN01:1) as a stand-in target the way m11/m13 do, since the harness has no fixture room actually named 'bloupblip'. Regression case for the observed browser failure (docs/ENGINE.md \"Agent loop\" / require_tool_call_first_step): with no id known yet, play_artist is correctly excluded from the grammar by the id rule, but before require_tool_call_first_step the free-text branch let the model answer with a prose refusal on step 0 instead of calling get_households_and_groups_and_players first."
+  },
+  {
+    "id": "m28",
+    "utterance": "What's playing on Kitchen Surround?",
+    "kind": "multi",
+    "expected": [
+      {
+        "name": "get_households_and_groups_and_players",
+        "args": {}
+      },
+      {
+        "name": "get_now_playing",
+        "args": {
+          "group_id": "RINCON_KITCHEN01:1"
+        }
+      }
+    ],
+    "accept": "subset",
+    "tools12_ok": true,
+    "notes": "Regression case for the observed browser failure (owner's real browser, 13 tools, build 9294f0c, \"what's playing on bloupblip?\"): 'Kitchen Surround' is a *player* name (playerId RINCON_KITCHEN02) belonging to the Kitchen *group* (groupId RINCON_KITCHEN01:1) in the fixture household. get_now_playing takes a group_id, not a player_id, so the model must resolve the player's group and call it with RINCON_KITCHEN01:1 — before the typed-ids fix (docs/ENGINE.md \"Typed ids\"), the flat id pool let a harvested player id satisfy a group_id-typed property just as readily as a real group id, and the relay rejected the resulting call as an invalid/stale group_id."
+  },
+  {
+    "id": "s18",
+    "utterance": "What can you do?",
+    "kind": "single",
+    "expected": [],
+    "accept": "no_mutation",
+    "tools12_ok": true,
+    "notes": "Chat-shaped question with tools present; documents the cost of require_tool_call_first_step — the grammar forces a tool call on step 0 even though this question doesn't need one, so a tool call is made first, then the answer."
+  }
+]

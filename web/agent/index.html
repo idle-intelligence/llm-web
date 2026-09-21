@@ -1,0 +1,301 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>llm-wasm agent demo</title>
+<style>
+  body { font-family: -apple-system, system-ui, sans-serif; max-width: 860px; margin: 2rem auto; padding: 0 1rem; color: #1a1a1a; }
+  h1 { font-size: 1.3rem; }
+  fieldset { margin-bottom: 1rem; border: 1px solid #ccc; border-radius: 6px; }
+  label { display: block; font-size: 0.85rem; color: #555; margin-top: 0.5rem; }
+  input[type=text] { width: 100%; box-sizing: border-box; padding: 0.4rem; font-size: 0.95rem; }
+  button { padding: 0.5rem 1rem; font-size: 0.95rem; cursor: pointer; }
+  progress { width: 100%; }
+  #log { font-family: ui-monospace, Menlo, monospace; font-size: 0.8rem; white-space: pre-wrap; background: #f6f6f6; border: 1px solid #ddd; border-radius: 6px; padding: 0.75rem; max-height: 40vh; overflow-y: auto; }
+  .step { border-left: 3px solid #888; padding-left: 0.6rem; margin-bottom: 0.6rem; }
+  .step.tool { border-left-color: #b58900; }
+  .step.final { border-left-color: #2aa198; }
+  #status { font-size: 0.85rem; color: #555; }
+</style>
+</head>
+<body>
+<h1>llm-wasm agent demo (xLAM-2-3b-fc-r, Burn+wgpu, WebGPU)</h1>
+<p id="status">Not loaded.</p>
+
+<fieldset>
+  <legend>1. Load model</legend>
+  <label>GGUF shard URL(s), comma-separated (single file is fine)</label>
+  <input id="gguf-url" type="text" value="http://127.0.0.1:8001/gguf/xlam-2-3b-fc-r/xLAM-2-3b-fc-r-q4_0.gguf" />
+  <label>tokenizer.json URL</label>
+  <input id="tokenizer-url" type="text" value="http://127.0.0.1:8001/hf/xLAM-2-3b-fc-r/tokenizer.json" />
+  <label>tokenizer_config.json URL</label>
+  <input id="template-url" type="text" value="http://127.0.0.1:8001/hf/xLAM-2-3b-fc-r/tokenizer_config.json" />
+  <p><button id="load-btn">Load model</button></p>
+  <progress id="load-progress" value="0" max="1"></progress>
+  <div id="load-detail" style="font-size:0.8rem;color:#777;"></div>
+</fieldset>
+
+<fieldset>
+  <legend>2. Ask</legend>
+  <input id="utterance" type="text" placeholder="what's the weather in Paris, and set the thermostat there to 21?" />
+  <label>tools</label>
+  <select id="tools-select">
+    <option value="demo" selected>demo (get_weather, set_thermostat)</option>
+    <option value="none">none (plain chat)</option>
+  </select>
+  <p><button id="run-btn" disabled>Run</button> <button id="reset-btn" disabled>Reset conversation</button> <button id="dump-prefix-btn" disabled>Export prefix inputs</button></p>
+</fieldset>
+
+<fieldset>
+  <legend>Steps / log</legend>
+  <div id="log"></div>
+</fieldset>
+
+<script type="module">
+import { LlmClient } from './llm-client.js';
+
+// Two fake tools, served in-page with canned answers — no real MCP server
+// needed for this demo. Shapes match the MCP `tools/list` entries the
+// worker/engine expect: {name, description, inputSchema}.
+const TOOLS = [
+  {
+    name: 'get_weather',
+    description: 'Get the current weather for a city.',
+    inputSchema: {
+      type: 'object',
+      properties: { city: { type: 'string', description: 'City name' } },
+      required: ['city'],
+    },
+  },
+  {
+    name: 'set_thermostat',
+    description: 'Set the target temperature for a room.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        room: { type: 'string', description: 'Room name' },
+        temperature: { type: 'number', description: 'Target temperature in Celsius' },
+      },
+      required: ['room', 'temperature'],
+    },
+  },
+];
+
+const CANNED = {
+  get_weather: (args) => ({ city: args.city, condition: 'partly cloudy', temperature_c: 18 }),
+  set_thermostat: (args) => ({ room: args.room, temperature: args.temperature, ok: true }),
+};
+
+// Real Sonos fixture results (fixtures/sonos/results/*.json), served
+// through this page's own dev server via the `fixtures/` symlink
+// (web/agent/fixtures -> ../../fixtures) — used when a Sonos tool set is
+// passed via scripts/headless/run.mjs's --tools-file, since those fixtures
+// carry the real groupId/playerId/householdId values the id rule
+// (grammar.rs's IdValues) needs to harvest for id-taking tools like
+// `pause`/`set_group_volume` to ever become callable.
+const SONOS_RESULTS_BASE = './fixtures/sonos/results/';
+const sonosResultCache = new Map();
+async function fetchSonosResult(name) {
+  if (sonosResultCache.has(name)) return sonosResultCache.get(name);
+  let data = null;
+  try {
+    const res = await fetch(`${SONOS_RESULTS_BASE}${name}.json`, { cache: 'no-store' });
+    if (res.ok) data = await res.json();
+  } catch {
+    // no fixture for this tool — fall through to the generic fallback below
+  }
+  sonosResultCache.set(name, data);
+  return data;
+}
+
+// Wrap a canned/fallback JS value as the shape a real MCP `tools/call`
+// result actually has: `{"content":[{"type":"text","text":"<pretty JSON>"}]}`,
+// mirroring `agent.rs::FixtureCaller`'s `as_mcp_result` (docs/ENGINE.md
+// "Agent loop" / "The id rule"). A bare parsed value here — what this page
+// returned before this fix — is exactly the shape mismatch that let the id
+// rule silently starve every id-taking tool in a real browser session
+// while native fixture-driven evals passed (see docs/ENGINE.md's
+// grammar.rs "content/text" fix).
+function asMcpResult(value) {
+  return { content: [{ type: 'text', text: JSON.stringify(value, null, 2) }] };
+}
+
+async function toolCaller(name, args) {
+  await new Promise((r) => setTimeout(r, 150)); // pretend it's a real round trip
+  const fn = CANNED[name];
+  if (fn) return asMcpResult(fn(args));
+  const fixture = await fetchSonosResult(name);
+  if (fixture) return asMcpResult(fixture);
+  // No canned fn and no fixture file for this tool name — generic
+  // acknowledgement, still MCP-shaped so the page never hands the engine a
+  // bare-object result.
+  return asMcpResult({ ok: true, tool: name, args });
+}
+
+window.__llmLog = [];
+
+const logEl = document.getElementById('log');
+function logLine(text) {
+  window.__llmLog.push(text);
+  const div = document.createElement('div');
+  div.textContent = text;
+  logEl.appendChild(div);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+function logStep(step) {
+  const callsText = step.calls ? step.calls.map((c) => `${c.name}(${JSON.stringify(c.args)})`).join(', ') : '(final answer)';
+  const forcedShare = step.tokens ? ((100 * (step.forcedTokens || 0)) / step.tokens).toFixed(0) : '0';
+  const text =
+    `step ${step.index}: ${callsText} — prompt=${step.promptTokens} tok, ` +
+    `prefill=${step.prefillMs.toFixed(1)}ms, decode=${step.decodeMs.toFixed(1)}ms, generated=${step.tokens} tok ` +
+    `(${step.modelSteps ?? step.tokens} model steps, ${forcedShare}% forced), ` +
+    `retries=${step.retries || 0}, toolErrors=${step.toolErrors || 0}\n` +
+    `  raw: ${step.text}`;
+  window.__llmLog.push(text);
+  const div = document.createElement('div');
+  div.className = 'step ' + (step.calls ? 'tool' : 'final');
+  div.textContent = text;
+  logEl.appendChild(div);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+let thinkingTimer = null;
+let thinkingStart = 0;
+function stopThinkingTimer() {
+  if (thinkingTimer) clearInterval(thinkingTimer);
+  thinkingTimer = null;
+  document.getElementById('status').textContent = 'Ready.';
+}
+function startThinkingTimer(phase) {
+  thinkingStart = performance.now();
+  if (thinkingTimer) clearInterval(thinkingTimer);
+  const tick = () => {
+    document.getElementById('status').textContent = `${phase}... (${((performance.now() - thinkingStart) / 1000).toFixed(1)}s)`;
+  };
+  tick();
+  thinkingTimer = setInterval(tick, 200);
+}
+
+// ?gpudebug=1 on this page's own URL forwards to the worker (wraps GPUDevice
+// calls in error scopes; slower, but surfaces the root WebGPU validation
+// error instead of only cascade "invalid due to a previous error" spam).
+const gpuDebug = new URLSearchParams(location.search).get('gpudebug') === '1';
+
+const client = new LlmClient({
+  toolCaller,
+  gpuDebug,
+  onEvent: (msg) => {
+    if (msg.type === 'progress') {
+      const pct = msg.total ? msg.loaded / msg.total : 0;
+      document.getElementById('load-progress').value = pct;
+      document.getElementById('load-detail').textContent = `${msg.shard}: ${msg.loaded}${msg.total ? ' / ' + msg.total : ''}`;
+    } else if (msg.type === 'status') {
+      if (msg.phase === 'idle') stopThinkingTimer();
+      else startThinkingTimer(msg.phase);
+      if (msg.note) logLine(`[status] ${msg.phase}: ${msg.note}`);
+    }
+  },
+});
+
+document.getElementById('load-btn').addEventListener('click', async () => {
+  const shards = document.getElementById('gguf-url').value.split(',').map((s) => s.trim()).filter(Boolean);
+  const tokenizerUrl = document.getElementById('tokenizer-url').value;
+  const templateUrl = document.getElementById('template-url').value;
+  document.getElementById('status').textContent = 'Loading model (this fetches ~1.7GB, then uploads to GPU)...';
+  document.getElementById('load-btn').disabled = true;
+  try {
+    const info = await client.load({ id: 'xlam-2-3b-fc-r', shards, tokenizerUrl, templateUrl });
+    document.getElementById('status').textContent = `Ready: ${JSON.stringify(info)}`;
+    logLine(`ready: ${JSON.stringify(info)}`);
+    document.getElementById('run-btn').disabled = false;
+    document.getElementById('reset-btn').disabled = false;
+    document.getElementById('dump-prefix-btn').disabled = false;
+  } catch (err) {
+    document.getElementById('status').textContent = `Load failed: ${err.message || err}`;
+    logLine(`load error: ${err.message || err}`);
+    document.getElementById('load-btn').disabled = false;
+  }
+});
+
+document.getElementById('run-btn').addEventListener('click', async () => {
+  const utterance = document.getElementById('utterance').value.trim();
+  if (!utterance) return;
+  const toolsMode = document.getElementById('tools-select').value;
+  logLine(`> ${utterance}`);
+  document.getElementById('run-btn').disabled = true;
+  try {
+    const transcript = await client.run(utterance, toolsMode === 'none' ? [] : TOOLS, { maxSteps: 6, maxNewTokens: 256 }, logStep);
+    logLine(`= ${transcript.finalText}  (${transcript.totalMs.toFixed(0)}ms total)`);
+  } catch (err) {
+    logLine(`! error: ${err.message || err}`);
+  } finally {
+    document.getElementById('run-btn').disabled = false;
+  }
+});
+
+document.getElementById('reset-btn').addEventListener('click', () => {
+  client.reset();
+  logLine('--- conversation reset ---');
+});
+
+// Debug/tooling (coordinator's "priority fix", 2026-09-11): dumps the
+// exact dieted tools JSON + system + rendered prefix text this page's next
+// `run()` would use for its prefix-KV-image cache key — save
+// `{system, tools}` from the downloaded file and hand it to
+// `bin/llm-agent.rs`'s `kv-export --tools <file> --system <system>` to
+// reproduce the key exactly, even when the live tools/list differs from
+// whatever fixture a human might otherwise reach for.
+document.getElementById('dump-prefix-btn').addEventListener('click', async () => {
+  const toolsMode = document.getElementById('tools-select').value;
+  const toolList = toolsMode === 'none' ? [] : TOOLS;
+  try {
+    const data = await client.dumpPrefixInputs(toolList, {});
+    logLine(`prefix key: ${data.prefixKey} (${data.prefixTokens} tokens, diet=${data.diet})`);
+    const blob = new Blob([JSON.stringify({ system: data.system, tools: data.tools }, null, 2)], { type: 'application/json' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `prefix-inputs-${data.prefixKey || 'unknown'}.json`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+  } catch (err) {
+    logLine(`! prefix inputs error: ${err.message || err}`);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// window.__llm: page automation surface for scripts/headless/run.mjs (and
+// any other external driver). Thin wrapper over the same `client` the human
+// UI uses — no separate code path, so headless runs exercise exactly what a
+// person clicking through the page exercises.
+// ---------------------------------------------------------------------------
+window.__llm = {
+  state: { loaded: false, info: null },
+  async load(modelSpec) {
+    const info = await client.load(modelSpec);
+    window.__llm.state.loaded = true;
+    window.__llm.state.info = info;
+    document.getElementById('run-btn').disabled = false;
+    document.getElementById('reset-btn').disabled = false;
+    document.getElementById('dump-prefix-btn').disabled = false;
+    return info;
+  },
+  async run(prompt, opts = {}) {
+    const { tools = 'demo', maxNewTokens = 256, maxSteps = 6, systemPrompt, prefillKernel } = opts;
+    // `tools` may be 'demo' | 'none' | an actual MCP tools/list array (see
+    // scripts/headless/run.mjs's --tools-file) — a real array is used
+    // as-is instead of the two built-in demo tools.
+    const toolList = Array.isArray(tools) ? tools : tools === 'none' ? [] : TOOLS;
+    return client.run(prompt, toolList, { maxNewTokens, maxSteps, systemPrompt, prefillKernel }, logStep);
+  },
+  reset() {
+    client.reset();
+  },
+  async dumpPrefixInputs(opts = {}) {
+    const { tools = 'demo', systemPrompt } = opts;
+    const toolList = Array.isArray(tools) ? tools : tools === 'none' ? [] : TOOLS;
+    return client.dumpPrefixInputs(toolList, { systemPrompt });
+  },
+};
+</script>
+</body>
+</html>

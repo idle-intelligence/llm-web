@@ -1,0 +1,6 @@
+scripts/.venv/
+__pycache__/
+*.pyc
+target/
+eval/results/*.log
+scripts/headless/out/

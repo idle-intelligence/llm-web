@@ -1,0 +1,95 @@
+[package]
+name = "llm-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Qwen2-family LLM (xLAM-2-3b-fc-r) in Burn+wgpu — runs natively and in browser via WASM+WebGPU"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "llm-agent"
+path = "src/bin/llm-agent.rs"
+required-features = ["native"]
+
+[[bin]]
+name = "lora-eval"
+path = "src/bin/lora_eval.rs"
+required-features = ["native"]
+
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false
+
+[features]
+default = ["wgpu", "native"]
+# Session 11: `burn/autotune` stays ON. It has no persistent cache in the
+# browser (cubecl's autotune cache lives at `target/autotune/`, native
+# only), so every distinct prefill length re-benchmarks every candidate
+# matmul kernel at full size on first use (6.5 min for a 2304-row prefill
+# in real Chrome) — but the fix is not to disable autotune globally: with
+# it off, Burn's `Tensor::matmul` falls back to `cubek_matmul`'s
+# un-benchmarked `Strategy::Auto`, which produced numerically wrong output
+# for the attention path's 4D matmuls (`model.rs`'s Q@K^T/P@V) — see
+# docs/BENCHMARKS.md Session 11 for the `full_forward` failure this caused.
+# Instead, the scratch-matmul path (gguf.rs's `q4_matmul`, the dominant
+# cost at the shapes that actually trigger multi-minute tuning) now calls
+# `cubek_matmul::launch::launch_ref` directly with a pinned `Strategy`,
+# bypassing Burn's `Tensor::matmul`/autotune entirely for just that path.
+# The attention path keeps using Burn's `Tensor::matmul` with autotune on
+# — its shapes are far cheaper to tune (native cache: microseconds at
+# M=1) and, empirically, its own un-tuned fallback is not safe to use.
+wgpu = ["burn/wgpu", "burn/template", "burn/autotune"]
+# Native CLI + native tokenizer build (never compiled for wasm32 — the `llm-agent`
+# bin is gated on this feature via `required-features` above).
+native = ["dep:clap", "dep:tokenizers", "tokenizers/fancy-regex"]
+web = [
+    "wgpu",
+    "dep:wgpu",
+    "dep:wasm-bindgen",
+    "dep:wasm-bindgen-futures",
+    "dep:js-sys",
+    "dep:web-sys",
+    "dep:console_error_panic_hook",
+    "getrandom/wasm_js",
+    "dep:tokenizers",
+    "tokenizers/unstable_wasm",
+    "tokenizers/fancy-regex",
+]
+
+[dependencies]
+# Burn ML framework
+burn = { workspace = true }
+cubecl = { workspace = true }
+cubek-matmul = { workspace = true }
+
+# Core
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+byteorder = { workspace = true }
+
+# Chat templating (Jinja2-compatible; xLAM-2's embedded chat_template uses `tojson`)
+minijinja = { workspace = true }
+
+# Tokenizer — onig/esaxx_fast (C/C++) are not wasm32-safe, so default features
+# are off everywhere; fancy-regex is the wasm-safe regex backend, and
+# unstable_wasm additionally swaps out rayon for wasm32 (see `web` feature).
+tokenizers = { workspace = true, optional = true }
+
+# CLI (native only)
+clap = { workspace = true, optional = true }
+
+# WASM support (optional)
+wasm-bindgen = { workspace = true, optional = true }
+wasm-bindgen-futures = { workspace = true, optional = true }
+js-sys = { workspace = true, optional = true }
+web-sys = { workspace = true, optional = true }
+console_error_panic_hook = { workspace = true, optional = true }
+getrandom = { workspace = true, optional = true }
+wgpu = { workspace = true, optional = true }
+
+[dev-dependencies]
+pollster = "0.4"

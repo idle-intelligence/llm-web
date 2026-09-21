@@ -1,0 +1,17 @@
+{
+  "name": "llm-wasm",
+  "type": "module",
+  "description": "Qwen2-family LLM (xLAM-2-3b-fc-r) in Burn+wgpu — runs natively and in browser via WASM+WebGPU",
+  "version": "0.1.0",
+  "license": "MIT",
+  "files": [
+    "llm_wasm_bg.wasm",
+    "llm_wasm.js",
+    "llm_wasm.d.ts"
+  ],
+  "main": "llm_wasm.js",
+  "types": "llm_wasm.d.ts",
+  "sideEffects": [
+    "./snippets/*"
+  ]
+}

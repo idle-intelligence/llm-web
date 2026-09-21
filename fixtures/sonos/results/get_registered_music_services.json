@@ -1,0 +1,16 @@
+{
+  "services": [
+    {
+      "service": "Spotify",
+      "accountLabel": "Spotify"
+    },
+    {
+      "service": "Sonos Radio",
+      "accountLabel": "Sonos Radio"
+    },
+    {
+      "service": "Apple Music",
+      "accountLabel": "Apple Music (family)"
+    }
+  ]
+}
