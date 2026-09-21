@@ -1,14 +1,15 @@
 # llm-web
 
-A Rust/Burn WebGPU engine for running an LLM tool-calling agent client-side, with a wllama/WASM fallback for a live chat demo.
+A Rust/Burn WebGPU inference engine for Qwen2-architecture language models, running client-side in the browser: quantized GGUF weights, runtime LoRA adapters, schema-constrained decoding and a tool-calling agent loop. A wllama fallback serves the public chat demo.
 
 [**Try the demo →**](https://idle-intelligence.github.io/llm-web/web/)
 
-> **Disclaimer:** The engine (`crates/llm-wasm/`) is an original Burn+wgpu implementation of the Qwen2 architecture, built from the model's public config and GGUF/tokenizer metadata, not a port of wllama or llama.cpp. It targets [Salesforce/xLAM-2-3b-fc-r](https://huggingface.co/Salesforce/xLAM-2-3b-fc-r), licensed CC-BY-NC-4.0 and released by Salesforce for research purposes only; model weights are not distributed in this repository. This project is not affiliated with or endorsed by Salesforce.
+> **Disclaimer:** the engine (`crates/llm-wasm/`) is an original Burn+wgpu implementation of the Qwen2 architecture, written from public model configs and GGUF metadata, not a port of wllama or llama.cpp. Models are fetched at run time from their authors' Hugging Face repos under their own licenses; no weights are redistributed here. This project is not affiliated with the Qwen team or Salesforce.
 
 ## Status
 
 - The Burn+wgpu engine runs the full Qwen2 forward pass (GQA attention, QKV bias, RoPE, RMSNorm, SwiGLU, tied embeddings) natively and compiles to `wasm32-unknown-unknown` with WebGPU, verified by a native CLI (`llm-agent`) and a browser demo page under `web/agent/`.
+- Runs Qwen2.5-0.5B-Instruct (Q4_0) with runtime LoRA adapters in the browser. This is the engine behind the LLM methods of [llm-life](https://github.com/idle-intelligence/llm-life), where fine-tuned adapters turn the model into a Game of Life update rule.
 - Schema-constrained decoding forces tool calls onto valid JSON matching the tool schema. On a 43-utterance Sonos tool-calling eval, constrained decoding scores 76.7% correct against a 53.3% unconstrained baseline (`docs/BENCHMARKS.md`).
 - An MCP-shaped agent loop (`agent.rs`/`web.rs`) drives multi-step tool calls, retries malformed output, and feeds tool errors back to the model.
 - Prefix KV cache images let a session restore GPU KV state to the longest matching prompt prefix instead of re-prefilling from scratch.
@@ -18,7 +19,8 @@ A Rust/Burn WebGPU engine for running an LLM tool-calling agent client-side, wit
 
 | Model | Size | Params | Quant | License |
 |-------|------|--------|-------|---------|
-| [xLAM-2-3b-fc-r](https://huggingface.co/Salesforce/xLAM-2-3b-fc-r) (Qwen2 arch) | ~1.8 GB (Q4_0 GGUF) | 3B | Q4_0 (Q6_K token embedding) | CC-BY-NC-4.0, research only |
+| [Qwen2.5-0.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct) | ~430 MB (Q4_0 GGUF) | 0.5B | Q4_0 | Apache 2.0 |
+| [xLAM-2-3b-fc-r](https://huggingface.co/Salesforce/xLAM-2-3b-fc-r) (Qwen2 architecture, tool calling) | ~1.8 GB (Q4_0 GGUF) | 3B | Q4_0 (Q6_K token embedding) | CC-BY-NC-4.0, research only |
 | [SmolLM2-360M-Instruct](https://huggingface.co/HuggingFaceTB/SmolLM2-360M-Instruct) | ~271 MB | 360M | Q4_K_M | Apache 2.0 |
 
 ## Structure
@@ -72,7 +74,7 @@ cargo run --release --bin llm-agent -- run --gguf <path-to-gguf> --tokens <path-
 ## Credits
 
 - [wllama](https://github.com/nicebyte/wllama) (MIT) and [llama.cpp](https://github.com/ggml-org/llama.cpp) (MIT), the vendored browser-inference path under `pkg/wllama/` and `web/index.html`.
-- [Salesforce/xLAM-2-3b-fc-r](https://huggingface.co/Salesforce/xLAM-2-3b-fc-r), the model the engine targets. CC-BY-NC-4.0, research purposes only; weights are not distributed here.
+- [Qwen/Qwen2.5-0.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct) (Apache 2.0) and [Salesforce/xLAM-2-3b-fc-r](https://huggingface.co/Salesforce/xLAM-2-3b-fc-r) (CC-BY-NC-4.0, research only), the models run on the engine so far; weights are not distributed here.
 - [HuggingFaceTB/SmolLM2-360M-Instruct](https://huggingface.co/HuggingFaceTB/SmolLM2-360M-Instruct) (Apache 2.0), the model served by the public wllama demo.
 
 ## License
