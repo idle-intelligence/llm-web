@@ -22,7 +22,20 @@ use tokenizers::Tokenizer;
 
 use crate::chat_template::{chat_template_from_config_json, render_user_prompt};
 use crate::engine::Engine;
-use crate::model::{build_rope_tables, forward_decode_step_argmax, forward_prefill, GpuModel, KvCache};
+use crate::model::{build_mask_bitset, build_rope_tables, forward_decode_step_argmax, forward_prefill, forward_prefill_suffix, GpuModel, KvCache, KvSnapshot};
+
+/// `mask_bits` is this crate's packed bitset format (`build_mask_bitset`/
+/// `buildMaskBitset`) - an empty vec means "no mask" (unmasked path, byte-
+/// identical dispatch sequence to before this feature existed). wasm-bindgen
+/// doesn't need `Option<Vec<u32>>` plumbing this way, and JS call sites read
+/// naturally as `engine.decodeStepArgmax(id, [])`.
+fn mask_buf(engine: &Engine, mask_bits: &[u32]) -> Option<wgpu::Buffer> {
+    if mask_bits.is_empty() {
+        None
+    } else {
+        Some(engine.buf_u32(mask_bits, "mask"))
+    }
+}
 
 fn wasm_log(msg: &str) {
     web_sys::console::log_1(&JsValue::from_str(msg));
@@ -143,7 +156,7 @@ impl LeanEngine {
         };
 
         self.engine.reset_dispatch_count();
-        let logits = forward_prefill(&self.engine, model, cache, &token_ids, cos_buf, sin_buf).await;
+        let logits = forward_prefill(&self.engine, model, cache, &token_ids, cos_buf, sin_buf, None).await;
         let prefill_dispatches = self.engine.dispatch_count();
         // Only the prompt's last-position argmax runs on the CPU (off the
         // one `Vec<f32>` prefill already reads back); every decode step's
@@ -160,7 +173,7 @@ impl LeanEngine {
             }
             generated.push(next_id);
             call_on_token(next_id);
-            next_id = forward_decode_step_argmax(&self.engine, model, cache, next_id, cos_buf, sin_buf).await;
+            next_id = forward_decode_step_argmax(&self.engine, model, cache, next_id, cos_buf, sin_buf, None).await;
         }
         let decode_steps = generated.len().max(1) as u64;
         wasm_log(&format!(
@@ -202,5 +215,150 @@ impl LeanEngine {
             .to_string(),
             None => serde_json::json!({ "loaded": false }).to_string(),
         }
+    }
+
+    /// Renders + tokenizes `prompt` through the model's chat template, same
+    /// as `generate()`, but returns the raw token ids instead of running
+    /// generation - the low-level entry point a consumer's own prefix/suffix
+    /// split (e.g. a resident tool-schema prefix) is built on top of, rather
+    /// than `generate()`'s all-in-one path.
+    #[wasm_bindgen(js_name = tokenize)]
+    pub fn tokenize(&self, prompt: String) -> Result<Vec<u32>, JsError> {
+        let tokenizer = self.tokenizer.as_ref().ok_or_else(|| JsError::new("load() must be called first"))?;
+        let chat_template = self.chat_template.as_ref().ok_or_else(|| JsError::new("load() must be called first"))?;
+        let rendered = render_user_prompt(chat_template, &prompt).map_err(|e| JsError::new(&format!("failed to render prompt: {e}")))?;
+        let encoding = tokenizer.encode(rendered, false).map_err(|e| JsError::new(&format!("tokenizer encode failed: {e}")))?;
+        Ok(encoding.get_ids().to_vec())
+    }
+
+    /// Tokenizes raw `text` with no chat-template rendering (unlike
+    /// `tokenize()`) - for building a target/mask continuation from
+    /// arbitrary text (e.g. a fixed string a constrained-decoding test wants
+    /// to force), not a user chat turn.
+    #[wasm_bindgen(js_name = encodeRaw)]
+    pub fn encode_raw(&self, text: String) -> Result<Vec<u32>, JsError> {
+        let tokenizer = self.tokenizer.as_ref().ok_or_else(|| JsError::new("load() must be called first"))?;
+        let encoding = tokenizer.encode(text, false).map_err(|e| JsError::new(&format!("tokenizer encode failed: {e}")))?;
+        Ok(encoding.get_ids().to_vec())
+    }
+
+    /// Decodes `token_ids` back into text - the inverse of `tokenize`/
+    /// `encodeRaw`, exposed so a harness can print what a masked or restored
+    /// generation actually produced.
+    #[wasm_bindgen(js_name = decodeIds)]
+    pub fn decode_ids(&self, token_ids: Vec<u32>) -> Result<String, JsError> {
+        let tokenizer = self.tokenizer.as_ref().ok_or_else(|| JsError::new("load() must be called first"))?;
+        tokenizer.decode(&token_ids, true).map_err(|e| JsError::new(&format!("tokenizer decode failed: {e}")))
+    }
+
+    /// Packs `allowed_ids` into this crate's mask-bitset format
+    /// (`model::build_mask_bitset`) for `mask_bits` arguments below - a
+    /// consumer's grammar/schema loop calls this once per step with that
+    /// step's allowed vocabulary, then passes the result straight through.
+    #[wasm_bindgen(js_name = buildMaskBitset)]
+    pub fn build_mask_bitset_js(&self, allowed_ids: Vec<u32>) -> Result<Vec<u32>, JsError> {
+        let model = self.model.as_ref().ok_or_else(|| JsError::new("load() must be called first"))?;
+        Ok(build_mask_bitset(model.config.vocab_size, &allowed_ids))
+    }
+
+    /// Low-level prefill over raw token ids (no chat-template rendering -
+    /// use `tokenize()` first if needed): resets the pool and starts a fresh
+    /// KV cache at position 0, runs prefill, and returns the last position's
+    /// logits (`vocab_size` long). `mask_bits`, if non-empty, constrains the
+    /// *first* generated token the same way `decodeStepArgmax`'s mask
+    /// constrains later ones (see `mask_buf`'s doc comment on the empty-vec
+    /// convention).
+    #[wasm_bindgen(js_name = prefillTokens)]
+    pub async fn prefill_tokens(&mut self, token_ids: Vec<u32>, mask_bits: Vec<u32>) -> Result<Vec<f32>, JsError> {
+        let model = self.model.as_ref().ok_or_else(|| JsError::new("load() must be called first"))?;
+        let cache = self.cache.as_mut().ok_or_else(|| JsError::new("load() must be called first"))?;
+        let cos_buf = self.cos_buf.as_ref().ok_or_else(|| JsError::new("load() must be called first"))?;
+        let sin_buf = self.sin_buf.as_ref().ok_or_else(|| JsError::new("load() must be called first"))?;
+        if token_ids.len() as u32 > cache.max_ctx {
+            return Err(JsError::new("token_ids exceeds max_ctx"));
+        }
+        model.pool.reset();
+        cache.kv_len = 0;
+        let mask = mask_buf(&self.engine, &mask_bits);
+        Ok(forward_prefill(&self.engine, model, cache, &token_ids, cos_buf, sin_buf, mask.as_ref()).await)
+    }
+
+    /// Appends `token_ids` onto the *existing* KV cache (typically just
+    /// after `restoreKv` from a resident-prefix snapshot, or continuing a
+    /// live session) instead of starting a fresh one - the "prefill(suffix)"
+    /// half of KV snapshot/restore. Returns the last position's logits.
+    #[wasm_bindgen(js_name = appendTokens)]
+    pub async fn append_tokens(&mut self, token_ids: Vec<u32>, mask_bits: Vec<u32>) -> Result<Vec<f32>, JsError> {
+        let model = self.model.as_ref().ok_or_else(|| JsError::new("load() must be called first"))?;
+        let cache = self.cache.as_mut().ok_or_else(|| JsError::new("load() must be called first"))?;
+        let cos_buf = self.cos_buf.as_ref().ok_or_else(|| JsError::new("load() must be called first"))?;
+        let sin_buf = self.sin_buf.as_ref().ok_or_else(|| JsError::new("load() must be called first"))?;
+        if token_ids.is_empty() {
+            return Err(JsError::new("appendTokens needs at least one token"));
+        }
+        if cache.kv_len + token_ids.len() as u32 > cache.max_ctx {
+            return Err(JsError::new("appendTokens would exceed max_ctx"));
+        }
+        let mask = mask_buf(&self.engine, &mask_bits);
+        Ok(forward_prefill_suffix(&self.engine, model, cache, &token_ids, cos_buf, sin_buf, mask.as_ref()).await)
+    }
+
+    /// Decodes one token against the existing KV cache and returns the
+    /// argmax id, same fast path `generate()` uses internally, exposed for a
+    /// consumer driving its own step loop (e.g. after `restoreKv`, or with a
+    /// per-step mask that changes every call - a fixed mask across an entire
+    /// `generate()` call would not let a grammar narrow the allowed set as
+    /// it consumes each token). `mask_bits` is applied before argmax, in the
+    /// same GPU submission as the rest of the step - no extra readback.
+    #[wasm_bindgen(js_name = decodeStepArgmax)]
+    pub async fn decode_step_argmax(&mut self, token_id: u32, mask_bits: Vec<u32>) -> Result<u32, JsError> {
+        let model = self.model.as_ref().ok_or_else(|| JsError::new("load() must be called first"))?;
+        let cache = self.cache.as_mut().ok_or_else(|| JsError::new("load() must be called first"))?;
+        let cos_buf = self.cos_buf.as_ref().ok_or_else(|| JsError::new("load() must be called first"))?;
+        let sin_buf = self.sin_buf.as_ref().ok_or_else(|| JsError::new("load() must be called first"))?;
+        if cache.kv_len >= cache.max_ctx {
+            return Err(JsError::new("decodeStepArgmax would exceed max_ctx"));
+        }
+        let mask = mask_buf(&self.engine, &mask_bits);
+        Ok(forward_decode_step_argmax(&self.engine, model, cache, token_id, cos_buf, sin_buf, mask.as_ref()).await)
+    }
+
+    /// The number of positions currently populated in the KV cache (0 right
+    /// after `load()` or a fresh `prefillTokens`, grows with `appendTokens`/
+    /// `decodeStepArgmax`, or is set directly by `restoreKv`).
+    #[wasm_bindgen(js_name = kvLen)]
+    pub fn kv_len(&self) -> Result<u32, JsError> {
+        let cache = self.cache.as_ref().ok_or_else(|| JsError::new("load() must be called first"))?;
+        Ok(cache.kv_len)
+    }
+
+    /// Reads back the KV cache's `[0, kvLen())` prefix and returns it as
+    /// `KvSnapshot::to_bytes()` - a resident-prefix image a consumer can
+    /// store keyed by its own prompt/tool-schema hash (see this crate's
+    /// consumer survey, gap #1) and later hand back to `restoreKv`. Async
+    /// (`Engine::read_buffer`'s `into_data_async` path) - never blocks the
+    /// browser's main/worker thread.
+    #[wasm_bindgen(js_name = snapshotKv)]
+    pub async fn snapshot_kv(&self) -> Result<Vec<u8>, JsError> {
+        let cache = self.cache.as_ref().ok_or_else(|| JsError::new("load() must be called first"))?;
+        Ok(cache.snapshot(&self.engine).await.to_bytes())
+    }
+
+    /// Restores a snapshot produced by `snapshotKv` (this session's own, or
+    /// one a consumer stored earlier and is handing back) into the current
+    /// KV cache, and sets `kvLen()` to the snapshot's length. Queued
+    /// `queue.write_buffer` calls only - no readback, safe to call
+    /// synchronously. Follow with `appendTokens` for the resumed suffix, or
+    /// `decodeStepArgmax` to continue decoding directly from the restored
+    /// prefix's last position.
+    #[wasm_bindgen(js_name = restoreKv)]
+    pub fn restore_kv(&mut self, bytes: Vec<u8>) -> Result<(), JsError> {
+        let cache = self.cache.as_mut().ok_or_else(|| JsError::new("load() must be called first"))?;
+        let snapshot = KvSnapshot::from_bytes(&bytes).map_err(|e| JsError::new(&format!("failed to parse kv snapshot: {e}")))?;
+        if snapshot.kv_len > cache.max_ctx {
+            return Err(JsError::new("kv snapshot's kv_len exceeds this engine's max_ctx"));
+        }
+        cache.restore(&self.engine, &snapshot);
+        Ok(())
     }
 }
