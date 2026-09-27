@@ -2649,9 +2649,11 @@ dependencies = [
  "clap",
  "futures-channel",
  "half",
+ "minijinja",
  "pollster 0.3.0",
  "serde",
  "serde_json",
+ "tokenizers",
  "wgpu",
 ]
 
