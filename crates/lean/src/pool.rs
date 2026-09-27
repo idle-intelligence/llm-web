@@ -24,6 +24,26 @@
 //! at a new shape pays for rebuilding every bind group touched so far (not
 //! just the ones whose buffers actually grew), but every call after that
 //! at the same shape reuses all of them.
+//!
+//! **Bug found in lean's slice 2 (2026-09-27), fixed by `reset()` below:**
+//! this generation scheme only knows about buffers the pool itself
+//! allocated (via `data`/`upload_*`/`uniform`). lean's `KvCache` buffers are
+//! allocated directly on the `Engine` (`engine.buf_empty`, not
+//! `pool.data`), so a brand-new `KvCache` per independent generation call
+//! (as `lean-cli`'s fixture harness does — one call per prompt, sharing one
+//! `GpuModel`/`Pool`) does NOT bump the pool's generation. If no
+//! pool-owned buffer happens to regrow between two such calls (e.g. a
+//! shorter prompt run after a longer one, so no prefill buffer needs to
+//! grow), decode's cached bind groups — which do bind directly to
+//! `&cache.k[i]`/`&cache.v[i]` — stay "valid" by generation number while
+//! silently still pointing at the *previous* call's now-dropped `KvCache`
+//! buffers. Symptom: prefill and the very first decode token are correct,
+//! then decode silently reads/writes the wrong KV cache and diverges hard
+//! from the second decode token on. Caught by `lean-cli`'s three-case
+//! fixture (short seq=36, long seq=86, non_english seq=54 — the *smaller*
+//! seq after a *larger* one is exactly the no-regrowth case that hid it).
+//! Fix: any caller starting an independent generation (a new `KvCache`)
+//! must call `pool.reset()` first.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -37,6 +57,20 @@ pub struct Pool {
     buffers: RefCell<HashMap<String, wgpu::Buffer>>,
     bind_groups: RefCell<HashMap<String, (wgpu::BindGroup, u64)>>,
     alloc_count: Cell<u64>,
+}
+
+impl Pool {
+    /// Drops every cached buffer and bind group and bumps the generation
+    /// counter. Call this before starting an independent generation run
+    /// (a new `KvCache`) against a `GpuModel` whose `Pool` may have served
+    /// a previous, now-stale `KvCache` — see this module's bug note above.
+    /// Cheap: the next forward call simply repays the "first call at a new
+    /// shape" allocation cost this module's doc comment already describes.
+    pub fn reset(&self) {
+        self.buffers.borrow_mut().clear();
+        self.bind_groups.borrow_mut().clear();
+        self.generation.set(self.generation.get() + 1);
+    }
 }
 
 impl Pool {
