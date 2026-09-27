@@ -210,9 +210,10 @@ succeeds.
 
 ## Commits
 
-- `lean: KV cache snapshot/restore, export/import, native+browser tests`
-- `lean: per-step GPU logit mask for constrained decoding`
-- `lean: expose kv snapshot/mask in web.rs and lean-cli, browser harness`
-- `lean: 2026-09-28 kv+mask run doc`
+On branch `lean-engine`:
 
-(see `git log` on branch `lean-engine` for exact SHAs and message bodies)
+- `2989e9e` lean: KV snapshot/restore + per-step logit mask in the core forward pass
+- `535de3c` lean: --check kv-snapshot/mask native smoke checks in lean-cli
+- `7afd1e7` lean: expose kv snapshot/restore and logit mask in the wasm API
+- `beae21b` lean: native parity/timing tests for kv snapshot and logit mask
+- `e404667` lean: browser harness checks for kv snapshot and logit mask, bump build tag
