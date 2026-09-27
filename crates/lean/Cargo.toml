@@ -7,7 +7,7 @@ license.workspace = true
 [lib]
 crate-type = ["cdylib", "rlib"]
 
-# Raw wgpu + hand-written WGSL only. No Burn, no CubeCL, no training — see
+# Raw wgpu + hand-written WGSL only. No Burn, no CubeCL, no training - see
 # ~/.claude/projects/-Users-tc-Code/memory/project_lean_engine_direction.md.
 [features]
 default = []
@@ -48,7 +48,7 @@ getrandom = { workspace = true, optional = true }
 pollster = "0.3"
 clap = { workspace = true }
 # native-only: tokenizers/fancy-regex only, onig/esaxx_fast are not
-# wasm32-safe — see the wasm32 target block below for the browser build.
+# wasm32-safe - see the wasm32 target block below for the browser build.
 tokenizers = { workspace = true, features = ["fancy-regex"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]

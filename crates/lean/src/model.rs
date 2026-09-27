@@ -1,33 +1,33 @@
 //! Qwen2.5-0.5B-Instruct GPU-resident forward pass: GGUF weights straight
-//! onto the GPU (two-phase loading — `GgufReader`'s file handle is dropped
+//! onto the GPU (two-phase loading - `GgufReader`'s file handle is dropped
 //! at the end of `GpuModel::load`, never held alongside the GPU-resident
 //! copies), one dispatch per op recorded into a single `wgpu::CommandEncoder`
 //! per prefill/decode call, one readback per call (`Engine::read_buffer`).
 //! Structure (Engine/Pool split, `linear`/`rmsnorm`/`add_inplace`/`silu_mul`
 //! helper-fn shape) ported from `t0-web/crates/t0-fast/src/model.rs`; the
 //! attention/RoPE/embedding-gather kernels are new (t0 has no GQA, no
-//! causal mask, no token embedding table — see the shaders' own doc
+//! causal mask, no token embedding table - see the shaders' own doc
 //! comments for exactly what's ported vs new).
 //!
 //! Reference for every op's numerics: `crates/lean/reference/gen_fixture.py`
 //! (HF transformers' own Qwen2 forward, `AutoModelForCausalLM` loading the
-//! same GGUF via `gguf_file=`) — see `modeling_qwen2.py` in that venv's
+//! same GGUF via `gguf_file=`) - see `modeling_qwen2.py` in that venv's
 //! transformers install for `rotate_half`, GQA `repeat_kv`, RMSNorm, SwiGLU.
 //!
 //! Tensor names follow llama.cpp's GGUF convention
 //! (`blk.N.attn_{q,k,v,output}`, `ffn_{gate,up,down}`). This GGUF carries a
 //! separate `output.weight` (Q8_0) distinct from `token_embd.weight`
-//! (Q4_0) despite `tie_word_embeddings: true` in `config.json` — verified
+//! (Q4_0) despite `tie_word_embeddings: true` in `config.json` - verified
 //! against the file directly (not assumed), so the lm head uses
 //! `output.weight` and needs no tied-embedding sharing logic.
 //!
 //! KV cache layout (load-bearing, chosen here): per layer, two buffers
-//! `[n_kv_heads, max_ctx, head_dim]`, head-major and contiguous per head —
+//! `[n_kv_heads, max_ctx, head_dim]`, head-major and contiguous per head -
 //! matches `shaders/attn_decode.wgsl`'s indexing. Not a ring buffer: `kv_len`
 //! only grows, capped by `max_ctx` (the CLI's fixed context, not the
 //! model's `qwen2.context_length`). Writes into it are plain
 //! `copy_buffer_to_buffer` calls recorded in the same encoder as the
-//! dispatch that produced the source K/V — GPU-resident, no CPU readback —
+//! dispatch that produced the source K/V - GPU-resident, no CPU readback -
 //! so a freshly-computed decode step's own K/V is visible to that same
 //! step's causal attention (`kv_len` passed to `attn_decode` already
 //! includes the current position).
@@ -162,7 +162,7 @@ pub struct GpuModel {
     /// Selects, inside `linear()`, between the naive reference kernel
     /// (`false`, always `linear_q4.wgsl`) and the tiled/coalesced
     /// fast kernels ported in slice 2 (`true`). Set at `load()` time so a
-    /// single `GpuModel` doesn't mix the two — the fixture check runs both.
+    /// single `GpuModel` doesn't mix the two - the fixture check runs both.
     pub fast_kernels: bool,
     pub pool: Pool,
 }
@@ -209,12 +209,12 @@ impl GpuModel {
     }
 
     /// Same loading logic as [`GpuModel::load`], generic over any
-    /// `Read + Seek` — the browser surface (`web.rs`) calls this with a
+    /// `Read + Seek` - the browser surface (`web.rs`) calls this with a
     /// `std::io::Cursor` over the whole GGUF file's bytes (fetched by JS and
     /// handed across the wasm boundary as one `Vec<u8>`; this model's
-    /// Q4_0 GGUF is ~350MB, comfortably under both the 2GB single-
+    /// Q4_0 GGUF is ~350MB, comfortably under both the 2GB single -
     /// `ArrayBuffer` limit and wasm32's 4GB address space, so no sharded
-    /// reader is needed here — see `gguf.rs`'s module doc comment on that).
+    /// reader is needed here - see `gguf.rs`'s module doc comment on that).
     pub fn load_from_reader<R: std::io::Read + std::io::Seek>(engine: &Engine, reader: R, fast_kernels: bool) -> Result<Self> {
         let mut reader = GgufReader::open(reader)?;
         let config = config_from_gguf(&reader)?;
@@ -253,7 +253,7 @@ impl GpuModel {
         let lm_head = gguf_matmul(engine, &mut reader, "output.weight")?;
         let zero_bias_vocab = engine.buf_f32(&vec![0f32; config.vocab_size], "zero_bias_vocab");
 
-        // `reader` (and its underlying `File`) drops here — two-phase
+        // `reader` (and its underlying `File`) drops here - two-phase
         // loading: no raw GGUF bytes remain in memory past this point,
         // only the GPU-resident buffers built above.
         drop(reader);
@@ -263,7 +263,7 @@ impl GpuModel {
 }
 
 /// RoPE cos/sin tables for absolute positions `[0, max_pos)`, `half =
-/// head_dim/2` columns each. `inv_freq[j] = theta^(-2j/head_dim)` — HF
+/// head_dim/2` columns each. `inv_freq[j] = theta^(-2j/head_dim)` - HF
 /// Qwen2RotaryEmbedding's convention (`gen_fixture.py`'s reference reads the
 /// same `qwen2.rope.freq_base` metadata key).
 pub fn build_rope_tables(head_dim: usize, theta: f32, max_pos: usize) -> (Vec<f32>, Vec<f32>) {
@@ -303,11 +303,11 @@ fn linear(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder, key:
         }
         MatMulWeight::Q8_0 { chunks, blocks_per_row, out_dim: n_total } => {
             // Q8_0 is only used for the lm head (`output.weight`) in this
-            // model — one call per forward, not worth a tiled/coalesced
+            // model - one call per forward, not worth a tiled/coalesced
             // port yet (see the slice-2 report's "did not port" list).
             // `output.weight`'s Q8_0 qs buffer (~130MB) is the one tensor in
             // this model that can exceed a browser's storage-buffer-binding
-            // limit, hence `chunks` (see `quant.rs::chunk_rows`) — one
+            // limit, hence `chunks` (see `quant.rs::chunk_rows`) - one
             // dispatch per chunk, each writing its own column range of
             // `out` (see linear_q8.wgsl's Dims doc comment).
             for chunk in chunks {
@@ -341,7 +341,7 @@ fn linear(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder, key:
                     BindGroupEntry { binding: 5, resource: dims.as_entire_binding() },
                 ];
                 if !fast {
-                    // Reference/naive path — always linear_q4.wgsl regardless
+                    // Reference/naive path - always linear_q4.wgsl regardless
                     // of `rows`, kept for the fixture-parity gate and as the
                     // fallback when a fast kernel's correctness is in doubt.
                     let bg = pool.bind_group(&ckey, &engine.linear_q4, &entries);
@@ -473,7 +473,7 @@ fn embed_gather(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder
 /// (`[rows, kv_heads, head_dim]`, row-major) into the cache's
 /// `[kv_head, kv_base+row, head_dim]` layout, via one `copy_buffer_to_buffer`
 /// per (row, kv_head) recorded into the same encoder as the dispatch that
-/// produced `src` — no CPU readback, so this can run before the attention
+/// produced `src` - no CPU readback, so this can run before the attention
 /// dispatch that needs to see it (decode's self-attention).
 fn scatter_kv_gpu(encoder: &mut wgpu::CommandEncoder, cache_buf: &wgpu::Buffer, src: &wgpu::Buffer, rows: u32, cfg: &Qwen2Config, kv_base: u32, max_ctx: u32) {
     let kv_heads = cfg.num_kv_heads as u32;
@@ -538,7 +538,7 @@ fn attn_decode(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder,
 }
 
 /// Prefill: runs every layer over the whole prompt with causal attention
-/// (no cache read needed — attends directly over this call's own q/k/v),
+/// (no cache read needed - attends directly over this call's own q/k/v),
 /// GPU-scatters every position's K/V into `cache`, and returns the last
 /// position's logits ([vocab]).
 pub async fn forward_prefill(engine: &Engine, model: &GpuModel, cache: &mut KvCache, token_ids: &[u32], cos: &wgpu::Buffer, sin: &wgpu::Buffer) -> Vec<f32> {

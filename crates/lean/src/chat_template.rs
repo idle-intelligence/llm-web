@@ -1,11 +1,11 @@
 //! Renders Qwen2.5-Instruct's own Jinja2 `chat_template` (read straight out
 //! of `tokenizer_config.json`, never hand-copied) via minijinja, for a
-//! single-user-turn prompt with no tools — the scope this slice needs.
+//! single-user-turn prompt with no tools - the scope this slice needs.
 //! Unlike llm-wasm's `template.rs` (347 lines: xLAM-2's tool-calling
 //! message model, custom `py_tojson` filter for byte-exact `tojson`
 //! fidelity against Python's `json.dumps`), Qwen2.5's own template never
 //! calls `tojson` on the no-tools path this crate exercises, so none of
-//! that machinery is needed here — this is intentionally the minimal
+//! that machinery is needed here - this is intentionally the minimal
 //! renderer for the plain-chat path, not a port of llm-wasm's tool-calling
 //! one.
 //!
@@ -25,7 +25,7 @@ struct ChatMessage<'a> {
 }
 
 /// Renders `chat_template` for a single user message, `add_generation_prompt
-/// = true` — the same call shape `gen_fixture.py` makes via
+/// = true` - the same call shape `gen_fixture.py` makes via
 /// `tok.apply_chat_template([{"role": "user", "content": prompt}],
 /// add_generation_prompt=True)`.
 pub fn render_user_prompt(chat_template: &str, prompt: &str) -> Result<String> {
@@ -41,7 +41,7 @@ pub fn render_user_prompt(chat_template: &str, prompt: &str) -> Result<String> {
 }
 
 /// Extracts the `chat_template` string out of a HF `tokenizer_config.json`'s
-/// already-read text — the wasm32-safe half of [`read_chat_template`] (no
+/// already-read text - the wasm32-safe half of [`read_chat_template`] (no
 /// filesystem access), shared with `web.rs`, which gets this text from JS
 /// (`fetch(...).text()`) instead of a path.
 pub fn chat_template_from_config_json(tokenizer_config_json: &str) -> Result<String> {
@@ -54,7 +54,7 @@ pub fn chat_template_from_config_json(tokenizer_config_json: &str) -> Result<Str
 }
 
 /// Reads the `chat_template` string out of a HF `tokenizer_config.json` file
-/// on disk. Native only (`std::fs`) — see [`chat_template_from_config_json`]
+/// on disk. Native only (`std::fs`) - see [`chat_template_from_config_json`]
 /// for the wasm32 path.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn read_chat_template(tokenizer_config_path: &str) -> Result<String> {
@@ -66,7 +66,7 @@ pub fn read_chat_template(tokenizer_config_path: &str) -> Result<String> {
 mod tests {
     use super::*;
 
-    /// Qwen2.5-Instruct's template, no-tools/no-system-message branch —
+    /// Qwen2.5-Instruct's template, no-tools/no-system-message branch -
     /// copied from the model's own `tokenizer_config.json` (not
     /// hand-written) so this test exercises the exact string
     /// `read_chat_template` would load, without needing the model files on

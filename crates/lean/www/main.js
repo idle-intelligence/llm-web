@@ -1,4 +1,4 @@
-// Headless parity/perf harness for the lean engine's wasm build — not a
+// Headless parity/perf harness for the lean engine's wasm build - not a
 // demo page. Loads the wasm module + GGUF + tokenizer, replays the three
 // fixture prompts (crates/lean/reference/fixture.json, the same file
 // lean-cli's native fixture check uses) through LeanEngine.generate(), and
@@ -8,8 +8,8 @@
 // (fixture.json) without duplicating either.
 //
 // Every wasm/js loading URL below carries `?v=ENGINE_BUILD`, bumped in the
-// same commit as any wasm/model rebuild — see docs/runs/2026-09-28-lean-web.md.
-const ENGINE_BUILD = "2026-09-28-1";
+// same commit as any wasm/model rebuild - see docs/runs/2026-09-28-lean-web.md.
+const ENGINE_BUILD = "2026-09-28-2";
 
 const HF_GGUF = "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_0.gguf";
 const HF_TOKENIZER = "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct/resolve/main/tokenizer.json";

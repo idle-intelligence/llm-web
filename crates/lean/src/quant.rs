@@ -3,7 +3,7 @@
 //! f32 once host-side into its own buffer, and the quantized nibbles/bytes
 //! are packed 4/u32 so WGSL reads them as `array<u32>` without a
 //! byte-addressed storage buffer. Block math matches `gguf.rs`'s
-//! `dequantize_q4_0`/`dequantize_q8_0` exactly — this module only repacks
+//! `dequantize_q4_0`/`dequantize_q8_0` exactly - this module only repacks
 //! the same on-disk bytes into that GPU-friendly layout, no
 //! dequantize-then-requantize round trip.
 
@@ -13,7 +13,7 @@ use crate::gguf::GgmlDtype;
 const QK: usize = 32;
 
 /// One row-range of a matmul weight, GPU-resident. `row_start`/`rows` are in
-/// units of the weight's `out_dim` (GGUF/PyTorch `shape[0]`) — the same axis
+/// units of the weight's `out_dim` (GGUF/PyTorch `shape[0]`) - the same axis
 /// `linear()`'s output columns index. A weight that fits under the device's
 /// `max_storage_buffer_binding_size` in one binding gets exactly one chunk
 /// covering `0..out_dim`.
@@ -77,7 +77,7 @@ fn split_q4_blocks(bytes: &[u8], n_elements: usize) -> (Vec<u32>, Vec<f32>) {
 /// `[out_dim, in_dim]` weight) into row-aligned chunks no larger than the
 /// device's `max_storage_buffer_binding_size`, uploading each chunk's `qs`/
 /// `scales` as its own pair of buffers. General mechanism (not special-cased
-/// to any one tensor) — a weight that already fits in one binding gets
+/// to any one tensor) - a weight that already fits in one binding gets
 /// exactly one chunk, identical to the pre-chunking layout.
 fn chunk_rows(engine: &Engine, label: &str, bytes: &[u8], out_dim: usize, blocks_per_row: usize, bytes_per_row: usize, is_q8: bool) -> Vec<QChunk> {
     let limit = engine.max_storage_buffer_binding_size() as usize;

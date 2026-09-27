@@ -1,14 +1,14 @@
 //! Minimal wasm-bindgen browser surface. One entry point, `LeanEngine`, for
-//! a Web Worker: `LeanEngine::create()` (async — requests the WebGPU
+//! a Web Worker: `LeanEngine::create()` (async - requests the WebGPU
 //! adapter/device), `load()` (parse GGUF bytes + tokenizer + chat template,
 //! upload weights to GPU), `generate()` (render -> tokenize -> prefill ->
 //! greedy decode, one `on_token(id: number)` JS callback per generated
-//! token). No agent/tool/grammar layer here (that's llm-wasm's `web.rs`) —
+//! token). No agent/tool/grammar layer here (that's llm-wasm's `web.rs`) -
 //! this crate's browser surface is exactly what `lean-cli` does natively,
 //! reused verbatim (`chat_template::render_user_prompt`,
 //! `model::{forward_prefill, forward_decode_step}`).
 //!
-//! WebGPU readback is async only in the browser — every GPU-reading call
+//! WebGPU readback is async only in the browser - every GPU-reading call
 //! here is `async`/`.await`s `Engine::read_buffer`'s `into_data_async`-style
 //! path (see `engine.rs`'s doc comment). Never call a blocking readback from
 //! this module.
@@ -59,7 +59,7 @@ pub struct LeanEngine {
 #[wasm_bindgen]
 impl LeanEngine {
     /// Requests a WebGPU adapter/device (the adapter's own limits, not
-    /// `wgpu::Limits::default()` — see `engine.rs::Engine::new_async`'s doc
+    /// `wgpu::Limits::default()` - see `engine.rs::Engine::new_async`'s doc
     /// comment) and builds every compute pipeline. Must be awaited before
     /// any other call.
     #[wasm_bindgen(js_name = create)]
@@ -106,11 +106,11 @@ impl LeanEngine {
     }
 
     /// Renders `prompt` through the model's own chat template (single user
-    /// turn, `add_generation_prompt = true` — same shape as `lean-cli`'s
+    /// turn, `add_generation_prompt = true` - same shape as `lean-cli`'s
     /// `--prompt` path), tokenizes it, prefills, then greedily decodes up to
     /// `max_new_tokens` tokens (stopping early on any of the model's
     /// `eos_token_ids`). Every decoded token id is passed to `on_token`
-    /// (called as `on_token(id: number)`) as soon as it's produced — a
+    /// (called as `on_token(id: number)`) as soon as it's produced - a
     /// no-op if `on_token` isn't a JS function. Returns the decoded
     /// continuation text and prefill/decode timing.
     #[wasm_bindgen(js_name = generate)]
