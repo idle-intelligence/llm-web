@@ -2640,6 +2640,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e2db585e1d738fc771bf08a151420d3ed193d9d895a36df7f6f8a9456b911ddc"
 
 [[package]]
+name = "lean"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytemuck",
+ "byteorder",
+ "clap",
+ "futures-channel",
+ "half",
+ "pollster 0.3.0",
+ "serde",
+ "serde_json",
+ "wgpu",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.189"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2723,7 +2739,7 @@ dependencies = [
  "getrandom 0.3.4",
  "js-sys",
  "minijinja",
- "pollster",
+ "pollster 0.4.0",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
@@ -3238,6 +3254,12 @@ name = "pkg-config"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
+
+[[package]]
+name = "pollster"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "22686f4785f02a4fcc856d3b3bb19bf6c8160d103f7a99cc258bddd0251dc7f2"
 
 [[package]]
 name = "pollster"
