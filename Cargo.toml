@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/llm-wasm",
+    "crates/lean",
 ]
 resolver = "2"
 

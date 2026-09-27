@@ -1,0 +1,30 @@
+[package]
+name = "lean"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Raw wgpu + hand-written WGSL only. No Burn, no CubeCL, no training — see
+# ~/.claude/projects/-Users-tc-Code/memory/project_lean_engine_direction.md.
+# Native first (Metal); wasm target added in a later slice.
+[features]
+default = []
+wasm = ["wgpu/webgpu"]
+
+[dependencies]
+anyhow = { workspace = true }
+byteorder = { workspace = true }
+bytemuck = { version = "1.25", features = ["derive"] }
+half = "2.4"
+wgpu = { workspace = true }
+futures-channel = "0.3"
+serde = { workspace = true }
+serde_json = { workspace = true }
+clap = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+pollster = "0.3"
+
+[[bin]]
+name = "lean-cli"
+path = "src/bin/lean_cli.rs"
