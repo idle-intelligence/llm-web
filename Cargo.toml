@@ -53,7 +53,7 @@ getrandom = { version = "0.3", default-features = false }
 wgpu = { version = "26", features = ["fragile-send-sync-non-atomic-wasm"] }
 
 # CLI
-clap = { version = "4.5", features = ["derive"] }
+clap = { version = "4.5", features = ["derive", "env"] }
 
 # Tokenizer (0.22, no default features — onig/esaxx_fast are not wasm32-safe;
 # fancy-regex is used instead, see crates/llm-wasm/Cargo.toml)
