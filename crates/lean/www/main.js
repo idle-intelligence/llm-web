@@ -9,7 +9,32 @@
 //
 // Every wasm/js loading URL below carries `?v=ENGINE_BUILD`, bumped in the
 // same commit as any wasm/model rebuild - see docs/runs/2026-09-28-lean-web.md.
-const ENGINE_BUILD = "2026-09-28-2";
+const ENGINE_BUILD = "2026-09-28-4";
+
+// Timing-only, not fixture-checked (no reference continuation exists for
+// it): a ~1000-token prompt to measure prefill throughput at a size closer
+// to a real chat context than the fixture's 36/54/86-token cases. Built as
+// repeated distinct sentences (not one repeated string) so the tokenizer
+// doesn't collapse it into a tiny number of repeated-BPE-merge tokens.
+const LONG_PROMPT_SENTENCES = [
+  "The history of the Roman Empire spans many centuries of political change.",
+  "Photosynthesis converts sunlight, water, and carbon dioxide into glucose and oxygen.",
+  "The Pacific Ocean is the largest and deepest of Earth's oceanic divisions.",
+  "Quantum mechanics describes the behavior of matter and energy at atomic scales.",
+  "The printing press revolutionized the spread of information across Europe.",
+  "Mount Everest is the tallest mountain above sea level on the planet.",
+  "The French Revolution reshaped the political landscape of eighteenth century Europe.",
+  "DNA carries the genetic instructions used in the growth of living organisms.",
+  "The Great Wall of China stretches thousands of kilometers across northern China.",
+  "Volcanic eruptions can reshape landscapes and affect climate for years afterward.",
+];
+function buildLongPrompt(targetSentences) {
+  const out = [];
+  for (let i = 0; i < targetSentences; i++) {
+    out.push(LONG_PROMPT_SENTENCES[i % LONG_PROMPT_SENTENCES.length]);
+  }
+  return `Summarize the following notes in one paragraph.\n\n${out.join(" ")}`;
+}
 
 const HF_GGUF = "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_0.gguf";
 const HF_TOKENIZER = "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct/resolve/main/tokenizer.json";
@@ -58,7 +83,10 @@ async function main() {
   log(`[lean] device ready: ${engine.info()}`);
 
   const loadStart = performance.now();
-  engine.load(ggufBytes, tokenizerJson, tokenizerCfgJson, 256);
+  // max_ctx raised from 256 to 1400: the synthetic ~1000-token timing case
+  // below plus its 32-token continuation must fit alongside the fixture's
+  // longest case (86 + 32).
+  engine.load(ggufBytes, tokenizerJson, tokenizerCfgJson, 1400);
   log(`[lean] model loaded in ${(performance.now() - loadStart).toFixed(0)}ms: ${engine.info()}`);
 
   let allMatch = true;
@@ -83,6 +111,27 @@ async function main() {
     );
   }
   log(allMatch ? "[lean] ALL FIXTURE CASES TOKEN-MATCH" : "[lean] FIXTURE MISMATCH");
+
+  // Timing-only long-prompt case (~1000 tokens), not part of allMatch.
+  const longPrompt = buildLongPrompt(90);
+  const longPromptLen = engine.tokenCount(longPrompt);
+  const longIds = [];
+  const longGenStart = performance.now();
+  let longFirstTokenAt = null;
+  const longText = await engine.generate(longPrompt, 32, (id) => {
+    if (longFirstTokenAt === null) longFirstTokenAt = performance.now();
+    longIds.push(id);
+  });
+  const longGenEnd = performance.now();
+  const longPrefillMs = longFirstTokenAt !== null ? longFirstTokenAt - longGenStart : NaN;
+  const longDecodeMsPerTok = longIds.length > 0 ? (longGenEnd - longFirstTokenAt) / longIds.length : NaN;
+  const longPrefillTokPerSec = longPromptLen / (longPrefillMs / 1000);
+  rows.push({ name: "long_1000", promptLen: longPromptLen, match: null, prefillMs: longPrefillMs, decodeMsPerTok: longDecodeMsPerTok, text: longText });
+  log(
+    `[lean] case=long_1000 prompt_len=${longPromptLen} (timing-only, not fixture-checked) ` +
+      `prefill_ms=${longPrefillMs.toFixed(1)} prefill_tok_per_sec=${longPrefillTokPerSec.toFixed(1)} decode_ms_per_tok=${longDecodeMsPerTok.toFixed(1)}`
+  );
+
   window.__leanResult = { allMatch, rows, engineBuild: ENGINE_BUILD, source: local ? "local" : "huggingface" };
 }
 
