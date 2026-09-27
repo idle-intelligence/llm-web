@@ -677,6 +677,11 @@ matvec kernel when the adapter reports it, falling back to the portable kernel o
 Unverified in a real browser (no headless browser available in this environment) whether any
 adapter actually reports `SUBGROUP` support.
 
+**Update (2026-09-27)**: this probe, the subgroup matvec kernel, and `set_subgroup_support`/
+`has_subgroup_support` were removed. wgpu 26's `BROWSER_WEBGPU` backend never reported a real
+subgroup size, so the gate never activated; the portable and coalesced kernels are the only
+decode paths now.
+
 ### What is untested
 
 No headless browser is available in this environment (Playwright/Chrome are explicitly

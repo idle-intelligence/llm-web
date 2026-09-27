@@ -851,8 +851,8 @@ impl Seek for ShardedCursor {
 /// lanes reading adjacent blocks. `from_q4_bytes` repacks on load into two
 /// separate, individually-aligned GPU buffers: `scales` (one f32 per block)
 /// and `nibbles` (16 bytes = exactly 4 u32 per block, scale stripped out) —
-/// see docs/BENCHMARKS.md's K5 section for the measured effect. All four
-/// WGSL kernels (naive, matvec, matvec_subgroup, tiled) read this layout.
+/// see docs/BENCHMARKS.md's K5 section for the measured effect. All three
+/// WGSL kernels (naive, matvec, tiled) read this layout.
 /// `Clone` is a cheap handle clone (ref-counted GPU buffer, not a copy) —
 /// used to share `token_embd.weight`'s buffers between the embedding table
 /// and the tied lm_head matmul.
@@ -965,24 +965,6 @@ impl Q4Linear {
 // Q4 matmul kernel dispatch
 // ---------------------------------------------------------------------------
 
-/// Set (from device-init code, e.g. after probing `wgpu::Features::SUBGROUP`)
-/// to route the M=1 decode matvec through `shader_q4_matvec_subgroup.wgsl`
-/// instead of the portable shared-memory-reduction variant — mirrors
-/// sts-web's `gguf.rs:33-46` / `web/bindings.rs:162-163` pattern. Nothing in
-/// this crate currently calls `set_subgroup_support(true)` (that wiring
-/// lives in web.rs, outside this crate's owned files for this task), so this
-/// defaults to `false` — every measured number in docs/BENCHMARKS.md uses
-/// the shared-memory variant.
-static HAS_SUBGROUPS: AtomicBool = AtomicBool::new(false);
-
-pub fn set_subgroup_support(supported: bool) {
-    HAS_SUBGROUPS.store(supported, Ordering::Relaxed);
-}
-
-pub fn has_subgroup_support() -> bool {
-    HAS_SUBGROUPS.load(Ordering::Relaxed)
-}
-
 /// Bench-only instrumentation (docs/BENCHMARKS.md P1c): when set, `q4_matmul`
 /// skips its GPU kernel launch entirely and returns an uninitialized output
 /// buffer of the correct shape/dtype. Used by `llm-agent bench` to measure
@@ -1024,18 +1006,6 @@ struct Q4MatvecCoalescedKernel;
 impl KernelSource for Q4MatvecCoalescedKernel {
     fn source(&self) -> SourceTemplate {
         SourceTemplate::new(include_str!("wgsl/shader_q4_matvec_coalesced.wgsl"))
-    }
-
-    fn id(&self) -> KernelId {
-        KernelId::new::<Self>()
-    }
-}
-
-struct Q4MatvecSubgroupKernel;
-
-impl KernelSource for Q4MatvecSubgroupKernel {
-    fn source(&self) -> SourceTemplate {
-        SourceTemplate::new(include_str!("wgsl/shader_q4_matvec_subgroup.wgsl"))
     }
 
     fn id(&self) -> KernelId {
@@ -1664,28 +1634,18 @@ fn q4_matmul_dispatch(input: Tensor<Wgpu, 3>, weights: &Q4Tensor, force: ForceKe
         .with_buffer(info_handle.binding());
 
     // M==1 (decode): dispatch the cooperative matvec kernel (Session 6's
-    // coalesced kernel — wgsl/shader_q4_matvec_coalesced.wgsl, or K1's
-    // subgroup variant when available) instead of the naive
-    // one-thread-per-output kernel. Condition is `m == 1`, not `b * m == 1`
-    // — the matvec kernel's `b`/`B` handling (wg_id.y, `b_valid` guard) was
-    // already batch-general, so B>1 M=1 decode (e.g. classifier-free
-    // guidance's dual-batch KV caches) now also takes this path instead of
-    // falling through to the naive kernel. M>1 (prefill) keeps the naive
-    // kernel unless a test forces K2's tiled kernel (see `q4_matmul`'s doc
-    // comment — not the production default).
+    // coalesced kernel, wgsl/shader_q4_matvec_coalesced.wgsl) instead of the
+    // naive one-thread-per-output kernel. Condition is `m == 1`, not
+    // `b * m == 1`: the matvec kernel's `b`/`B` handling (wg_id.y,
+    // `b_valid` guard) was already batch-general, so B>1 M=1 decode (e.g.
+    // classifier-free guidance's dual-batch KV caches) now also takes this
+    // path instead of falling through to the naive kernel. M>1 (prefill)
+    // keeps the naive kernel unless a test forces K2's tiled kernel (see
+    // `q4_matmul`'s doc comment, not the production default).
     if force == ForceKernel::Auto && m == 1 {
-        let (kernel, rows_per_wg): (Box<dyn CubeTask<AutoCompiler>>, usize) = if has_subgroup_support() {
-            (
-                Box::new(SourceKernel::new(Q4MatvecSubgroupKernel, CubeDim::new_1d(256))),
-                MATVEC_ROWS_PER_WG,
-            )
-        } else {
-            (
-                Box::new(SourceKernel::new(Q4MatvecCoalescedKernel, CubeDim::new_1d(128))),
-                MATVEC_COALESCED_ROWS_PER_WG,
-            )
-        };
-        let wg_x = n.div_ceil(rows_per_wg) as u32;
+        let kernel: Box<dyn CubeTask<AutoCompiler>> =
+            Box::new(SourceKernel::new(Q4MatvecCoalescedKernel, CubeDim::new_1d(128)));
+        let wg_x = n.div_ceil(MATVEC_COALESCED_ROWS_PER_WG) as u32;
         let wg_y = b as u32;
         client
             .launch(kernel, CubeCount::new_2d(wg_x, wg_y), bindings)

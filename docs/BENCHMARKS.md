@@ -37,6 +37,13 @@ is the only place in either codebase that calls `set_subgroup_support`, gated on
 device-init plumbing, not something this crate's `llm-agent` CLI exercises. Treat this
 as unverified for this model; the portable variant is the safe default either way.
 
+**Update (2026-09-27)**: the subgroupAdd() variant (`shader_q4_matvec_subgroup.wgsl`)
+and its gating (`has_subgroup_support`/`set_subgroup_support`) were removed. It never
+activated: wgpu 26's `BROWSER_WEBGPU` backend reports `min_subgroup_size`/
+`max_subgroup_size` as 0/0, so the confirm-32 gate in `web.rs` never passed. The
+portable shared-memory kernel and the coalesced kernel below remain the only decode
+paths.
+
 `cargo test --release --features wgpu --test q4_matmul`: `test_q4_matvec_m1_large_n`
 (N=151936, K∈{2048,11008}) plus the pre-existing `test_q4_matmul_synthetic_shapes`
 (M=1, K,N∈{2048,11008}) and `test_q4_matmul_real_gguf_token_embd` (M=1, real

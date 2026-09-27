@@ -1,8 +1,7 @@
 // Q4_0 Cooperative Matvec — M=1 (decode) — shared-memory reduction variant.
 //
-// Portable default: no subgroup ops, safe for WASM/WebGPU where
-// `Features::SUBGROUP` may be unavailable (see shader_q4_matvec_subgroup.wgsl
-// and gguf.rs's `has_subgroup_support`). Modeled on sts-web's
+// Portable default: no subgroup ops, safe for WASM/WebGPU adapters that
+// don't support `Features::SUBGROUP`. Modeled on sts-web's
 // shader_q4k_matvec_coop.wgsl cooperative-K-split structure, adapted from
 // Q4_K's 256-element/144-byte block to Q4_0's 32-element/18-byte block (see
 // shader_naive.wgsl for the byte layout this shares: f16 scale + 16 bytes of
@@ -45,8 +44,7 @@
 // `var<workgroup>` array, then every thread reads it back via
 // `workgroupUniformLoad`, which Tint's analysis treats as uniform (it
 // contains its own barrier pair). All loop/branch bounds that gate a
-// barrier or subgroup op must be read this way — see
-// `shader_rmsnorm.wgsl`/`shader_q4_matvec_subgroup.wgsl` for the same
+// barrier must be read this way: see `shader_rmsnorm.wgsl` for the same
 // pattern.
 
 // K5 (docs/BENCHMARKS.md): `weights` holds only the 16-byte nibble portion
