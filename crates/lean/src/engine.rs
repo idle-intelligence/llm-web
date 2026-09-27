@@ -50,11 +50,19 @@ impl Engine {
             })
             .await
             .map_err(|e| anyhow::anyhow!("no wgpu adapter: {e}"))?;
+        // wgpu::Limits::default() caps max_storage_buffer_binding_size at
+        // 128MB — too small for this model's lm_head/embedding Q8_0/Q4_0
+        // buffers in one binding (e.g. output.weight's Q8_0 qs buffer is
+        // ~130MB). Request the adapter's own limits instead (native Metal
+        // supports far more); a wasm build will need to cap this at
+        // whatever WebGPU's downlevel limits actually allow and split
+        // large tensors across bindings if it doesn't.
+        let adapter_limits = adapter.limits();
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("lean"),
                 required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::default(),
+                required_limits: adapter_limits,
                 memory_hints: wgpu::MemoryHints::Performance,
                 trace: wgpu::Trace::Off,
             })
