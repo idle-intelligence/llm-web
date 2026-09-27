@@ -21,9 +21,16 @@ futures-channel = "0.3"
 serde = { workspace = true }
 serde_json = { workspace = true }
 clap = { workspace = true }
+minijinja = { workspace = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 pollster = "0.3"
+# native-only for now, same as llm-wasm's `native` feature
+# (tokenizers/fancy-regex, onig/esaxx_fast are not wasm32-safe); when this
+# crate gets a wasm target, switch to llm-wasm's Cargo.toml pattern
+# (tokenizers/unstable_wasm + tokenizers/fancy-regex, no onig) — see
+# crates/llm-wasm/Cargo.toml lines 40/50-52.
+tokenizers = { workspace = true, features = ["fancy-regex"] }
 
 [[bin]]
 name = "lean-cli"

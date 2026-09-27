@@ -18,6 +18,25 @@ pub struct Engine {
     pub linear: wgpu::ComputePipeline,
     pub linear_q4: wgpu::ComputePipeline,
     pub linear_q8: wgpu::ComputePipeline,
+    /// Tiled Q4_0 matmul (prefill, M>1) — ported from llm-wasm's
+    /// shader_q4_tiled.wgsl. Only faster than `linear_q4` once weight reuse
+    /// across rows outweighs the tile/barrier overhead — see the shader's
+    /// doc comment for llm-wasm's own measured regression at small M.
+    pub linear_q4_tiled: wgpu::ComputePipeline,
+    /// Coalesced Q4_0 matvec (decode, M=1) — ported from llm-wasm's
+    /// shader_q4_matvec_coalesced.wgsl. The default "fast" decode kernel
+    /// when `has_subgroups` is false.
+    pub linear_q4_decode: wgpu::ComputePipeline,
+    /// subgroupAdd()-reduction Q4_0 matvec (decode, M=1) — ported from
+    /// llm-wasm's shader_q4_matvec_subgroup.wgsl. `None` unless the adapter
+    /// reported `wgpu::Features::SUBGROUP` support at device-init time (see
+    /// `has_subgroups`); the fast decode path falls back to
+    /// `linear_q4_decode` when this is `None` (native Metal/M2 in this
+    /// crate's testing does not expose `SUBGROUP` through wgpu 26 — see
+    /// this file's `new_async` for the exact check — so this is the
+    /// WebGPU-later fallback the brief asked for, not yet exercised).
+    pub linear_q4_decode_subgroup: Option<wgpu::ComputePipeline>,
+    pub has_subgroups: bool,
     pub attn_prefill: wgpu::ComputePipeline,
     pub attn_decode: wgpu::ComputePipeline,
     pub add_inplace: wgpu::ComputePipeline,
@@ -58,16 +77,38 @@ impl Engine {
         // whatever WebGPU's downlevel limits actually allow and split
         // large tensors across bindings if it doesn't.
         let adapter_limits = adapter.limits();
+        // Probe subgroup support up front (never assumed) — mirrors
+        // llm-wasm's gguf.rs::has_subgroup_support() runtime-check pattern,
+        // but actually wired to a real adapter query here instead of a
+        // manually-set flag nothing calls.
+        let has_subgroups = adapter.features().contains(wgpu::Features::SUBGROUP);
+        let mut required_features = wgpu::Features::empty();
+        if has_subgroups {
+            required_features |= wgpu::Features::SUBGROUP;
+        }
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("lean"),
-                required_features: wgpu::Features::empty(),
+                required_features,
                 required_limits: adapter_limits,
                 memory_hints: wgpu::MemoryHints::Performance,
                 trace: wgpu::Trace::Off,
             })
             .await
             .map_err(|e| anyhow::anyhow!("no wgpu device: {e}"))?;
+
+        // Measured on this Mac (wgpu 26.0.1 / Metal): the adapter *reports*
+        // `Features::SUBGROUP` support (`has_subgroups` above is true), but
+        // wgpu 26's Naga WGSL frontend does not implement the `enable
+        // subgroups;` directive yet — `create_shader_module` panics with
+        // "the `subgroups` enable-extension is not yet supported" (see
+        // https://github.com/gfx-rs/wgpu/issues/5555). So `has_subgroups`
+        // alone is not a safe gate for compiling this shader; never compile
+        // it. `linear_q4_decode` (the coalesced, non-subgroup kernel) is the
+        // fast decode path until wgpu's Naga catches up — the exact
+        // "WebGPU later" fallback this crate's brief asked for, now with a
+        // concrete, reproduced reason rather than a guess.
+        let linear_q4_decode_subgroup = None;
 
         Ok(Engine {
             embed_gather_q4: make_pipeline(&device, "embed_gather_q4", include_str!("shaders/embed_gather_q4.wgsl")),
@@ -76,6 +117,10 @@ impl Engine {
             linear: make_pipeline(&device, "linear", include_str!("shaders/linear.wgsl")),
             linear_q4: make_pipeline(&device, "linear_q4", include_str!("shaders/linear_q4.wgsl")),
             linear_q8: make_pipeline(&device, "linear_q8", include_str!("shaders/linear_q8.wgsl")),
+            linear_q4_tiled: make_pipeline(&device, "linear_q4_tiled", include_str!("shaders/linear_q4_tiled.wgsl")),
+            linear_q4_decode: make_pipeline(&device, "linear_q4_decode", include_str!("shaders/linear_q4_decode.wgsl")),
+            linear_q4_decode_subgroup,
+            has_subgroups,
             attn_prefill: make_pipeline(&device, "attn_prefill", include_str!("shaders/attn_prefill.wgsl")),
             attn_decode: make_pipeline(&device, "attn_decode", include_str!("shaders/attn_decode.wgsl")),
             add_inplace: make_pipeline(&device, "add_inplace", include_str!("shaders/add_inplace.wgsl")),
