@@ -29,7 +29,7 @@ use tokenizers::Tokenizer;
 enum Kernel {
     /// Always the naive reference kernel (linear_q4.wgsl) regardless of M.
     Naive,
-    /// Tiled prefill / coalesced-or-subgroup decode kernels (slice 2).
+    /// Tiled prefill / coalesced decode kernels (slice 2).
     Fast,
 }
 
@@ -139,7 +139,6 @@ fn main() -> Result<()> {
     let chat_template = read_chat_template(&tokenizer_config_json)?;
 
     let engine = lean::engine::Engine::new()?;
-    eprintln!("subgroup support: {}", engine.has_subgroups);
     let load_start = Instant::now();
     let model = GpuModel::load(&engine, &args.gguf, args.kernel == Kernel::Fast)?;
     eprintln!("loaded model in {:?} (kernel={:?})", load_start.elapsed(), args.kernel);

@@ -155,7 +155,7 @@ pub struct GpuModel {
     lm_head: MatMulWeight,
     zero_bias_vocab: wgpu::Buffer,
     /// Selects, inside `linear()`, between the naive reference kernel
-    /// (`false`, always `linear_q4.wgsl`) and the tiled/coalesced/subgroup
+    /// (`false`, always `linear_q4.wgsl`) and the tiled/coalesced
     /// fast kernels ported in slice 2 (`true`). Set at `load()` time so a
     /// single `GpuModel` doesn't mix the two — the fixture check runs both.
     pub fast_kernels: bool,
@@ -323,13 +323,6 @@ fn linear(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder, key:
                 // Prefill: tiled matmul (llm-wasm's shader_q4_tiled.wgsl port).
                 let bg = pool.bind_group(&format!("{key}.tiled"), &engine.linear_q4_tiled, &entries);
                 engine.dispatch(encoder, &engine.linear_q4_tiled, &bg, (out_dim.div_ceil(64), rows.div_ceil(64), 1), key);
-            } else if let Some(subgroup) = &engine.linear_q4_decode_subgroup {
-                // Decode, subgroup path (native Metal in this crate's own
-                // testing does not expose wgpu::Features::SUBGROUP — see
-                // engine.rs — so this branch is untested here; falls back
-                // to the coalesced kernel below whenever it's None).
-                let bg = pool.bind_group(&format!("{key}.decode_sg"), subgroup, &entries);
-                engine.dispatch(encoder, subgroup, &bg, (out_dim.div_ceil(8), 1, 1), key);
             } else {
                 // Decode: coalesced matvec (llm-wasm's shader_q4_matvec_coalesced.wgsl port).
                 let bg = pool.bind_group(&format!("{key}.decode"), &engine.linear_q4_decode, &entries);
