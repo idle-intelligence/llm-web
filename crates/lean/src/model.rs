@@ -146,6 +146,14 @@ struct ArgmaxDims {
     _p1: u32,
     _p2: u32,
 }
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct MaskDims {
+    n: u32,
+    offset: u32,
+    _p0: u32,
+    _p1: u32,
+}
 
 struct LayerWeights {
     attn_norm: wgpu::Buffer,
@@ -189,6 +197,8 @@ pub struct KvCache {
     pub v: Vec<wgpu::Buffer>,
     pub max_ctx: u32,
     pub kv_len: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
 }
 
 impl KvCache {
@@ -196,8 +206,149 @@ impl KvCache {
         let per_layer = (config.num_kv_heads * config.head_dim) as u32 * max_ctx;
         let k = (0..config.num_layers).map(|i| engine.buf_empty(per_layer as usize, &format!("kv{i}.k"))).collect();
         let v = (0..config.num_layers).map(|i| engine.buf_empty(per_layer as usize, &format!("kv{i}.v"))).collect();
-        KvCache { k, v, max_ctx, kv_len: 0 }
+        KvCache { k, v, max_ctx, kv_len: 0, num_kv_heads: config.num_kv_heads as u32, head_dim: config.head_dim as u32 }
     }
+
+    /// Reads back positions `[0, kv_len)` of every layer's K/V buffers,
+    /// compacted (no `max_ctx` padding) into a max_ctx-independent snapshot
+    /// that can be restored into a cache with a *different* `max_ctx` (e.g.
+    /// a resident prefix snapshot restored into a fresh, longer-context
+    /// cache for a new turn). Async readback only (`Engine::read_buffer`) -
+    /// safe to call from the browser.
+    pub async fn snapshot(&self, engine: &Engine) -> KvSnapshot {
+        let mut k_out = Vec::with_capacity(self.k.len());
+        let mut v_out = Vec::with_capacity(self.v.len());
+        for i in 0..self.k.len() {
+            k_out.push(compact_kv_prefix(engine, &self.k[i], self.num_kv_heads, self.head_dim, self.kv_len, self.max_ctx).await);
+            v_out.push(compact_kv_prefix(engine, &self.v[i], self.num_kv_heads, self.head_dim, self.kv_len, self.max_ctx).await);
+        }
+        KvSnapshot { kv_len: self.kv_len, num_kv_heads: self.num_kv_heads, head_dim: self.head_dim, num_layers: self.k.len() as u32, k: k_out, v: v_out }
+    }
+
+    /// Writes a snapshot's compacted K/V back into this cache's own buffers
+    /// (`queue.write_buffer`, no readback - safe on any target) and sets
+    /// `kv_len` to the snapshot's, so generation can resume from the
+    /// restored prefix without re-prefilling it. Restoring into the *same*
+    /// `KvCache` instance the snapshot was taken from (or any instance
+    /// whose buffers were already bound into a `Pool`'s cached bind groups)
+    /// needs no `pool.reset()` - only allocating a *new* `KvCache` does
+    /// (see `pool.rs`'s bug note).
+    pub fn restore(&mut self, engine: &Engine, snapshot: &KvSnapshot) {
+        assert_eq!(snapshot.num_layers as usize, self.k.len(), "kv snapshot layer count mismatch");
+        assert_eq!(snapshot.num_kv_heads, self.num_kv_heads, "kv snapshot num_kv_heads mismatch");
+        assert_eq!(snapshot.head_dim, self.head_dim, "kv snapshot head_dim mismatch");
+        assert!(snapshot.kv_len <= self.max_ctx, "kv snapshot kv_len {} exceeds max_ctx {}", snapshot.kv_len, self.max_ctx);
+        for i in 0..self.k.len() {
+            write_kv_prefix(engine, &self.k[i], &snapshot.k[i], self.num_kv_heads, self.head_dim, snapshot.kv_len, self.max_ctx);
+            write_kv_prefix(engine, &self.v[i], &snapshot.v[i], self.num_kv_heads, self.head_dim, snapshot.kv_len, self.max_ctx);
+        }
+        self.kv_len = snapshot.kv_len;
+    }
+}
+
+/// A resident-prefix KV image: every layer's K/V for positions `[0,
+/// kv_len)`, compacted (`[kv_heads, kv_len, head_dim]`, no `max_ctx`
+/// padding) so it can be exported/imported as bytes and stored by a
+/// consumer keyed by its own prompt/tool-schema hash (see this crate's
+/// consumer survey, gap #1). Layout must match `KvCache`'s per-head
+/// contiguous convention (this file's top doc comment) for `restore` to be
+/// a plain per-head copy.
+pub struct KvSnapshot {
+    pub kv_len: u32,
+    pub num_kv_heads: u32,
+    pub head_dim: u32,
+    pub num_layers: u32,
+    pub k: Vec<Vec<f32>>,
+    pub v: Vec<Vec<f32>>,
+}
+
+impl KvSnapshot {
+    /// Flat little-endian format: `[kv_len, num_kv_heads, head_dim,
+    /// num_layers]` (4 x u32) followed by, per layer, `k` then `v` as raw
+    /// f32 bytes (`num_kv_heads * kv_len * head_dim` each). No length
+    /// prefix per tensor - every tensor's length is derivable from the
+    /// header, matching `from_bytes`'s parse.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(16 + self.k.iter().map(|v| v.len() * 4).sum::<usize>() * 2);
+        out.extend_from_slice(&self.kv_len.to_le_bytes());
+        out.extend_from_slice(&self.num_kv_heads.to_le_bytes());
+        out.extend_from_slice(&self.head_dim.to_le_bytes());
+        out.extend_from_slice(&self.num_layers.to_le_bytes());
+        for i in 0..self.num_layers as usize {
+            out.extend_from_slice(bytemuck::cast_slice(&self.k[i]));
+            out.extend_from_slice(bytemuck::cast_slice(&self.v[i]));
+        }
+        out
+    }
+
+    /// Inverse of `to_bytes`. Parses f32s with `f32::from_le_bytes` on
+    /// individually-sliced 4-byte chunks rather than `bytemuck::cast_slice`
+    /// on the input `&[u8]` - a `Vec<u8>` handed across a JS/wasm boundary
+    /// (or read from a file) is not guaranteed 4-byte aligned, and
+    /// `cast_slice` panics on misalignment.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        anyhow::ensure!(bytes.len() >= 16, "kv snapshot bytes too short for header");
+        let kv_len = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+        let num_kv_heads = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+        let head_dim = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+        let num_layers = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
+        let per_tensor = (num_kv_heads as usize) * (kv_len as usize) * (head_dim as usize);
+        let mut off = 16usize;
+        let mut k = Vec::with_capacity(num_layers as usize);
+        let mut v = Vec::with_capacity(num_layers as usize);
+        for _ in 0..num_layers {
+            anyhow::ensure!(bytes.len() >= off + per_tensor * 4 * 2, "kv snapshot bytes truncated");
+            k.push(read_f32_le(&bytes[off..off + per_tensor * 4]));
+            off += per_tensor * 4;
+            v.push(read_f32_le(&bytes[off..off + per_tensor * 4]));
+            off += per_tensor * 4;
+        }
+        Ok(KvSnapshot { kv_len, num_kv_heads, head_dim, num_layers, k, v })
+    }
+}
+
+fn read_f32_le(bytes: &[u8]) -> Vec<f32> {
+    bytes.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect()
+}
+
+/// Reads a KV buffer's full `[kv_heads, max_ctx, head_dim]` contents back
+/// and compacts it to `[kv_heads, kv_len, head_dim]` (dropping the unused
+/// `[kv_len, max_ctx)` padding per head).
+async fn compact_kv_prefix(engine: &Engine, buf: &wgpu::Buffer, kv_heads: u32, head_dim: u32, kv_len: u32, max_ctx: u32) -> Vec<f32> {
+    let full = engine.read_buffer(buf, (kv_heads * max_ctx * head_dim) as usize).await;
+    let mut out = Vec::with_capacity((kv_heads * kv_len * head_dim) as usize);
+    for h in 0..kv_heads {
+        let base = (h * max_ctx * head_dim) as usize;
+        let len = (kv_len * head_dim) as usize;
+        out.extend_from_slice(&full[base..base + len]);
+    }
+    out
+}
+
+/// Inverse of `compact_kv_prefix`: writes a compacted `[kv_heads, kv_len,
+/// head_dim]` snapshot back into a `[kv_heads, max_ctx, head_dim]` cache
+/// buffer's `[0, kv_len)` prefix, one `queue.write_buffer` per head (queued
+/// CPU->GPU writes, no mapping/readback - safe in the browser).
+fn write_kv_prefix(engine: &Engine, buf: &wgpu::Buffer, compact: &[f32], kv_heads: u32, head_dim: u32, kv_len: u32, max_ctx: u32) {
+    for h in 0..kv_heads {
+        let src_base = (h * kv_len * head_dim) as usize;
+        let src_len = (kv_len * head_dim) as usize;
+        let dst_offset = ((h * max_ctx * head_dim) as u64) * 4;
+        engine.queue.write_buffer(buf, dst_offset, bytemuck::cast_slice(&compact[src_base..src_base + src_len]));
+    }
+}
+
+/// Packs `allowed` token ids into a bitset (32 ids per `u32`, bit `i % 32`
+/// of word `i / 32`) for `mask_logits.wgsl`. `vocab` sizes the bitset (any
+/// id `>= vocab` is meaningless to the kernel, which never reads past
+/// `dims.n`, but is rejected here to catch a caller bug early).
+pub fn build_mask_bitset(vocab: usize, allowed: &[u32]) -> Vec<u32> {
+    let mut bits = vec![0u32; vocab.div_ceil(32)];
+    for &t in allowed {
+        assert!((t as usize) < vocab, "mask token id {t} >= vocab {vocab}");
+        bits[(t / 32) as usize] |= 1u32 << (t % 32);
+    }
+    bits
 }
 
 fn gguf_f32<R: std::io::Read + std::io::Seek>(engine: &Engine, reader: &mut GgufReader<R>, name: &str) -> Result<wgpu::Buffer> {
@@ -566,7 +717,7 @@ fn attn_decode(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder,
 /// (no cache read needed - attends directly over this call's own q/k/v),
 /// GPU-scatters every position's K/V into `cache`, and returns the last
 /// position's logits ([vocab]).
-pub async fn forward_prefill(engine: &Engine, model: &GpuModel, cache: &mut KvCache, token_ids: &[u32], cos: &wgpu::Buffer, sin: &wgpu::Buffer) -> Vec<f32> {
+pub async fn forward_prefill(engine: &Engine, model: &GpuModel, cache: &mut KvCache, token_ids: &[u32], cos: &wgpu::Buffer, sin: &wgpu::Buffer, mask: Option<&wgpu::Buffer>) -> Vec<f32> {
     let cfg = &model.config;
     let seq = token_ids.len() as u32;
     let hidden = cfg.hidden_size as u32;
@@ -595,12 +746,48 @@ pub async fn forward_prefill(engine: &Engine, model: &GpuModel, cache: &mut KvCa
 
     let normed_final = rmsnorm(engine, pool, &mut encoder, "out_norm", &x, &model.out_norm, seq, hidden, cfg.rms_norm_eps);
     let logits = linear(engine, pool, &mut encoder, "lm_head", &normed_final, seq, hidden, &model.lm_head, &model.zero_bias_vocab, cfg.vocab_size as u32, false);
+    // Only the last position's row feeds the next token (see this fn's
+    // return value below), so only it needs masking - `row_offset =
+    // (seq-1)*vocab` into the `[seq, vocab]` logits buffer.
+    if let Some(mask) = mask {
+        mask_logits_gpu(engine, pool, &mut encoder, "prefill_mask", &logits, mask, cfg.vocab_size as u32, (seq - 1) * cfg.vocab_size as u32);
+    }
 
     engine.queue.submit(Some(encoder.finish()));
     let vocab = cfg.vocab_size;
     let all_logits = engine.read_buffer(&logits, (seq as usize) * vocab).await;
     cache.kv_len = seq;
     all_logits[(seq as usize - 1) * vocab..].to_vec()
+}
+
+/// Applies an allowed-token bitset to one row of `logits` (`vocab` wide, at
+/// element offset `row_offset`) in place, on the GPU, before argmax or
+/// readback - the mechanism behind per-step constrained decoding. A no-op
+/// dispatch is never recorded when `mask` is `None`: unmasked generation
+/// then has exactly the same dispatch sequence (and result) as before this
+/// feature existed.
+#[allow(clippy::too_many_arguments)]
+fn mask_logits_gpu(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder, key: &str, logits: &wgpu::Buffer, mask: &wgpu::Buffer, vocab: u32, row_offset: u32) {
+    let dims = pool.uniform(&format!("{key}.dims"), MaskDims { n: vocab, offset: row_offset, _p0: 0, _p1: 0 });
+    // Not `pool.bind_group`: a caller driving constrained decoding uploads a
+    // *different* mask buffer every step (a fresh `wgpu::Buffer`, not a
+    // `Pool`-tracked one written in place) - `Pool`'s bind-group cache only
+    // invalidates on its own generation counter (bumped when a pool-owned
+    // buffer regrows), so a cached bind group here would keep pointing at
+    // the *first* step's mask buffer forever (exactly `pool.rs`'s documented
+    // stale-binding hazard, applied to an externally-owned buffer). Building
+    // fresh every call is the correct fix, not a missing optimization: the
+    // cost is one small bind-group alloc per masked step, only paid when a
+    // caller opts into masking at all.
+    let bg = engine.bind_group(
+        &engine.mask_logits,
+        &[
+            BindGroupEntry { binding: 0, resource: logits.as_entire_binding() },
+            BindGroupEntry { binding: 1, resource: mask.as_entire_binding() },
+            BindGroupEntry { binding: 2, resource: dims.as_entire_binding() },
+        ],
+    );
+    engine.dispatch(encoder, &engine.mask_logits, &bg, (vocab.div_ceil(256), 1, 1), key);
 }
 
 fn argmax_gpu(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder, key: &str, logits: &wgpu::Buffer, vocab: u32) -> wgpu::Buffer {
@@ -625,7 +812,7 @@ fn argmax_gpu(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder, 
 /// `forward_decode_step_argmax` (single-index readback, the fast path),
 /// so the two only differ in what they append after the layer stack.
 #[allow(clippy::too_many_arguments)]
-fn decode_layers(engine: &Engine, model: &GpuModel, encoder: &mut wgpu::CommandEncoder, cache: &mut KvCache, token_id: u32, cos: &wgpu::Buffer, sin: &wgpu::Buffer) -> wgpu::Buffer {
+fn decode_layers(engine: &Engine, model: &GpuModel, encoder: &mut wgpu::CommandEncoder, cache: &mut KvCache, token_id: u32, cos: &wgpu::Buffer, sin: &wgpu::Buffer, mask: Option<&wgpu::Buffer>) -> wgpu::Buffer {
     let cfg = &model.config;
     let hidden = cfg.hidden_size as u32;
     let pool = &model.pool;
@@ -653,7 +840,11 @@ fn decode_layers(engine: &Engine, model: &GpuModel, encoder: &mut wgpu::CommandE
     }
 
     let normed_final = rmsnorm(engine, pool, encoder, "dec_out_norm", &x, &model.out_norm, 1, hidden, cfg.rms_norm_eps);
-    linear(engine, pool, encoder, "dec_lm_head", &normed_final, 1, hidden, &model.lm_head, &model.zero_bias_vocab, cfg.vocab_size as u32, false)
+    let logits = linear(engine, pool, encoder, "dec_lm_head", &normed_final, 1, hidden, &model.lm_head, &model.zero_bias_vocab, cfg.vocab_size as u32, false);
+    if let Some(mask) = mask {
+        mask_logits_gpu(engine, pool, encoder, "dec_mask", &logits, mask, cfg.vocab_size as u32, 0);
+    }
+    logits
 }
 
 /// Decode one token against the cache (already populated up to
@@ -662,10 +853,12 @@ fn decode_layers(engine: &Engine, model: &GpuModel, encoder: &mut wgpu::CommandE
 /// dispatch, so the step attends to itself too), return logits ([vocab]).
 /// Full-vocab readback (~608KB for this model) - kept for samplers that need
 /// more than the top-1 id; greedy decode should prefer
-/// `forward_decode_step_argmax` below.
-pub async fn forward_decode_step(engine: &Engine, model: &GpuModel, cache: &mut KvCache, token_id: u32, cos: &wgpu::Buffer, sin: &wgpu::Buffer) -> Vec<f32> {
+/// `forward_decode_step_argmax` below. `mask`, if given, is a bitset built
+/// by `build_mask_bitset` - see `mask_logits_gpu`'s doc comment for how it's
+/// applied.
+pub async fn forward_decode_step(engine: &Engine, model: &GpuModel, cache: &mut KvCache, token_id: u32, cos: &wgpu::Buffer, sin: &wgpu::Buffer, mask: Option<&wgpu::Buffer>) -> Vec<f32> {
     let mut encoder = engine.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("decode") });
-    let logits = decode_layers(engine, model, &mut encoder, cache, token_id, cos, sin);
+    let logits = decode_layers(engine, model, &mut encoder, cache, token_id, cos, sin, mask);
     engine.queue.submit(Some(encoder.finish()));
     cache.kv_len += 1;
     engine.read_buffer(&logits, model.config.vocab_size).await
@@ -676,12 +869,56 @@ pub async fn forward_decode_step(engine: &Engine, model: &GpuModel, cache: &mut 
 /// encoder/submit as the rest of the step, so the only readback is 4 bytes
 /// (one `u32`) instead of `vocab_size * 4` - the fast path for greedy
 /// decoding. Ties broken toward the lower index, matching the CPU `argmax()`
-/// helpers in `lean_cli.rs`/`web.rs`.
-pub async fn forward_decode_step_argmax(engine: &Engine, model: &GpuModel, cache: &mut KvCache, token_id: u32, cos: &wgpu::Buffer, sin: &wgpu::Buffer) -> u32 {
+/// helpers in `lean_cli.rs`/`web.rs`. When `mask` is given, the mask is
+/// applied (in the same encoder) before argmax, so the returned index is
+/// always drawn from the allowed set - constrained greedy decoding with no
+/// extra readback over the unconstrained path.
+#[allow(clippy::too_many_arguments)]
+pub async fn forward_decode_step_argmax(engine: &Engine, model: &GpuModel, cache: &mut KvCache, token_id: u32, cos: &wgpu::Buffer, sin: &wgpu::Buffer, mask: Option<&wgpu::Buffer>) -> u32 {
     let mut encoder = engine.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("decode_argmax") });
-    let logits = decode_layers(engine, model, &mut encoder, cache, token_id, cos, sin);
+    let logits = decode_layers(engine, model, &mut encoder, cache, token_id, cos, sin, mask);
     let idx = argmax_gpu(engine, &model.pool, &mut encoder, "dec_argmax", &logits, model.config.vocab_size as u32);
     engine.queue.submit(Some(encoder.finish()));
     cache.kv_len += 1;
     engine.read_u32(&idx).await
+}
+
+/// Appends `token_ids` onto a cache already populated up to `cache.kv_len`
+/// (typically just after `KvCache::restore` from a resident-prefix
+/// snapshot) - the "prefill(suffix)" half of KV snapshot/restore. Each token
+/// is forced (no argmax - these are known tokens, not generated ones)
+/// through its own `decode_layers` call/submit, exactly `forward_decode_step`'s
+/// shape, except intermediate tokens' logits are never read back (nothing
+/// needs them) - only the *last* token's logits are, matching
+/// `forward_prefill`'s "returns the last position's logits" contract.
+///
+/// **Deliberately one submit per token, not one encoder/submit for the
+/// whole suffix.** An earlier version of this function batched every
+/// token's `decode_layers` call into a single encoder before one submit, to
+/// save dispatch/submit overhead. That hung on native (Metal) with no CPU
+/// spin and no error: `Pool`'s per-call-site uniform buffers (`RopeDims`'s
+/// `pos_base`, `AttnDecodeDims`'s `kv_len`, etc.) are updated via
+/// `queue.write_buffer`, which is a *queue-timeline* operation, not an
+/// encoder-timeline one - every `write_buffer` call for the same
+/// pool-cached key before the next `submit()` clobbers the previous one, so
+/// batching multiple `decode_layers` calls into one unsubmitted encoder
+/// made every dispatch in that encoder read whatever dims the *last*
+/// iteration's writes left behind, not its own - undefined/hanging
+/// behavior on the KV-cache offsets `scatter_kv_gpu` computes from them.
+/// One submit per token keeps every `write_buffer` visible before the
+/// dispatches that depend on it run, at the cost of `token_ids.len()`
+/// submits instead of 1 (still zero *readbacks* except the last).
+pub async fn forward_prefill_suffix(engine: &Engine, model: &GpuModel, cache: &mut KvCache, token_ids: &[u32], cos: &wgpu::Buffer, sin: &wgpu::Buffer, mask: Option<&wgpu::Buffer>) -> Vec<f32> {
+    let (last, rest) = token_ids.split_last().expect("forward_prefill_suffix needs at least one token");
+    for &tok in rest {
+        let mut encoder = engine.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("prefill_suffix_step") });
+        let _ = decode_layers(engine, model, &mut encoder, cache, tok, cos, sin, None);
+        engine.queue.submit(Some(encoder.finish()));
+        cache.kv_len += 1;
+    }
+    let mut encoder = engine.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("prefill_suffix_last") });
+    let logits = decode_layers(engine, model, &mut encoder, cache, *last, cos, sin, mask);
+    engine.queue.submit(Some(encoder.finish()));
+    cache.kv_len += 1;
+    engine.read_buffer(&logits, model.config.vocab_size).await
 }

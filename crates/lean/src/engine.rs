@@ -42,6 +42,11 @@ pub struct Engine {
     /// bytes (~608KB for this model's 151936-vocab lm head) per step - see
     /// `model.rs::forward_decode_step`'s `argmax_readback` parameter.
     pub argmax: wgpu::ComputePipeline,
+    /// Per-step constrained-decoding mask (`shaders/mask_logits.wgsl`):
+    /// zeroes-out (sets to -inf) any vocab id whose bit is unset in a
+    /// caller-supplied bitset, in place on the logits buffer, before
+    /// argmax/readback - see `model.rs::mask_logits_gpu`.
+    pub mask_logits: wgpu::ComputePipeline,
 }
 
 fn make_pipeline(device: &wgpu::Device, label: &str, src: &str) -> wgpu::ComputePipeline {
@@ -103,6 +108,7 @@ impl Engine {
             add_inplace: make_pipeline(&device, "add_inplace", include_str!("shaders/add_inplace.wgsl")),
             silu_mul: make_pipeline(&device, "silu_mul", include_str!("shaders/silu_mul.wgsl")),
             argmax: make_pipeline(&device, "argmax", include_str!("shaders/argmax.wgsl")),
+            mask_logits: make_pipeline(&device, "mask_logits", include_str!("shaders/mask_logits.wgsl")),
             device,
             queue,
             dispatch_count: Cell::new(0),

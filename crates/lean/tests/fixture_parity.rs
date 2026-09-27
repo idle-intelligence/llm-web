@@ -80,7 +80,7 @@ fn fixture_parity_both_kernel_paths() {
             let cos_buf = engine.buf_f32(&cos, "rope_cos");
             let sin_buf = engine.buf_f32(&sin, "rope_sin");
 
-            let mut logits = pollster::block_on(forward_prefill(&engine, &model, &mut cache, &case.input_ids, &cos_buf, &sin_buf));
+            let mut logits = pollster::block_on(forward_prefill(&engine, &model, &mut cache, &case.input_ids, &cos_buf, &sin_buf, None));
 
             let mut top20: Vec<(u32, f32)> = (0..logits.len() as u32).map(|i| (i, logits[i as usize])).collect();
             top20.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
@@ -94,7 +94,7 @@ fn fixture_parity_both_kernel_paths() {
             for _ in 0..case.greedy_continuation.len() {
                 let next_id = argmax(&logits);
                 got_tokens.push(next_id);
-                logits = pollster::block_on(forward_decode_step(&engine, &model, &mut cache, next_id, &cos_buf, &sin_buf));
+                logits = pollster::block_on(forward_decode_step(&engine, &model, &mut cache, next_id, &cos_buf, &sin_buf, None));
             }
             assert_eq!(got_tokens, case.greedy_continuation, "[fast={fast_kernels} case={}] greedy continuation mismatch", case.name);
         }
