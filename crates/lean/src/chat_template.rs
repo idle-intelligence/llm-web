@@ -40,15 +40,26 @@ pub fn render_user_prompt(chat_template: &str, prompt: &str) -> Result<String> {
     Ok(rendered)
 }
 
-/// Reads the `chat_template` string out of a HF `tokenizer_config.json`.
-pub fn read_chat_template(tokenizer_config_path: &str) -> Result<String> {
-    let text = std::fs::read_to_string(tokenizer_config_path).with_context(|| format!("reading {tokenizer_config_path}"))?;
-    let value: serde_json::Value = serde_json::from_str(&text)?;
+/// Extracts the `chat_template` string out of a HF `tokenizer_config.json`'s
+/// already-read text — the wasm32-safe half of [`read_chat_template`] (no
+/// filesystem access), shared with `web.rs`, which gets this text from JS
+/// (`fetch(...).text()`) instead of a path.
+pub fn chat_template_from_config_json(tokenizer_config_json: &str) -> Result<String> {
+    let value: serde_json::Value = serde_json::from_str(tokenizer_config_json)?;
     value
         .get("chat_template")
         .and_then(|v| v.as_str())
         .map(str::to_string)
-        .with_context(|| format!("{tokenizer_config_path} has no string 'chat_template' field"))
+        .context("tokenizer_config.json has no string 'chat_template' field")
+}
+
+/// Reads the `chat_template` string out of a HF `tokenizer_config.json` file
+/// on disk. Native only (`std::fs`) — see [`chat_template_from_config_json`]
+/// for the wasm32 path.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn read_chat_template(tokenizer_config_path: &str) -> Result<String> {
+    let text = std::fs::read_to_string(tokenizer_config_path).with_context(|| format!("reading {tokenizer_config_path}"))?;
+    chat_template_from_config_json(&text).with_context(|| format!("in {tokenizer_config_path}"))
 }
 
 #[cfg(test)]

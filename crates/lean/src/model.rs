@@ -33,7 +33,9 @@
 //! includes the current position).
 
 use anyhow::{Context, Result};
+#[cfg(not(target_arch = "wasm32"))]
 use std::fs::File;
+#[cfg(not(target_arch = "wasm32"))]
 use std::io::BufReader;
 use wgpu::BindGroupEntry;
 
@@ -200,9 +202,21 @@ fn gguf_matmul<R: std::io::Read + std::io::Seek>(engine: &Engine, reader: &mut G
 }
 
 impl GpuModel {
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn load(engine: &Engine, gguf_path: &str, fast_kernels: bool) -> Result<Self> {
         let file = File::open(gguf_path).with_context(|| format!("opening {gguf_path}"))?;
-        let mut reader = GgufReader::open(BufReader::new(file))?;
+        Self::load_from_reader(engine, BufReader::new(file), fast_kernels)
+    }
+
+    /// Same loading logic as [`GpuModel::load`], generic over any
+    /// `Read + Seek` — the browser surface (`web.rs`) calls this with a
+    /// `std::io::Cursor` over the whole GGUF file's bytes (fetched by JS and
+    /// handed across the wasm boundary as one `Vec<u8>`; this model's
+    /// Q4_0 GGUF is ~350MB, comfortably under both the 2GB single-
+    /// `ArrayBuffer` limit and wasm32's 4GB address space, so no sharded
+    /// reader is needed here — see `gguf.rs`'s module doc comment on that).
+    pub fn load_from_reader<R: std::io::Read + std::io::Seek>(engine: &Engine, reader: R, fast_kernels: bool) -> Result<Self> {
+        let mut reader = GgufReader::open(reader)?;
         let config = config_from_gguf(&reader)?;
 
         let embed_info = reader.tensor_info("token_embd.weight").context("missing token_embd.weight")?.clone();

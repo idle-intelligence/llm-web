@@ -4,12 +4,27 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[lib]
+crate-type = ["cdylib", "rlib"]
+
 # Raw wgpu + hand-written WGSL only. No Burn, no CubeCL, no training — see
 # ~/.claude/projects/-Users-tc-Code/memory/project_lean_engine_direction.md.
-# Native first (Metal); wasm target added in a later slice.
 [features]
 default = []
 wasm = ["wgpu/webgpu"]
+# Minimal wasm-bindgen surface (src/web.rs): load GGUF + tokenizer bytes from
+# JS, generate greedily. Same tokenizers feature pattern as
+# crates/llm-wasm/Cargo.toml's `web` feature (onig/esaxx_fast are not
+# wasm32-safe; unstable_wasm swaps out rayon for wasm32).
+web = [
+    "wasm",
+    "dep:wasm-bindgen",
+    "dep:wasm-bindgen-futures",
+    "dep:js-sys",
+    "dep:web-sys",
+    "dep:console_error_panic_hook",
+    "getrandom/wasm_js",
+]
 
 [dependencies]
 anyhow = { workspace = true }
@@ -20,17 +35,24 @@ wgpu = { workspace = true }
 futures-channel = "0.3"
 serde = { workspace = true }
 serde_json = { workspace = true }
-clap = { workspace = true }
 minijinja = { workspace = true }
+
+wasm-bindgen = { workspace = true, optional = true }
+wasm-bindgen-futures = { workspace = true, optional = true }
+js-sys = { workspace = true, optional = true }
+web-sys = { workspace = true, optional = true }
+console_error_panic_hook = { workspace = true, optional = true }
+getrandom = { workspace = true, optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 pollster = "0.3"
-# native-only for now, same as llm-wasm's `native` feature
-# (tokenizers/fancy-regex, onig/esaxx_fast are not wasm32-safe); when this
-# crate gets a wasm target, switch to llm-wasm's Cargo.toml pattern
-# (tokenizers/unstable_wasm + tokenizers/fancy-regex, no onig) — see
-# crates/llm-wasm/Cargo.toml lines 40/50-52.
+clap = { workspace = true }
+# native-only: tokenizers/fancy-regex only, onig/esaxx_fast are not
+# wasm32-safe — see the wasm32 target block below for the browser build.
 tokenizers = { workspace = true, features = ["fancy-regex"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+tokenizers = { workspace = true, features = ["unstable_wasm", "fancy-regex"] }
 
 [[bin]]
 name = "lean-cli"

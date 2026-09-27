@@ -10,3 +10,5 @@ pub mod gguf;
 pub mod model;
 pub mod pool;
 pub mod quant;
+#[cfg(feature = "web")]
+pub mod web;
