@@ -12,17 +12,31 @@ use crate::gguf::GgmlDtype;
 
 const QK: usize = 32;
 
+/// One row-range of a matmul weight, GPU-resident. `row_start`/`rows` are in
+/// units of the weight's `out_dim` (GGUF/PyTorch `shape[0]`) — the same axis
+/// `linear()`'s output columns index. A weight that fits under the device's
+/// `max_storage_buffer_binding_size` in one binding gets exactly one chunk
+/// covering `0..out_dim`.
+pub struct QChunk {
+    pub qs: wgpu::Buffer,
+    pub scales: wgpu::Buffer,
+    pub row_start: u32,
+    pub rows: u32,
+}
+
 pub enum MatMulWeight {
     F32 { w: wgpu::Buffer },
-    Q8_0 { qs: wgpu::Buffer, scales: wgpu::Buffer, blocks_per_row: u32 },
-    Q4_0 { qs: wgpu::Buffer, scales: wgpu::Buffer, blocks_per_row: u32 },
+    Q8_0 { chunks: Vec<QChunk>, blocks_per_row: u32, out_dim: u32 },
+    Q4_0 { chunks: Vec<QChunk>, blocks_per_row: u32, out_dim: u32 },
 }
 
 impl MatMulWeight {
     pub fn gpu_bytes(&self) -> u64 {
         match self {
             MatMulWeight::F32 { w } => w.size(),
-            MatMulWeight::Q8_0 { qs, scales, .. } | MatMulWeight::Q4_0 { qs, scales, .. } => qs.size() + scales.size(),
+            MatMulWeight::Q8_0 { chunks, .. } | MatMulWeight::Q4_0 { chunks, .. } => {
+                chunks.iter().map(|c| c.qs.size() + c.scales.size()).sum()
+            }
         }
     }
 }
@@ -59,30 +73,60 @@ fn split_q4_blocks(bytes: &[u8], n_elements: usize) -> (Vec<u32>, Vec<f32>) {
     (qs, scales)
 }
 
+/// Splits `bytes` (row-major, block-contiguous Q4_0/Q8_0 data for a
+/// `[out_dim, in_dim]` weight) into row-aligned chunks no larger than the
+/// device's `max_storage_buffer_binding_size`, uploading each chunk's `qs`/
+/// `scales` as its own pair of buffers. General mechanism (not special-cased
+/// to any one tensor) — a weight that already fits in one binding gets
+/// exactly one chunk, identical to the pre-chunking layout.
+fn chunk_rows(engine: &Engine, label: &str, bytes: &[u8], out_dim: usize, blocks_per_row: usize, bytes_per_row: usize, is_q8: bool) -> Vec<QChunk> {
+    let limit = engine.max_storage_buffer_binding_size() as usize;
+    let rows_per_chunk = (limit / bytes_per_row).clamp(1, out_dim);
+    let mut chunks = Vec::with_capacity(out_dim.div_ceil(rows_per_chunk));
+    let mut row_start = 0usize;
+    while row_start < out_dim {
+        let rows = rows_per_chunk.min(out_dim - row_start);
+        let byte_start = row_start * bytes_per_row;
+        let byte_end = byte_start + rows * bytes_per_row;
+        let n_elements = rows * blocks_per_row * QK;
+        let (qs, scales) = if is_q8 {
+            split_q8_blocks(&bytes[byte_start..byte_end], n_elements)
+        } else {
+            split_q4_blocks(&bytes[byte_start..byte_end], n_elements)
+        };
+        chunks.push(QChunk {
+            qs: engine.buf_u32(&qs, &format!("{label}.qs[{row_start}]")),
+            scales: engine.buf_f32(&scales, &format!("{label}.scales[{row_start}]")),
+            row_start: row_start as u32,
+            rows: rows as u32,
+        });
+        row_start += rows;
+    }
+    chunks
+}
+
 /// Loads one matmul weight (`shape = [out_dim, in_dim]`, GGUF/PyTorch
 /// convention) straight from GGUF bytes at whatever residency it already
 /// has on disk: Q4_0/Q8_0 blocks go straight into the split_*_blocks repack
 /// (no requantize), F32/F16 dequantizes to f32. `bytes` is consumed and can
-/// be dropped by the caller immediately after this call returns.
+/// be dropped by the caller immediately after this call returns. Q4_0/Q8_0
+/// weights are split into row chunks by `chunk_rows` when they'd otherwise
+/// exceed the device's single-binding size limit (see that fn's doc
+/// comment); `linear()` in `model.rs` dispatches once per chunk.
 pub fn load_matmul_weight_gguf(engine: &Engine, label: &str, shape: &[usize], dtype: GgmlDtype, bytes: &[u8]) -> MatMulWeight {
+    let out_dim = shape[0];
     let in_dim = shape[1];
     let n_elements: usize = shape.iter().product();
     match dtype {
         GgmlDtype::Q8_0 => {
-            let (qs, scales) = split_q8_blocks(bytes, n_elements);
-            MatMulWeight::Q8_0 {
-                qs: engine.buf_u32(&qs, &format!("{label}.qs")),
-                scales: engine.buf_f32(&scales, &format!("{label}.scales")),
-                blocks_per_row: (in_dim / QK) as u32,
-            }
+            let blocks_per_row = in_dim / QK;
+            let chunks = chunk_rows(engine, label, bytes, out_dim, blocks_per_row, blocks_per_row * 34, true);
+            MatMulWeight::Q8_0 { chunks, blocks_per_row: blocks_per_row as u32, out_dim: out_dim as u32 }
         }
         GgmlDtype::Q4_0 => {
-            let (qs, scales) = split_q4_blocks(bytes, n_elements);
-            MatMulWeight::Q4_0 {
-                qs: engine.buf_u32(&qs, &format!("{label}.qs")),
-                scales: engine.buf_f32(&scales, &format!("{label}.scales")),
-                blocks_per_row: (in_dim / QK) as u32,
-            }
+            let blocks_per_row = in_dim / QK;
+            let chunks = chunk_rows(engine, label, bytes, out_dim, blocks_per_row, blocks_per_row * 18, false);
+            MatMulWeight::Q4_0 { chunks, blocks_per_row: blocks_per_row as u32, out_dim: out_dim as u32 }
         }
         GgmlDtype::F32 | GgmlDtype::F16 => {
             let data = crate::gguf::dequantize_for(dtype, bytes, n_elements);
@@ -102,6 +146,12 @@ pub struct Q4EmbeddingTable {
     pub vocab: u32,
 }
 
+/// Not chunked like `load_matmul_weight_gguf`'s Q4_0/Q8_0 weights: this
+/// model's `token_embd.weight` (~68MB packed) fits in one binding under
+/// every WebGPU adapter this crate targets. If a larger vocab/hidden size
+/// ever pushes it over a device's `max_storage_buffer_binding_size`,
+/// `embed_gather_q4.wgsl` would need the same chunk-dispatch treatment
+/// `linear()` gets for `MatMulWeight`.
 pub fn load_q4_embedding_gguf(engine: &Engine, label: &str, shape: &[usize], bytes: &[u8]) -> Q4EmbeddingTable {
     let vocab = shape[0];
     let hidden = shape[1];

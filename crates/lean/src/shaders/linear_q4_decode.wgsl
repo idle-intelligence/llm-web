@@ -11,8 +11,10 @@ struct Dims {
     n: u32,
     act: u32,
     blocks_per_row: u32,
-    _p0: u32,
-    _p1: u32,
+    // See linear_q4.wgsl's Dims doc comment: row-chunk offset/total for
+    // weights split across bindings.
+    n_offset: u32,
+    n_total: u32,
     _p2: u32,
 };
 
@@ -115,10 +117,10 @@ fn main(
     }
 
     if (lane == 0u && row_has_output) {
-        var v = partial_sums[tid] + b[n];
+        var v = partial_sums[tid] + b[dims.n_offset + n];
         if (dims.act == 1u) {
             v = max(v, 0.0);
         }
-        out[n] = v;
+        out[dims.n_offset + n] = v;
     }
 }

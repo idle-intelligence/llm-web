@@ -101,6 +101,16 @@ impl Engine {
         pollster::block_on(Self::new_async())
     }
 
+    /// Browser adapters commonly cap a single storage-buffer binding well
+    /// below what `max_buffer_size` allows (WebGPU's downlevel default is
+    /// 128 MiB; native Metal reports far more). `quant.rs::load_matmul_weight_gguf`
+    /// splits any weight whose per-row byte size times its row count would
+    /// exceed this into row-aligned chunks bound separately, so a single
+    /// tensor's residency is never assumed to fit in one binding.
+    pub fn max_storage_buffer_binding_size(&self) -> u64 {
+        self.device.limits().max_storage_buffer_binding_size as u64
+    }
+
     pub fn buf_f32(&self, data: &[f32], label: &str) -> wgpu::Buffer {
         self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some(label),

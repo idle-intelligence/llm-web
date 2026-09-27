@@ -14,8 +14,12 @@ struct Dims {
     n: u32,
     act: u32,
     blocks_per_row: u32,
-    _p0: u32,
-    _p1: u32,
+    // See linear_q4.wgsl's Dims doc comment: row-chunk offset/total for
+    // weights split across bindings. `n`/`N` here stay the chunk's local
+    // row count (qs/scales are per-chunk buffers, addressed from 0); only
+    // the bias read and output write need the global column.
+    n_offset: u32,
+    n_total: u32,
     _p2: u32,
 };
 
@@ -137,11 +141,11 @@ fn main(
             if (n_global >= N) {
                 continue;
             }
-            var v = acc[i][j] + b[n_global];
+            var v = acc[i][j] + b[dims.n_offset + n_global];
             if (dims.act == 1u) {
                 v = max(v, 0.0);
             }
-            out[m_global * N + n_global] = v;
+            out[m_global * dims.n_total + dims.n_offset + n_global] = v;
         }
     }
 }

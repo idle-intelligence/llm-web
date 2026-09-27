@@ -59,8 +59,11 @@ struct LinearQDims {
     n: u32,
     act: u32,
     blocks_per_row: u32,
-    _p0: u32,
-    _p1: u32,
+    /// Row-chunk offset/total for weights `quant.rs::chunk_rows` split
+    /// across multiple bindings (see its doc comment). A single-chunk
+    /// weight passes `n_offset: 0, n_total: n`.
+    n_offset: u32,
+    n_total: u32,
     _p2: u32,
 }
 #[repr(C)]
@@ -284,49 +287,60 @@ fn linear(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder, key:
             );
             engine.dispatch(encoder, &engine.linear, &bg, wgs, key);
         }
-        MatMulWeight::Q8_0 { qs, scales, blocks_per_row } => {
+        MatMulWeight::Q8_0 { chunks, blocks_per_row, out_dim: n_total } => {
             // Q8_0 is only used for the lm head (`output.weight`) in this
             // model — one call per forward, not worth a tiled/coalesced
             // port yet (see the slice-2 report's "did not port" list).
-            let dims = pool.uniform(&format!("{key}.dims"), LinearQDims { m: rows, k: in_dim, n: out_dim, act: 0, blocks_per_row: *blocks_per_row, _p0: 0, _p1: 0, _p2: 0 });
-            let bg = pool.bind_group(
-                key,
-                &engine.linear_q8,
-                &[
+            // `output.weight`'s Q8_0 qs buffer (~130MB) is the one tensor in
+            // this model that can exceed a browser's storage-buffer-binding
+            // limit, hence `chunks` (see `quant.rs::chunk_rows`) — one
+            // dispatch per chunk, each writing its own column range of
+            // `out` (see linear_q8.wgsl's Dims doc comment).
+            for chunk in chunks {
+                let ckey = format!("{key}.{}", chunk.row_start);
+                let dims = pool.uniform(&format!("{ckey}.dims"), LinearQDims { m: rows, k: in_dim, n: chunk.rows, act: 0, blocks_per_row: *blocks_per_row, n_offset: chunk.row_start, n_total: *n_total, _p2: 0 });
+                let bg = pool.bind_group(
+                    &ckey,
+                    &engine.linear_q8,
+                    &[
+                        BindGroupEntry { binding: 0, resource: x.as_entire_binding() },
+                        BindGroupEntry { binding: 1, resource: chunk.qs.as_entire_binding() },
+                        BindGroupEntry { binding: 2, resource: chunk.scales.as_entire_binding() },
+                        BindGroupEntry { binding: 3, resource: b.as_entire_binding() },
+                        BindGroupEntry { binding: 4, resource: out.as_entire_binding() },
+                        BindGroupEntry { binding: 5, resource: dims.as_entire_binding() },
+                    ],
+                );
+                engine.dispatch(encoder, &engine.linear_q8, &bg, (chunk.rows.div_ceil(16), rows.div_ceil(16), 1), &ckey);
+            }
+        }
+        MatMulWeight::Q4_0 { chunks, blocks_per_row, out_dim: n_total } => {
+            for chunk in chunks {
+                let ckey = format!("{key}.{}", chunk.row_start);
+                let dims = pool.uniform(&format!("{ckey}.dims"), LinearQDims { m: rows, k: in_dim, n: chunk.rows, act: 0, blocks_per_row: *blocks_per_row, n_offset: chunk.row_start, n_total: *n_total, _p2: 0 });
+                let entries = [
                     BindGroupEntry { binding: 0, resource: x.as_entire_binding() },
-                    BindGroupEntry { binding: 1, resource: qs.as_entire_binding() },
-                    BindGroupEntry { binding: 2, resource: scales.as_entire_binding() },
+                    BindGroupEntry { binding: 1, resource: chunk.qs.as_entire_binding() },
+                    BindGroupEntry { binding: 2, resource: chunk.scales.as_entire_binding() },
                     BindGroupEntry { binding: 3, resource: b.as_entire_binding() },
                     BindGroupEntry { binding: 4, resource: out.as_entire_binding() },
                     BindGroupEntry { binding: 5, resource: dims.as_entire_binding() },
-                ],
-            );
-            engine.dispatch(encoder, &engine.linear_q8, &bg, wgs, key);
-        }
-        MatMulWeight::Q4_0 { qs, scales, blocks_per_row } => {
-            let dims = pool.uniform(&format!("{key}.dims"), LinearQDims { m: rows, k: in_dim, n: out_dim, act: 0, blocks_per_row: *blocks_per_row, _p0: 0, _p1: 0, _p2: 0 });
-            let entries = [
-                BindGroupEntry { binding: 0, resource: x.as_entire_binding() },
-                BindGroupEntry { binding: 1, resource: qs.as_entire_binding() },
-                BindGroupEntry { binding: 2, resource: scales.as_entire_binding() },
-                BindGroupEntry { binding: 3, resource: b.as_entire_binding() },
-                BindGroupEntry { binding: 4, resource: out.as_entire_binding() },
-                BindGroupEntry { binding: 5, resource: dims.as_entire_binding() },
-            ];
-            if !fast {
-                // Reference/naive path — always linear_q4.wgsl regardless
-                // of `rows`, kept for the fixture-parity gate and as the
-                // fallback when a fast kernel's correctness is in doubt.
-                let bg = pool.bind_group(key, &engine.linear_q4, &entries);
-                engine.dispatch(encoder, &engine.linear_q4, &bg, wgs, key);
-            } else if rows > 1 {
-                // Prefill: tiled matmul (llm-wasm's shader_q4_tiled.wgsl port).
-                let bg = pool.bind_group(&format!("{key}.tiled"), &engine.linear_q4_tiled, &entries);
-                engine.dispatch(encoder, &engine.linear_q4_tiled, &bg, (out_dim.div_ceil(64), rows.div_ceil(64), 1), key);
-            } else {
-                // Decode: coalesced matvec (llm-wasm's shader_q4_matvec_coalesced.wgsl port).
-                let bg = pool.bind_group(&format!("{key}.decode"), &engine.linear_q4_decode, &entries);
-                engine.dispatch(encoder, &engine.linear_q4_decode, &bg, (out_dim.div_ceil(4), 1, 1), key);
+                ];
+                if !fast {
+                    // Reference/naive path — always linear_q4.wgsl regardless
+                    // of `rows`, kept for the fixture-parity gate and as the
+                    // fallback when a fast kernel's correctness is in doubt.
+                    let bg = pool.bind_group(&ckey, &engine.linear_q4, &entries);
+                    engine.dispatch(encoder, &engine.linear_q4, &bg, (chunk.rows.div_ceil(16), rows.div_ceil(16), 1), &ckey);
+                } else if rows > 1 {
+                    // Prefill: tiled matmul (llm-wasm's shader_q4_tiled.wgsl port).
+                    let bg = pool.bind_group(&format!("{ckey}.tiled"), &engine.linear_q4_tiled, &entries);
+                    engine.dispatch(encoder, &engine.linear_q4_tiled, &bg, (chunk.rows.div_ceil(64), rows.div_ceil(64), 1), &ckey);
+                } else {
+                    // Decode: coalesced matvec (llm-wasm's shader_q4_matvec_coalesced.wgsl port).
+                    let bg = pool.bind_group(&format!("{ckey}.decode"), &engine.linear_q4_decode, &entries);
+                    engine.dispatch(encoder, &engine.linear_q4_decode, &bg, (chunk.rows.div_ceil(4), 1, 1), &ckey);
+                }
             }
         }
     }

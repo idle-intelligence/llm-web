@@ -10,8 +10,13 @@ struct Dims {
     n: u32,
     act: u32,
     blocks_per_row: u32,
-    _p0: u32,
-    _p1: u32,
+    // Row-chunk offset/total for weights split across bindings by
+    // `quant.rs::load_matmul_weight_gguf` (browser storage-buffer-size
+    // limit): `n` above is the chunk's local row count; a chunk covering
+    // the whole tensor sets `n_offset = 0, n_total = n`, identical to the
+    // unchunked layout this kernel originally had.
+    n_offset: u32,
+    n_total: u32,
     _p2: u32,
 };
 
@@ -55,9 +60,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
         k = k + 32u;
     }
-    acc = acc + b[n];
+    acc = acc + b[dims.n_offset + n];
     if (dims.act == 1u) {
         acc = max(acc, 0.0);
     }
-    out[m * dims.n + n] = acc;
+    out[m * dims.n_total + dims.n_offset + n] = acc;
 }
