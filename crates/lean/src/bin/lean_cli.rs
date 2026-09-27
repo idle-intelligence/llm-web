@@ -21,7 +21,7 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use lean::chat_template::{read_chat_template, render_user_prompt};
-use lean::model::{build_rope_tables, forward_decode_step_argmax, forward_prefill, GpuModel, KvCache};
+use lean::model::{build_mask_bitset, build_rope_tables, forward_decode_step, forward_decode_step_argmax, forward_prefill, forward_prefill_suffix, GpuModel, KvCache, KvSnapshot};
 use serde::Deserialize;
 use tokenizers::Tokenizer;
 
@@ -31,6 +31,19 @@ enum Kernel {
     Naive,
     /// Tiled prefill / coalesced decode kernels (slice 2).
     Fast,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
+enum Check {
+    /// Default: the fixture-parity loop this file has always run.
+    Fixture,
+    /// KV snapshot/restore: prefill(prefix) -> snapshot -> restore ->
+    /// prefill(suffix) -> generate must match prefill(prefix+suffix) ->
+    /// generate exactly, plus an export/import byte round trip.
+    KvSnapshot,
+    /// Per-step logit mask: a singleton mask at every step must force an
+    /// exact target string; an all-allowed mask must match unmasked output.
+    Mask,
 }
 
 #[derive(Parser)]
@@ -48,6 +61,9 @@ struct Args {
     fixture: String,
     #[arg(long, value_enum, default_value_t = Kernel::Fast)]
     kernel: Kernel,
+    /// Which native check to run instead of the default fixture loop.
+    #[arg(long, value_enum, default_value_t = Check::Fixture)]
+    check: Check,
 }
 
 #[derive(Deserialize)]
@@ -114,7 +130,7 @@ fn run_generation(engine: &lean::engine::Engine, model: &GpuModel, token_ids: &[
 
     engine.reset_dispatch_count();
     let prefill_start = Instant::now();
-    let logits = pollster::block_on(forward_prefill(engine, model, &mut cache, token_ids, &cos_buf, &sin_buf));
+    let logits = pollster::block_on(forward_prefill(engine, model, &mut cache, token_ids, &cos_buf, &sin_buf, None));
     let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
     let prefill_dispatches = engine.dispatch_count();
     let prefill_logits = logits.clone();
@@ -131,7 +147,7 @@ fn run_generation(engine: &lean::engine::Engine, model: &GpuModel, token_ids: &[
     for _ in 0..n_tokens {
         got_tokens.push(next_id);
         let decode_start = Instant::now();
-        next_id = pollster::block_on(forward_decode_step_argmax(engine, model, &mut cache, next_id, &cos_buf, &sin_buf));
+        next_id = pollster::block_on(forward_decode_step_argmax(engine, model, &mut cache, next_id, &cos_buf, &sin_buf, None));
         decode_ms_total += decode_start.elapsed().as_secs_f64() * 1000.0;
     }
     let decode_dispatches_per_step = engine.dispatch_count() / n_tokens as u64;
@@ -141,6 +157,126 @@ fn run_generation(engine: &lean::engine::Engine, model: &GpuModel, token_ids: &[
     );
 
     (prefill_logits, got_tokens, prefill_ms / seq as f64, decode_ms_total / n_tokens as f64)
+}
+
+/// `--check kv-snapshot`: prefill(prefix) -> snapshot -> restore into a
+/// fresh cache -> prefill(suffix) -> greedy generate must reproduce
+/// prefill(prefix+suffix) -> greedy generate exactly, plus an export/import
+/// byte round trip. Uses `--prompt` split at its midpoint token.
+fn check_kv_snapshot(engine: &lean::engine::Engine, model: &GpuModel, tokenizer: &Tokenizer, chat_template: &str, prompt: &str, n_new: usize) -> Result<()> {
+    let all_ids = tokenize_prompt(tokenizer, chat_template, prompt)?;
+    anyhow::ensure!(all_ids.len() >= 4, "prompt too short to split into a prefix/suffix ({} tokens)", all_ids.len());
+    let split = all_ids.len() / 2;
+    let (prefix, suffix) = all_ids.split_at(split);
+    let max_ctx = all_ids.len() as u32 + n_new as u32 + 4;
+    let (cos, sin) = build_rope_tables(model.config.head_dim, model.config.rope_theta, max_ctx as usize);
+    let cos_buf = engine.buf_f32(&cos, "rope_cos");
+    let sin_buf = engine.buf_f32(&sin, "rope_sin");
+
+    // Path A: prefill(prefix+suffix) from scratch, then greedy generate.
+    model.pool.reset();
+    let mut cache_a = KvCache::new(engine, &model.config, max_ctx);
+    let mut logits_a = pollster::block_on(forward_prefill(engine, model, &mut cache_a, &all_ids, &cos_buf, &sin_buf, None));
+    let mut tokens_a = Vec::with_capacity(n_new);
+    for _ in 0..n_new {
+        let id = argmax(&logits_a);
+        tokens_a.push(id);
+        logits_a = pollster::block_on(forward_decode_step(engine, model, &mut cache_a, id, &cos_buf, &sin_buf, None));
+    }
+
+    // Path B: prefill(prefix) -> snapshot -> restore -> prefill(suffix) -> generate.
+    model.pool.reset();
+    let mut cache_prefix = KvCache::new(engine, &model.config, max_ctx);
+    let _ = pollster::block_on(forward_prefill(engine, model, &mut cache_prefix, prefix, &cos_buf, &sin_buf, None));
+    let snapshot = pollster::block_on(cache_prefix.snapshot(engine));
+
+    let bytes = snapshot.to_bytes();
+    let snapshot2 = KvSnapshot::from_bytes(&bytes)?;
+
+    model.pool.reset();
+    let mut cache_b = KvCache::new(engine, &model.config, max_ctx);
+    cache_b.restore(engine, &snapshot2);
+    let mut logits_b = pollster::block_on(forward_prefill_suffix(engine, model, &mut cache_b, suffix, &cos_buf, &sin_buf, None));
+    let mut tokens_b = Vec::with_capacity(n_new);
+    for _ in 0..n_new {
+        let id = argmax(&logits_b);
+        tokens_b.push(id);
+        logits_b = pollster::block_on(forward_decode_step(engine, model, &mut cache_b, id, &cos_buf, &sin_buf, None));
+    }
+
+    println!("prefix_tokens={} suffix_tokens={} export_bytes={}", prefix.len(), suffix.len(), bytes.len());
+    if tokens_a == tokens_b {
+        println!("PASS: restore+prefill(suffix) matches prefill(prefix+suffix) exactly ({tokens_a:?})");
+        Ok(())
+    } else {
+        anyhow::bail!("FAIL: token mismatch\n  full_prefill: {tokens_a:?}\n  restore+suffix: {tokens_b:?}");
+    }
+}
+
+/// `--check mask`: a per-step singleton mask must force greedy decoding to
+/// reproduce a fixed target string; an all-allowed mask must match
+/// unmasked output.
+fn check_mask(engine: &lean::engine::Engine, model: &GpuModel, tokenizer: &Tokenizer, chat_template: &str, prompt: &str) -> Result<()> {
+    let vocab = model.config.vocab_size;
+    let prompt_ids = tokenize_prompt(tokenizer, chat_template, prompt)?;
+    let target = "{\"ok\":true}";
+    let target_ids = tokenizer.encode(target, false).map_err(|e| anyhow::anyhow!("tokenizer encode failed: {e}"))?.get_ids().to_vec();
+
+    let max_ctx = prompt_ids.len() as u32 + target_ids.len() as u32 + 4;
+    let (cos, sin) = build_rope_tables(model.config.head_dim, model.config.rope_theta, max_ctx as usize);
+    let cos_buf = engine.buf_f32(&cos, "rope_cos");
+    let sin_buf = engine.buf_f32(&sin, "rope_sin");
+
+    model.pool.reset();
+    let mut cache = KvCache::new(engine, &model.config, max_ctx);
+    let mask0 = engine.buf_u32(&build_mask_bitset(vocab, &[target_ids[0]]), "mask0");
+    let logits = pollster::block_on(forward_prefill(engine, model, &mut cache, &prompt_ids, &cos_buf, &sin_buf, Some(&mask0)));
+    let mut got = Vec::with_capacity(target_ids.len());
+    let mut next = argmax(&logits);
+    got.push(next);
+    for &want in &target_ids[1..] {
+        let mask = engine.buf_u32(&build_mask_bitset(vocab, &[want]), "mask_step");
+        next = pollster::block_on(forward_decode_step_argmax(engine, model, &mut cache, next, &cos_buf, &sin_buf, Some(&mask)));
+        got.push(next);
+    }
+
+    if got != target_ids {
+        anyhow::bail!("FAIL: singleton mask did not force the target string\n  got:    {got:?}\n  target: {target_ids:?}");
+    }
+    let text = tokenizer.decode(&got, true).map_err(|e| anyhow::anyhow!("tokenizer decode failed: {e}"))?;
+    println!("PASS: singleton mask forced target string {text:?}");
+
+    // All-allowed mask must match unmasked output over the same prompt.
+    let n_steps = 8usize.min(max_ctx as usize - prompt_ids.len());
+    model.pool.reset();
+    let mut cache_free = KvCache::new(engine, &model.config, max_ctx);
+    let logits_free = pollster::block_on(forward_prefill(engine, model, &mut cache_free, &prompt_ids, &cos_buf, &sin_buf, None));
+    let mut unmasked = Vec::with_capacity(n_steps);
+    let mut next = argmax(&logits_free);
+    for _ in 0..n_steps {
+        unmasked.push(next);
+        next = pollster::block_on(forward_decode_step_argmax(engine, model, &mut cache_free, next, &cos_buf, &sin_buf, None));
+    }
+
+    let all_bits = build_mask_bitset(vocab, &(0..vocab as u32).collect::<Vec<_>>());
+    model.pool.reset();
+    let mut cache_masked = KvCache::new(engine, &model.config, max_ctx);
+    let mask_all0 = engine.buf_u32(&all_bits, "mask_all0");
+    let logits_masked = pollster::block_on(forward_prefill(engine, model, &mut cache_masked, &prompt_ids, &cos_buf, &sin_buf, Some(&mask_all0)));
+    let mut masked = Vec::with_capacity(n_steps);
+    let mut next = argmax(&logits_masked);
+    for _ in 0..n_steps {
+        masked.push(next);
+        let mask_step = engine.buf_u32(&all_bits, "mask_all_step");
+        next = pollster::block_on(forward_decode_step_argmax(engine, model, &mut cache_masked, next, &cos_buf, &sin_buf, Some(&mask_step)));
+    }
+
+    if unmasked == masked {
+        println!("PASS: all-allowed mask matches unmasked output ({} tokens)", n_steps);
+        Ok(())
+    } else {
+        anyhow::bail!("FAIL: all-allowed mask changed output\n  unmasked: {unmasked:?}\n  masked:   {masked:?}");
+    }
 }
 
 fn main() -> Result<()> {
@@ -159,6 +295,17 @@ fn main() -> Result<()> {
         "config: layers={} hidden={} heads={} kv_heads={} head_dim={} intermediate={} vocab={} eps={} theta={}",
         model.config.num_layers, model.config.hidden_size, model.config.num_heads, model.config.num_kv_heads, model.config.head_dim, model.config.intermediate_size, model.config.vocab_size, model.config.rms_norm_eps, model.config.rope_theta
     );
+
+    let default_check_prompt = "Tell me a short fact about the ocean.".to_string();
+    match args.check {
+        Check::KvSnapshot => {
+            return check_kv_snapshot(&engine, &model, &tokenizer, &chat_template, args.prompt.as_ref().unwrap_or(&default_check_prompt), args.tokens.min(16));
+        }
+        Check::Mask => {
+            return check_mask(&engine, &model, &tokenizer, &chat_template, args.prompt.as_ref().unwrap_or(&default_check_prompt));
+        }
+        Check::Fixture => {}
+    }
 
     if let Some(prompt) = &args.prompt {
         let token_ids = tokenize_prompt(&tokenizer, &chat_template, prompt)?;
