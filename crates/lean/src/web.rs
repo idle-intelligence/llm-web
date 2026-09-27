@@ -22,7 +22,7 @@ use tokenizers::Tokenizer;
 
 use crate::chat_template::{chat_template_from_config_json, render_user_prompt};
 use crate::engine::Engine;
-use crate::model::{build_rope_tables, forward_decode_step, forward_prefill, GpuModel, KvCache};
+use crate::model::{build_rope_tables, forward_decode_step_argmax, forward_prefill, GpuModel, KvCache};
 
 fn wasm_log(msg: &str) {
     web_sys::console::log_1(&JsValue::from_str(msg));
@@ -142,20 +142,50 @@ impl LeanEngine {
             }
         };
 
-        let mut logits = forward_prefill(&self.engine, model, cache, &token_ids, cos_buf, sin_buf).await;
+        self.engine.reset_dispatch_count();
+        let logits = forward_prefill(&self.engine, model, cache, &token_ids, cos_buf, sin_buf).await;
+        let prefill_dispatches = self.engine.dispatch_count();
+        // Only the prompt's last-position argmax runs on the CPU (off the
+        // one `Vec<f32>` prefill already reads back); every decode step's
+        // argmax runs on the GPU inside `forward_decode_step_argmax`, so
+        // decode's readback is 4 bytes/step, not `vocab_size * 4` - see
+        // model.rs's doc comment.
+        let mut next_id = argmax(&logits);
 
+        self.engine.reset_dispatch_count();
         let mut generated = Vec::with_capacity(max_new_tokens as usize);
         for _ in 0..max_new_tokens {
-            let next_id = argmax(&logits);
             if model.config.eos_token_ids.contains(&next_id) {
                 break;
             }
             generated.push(next_id);
             call_on_token(next_id);
-            logits = forward_decode_step(&self.engine, model, cache, next_id, cos_buf, sin_buf).await;
+            next_id = forward_decode_step_argmax(&self.engine, model, cache, next_id, cos_buf, sin_buf).await;
         }
+        let decode_steps = generated.len().max(1) as u64;
+        wasm_log(&format!(
+            "[lean] seq={} prefill_dispatches={} ({:.1}/token) decode_dispatches_per_step={}",
+            token_ids.len(),
+            prefill_dispatches,
+            prefill_dispatches as f64 / token_ids.len() as f64,
+            self.engine.dispatch_count() / decode_steps
+        ));
 
         tokenizer.decode(&generated, true).map_err(|e| JsError::new(&format!("tokenizer decode failed: {e}")))
+    }
+
+    /// Renders + tokenizes `prompt` the same way `generate()` does and
+    /// returns the resulting token count, with no GPU work - lets a harness
+    /// log a synthetic timing-only prompt's actual length (e.g. the
+    /// ~1000-token prefill case in `www/main.js`) without duplicating the
+    /// chat-template/tokenizer path in JS.
+    #[wasm_bindgen(js_name = tokenCount)]
+    pub fn token_count(&self, prompt: String) -> Result<u32, JsError> {
+        let tokenizer = self.tokenizer.as_ref().ok_or_else(|| JsError::new("load() must be called first"))?;
+        let chat_template = self.chat_template.as_ref().ok_or_else(|| JsError::new("load() must be called first"))?;
+        let rendered = render_user_prompt(chat_template, &prompt).map_err(|e| JsError::new(&format!("failed to render prompt: {e}")))?;
+        let encoding = tokenizer.encode(rendered, false).map_err(|e| JsError::new(&format!("tokenizer encode failed: {e}")))?;
+        Ok(encoding.get_ids().len() as u32)
     }
 
     /// JSON string with basic model/device info, for a status line.

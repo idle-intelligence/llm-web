@@ -7,11 +7,17 @@
 //! declaration order matching each `.wgsl` file.
 
 use std::borrow::Cow;
+use std::cell::Cell;
 use wgpu::util::DeviceExt;
 
 pub struct Engine {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
+    /// Total `dispatch()` calls since the last `reset_dispatch_count()` -
+    /// same op-count metric on native and wasm (same Rust forward-pass
+    /// code), used to separate "more work" from "slower per-op overhead"
+    /// when comparing the two - see docs/runs/2026-09-28-lean-perf.md.
+    dispatch_count: Cell<u64>,
     pub embed_gather_q4: wgpu::ComputePipeline,
     pub rmsnorm: wgpu::ComputePipeline,
     pub rope: wgpu::ComputePipeline,
@@ -31,6 +37,11 @@ pub struct Engine {
     pub attn_decode: wgpu::ComputePipeline,
     pub add_inplace: wgpu::ComputePipeline,
     pub silu_mul: wgpu::ComputePipeline,
+    /// Single-workgroup argmax over the logits vector -> one u32 output.
+    /// Lets decode read back 4 bytes instead of the full `vocab_size * 4`
+    /// bytes (~608KB for this model's 151936-vocab lm head) per step - see
+    /// `model.rs::forward_decode_step`'s `argmax_readback` parameter.
+    pub argmax: wgpu::ComputePipeline,
 }
 
 fn make_pipeline(device: &wgpu::Device, label: &str, src: &str) -> wgpu::ComputePipeline {
@@ -91,8 +102,10 @@ impl Engine {
             attn_decode: make_pipeline(&device, "attn_decode", include_str!("shaders/attn_decode.wgsl")),
             add_inplace: make_pipeline(&device, "add_inplace", include_str!("shaders/add_inplace.wgsl")),
             silu_mul: make_pipeline(&device, "silu_mul", include_str!("shaders/silu_mul.wgsl")),
+            argmax: make_pipeline(&device, "argmax", include_str!("shaders/argmax.wgsl")),
             device,
             queue,
+            dispatch_count: Cell::new(0),
         })
     }
 
@@ -154,6 +167,15 @@ impl Engine {
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, bind_group, &[]);
         pass.dispatch_workgroups(wgs.0, wgs.1, wgs.2);
+        self.dispatch_count.set(self.dispatch_count.get() + 1);
+    }
+
+    pub fn reset_dispatch_count(&self) {
+        self.dispatch_count.set(0);
+    }
+
+    pub fn dispatch_count(&self) -> u64 {
+        self.dispatch_count.get()
     }
 
     /// One copy-to-staging + map + read. NEVER call this crate's equivalent
@@ -181,6 +203,35 @@ impl Engine {
         rx.await.expect("map_async channel dropped").expect("buffer map failed");
         let data = slice.get_mapped_range();
         let result: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
+        drop(data);
+        staging.unmap();
+        result
+    }
+
+    /// Same shape as `read_buffer` but for a single `u32` (the argmax
+    /// kernel's output) - a 4-byte readback instead of a `vocab_size * 4`
+    /// one for every decode step.
+    pub async fn read_u32(&self, buf: &wgpu::Buffer) -> u32 {
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("readback_staging_u32"),
+            size: 4,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("readback_u32") });
+        encoder.copy_buffer_to_buffer(buf, 0, &staging, 0, 4);
+        self.queue.submit(Some(encoder.finish()));
+
+        let slice = staging.slice(..);
+        let (tx, rx) = futures_channel::oneshot::channel();
+        slice.map_async(wgpu::MapMode::Read, move |res| {
+            let _ = tx.send(res);
+        });
+        #[cfg(not(target_arch = "wasm32"))]
+        self.device.poll(wgpu::PollType::Wait).expect("device poll failed");
+        rx.await.expect("map_async channel dropped").expect("buffer map failed");
+        let data = slice.get_mapped_range();
+        let result: u32 = bytemuck::cast_slice(&data)[0];
         drop(data);
         staging.unmap();
         result

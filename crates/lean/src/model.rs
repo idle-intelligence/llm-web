@@ -45,6 +45,12 @@ use crate::gguf::GgufReader;
 use crate::pool::Pool;
 use crate::quant::{load_matmul_weight_gguf, load_q4_embedding_gguf, MatMulWeight, Q4EmbeddingTable};
 
+/// Row-count (`M`) threshold above which the tiled Q4_0 matmul
+/// (`linear_q4_tiled.wgsl`) is used for prefill; below it, the naive
+/// per-element kernel (`linear_q4.wgsl`) is faster (see `linear()`'s match
+/// arm doc comment) - measured in `docs/runs/2026-09-28-lean-perf.md`.
+const TILED_MIN_ROWS: u32 = 16;
+
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct LinearDims {
@@ -131,6 +137,14 @@ struct GatherDims {
     hidden: u32,
     blocks_per_row: u32,
     _p0: u32,
+}
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct ArgmaxDims {
+    n: u32,
+    _p0: u32,
+    _p1: u32,
+    _p2: u32,
 }
 
 struct LayerWeights {
@@ -346,14 +360,25 @@ fn linear(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder, key:
                     // fallback when a fast kernel's correctness is in doubt.
                     let bg = pool.bind_group(&ckey, &engine.linear_q4, &entries);
                     engine.dispatch(encoder, &engine.linear_q4, &bg, (chunk.rows.div_ceil(16), rows.div_ceil(16), 1), &ckey);
-                } else if rows > 1 {
-                    // Prefill: tiled matmul (llm-wasm's shader_q4_tiled.wgsl port).
-                    let bg = pool.bind_group(&format!("{ckey}.tiled"), &engine.linear_q4_tiled, &entries);
-                    engine.dispatch(encoder, &engine.linear_q4_tiled, &bg, (chunk.rows.div_ceil(64), rows.div_ceil(64), 1), &ckey);
-                } else {
+                } else if rows == 1 {
                     // Decode: coalesced matvec (llm-wasm's shader_q4_matvec_coalesced.wgsl port).
                     let bg = pool.bind_group(&format!("{ckey}.decode"), &engine.linear_q4_decode, &entries);
                     engine.dispatch(encoder, &engine.linear_q4_decode, &bg, (chunk.rows.div_ceil(4), 1, 1), &ckey);
+                } else if rows >= TILED_MIN_ROWS {
+                    // Prefill (M >= 16): tiled matmul (llm-wasm's
+                    // shader_q4_tiled.wgsl port). llm-wasm measured this
+                    // kernel 3-4x slower than the naive one at M=1 (tile/
+                    // barrier overhead not amortized) - it only pays off
+                    // once weight reuse across enough rows outweighs that,
+                    // hence the size gate rather than "any M > 1".
+                    let bg = pool.bind_group(&format!("{ckey}.tiled"), &engine.linear_q4_tiled, &entries);
+                    engine.dispatch(encoder, &engine.linear_q4_tiled, &bg, (chunk.rows.div_ceil(64), rows.div_ceil(64), 1), &ckey);
+                } else {
+                    // 2 <= M < 16: below the tiled kernel's break-even point
+                    // and not the M=1 shape the coalesced matvec assumes -
+                    // fall back to the naive per-element kernel.
+                    let bg = pool.bind_group(&format!("{ckey}.naive_small_m"), &engine.linear_q4, &entries);
+                    engine.dispatch(encoder, &engine.linear_q4, &bg, (chunk.rows.div_ceil(16), rows.div_ceil(16), 1), &ckey);
                 }
             }
         }
@@ -578,42 +603,85 @@ pub async fn forward_prefill(engine: &Engine, model: &GpuModel, cache: &mut KvCa
     all_logits[(seq as usize - 1) * vocab..].to_vec()
 }
 
-/// Decode one token against the cache (already populated up to
-/// `cache.kv_len`): embed, run every layer (each layer GPU-scatters this
-/// step's K/V into the cache at `cache.kv_len` before its own attention
-/// dispatch, so the step attends to itself too), return logits ([vocab]).
-pub async fn forward_decode_step(engine: &Engine, model: &GpuModel, cache: &mut KvCache, token_id: u32, cos: &wgpu::Buffer, sin: &wgpu::Buffer) -> Vec<f32> {
+fn argmax_gpu(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder, key: &str, logits: &wgpu::Buffer, vocab: u32) -> wgpu::Buffer {
+    let out = pool.data(&format!("{key}.out"), 1);
+    let dims = pool.uniform(&format!("{key}.dims"), ArgmaxDims { n: vocab, _p0: 0, _p1: 0, _p2: 0 });
+    let bg = pool.bind_group(
+        key,
+        &engine.argmax,
+        &[
+            BindGroupEntry { binding: 0, resource: logits.as_entire_binding() },
+            BindGroupEntry { binding: 1, resource: out.as_entire_binding() },
+            BindGroupEntry { binding: 2, resource: dims.as_entire_binding() },
+        ],
+    );
+    engine.dispatch(encoder, &engine.argmax, &bg, (1, 1, 1), key);
+    out
+}
+
+/// Records one decode step's whole layer stack (embed through the lm-head
+/// logits) into `encoder`, without submitting or reading anything back -
+/// shared by `forward_decode_step` (full-logits readback, for samplers) and
+/// `forward_decode_step_argmax` (single-index readback, the fast path),
+/// so the two only differ in what they append after the layer stack.
+#[allow(clippy::too_many_arguments)]
+fn decode_layers(engine: &Engine, model: &GpuModel, encoder: &mut wgpu::CommandEncoder, cache: &mut KvCache, token_id: u32, cos: &wgpu::Buffer, sin: &wgpu::Buffer) -> wgpu::Buffer {
     let cfg = &model.config;
     let hidden = cfg.hidden_size as u32;
     let pool = &model.pool;
     let pos = cache.kv_len;
 
-    let mut encoder = engine.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("decode") });
-    let x = embed_gather(engine, pool, &mut encoder, model, &[token_id]);
+    let x = embed_gather(engine, pool, encoder, model, &[token_id]);
 
     for (i, layer) in model.layers.iter().enumerate() {
         let key = format!("dec_layer{i}");
-        let normed = rmsnorm(engine, pool, &mut encoder, &format!("{key}.norm"), &x, &layer.attn_norm, 1, hidden, cfg.rms_norm_eps);
-        let (q, k, v) = qkv_proj(engine, pool, &mut encoder, &format!("{key}.qkv"), &normed, 1, cfg, layer, model.fast_kernels);
-        rope(engine, pool, &mut encoder, &format!("{key}.ropeq"), &q, cos, sin, 1, cfg.num_heads as u32, cfg.head_dim as u32, pos);
-        rope(engine, pool, &mut encoder, &format!("{key}.ropek"), &k, cos, sin, 1, cfg.num_kv_heads as u32, cfg.head_dim as u32, pos);
+        let normed = rmsnorm(engine, pool, encoder, &format!("{key}.norm"), &x, &layer.attn_norm, 1, hidden, cfg.rms_norm_eps);
+        let (q, k, v) = qkv_proj(engine, pool, encoder, &format!("{key}.qkv"), &normed, 1, cfg, layer, model.fast_kernels);
+        rope(engine, pool, encoder, &format!("{key}.ropeq"), &q, cos, sin, 1, cfg.num_heads as u32, cfg.head_dim as u32, pos);
+        rope(engine, pool, encoder, &format!("{key}.ropek"), &k, cos, sin, 1, cfg.num_kv_heads as u32, cfg.head_dim as u32, pos);
 
-        scatter_kv_gpu(&mut encoder, &cache.k[i], &k, 1, cfg, pos, cache.max_ctx);
-        scatter_kv_gpu(&mut encoder, &cache.v[i], &v, 1, cfg, pos, cache.max_ctx);
-        let attn_out = attn_decode(engine, pool, &mut encoder, &format!("{key}.attn"), &q, &cache.k[i], &cache.v[i], pos + 1, cache.max_ctx, cfg);
+        scatter_kv_gpu(encoder, &cache.k[i], &k, 1, cfg, pos, cache.max_ctx);
+        scatter_kv_gpu(encoder, &cache.v[i], &v, 1, cfg, pos, cache.max_ctx);
+        let attn_out = attn_decode(engine, pool, encoder, &format!("{key}.attn"), &q, &cache.k[i], &cache.v[i], pos + 1, cache.max_ctx, cfg);
 
-        let o = linear(engine, pool, &mut encoder, &format!("{key}.wo"), &attn_out, 1, hidden, &layer.o_w, &layer.o_b, hidden, model.fast_kernels);
-        add_inplace(engine, pool, &mut encoder, &format!("{key}.add1"), &x, &o, hidden);
+        let o = linear(engine, pool, encoder, &format!("{key}.wo"), &attn_out, 1, hidden, &layer.o_w, &layer.o_b, hidden, model.fast_kernels);
+        add_inplace(engine, pool, encoder, &format!("{key}.add1"), &x, &o, hidden);
 
-        let ffn_normed = rmsnorm(engine, pool, &mut encoder, &format!("{key}.ffnnorm"), &x, &layer.ffn_norm, 1, hidden, cfg.rms_norm_eps);
-        let mlp_out = mlp(engine, pool, &mut encoder, &format!("{key}.mlp"), &ffn_normed, 1, cfg, layer, model.fast_kernels);
-        add_inplace(engine, pool, &mut encoder, &format!("{key}.add2"), &x, &mlp_out, hidden);
+        let ffn_normed = rmsnorm(engine, pool, encoder, &format!("{key}.ffnnorm"), &x, &layer.ffn_norm, 1, hidden, cfg.rms_norm_eps);
+        let mlp_out = mlp(engine, pool, encoder, &format!("{key}.mlp"), &ffn_normed, 1, cfg, layer, model.fast_kernels);
+        add_inplace(engine, pool, encoder, &format!("{key}.add2"), &x, &mlp_out, hidden);
     }
 
-    let normed_final = rmsnorm(engine, pool, &mut encoder, "dec_out_norm", &x, &model.out_norm, 1, hidden, cfg.rms_norm_eps);
-    let logits = linear(engine, pool, &mut encoder, "dec_lm_head", &normed_final, 1, hidden, &model.lm_head, &model.zero_bias_vocab, cfg.vocab_size as u32, false);
+    let normed_final = rmsnorm(engine, pool, encoder, "dec_out_norm", &x, &model.out_norm, 1, hidden, cfg.rms_norm_eps);
+    linear(engine, pool, encoder, "dec_lm_head", &normed_final, 1, hidden, &model.lm_head, &model.zero_bias_vocab, cfg.vocab_size as u32, false)
+}
 
+/// Decode one token against the cache (already populated up to
+/// `cache.kv_len`): embed, run every layer (each layer GPU-scatters this
+/// step's K/V into the cache at `cache.kv_len` before its own attention
+/// dispatch, so the step attends to itself too), return logits ([vocab]).
+/// Full-vocab readback (~608KB for this model) - kept for samplers that need
+/// more than the top-1 id; greedy decode should prefer
+/// `forward_decode_step_argmax` below.
+pub async fn forward_decode_step(engine: &Engine, model: &GpuModel, cache: &mut KvCache, token_id: u32, cos: &wgpu::Buffer, sin: &wgpu::Buffer) -> Vec<f32> {
+    let mut encoder = engine.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("decode") });
+    let logits = decode_layers(engine, model, &mut encoder, cache, token_id, cos, sin);
     engine.queue.submit(Some(encoder.finish()));
-    cache.kv_len = pos + 1;
-    engine.read_buffer(&logits, cfg.vocab_size).await
+    cache.kv_len += 1;
+    engine.read_buffer(&logits, model.config.vocab_size).await
+}
+
+/// Same forward as `forward_decode_step`, but the argmax over the logits
+/// runs on the GPU (`shaders/argmax.wgsl`, one workgroup) in the same
+/// encoder/submit as the rest of the step, so the only readback is 4 bytes
+/// (one `u32`) instead of `vocab_size * 4` - the fast path for greedy
+/// decoding. Ties broken toward the lower index, matching the CPU `argmax()`
+/// helpers in `lean_cli.rs`/`web.rs`.
+pub async fn forward_decode_step_argmax(engine: &Engine, model: &GpuModel, cache: &mut KvCache, token_id: u32, cos: &wgpu::Buffer, sin: &wgpu::Buffer) -> u32 {
+    let mut encoder = engine.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("decode_argmax") });
+    let logits = decode_layers(engine, model, &mut encoder, cache, token_id, cos, sin);
+    let idx = argmax_gpu(engine, &model.pool, &mut encoder, "dec_argmax", &logits, model.config.vocab_size as u32);
+    engine.queue.submit(Some(encoder.finish()));
+    cache.kv_len += 1;
+    engine.read_u32(&idx).await
 }

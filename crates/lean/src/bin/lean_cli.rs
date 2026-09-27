@@ -21,7 +21,7 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use lean::chat_template::{read_chat_template, render_user_prompt};
-use lean::model::{build_rope_tables, forward_decode_step, forward_prefill, GpuModel, KvCache};
+use lean::model::{build_rope_tables, forward_decode_step_argmax, forward_prefill, GpuModel, KvCache};
 use serde::Deserialize;
 use tokenizers::Tokenizer;
 
@@ -112,20 +112,33 @@ fn run_generation(engine: &lean::engine::Engine, model: &GpuModel, token_ids: &[
     let cos_buf = engine.buf_f32(&cos, "rope_cos");
     let sin_buf = engine.buf_f32(&sin, "rope_sin");
 
+    engine.reset_dispatch_count();
     let prefill_start = Instant::now();
-    let mut logits = pollster::block_on(forward_prefill(engine, model, &mut cache, token_ids, &cos_buf, &sin_buf));
+    let logits = pollster::block_on(forward_prefill(engine, model, &mut cache, token_ids, &cos_buf, &sin_buf));
     let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
+    let prefill_dispatches = engine.dispatch_count();
     let prefill_logits = logits.clone();
 
+    // Argmax over the prompt's last-position logits happens once here (CPU,
+    // off the already-read-back `Vec<f32>`); every subsequent token's argmax
+    // runs on the GPU inside `forward_decode_step_argmax` itself, so the
+    // decode loop's only readback per step is 4 bytes (one `u32`), not the
+    // full `vocab_size * 4`-byte logits vector - see model.rs's doc comment.
+    let mut next_id = argmax(&logits);
     let mut got_tokens = Vec::with_capacity(n_tokens);
     let mut decode_ms_total = 0f64;
+    engine.reset_dispatch_count();
     for _ in 0..n_tokens {
-        let next_id = argmax(&logits);
         got_tokens.push(next_id);
         let decode_start = Instant::now();
-        logits = pollster::block_on(forward_decode_step(engine, model, &mut cache, next_id, &cos_buf, &sin_buf));
+        next_id = pollster::block_on(forward_decode_step_argmax(engine, model, &mut cache, next_id, &cos_buf, &sin_buf));
         decode_ms_total += decode_start.elapsed().as_secs_f64() * 1000.0;
     }
+    let decode_dispatches_per_step = engine.dispatch_count() / n_tokens as u64;
+    eprintln!(
+        "seq={seq} prefill_dispatches={prefill_dispatches} ({:.1}/token) decode_dispatches_per_step={decode_dispatches_per_step}",
+        prefill_dispatches as f64 / seq as f64
+    );
 
     (prefill_logits, got_tokens, prefill_ms / seq as f64, decode_ms_total / n_tokens as f64)
 }
