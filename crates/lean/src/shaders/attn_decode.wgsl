@@ -1,4 +1,5 @@
-// Single-token GQA decode attention over an F32 KV cache, length-independent.
+// Single-token GQA decode attention over an F32 KV cache, length-independent
+// in kv_len and generic in head_dim via a pipeline-overridable constant.
 //
 // Previous version stored every key's raw score in a `scratch: array<f32,
 // 2048>` workgroup array, capping `kv_len` at 2048 (silently wrong past
@@ -8,27 +9,45 @@
 // this was reachable.
 //
 // Fix: flash-attention-style tiled online softmax. Keys are processed in
-// tiles of `WG` (64) at a time; each tile's raw scores live in a
-// `WG`-sized shared array (reused every tile, not one slot per key), so
+// tiles of `HEAD_DIM` at a time; each tile's raw scores live in a
+// `HEAD_DIM`-sized shared array (reused every tile, not one slot per key), so
 // shared-memory use no longer depends on `kv_len` at all. Per-thread state
 // across tiles is just a scalar running max/sum (`m`/`l`) plus one scalar
 // accumulator (`acc`, since thread `tid` owns output dimension `tid` and
-// `WG == head_dim`): same running-softmax update flash attention uses,
-// applied one `WG`-wide tile of keys at a time instead of one key at a
-// time (attn_prefill.wgsl's per-thread version, which has no shared memory
-// to batch into, updates one key at a time instead).
+// the tile width equals `HEAD_DIM`): same running-softmax update flash
+// attention uses, applied one `HEAD_DIM`-wide tile of keys at a time instead
+// of one key at a time (attn_prefill.wgsl's per-thread version, which has no
+// shared memory to batch into, updates one key at a time instead).
 //
+// `HEAD_DIM` is a pipeline-overridable constant (WGSL `override`), not a
+// compile-time literal: engine.rs creates one pipeline per model head_dim
+// (64 for Qwen2.5, 128 for Qwen3) from this single shader source, setting
+// `HEAD_DIM` via `PipelineCompilationOptions::constants` at pipeline
+// creation, and `@workgroup_size(HEAD_DIM)` picks up the same override. The
+// per-thread-owns-one-output-dim design requires workgroup width to equal
+// head_dim exactly (one thread per dim, one tile-of-keys per workgroup pass
+// wide), which is why this can't just be a runtime uniform.
+//
+// Shared arrays are still sized at compile time (WGSL array lengths must be
+// const, not override, expressions) at `SHARED_CAP`, a fixed upper bound
+// independent of which model is loaded; only the *active* `0..HEAD_DIM`
+// prefix of each is ever touched. `SHARED_CAP == 256` matches WebGPU's
+// browser-mandated max workgroup invocation count, so this kernel already
+// covers every head_dim a workgroup could dispatch with one thread per dim.
+// 3 arrays * 256 * 4 bytes = 3KB, far under WebGPU's guaranteed minimum
+// 16KB workgroup storage limit - no adapter-limit check needed.
+override HEAD_DIM: u32 = 64u;
+const SHARED_CAP: u32 = 256u;
+var<workgroup> q_shared: array<f32, SHARED_CAP>;
+var<workgroup> tile_scores: array<f32, SHARED_CAP>; // this tile's raw/exp'd scores, reused per tile
+var<workgroup> reduce_buf: array<f32, SHARED_CAP>;
+
 // KV cache layout (load-bearing, documented here since this is the
 // kernel that defines it): [n_kv_heads, max_ctx, head_dim], head-major,
 // contiguous per head, written once per decode step at `[kv_head, kv_len,
 // :]`: see model.rs's `KvCache`. No causal mask needed: decode's single
 // query is always the newest position, so it attends to every key in
 // [0, kv_len).
-const WG: u32 = 64u; // head_dim for Qwen2.5-0.5B; must equal dims.head_dim at dispatch.
-var<workgroup> q_shared: array<f32, 64>;
-var<workgroup> tile_scores: array<f32, 64>; // this tile's WG raw/exp'd scores, reused per tile
-var<workgroup> reduce_buf: array<f32, 64>;
-
 struct Dims { n_heads: u32, n_kv_heads: u32, head_dim: u32, kv_len: u32, max_ctx: u32, scale: f32, _p0: u32, _p1: u32 };
 
 @group(0) @binding(0) var<storage, read> q: array<f32>;
@@ -37,13 +56,13 @@ struct Dims { n_heads: u32, n_kv_heads: u32, head_dim: u32, kv_len: u32, max_ctx
 @group(0) @binding(3) var<storage, read_write> out: array<f32>;
 @group(0) @binding(4) var<uniform> dims: Dims;
 
-@compute @workgroup_size(64)
+@compute @workgroup_size(HEAD_DIM)
 fn main(@builtin(workgroup_id) wg_id: vec3<u32>, @builtin(local_invocation_id) local_id: vec3<u32>) {
     let h = wg_id.x;
     let n_rep = dims.n_heads / dims.n_kv_heads;
     let kv_head = h / n_rep;
     let tid = local_id.x;
-    let hd = dims.head_dim;
+    let hd = dims.head_dim; // must equal HEAD_DIM at dispatch time - the override picks the pipeline, this is the runtime cross-check value used for indexing
 
     q_shared[tid] = q[h * hd + tid];
     workgroupBarrier();
@@ -70,10 +89,11 @@ fn main(@builtin(workgroup_id) wg_id: vec3<u32>, @builtin(local_invocation_id) l
         tile_scores[tid] = raw;
         workgroupBarrier();
 
-        // Tile max (tree reduction into reduce_buf).
+        // Tile max (tree reduction into reduce_buf). HEAD_DIM is a power of
+        // two (64/128/...), so halving the stride to 0 covers the whole tile.
         reduce_buf[tid] = raw;
         workgroupBarrier();
-        var stride: u32 = WG / 2u;
+        var stride: u32 = HEAD_DIM / 2u;
         loop {
             if (stride == 0u) {
                 break;
@@ -97,7 +117,7 @@ fn main(@builtin(workgroup_id) wg_id: vec3<u32>, @builtin(local_invocation_id) l
         tile_scores[tid] = this_p;
         reduce_buf[tid] = this_p;
         workgroupBarrier();
-        stride = WG / 2u;
+        stride = HEAD_DIM / 2u;
         loop {
             if (stride == 0u) {
                 break;
@@ -112,10 +132,10 @@ fn main(@builtin(workgroup_id) wg_id: vec3<u32>, @builtin(local_invocation_id) l
         workgroupBarrier();
 
         // Weighted V accumulation for this tile: every thread (owns dim
-        // `tid`) walks all WG keys in the tile.
+        // `tid`) walks all HEAD_DIM keys in the tile.
         var j: u32 = 0u;
         loop {
-            if (j >= WG) {
+            if (j >= HEAD_DIM) {
                 break;
             }
             let kk = tile_start + j;
@@ -127,7 +147,7 @@ fn main(@builtin(workgroup_id) wg_id: vec3<u32>, @builtin(local_invocation_id) l
         }
 
         m = new_m;
-        tile_start = tile_start + WG;
+        tile_start = tile_start + HEAD_DIM;
         workgroupBarrier();
     }
 

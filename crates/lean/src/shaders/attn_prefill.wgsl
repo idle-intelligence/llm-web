@@ -34,11 +34,10 @@
 // serves query heads [k*n_rep, (k+1)*n_rep)).
 //
 // `HEAD_DIM_MAX` is a compile-time bound on the private accumulator array
-// (WGSL arrays need a const length); 64 covers every head_dim this crate
-// targets today (Qwen2.5-0.5B's head_dim=64, same assumption
-// attn_decode.wgsl's `WG: u32 = 64u` already hardcodes). Bump alongside
-// that constant if a model with a larger head_dim is ever added.
-const HEAD_DIM_MAX: u32 = 64u;
+// (WGSL arrays need a const length); 128 covers every head_dim this crate
+// targets today (Qwen2.5-0.5B's head_dim=64, Qwen3's explicit head_dim=128).
+// Bump if a model with a larger head_dim is ever added.
+const HEAD_DIM_MAX: u32 = 128u;
 
 struct Dims { seq: u32, n_heads: u32, n_kv_heads: u32, head_dim: u32, scale: f32, _p0: u32, _p1: u32, _p2: u32 };
 

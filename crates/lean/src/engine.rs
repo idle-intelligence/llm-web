@@ -37,7 +37,14 @@ pub struct Engine {
     /// cooperative-group extension, so it runs on any WebGPU adapter.
     pub linear_q4_decode: wgpu::ComputePipeline,
     pub attn_prefill: wgpu::ComputePipeline,
+    /// `shaders/attn_decode.wgsl` compiled with its `HEAD_DIM` override
+    /// constant set to 64 (Qwen2.5). One thread owns one output dim, so
+    /// workgroup width must equal head_dim exactly - see the shader's doc
+    /// comment. `model.rs::attn_decode` picks between this and
+    /// `attn_decode_128` by `cfg.head_dim`.
     pub attn_decode: wgpu::ComputePipeline,
+    /// Same shader as `attn_decode`, `HEAD_DIM` overridden to 128 (Qwen3).
+    pub attn_decode_128: wgpu::ComputePipeline,
     pub add_inplace: wgpu::ComputePipeline,
     pub silu_mul: wgpu::ComputePipeline,
     /// Single-workgroup argmax over the logits vector -> one u32 output.
@@ -64,6 +71,14 @@ pub struct Engine {
 }
 
 fn make_pipeline(device: &wgpu::Device, label: &str, src: &str) -> wgpu::ComputePipeline {
+    make_pipeline_with_constants(device, label, src, &[])
+}
+
+/// Like `make_pipeline`, but sets WGSL `override` constants
+/// (`shaders/attn_decode.wgsl`'s `HEAD_DIM`) at pipeline-creation time via
+/// `PipelineCompilationOptions`, so one shader source compiles to a
+/// different fixed `@workgroup_size` per model.
+fn make_pipeline_with_constants(device: &wgpu::Device, label: &str, src: &str, constants: &[(&str, f64)]) -> wgpu::ComputePipeline {
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some(label),
         source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(src)),
@@ -73,7 +88,7 @@ fn make_pipeline(device: &wgpu::Device, label: &str, src: &str) -> wgpu::Compute
         layout: None,
         module: &module,
         entry_point: Some("main"),
-        compilation_options: Default::default(),
+        compilation_options: wgpu::PipelineCompilationOptions { constants, ..Default::default() },
         cache: None,
     })
 }
@@ -119,7 +134,8 @@ impl Engine {
             linear_q4_tiled: make_pipeline(&device, "linear_q4_tiled", include_str!("shaders/linear_q4_tiled.wgsl")),
             linear_q4_decode: make_pipeline(&device, "linear_q4_decode", include_str!("shaders/linear_q4_decode.wgsl")),
             attn_prefill: make_pipeline(&device, "attn_prefill", include_str!("shaders/attn_prefill.wgsl")),
-            attn_decode: make_pipeline(&device, "attn_decode", include_str!("shaders/attn_decode.wgsl")),
+            attn_decode: make_pipeline_with_constants(&device, "attn_decode", include_str!("shaders/attn_decode.wgsl"), &[("HEAD_DIM", 64.0)]),
+            attn_decode_128: make_pipeline_with_constants(&device, "attn_decode_128", include_str!("shaders/attn_decode.wgsl"), &[("HEAD_DIM", 128.0)]),
             add_inplace: make_pipeline(&device, "add_inplace", include_str!("shaders/add_inplace.wgsl")),
             silu_mul: make_pipeline(&device, "silu_mul", include_str!("shaders/silu_mul.wgsl")),
             argmax: make_pipeline(&device, "argmax", include_str!("shaders/argmax.wgsl")),
@@ -192,6 +208,54 @@ impl Engine {
         pass.set_bind_group(0, bind_group, &[]);
         pass.dispatch_workgroups(wgs.0, wgs.1, wgs.2);
         self.dispatch_count.set(self.dispatch_count.get() + 1);
+    }
+
+    /// Submits `encoder`'s recorded work, replaces it with a fresh encoder
+    /// of the same label, and (native only) blocks until that submission
+    /// completes.
+    ///
+    /// Root cause, found by bisecting with a temporary
+    /// `LEAN_DEBUG_MAX_LAYERS` cap on the model's layer loop: Qwen3-0.6B's
+    /// 28-layer prefill, run as one encoder/submit per model.rs's
+    /// `forward_prefill`/`decode_layers`/`forward_chunk_spec` (as every
+    /// model's forward pass always was), reliably produced a native `device
+    /// poll failed: Timeout` even on a 15-token prompt - but 24, 26 and 27
+    /// real layers all finished correctly in ~1.5s, only the real 28th
+    /// tipped it over: not a smooth compute-time trend, a threshold. It
+    /// turned out not to be about command-buffer size or a bad kernel at
+    /// all (the full 28-layer computation is numerically correct - it
+    /// matches `reference/fixture_qwen3.json` exactly once it completes):
+    /// splitting into one submit-per-layer with *no* intervening wait (just
+    /// `queue.submit`, or even a non-blocking `PollType::Poll` maintain
+    /// tick) hung exactly as badly. Only an actual blocking
+    /// `device.poll(PollType::Wait)` between layers fixed it. Best
+    /// explanation: every submission's bookkeeping (temp resources,
+    /// buffer-map callbacks, retired-submission tracking) stays pending
+    /// until something actually blocks on it, so without a real wait
+    /// in between, ~500 dispatches' worth of unretired submissions still
+    /// pile up for the final `read_buffer` call to wait on in one shot -
+    /// and `device.poll(PollType::Wait)`'s wait has a hardcoded 60s
+    /// timeout (`wgpu_core::device::CLEANUP_WAIT_MS`), which that pile-up
+    /// reliably exceeded. Waiting once per layer keeps each wait's
+    /// backlog bounded to one layer's dispatches regardless of model
+    /// depth, at the cost of a CPU/GPU round-trip per layer (measured:
+    /// `fixture_parity_qwen3`'s full 4-case suite, prefill and greedy
+    /// decode included, at 106.97s - see docs/runs/2026-09-28-lean-qwen3.md;
+    /// this is a native-only correctness fix, not a perf target - the
+    /// production path is WASM/WebGPU).
+    ///
+    /// WASM-gated out entirely: the `wgpu/webgpu` backend used there talks
+    /// to the browser's own WebGPU implementation directly, not
+    /// wgpu-core's native Metal/Vulkan/DX12 path, so `CLEANUP_WAIT_MS`
+    /// doesn't apply there, and this crate's WASM code must never call a
+    /// blocking poll at all (see this crate's `read_buffer` doc comment on
+    /// `into_data_async`-style async-only readback).
+    pub fn flush_encoder(&self, encoder: &mut wgpu::CommandEncoder, label: &str) {
+        let fresh = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some(label) });
+        let old = std::mem::replace(encoder, fresh);
+        self.queue.submit(Some(old.finish()));
+        #[cfg(not(target_arch = "wasm32"))]
+        let _ = self.device.poll(wgpu::PollType::Wait);
     }
 
     pub fn reset_dispatch_count(&self) {

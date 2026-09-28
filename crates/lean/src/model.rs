@@ -994,9 +994,18 @@ fn attn_decode(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder,
         &format!("{key}.dims"),
         AttnDecodeDims { n_heads: cfg.num_heads as u32, n_kv_heads: cfg.num_kv_heads as u32, head_dim: cfg.head_dim as u32, kv_len, max_ctx, scale, _p0: 0, _p1: 0 },
     );
+    // attn_decode.wgsl/attn_decode_128.wgsl have `workgroup_size` and a
+    // per-thread-owns-one-output-dim design compile-time-fixed to
+    // head_dim=64/128 respectively - see engine.rs's doc comment on
+    // `attn_decode_128`. Picked by `cfg.head_dim`, not a runtime parameter.
+    let pipeline = match cfg.head_dim {
+        64 => &engine.attn_decode,
+        128 => &engine.attn_decode_128,
+        other => panic!("attn_decode: unsupported head_dim {other} (only 64/Qwen2.5 and 128/Qwen3 have a compiled kernel)"),
+    };
     let bg = pool.bind_group(
         key,
-        &engine.attn_decode,
+        pipeline,
         &[
             BindGroupEntry { binding: 0, resource: q.as_entire_binding() },
             BindGroupEntry { binding: 1, resource: k_cache.as_entire_binding() },
@@ -1005,7 +1014,7 @@ fn attn_decode(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder,
             BindGroupEntry { binding: 4, resource: dims.as_entire_binding() },
         ],
     );
-    engine.dispatch(encoder, &engine.attn_decode, &bg, (cfg.num_heads as u32, 1, 1), key);
+    engine.dispatch(encoder, pipeline, &bg, (cfg.num_heads as u32, 1, 1), key);
     out
 }
 
@@ -1106,6 +1115,11 @@ pub async fn forward_prefill(engine: &Engine, model: &GpuModel, cache: &mut KvCa
         let ffn_normed = rmsnorm(engine, pool, &mut encoder, &format!("{key}.ffnnorm"), &x, &layer.ffn_norm, seq, hidden, cfg.rms_norm_eps);
         let mlp_out = mlp(engine, pool, &mut encoder, &format!("{key}.mlp"), &ffn_normed, seq, cfg, layer, model.fast_kernels);
         add_inplace(engine, pool, &mut encoder, &format!("{key}.add2"), &x, &mlp_out, seq * hidden);
+
+        // Flush per layer - see `Engine::flush_encoder`'s doc comment for
+        // why a single encoder covering every layer hangs on Metal at
+        // Qwen3-0.6B's depth (28 layers).
+        engine.flush_encoder(&mut encoder, "prefill");
     }
 
     let normed_final = rmsnorm(engine, pool, &mut encoder, "out_norm", &x, &model.out_norm, seq, hidden, cfg.rms_norm_eps);
@@ -1203,6 +1217,11 @@ fn decode_layers(engine: &Engine, model: &GpuModel, encoder: &mut wgpu::CommandE
         let ffn_normed = rmsnorm(engine, pool, encoder, &format!("{key}.ffnnorm"), &x, &layer.ffn_norm, 1, hidden, cfg.rms_norm_eps);
         let mlp_out = mlp(engine, pool, encoder, &format!("{key}.mlp"), &ffn_normed, 1, cfg, layer, model.fast_kernels);
         add_inplace(engine, pool, encoder, &format!("{key}.add2"), &x, &mlp_out, hidden);
+
+        // See `Engine::flush_encoder`'s doc comment - same per-layer-encoder
+        // fix as `forward_prefill`, needed here too since decode also
+        // records every layer into one encoder/submit.
+        engine.flush_encoder(encoder, "decode");
     }
 
     let normed_final = rmsnorm(engine, pool, encoder, "dec_out_norm", &x, &model.out_norm, 1, hidden, cfg.rms_norm_eps);
@@ -1359,6 +1378,9 @@ pub async fn forward_chunk_spec(engine: &Engine, model: &GpuModel, cache: &mut K
         let ffn_normed = rmsnorm(engine, pool, &mut encoder, &format!("{key}.ffnnorm"), &x, &layer.ffn_norm, t, hidden, cfg.rms_norm_eps);
         let mlp_out = mlp(engine, pool, &mut encoder, &format!("{key}.mlp"), &ffn_normed, t, cfg, layer, model.fast_kernels);
         add_inplace(engine, pool, &mut encoder, &format!("{key}.add2"), &x, &mlp_out, t * hidden);
+
+        // See `Engine::flush_encoder`'s doc comment.
+        engine.flush_encoder(&mut encoder, "chunk");
     }
 
     let normed_final = rmsnorm(engine, pool, &mut encoder, "chunk_out_norm", &x, &model.out_norm, t, hidden, cfg.rms_norm_eps);

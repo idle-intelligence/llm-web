@@ -19,7 +19,7 @@
 // first, fast later - llm-life's chunks are hundreds, not thousands, of
 // keys, and this is also the WASM-safe shape (one workgroup's threads only
 // ever read, never share, key data).
-const HEAD_DIM_MAX: u32 = 64u;
+const HEAD_DIM_MAX: u32 = 128u;
 
 struct Dims {
     t: u32,
