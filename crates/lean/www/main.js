@@ -9,10 +9,10 @@
 //
 // Every wasm/js loading URL below carries `?v=ENGINE_BUILD`, bumped in the
 // same commit as any wasm/model rebuild - see docs/runs/2026-09-28-lean-web.md.
-const ENGINE_BUILD = "2026-09-28-5";
+const ENGINE_BUILD = "2026-09-28-6";
 
 // Timing-only, not fixture-checked (no reference continuation exists for
-// it): a ~1000-token prompt to measure prefill throughput at a size closer
+// it): a ~1500-token prompt to measure prefill throughput at a size closer
 // to a real chat context than the fixture's 36/54/86-token cases. Built as
 // repeated distinct sentences (not one repeated string) so the tokenizer
 // doesn't collapse it into a tiny number of repeated-BPE-merge tokens.
@@ -83,10 +83,12 @@ async function main() {
   log(`[lean] device ready: ${engine.info()}`);
 
   const loadStart = performance.now();
-  // max_ctx raised from 256 to 1400: the synthetic ~1000-token timing case
-  // below plus its 32-token continuation must fit alongside the fixture's
-  // longest case (86 + 32).
-  engine.load(ggufBytes, tokenizerJson, tokenizerCfgJson, 1400);
+  // max_ctx raised to 2500: the fixture's `no_retokenize` long cases (the
+  // Sonos MCP agent's real tool-calling inputs, up to 2354 prompt tokens -
+  // see reference/gen_fixture.py's LONG_TOKEN_CASES) plus their 32-token
+  // continuation must fit alongside the synthetic ~1000-token timing case
+  // below.
+  engine.load(ggufBytes, tokenizerJson, tokenizerCfgJson, 2500);
   log(`[lean] model loaded in ${(performance.now() - loadStart).toFixed(0)}ms: ${engine.info()}`);
 
   let allMatch = true;
@@ -95,10 +97,31 @@ async function main() {
     const ids = [];
     const genStart = performance.now();
     let firstTokenAt = null;
-    const text = await engine.generate(c.prompt, 32, (id) => {
-      if (firstTokenAt === null) firstTokenAt = performance.now();
-      ids.push(id);
-    });
+    let text;
+    if (c.no_retokenize) {
+      // Real Sonos MCP tool-calling prompts (see reference/gen_fixture.py):
+      // pre-tokenized with HF's tools-aware chat template, which this
+      // engine's chat_template.rs doesn't implement - feed input_ids
+      // straight into prefillTokens/decodeStepArgmax instead of
+      // engine.generate(prompt, ...)'s own tokenize-from-text path.
+      const logits0 = await engine.prefillTokens(c.input_ids, []);
+      firstTokenAt = performance.now();
+      let cur = (() => {
+        let best = 0;
+        for (let i = 1; i < logits0.length; i++) if (logits0[i] > logits0[best]) best = i;
+        return best;
+      })();
+      for (let i = 0; i < c.greedy_continuation.length; i++) {
+        ids.push(cur);
+        cur = await engine.decodeStepArgmax(cur, []);
+      }
+      text = engine.decodeIds(Uint32Array.from(ids));
+    } else {
+      text = await engine.generate(c.prompt, 32, (id) => {
+        if (firstTokenAt === null) firstTokenAt = performance.now();
+        ids.push(id);
+      });
+    }
     const genEnd = performance.now();
     const prefillMs = firstTokenAt !== null ? firstTokenAt - genStart : NaN;
     const decodeMsPerTok = ids.length > 0 ? (genEnd - firstTokenAt) / ids.length : NaN;
@@ -112,8 +135,9 @@ async function main() {
   }
   log(allMatch ? "[lean] ALL FIXTURE CASES TOKEN-MATCH" : "[lean] FIXTURE MISMATCH");
 
-  // Timing-only long-prompt case (~1000 tokens), not part of allMatch.
-  const longPrompt = buildLongPrompt(90);
+  // Timing-only long-prompt case (~1500 tokens, per the 2026-09-28
+  // long-context perf pass's target checkpoints), not part of allMatch.
+  const longPrompt = buildLongPrompt(107);
   const longPromptLen = engine.tokenCount(longPrompt);
   const longIds = [];
   const longGenStart = performance.now();
@@ -126,9 +150,9 @@ async function main() {
   const longPrefillMs = longFirstTokenAt !== null ? longFirstTokenAt - longGenStart : NaN;
   const longDecodeMsPerTok = longIds.length > 0 ? (longGenEnd - longFirstTokenAt) / longIds.length : NaN;
   const longPrefillTokPerSec = longPromptLen / (longPrefillMs / 1000);
-  rows.push({ name: "long_1000", promptLen: longPromptLen, match: null, prefillMs: longPrefillMs, decodeMsPerTok: longDecodeMsPerTok, text: longText });
+  rows.push({ name: "long_1500", promptLen: longPromptLen, match: null, prefillMs: longPrefillMs, decodeMsPerTok: longDecodeMsPerTok, text: longText });
   log(
-    `[lean] case=long_1000 prompt_len=${longPromptLen} (timing-only, not fixture-checked) ` +
+    `[lean] case=long_1500 prompt_len=${longPromptLen} (timing-only, not fixture-checked) ` +
       `prefill_ms=${longPrefillMs.toFixed(1)} prefill_tok_per_sec=${longPrefillTokPerSec.toFixed(1)} decode_ms_per_tok=${longDecodeMsPerTok.toFixed(1)}`
   );
 
