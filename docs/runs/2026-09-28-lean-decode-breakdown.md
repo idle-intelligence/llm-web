@@ -346,3 +346,176 @@ the reverse of the 0.5B case, and not investigated further this session).
   `EmbeddingTable::gpu_bytes()`, and `LeanEngine::gpuMemoryInfo()`
   (`web.rs`, wasm-bindgen export) - all added this session, all still in
   the tree.
+
+## Session 3: load-time memory - the double-copy fix (2026-09-29)
+
+Task A of this session's brief: after Session 2's two fixes, load-time wasm
+memory for Qwen2.5-0.5B (a ~409MB local Q4_0 GGUF) was still 957.9MB
+(measured on this session's own build of the same commit, `www/mem_profile.html`,
+"after_load" row) - about 2.34x the file size, despite `GpuModel::load_from_reader`
+already reading and uploading one tensor at a time and dropping each tensor's
+raw bytes immediately after upload (`model.rs::load_from_reader`'s doc
+comment, `quant.rs::load_matmul_weight_gguf`'s per-call `bytes: &[u8]`
+parameter never outliving that call).
+
+### Root cause (`crates/lean/src/web.rs`)
+
+`LeanEngine::load`/`LeanEngineCpu::load` took `gguf_bytes: Vec<u8>` as their
+wasm-bindgen parameter. wasm-bindgen's `Vec<u8>` argument type always copies:
+JS's `Uint8Array` (already a copy of the fetched `ArrayBuffer`) gets copied a
+*second* time into a freshly-allocated wasm-linear-memory `Vec<u8>` before
+Rust code runs at all. That `Vec<u8>` was then wrapped in
+`std::io::Cursor::new(gguf_bytes)` and held for the whole parse (per
+`model.rs`'s own now-stale doc comment: "handed across the wasm boundary as
+one `Vec<u8>`... no sharded reader is needed"). So at any point during
+loading, wasm linear memory held: the entire file (via the `Cursor`, held
+until `load_from_reader` returns) *plus* whatever the tensor-at-a-time
+processing was transiently allocating on top (the current tensor's raw
+bytes, plus `quant.rs::split_q4_blocks`/`split_q8_blocks`/`split_q6k_blocks`'s
+repacked `qs`/`scales` arrays) - and wasm memory never shrinks back down
+after a peak, so that sum became the load's permanent floor.
+
+### Fix (`crates/lean/src/web.rs`)
+
+Added `JsBytesReader`, a `Read + Seek` adapter directly over a
+`js_sys::Uint8Array` (no `Vec<u8>` copy at construction - `js_sys::Uint8Array`
+is a JS-owned view, not a wasm-bindgen-copied argument type). `read()` calls
+`Uint8Array::subarray(start, end).copy_to(&mut buf[..n])`, copying only the
+bytes the caller actually asked for into a small transient Rust buffer -
+`GgufReader::open`'s header/metadata parse and `tensor_data()`'s one-tensor-
+at-a-time reads already only ever ask for small windows (see Session 2's
+notes above), so this reader never has to materialize more than one tensor's
+raw bytes at a time in wasm memory, and the fetched file's bytes now live
+only in the JS heap (as the caller's own `Uint8Array`/`ArrayBuffer`) until
+each small window is pulled across.
+
+`LeanEngine::load`/`LeanEngineCpu::load`'s `gguf_bytes` parameter type
+changed from `Vec<u8>` to `js_sys::Uint8Array`; `GpuModel::load_from_reader`/
+`CpuModel::load_from_reader` are unchanged (already generic over `R: Read +
+Seek`, per Session 2's notes - `model.rs`/`cpu.rs` needed zero edits).
+`LeanEngineCpu`'s CPU rung still legitimately holds the raw quantized
+tensor bytes resident for its whole lifetime (it computes directly off them,
+`cpu.rs`'s own doc comment) - `JsBytesReader` only removes the *duplicate*
+whole-file copy on the way in, not `CpuModel`'s one necessary copy.
+
+Every `www/main*.js` harness's `.load(ggufBytes, ...)` call site needed no
+change (a JS `Uint8Array` is what was already being passed - wasm-bindgen's
+old `Vec<u8>` parameter type accepted the same JS value and copied it; the
+new `js_sys::Uint8Array` parameter type accepts it without copying). Added
+one line after each `.load()` call, `ggufBytes = null;`, so the harness's own
+reference to the fetched buffer is dropped as soon as `load()` (synchronous -
+every tensor is uploaded before it returns) is done with it, letting the JS
+heap reclaim it too (`const [ggufBytes, ...]` changed to `let [...]` in each
+file to allow the reassignment). Added a load-only memory profiler for
+Qwen2.5-3B, `www/mem_profile_3b.html`/`main_mem_profile_3b.js` (mirrors
+`main_mem_profile.js`'s device-create/load/snapshot shape, skips
+prefill/decode - a 1.9GB GGUF's browser decode is slow and out of scope for
+a load-time-memory measurement). `ENGINE_BUILD` bumped to
+`2026-09-29-02`/`2026-09-29-cpu-02`/`2026-09-29-cpu-qwen3-02` in every
+`www/main*.js` file in this same commit; served `pkg/lean_bg.wasm` bytes
+hashed and confirmed to match the freshly built artifact before every
+timing/memory run below (`shasum -a256` on both the built file and the
+`curl`'d served file).
+
+### Before/after: wasm memory after `load()`, single page load, local GGUF
+
+Measured with `www/mem_profile.html`/`main_mem_profile.js`
+("after_load" row) for Qwen2.5-0.5B and `www/mem_profile_3b.html`/
+`main_mem_profile_3b.js` ("after_load" row, load-only) for Qwen2.5-3B, both
+via Playwright's bundled headless Chromium
+(`--enable-unsafe-webgpu --enable-features=Vulkan,WebGPU --use-angle=metal`),
+one page load each, `pgrep` confirmed no other Chrome-for-Testing/headless-
+shell process running before either run. "Before" is this session's own
+build of the pre-fix code (commit `0f74d76`, Session 2's `Vec<u8>`-parameter
+`load()`) run through the same harness; "after" is the `JsBytesReader` fix.
+
+| model | GGUF size | wasm before | wasm after | wasm after / GGUF size | gpu.weight | gpu.kvCache |
+|---|---|---|---|---|---|---|
+| Qwen2.5-0.5B-Instruct | 408.7MB (428,730,208 bytes) | 957.9MB | 529.1MB | 1.29x | 463.9MB | 56.5MB (max_ctx=2500) |
+| Qwen2.5-3B-Instruct | 1905.0MB (1,997,879,712 bytes) | not measured (see note) | 707.9MB | 0.37x | 2191.6MB | 9.4MB (max_ctx=128, load-only) |
+
+Note: the 3B model's pre-fix wasm-memory number was not separately
+re-measured this session (Session 2's own 3B browser runs predate the
+`mem_profile_3b.html` harness and used the full prefill+decode
+`main_qwen25_3b.js` harness instead, whose wasm-memory numbers are not
+directly comparable to this load-only harness) - the 0.37x-of-file-size
+"after" figure and the 0.5B model's like-for-like 2.34x-before/1.29x-after
+comparison are the evidence this fix generalizes to the larger model rather
+than being 0.5B-specific.
+
+### Before/after: JS heap and Chromium process footprint
+
+`jsHeap` below is Chrome's `performance.memory.usedJSHeapSize`, read
+straight from the page; `chromium peak RSS` is this session's own
+`scripts/run_mem_profile.py`, which samples every Chrome-for-Testing/
+chrome-headless-shell process's RSS (`ps aux`, summed across the whole
+process tree Playwright's launch produced) every 250ms for the run's
+duration and reports the peak. `performance.memory.usedJSHeapSize` did not
+move at all between "after_device_create" and "after_load" in either run
+(fixed at 462.0MB for 0.5B, 2060.0MB for 3B) and did not change after an
+explicit `window.gc()` call (tested standalone with `--js-flags=--expose-gc`)
+- this reads as this Chromium build's `performance.memory` being coarsely
+bucketed/quantized (a known privacy-motivated behavior in recent Chrome
+versions) rather than evidence the JS-heap fix did nothing; `chromium peak
+RSS` (real process memory, not a JS API) is the metric this section treats
+as ground truth.
+
+| model | jsHeap after_load | chromium peak RSS (this session's fix, single run) | guard limit |
+|---|---|---|---|
+| Qwen2.5-0.5B-Instruct | 462.0MB | 2.721GB | 6GB |
+| Qwen2.5-3B-Instruct (load-only) | 2060.0MB | 6.352GB | 8GB |
+
+No guard trip on either run. The 3B load-only number (6.35GB) is close to
+its 8GB guard and to this 16GB machine's practical ceiling once a page,
+OS, and any other process are accounted for - prefill/decode on top of this
+load (not measured in this load-only harness) would add further GPU-pool
+and KV-cache growth on top of the number above, so 3B in the browser
+remains memory-tight on this machine even after this fix; this was not
+pushed further this session (a fully lazy/streaming GGUF reader that never
+materializes even one tensor's raw bytes in wasm memory, only its own
+compressed qs/scales, is the next lever, not attempted here).
+
+### Gates (unchanged code paths, run after this fix)
+
+Native, GPU-locked, `--ignored --test-threads=1`, all pass on this fix (this
+change is wasm/web.rs-only - `model.rs`/`cpu.rs`/native `lean-cli` are
+untouched, so this is confirmation, not new risk):
+`fixture_parity` (211.7s), `fixture_parity_llama_1_7b` (54.75s),
+`fixture_parity_llama_360m` (21.5s), `fixture_parity_qwen25_3b` (official
+3B GGUF, 79.94s), `fixture_parity_qwen3` (136.37s), `fixture_parity_qwen3_1_7b`
+(314.53s), `kv_snapshot` (both cases, 191.5s), `logit_mask` (all 3 cases,
+8.04s).
+
+Browser, same headless Chromium, `www/index.html?local=1`
+(`main.js`, Qwen2.5-0.5B, all 6 fixture cases plus the long-context/KV-
+snapshot/logit-mask extras this harness also runs):
+`allMatch: true` - every case's `tokens_match` is `true` (`short`, `long`,
+`non_english`, `long_tools_single` at 2225 prompt tokens,
+`long_tools_multiturn` at 2354), `kv_snapshot_restore`'s
+`restore_bytes_match`/`tokens_match` both `true`, `logit_mask`'s
+`target_match` `true` - the browser's greedy continuation is unchanged by
+this fix, as expected (it only changes how bytes cross the JS/wasm
+boundary, never what gets computed).
+
+`cargo clippy -p lean --lib --no-default-features --features web --target
+wasm32-unknown-unknown -- -D warnings` and `cargo clippy -p lean -- -D
+warnings` (native default features) both clean.
+
+### Files touched
+
+`crates/lean/src/web.rs` (`JsBytesReader`, `LeanEngine::load`/
+`LeanEngineCpu::load` parameter type), `crates/lean/www/main*.js` (8 files:
+`ggufBytes = null` after `.load()`, `ENGINE_BUILD` bump),
+`crates/lean/www/mem_profile_3b.html` + `main_mem_profile_3b.js` (new,
+load-only 3B memory harness), `scripts/run_mem_profile.py` (new, Playwright
+driver: loads a `mem_profile*.html` page, reports `window.__leanResult` plus
+peak Chromium process-tree RSS, with a self-kill guard at a caller-supplied
+GB limit - never touches another session's browser, matches pids by process
+name, not `pgrep -f` against its own argv).
+
+Task B (dispatch/kernel-fusion work: argmax folding into
+`forward_decode_step_argmax`, QKV/gate-up fusion) was not attempted this
+session - Task A's fix and its gates took the full session; starting a
+kernel fusion without room to verify qk-norm/QKV-bias correctness against
+all four models' fixtures would have been a worse outcome than not starting
+it.
