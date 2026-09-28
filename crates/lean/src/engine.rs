@@ -22,11 +22,20 @@ pub struct Engine {
     /// Q8_0 counterpart of `embed_gather_q4` (`shaders/embed_gather_q8.wgsl`)
     /// - Qwen3's official GGUFs ship no Q4_0 quant, only Q8_0 (qwen3 survey).
     pub embed_gather_q8: wgpu::ComputePipeline,
+    /// Q6_K counterpart of `embed_gather_q4`/`embed_gather_q8`
+    /// (`shaders/embed_gather_q6k.wgsl`) - Qwen2.5-3B-Instruct's official
+    /// "q4_0" GGUF carries `token_embd.weight` at Q6_K residency (see
+    /// `gguf.rs::GgmlDtype`'s doc comment).
+    pub embed_gather_q6k: wgpu::ComputePipeline,
     pub rmsnorm: wgpu::ComputePipeline,
     pub rope: wgpu::ComputePipeline,
     pub linear: wgpu::ComputePipeline,
     pub linear_q4: wgpu::ComputePipeline,
     pub linear_q8: wgpu::ComputePipeline,
+    /// Naive Q6_K matmul/matvec (`shaders/linear_q6k.wgsl`) - see that
+    /// file's doc comment on why no tiled/decode-specialized variant exists
+    /// yet.
+    pub linear_q6k: wgpu::ComputePipeline,
     /// Tiled Q4_0 matmul (prefill, M>1): ported from llm-wasm's
     /// shader_q4_tiled.wgsl. Only faster than `linear_q4` once weight reuse
     /// across rows outweighs the tile/barrier overhead: see the shader's
@@ -126,11 +135,13 @@ impl Engine {
         Ok(Engine {
             embed_gather_q4: make_pipeline(&device, "embed_gather_q4", include_str!("shaders/embed_gather_q4.wgsl")),
             embed_gather_q8: make_pipeline(&device, "embed_gather_q8", include_str!("shaders/embed_gather_q8.wgsl")),
+            embed_gather_q6k: make_pipeline(&device, "embed_gather_q6k", include_str!("shaders/embed_gather_q6k.wgsl")),
             rmsnorm: make_pipeline(&device, "rmsnorm", include_str!("shaders/rmsnorm.wgsl")),
             rope: make_pipeline(&device, "rope", include_str!("shaders/rope_neox.wgsl")),
             linear: make_pipeline(&device, "linear", include_str!("shaders/linear.wgsl")),
             linear_q4: make_pipeline(&device, "linear_q4", include_str!("shaders/linear_q4.wgsl")),
             linear_q8: make_pipeline(&device, "linear_q8", include_str!("shaders/linear_q8.wgsl")),
+            linear_q6k: make_pipeline(&device, "linear_q6k", include_str!("shaders/linear_q6k.wgsl")),
             linear_q4_tiled: make_pipeline(&device, "linear_q4_tiled", include_str!("shaders/linear_q4_tiled.wgsl")),
             linear_q4_decode: make_pipeline(&device, "linear_q4_decode", include_str!("shaders/linear_q4_decode.wgsl")),
             attn_prefill: make_pipeline(&device, "attn_prefill", include_str!("shaders/attn_prefill.wgsl")),
