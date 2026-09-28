@@ -128,7 +128,12 @@ pub fn load_matmul_weight_gguf(engine: &Engine, label: &str, shape: &[usize], dt
             let chunks = chunk_rows(engine, label, bytes, out_dim, blocks_per_row, blocks_per_row * 18, false);
             MatMulWeight::Q4_0 { chunks, blocks_per_row: blocks_per_row as u32, out_dim: out_dim as u32 }
         }
-        GgmlDtype::F32 | GgmlDtype::F16 => {
+        // Q4_1 is dequantized host-side straight to F32 rather than given
+        // its own GPU-resident block kernel (see `gguf.rs::dequantize_q4_1`'s
+        // doc comment): only a handful of tensors (some of SmolLM2's
+        // `ffn_down.weight`s) are ever Q4_1, not worth a third quantized
+        // matmul kernel for.
+        GgmlDtype::F32 | GgmlDtype::F16 | GgmlDtype::Q4_1 => {
             let data = crate::gguf::dequantize_for(dtype, bytes, n_elements);
             MatMulWeight::F32 { w: engine.buf_f32(&data, label) }
         }

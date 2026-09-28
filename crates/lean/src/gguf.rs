@@ -122,13 +122,21 @@ fn read_gguf_value<R: Read + Seek>(reader: &mut R, value_type: u32) -> Result<Gg
 }
 
 /// GGML tensor dtype codes actually needed for a Qwen2 Q4_0 GGUF: F32 (0),
-/// F16 (1), Q4_0 (2), Q8_0 (8). Anything else is rejected (this slice never
-/// needs Q5/Q6/K-quants).
+/// F16 (1), Q4_0 (2), Q8_0 (8). `Q4_1` (3) was added for SmolLM2's "Q4_0"
+/// GGUFs (bartowski's llama.cpp quantize run bumps a handful of
+/// `ffn_down.weight` tensors, at both SmolLM2 sizes, from Q4_0 to Q4_1 for
+/// quality - verified against the file's own tensor dtypes, not assumed;
+/// see `config.rs`'s module doc comment). Anything else (K-quants) is still
+/// rejected - SmolLM2-1.7B-Instruct's own "Q4_0" GGUF additionally carries
+/// a Q6_K `token_embd.weight`, which this crate does not read (the same
+/// gap already flagged for Qwen2.5-3B-Instruct's GGUF); that model's Q4_0
+/// file is not loadable here, only its Q8_0 file (pure Q8_0, no K-quants).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GgmlDtype {
     F32,
     F16,
     Q4_0,
+    Q4_1,
     Q8_0,
 }
 
@@ -138,8 +146,9 @@ impl GgmlDtype {
             0 => Ok(Self::F32),
             1 => Ok(Self::F16),
             2 => Ok(Self::Q4_0),
+            3 => Ok(Self::Q4_1),
             8 => Ok(Self::Q8_0),
-            other => bail!("unsupported GGML dtype code: {other} (this crate only reads F32/F16/Q4_0/Q8_0)"),
+            other => bail!("unsupported GGML dtype code: {other} (this crate only reads F32/F16/Q4_0/Q4_1/Q8_0)"),
         }
     }
 
@@ -150,6 +159,10 @@ impl GgmlDtype {
             Self::Q4_0 => {
                 let num_blocks = num_elements / 32;
                 num_blocks.checked_mul(18) // 2 (f16 scale) + 16 (nibbles)
+            }
+            Self::Q4_1 => {
+                let num_blocks = num_elements / 32;
+                num_blocks.checked_mul(20) // 2 (f16 scale) + 2 (f16 min) + 16 (nibbles)
             }
             Self::Q8_0 => {
                 let num_blocks = num_elements / 32;
@@ -333,6 +346,32 @@ pub fn dequantize_q4_0(bytes: &[u8], n_elements: usize) -> Vec<f32> {
     out
 }
 
+/// Dequantize a Q4_1 block stream to f32. Block: 2 bytes f16 scale (`d`) + 2
+/// bytes f16 min (`m`) + 16 bytes of paired nibbles (low nibble -> element
+/// j, high nibble -> element j+16), `value = nibble * d + m` - llama.cpp's
+/// `quantize_row_q4_1_ref` convention (unsigned nibble, no -8 offset,
+/// unlike Q4_0). This crate only ever materializes Q4_1 tensors as F32
+/// (see `quant.rs::load_matmul_weight_gguf`) - no GPU-resident Q4_1 kernel
+/// exists, since the only Q4_1 tensors seen so far (a handful of SmolLM2's
+/// `ffn_down.weight`s) are few enough that a dedicated GPU kernel isn't
+/// worth it.
+pub fn dequantize_q4_1(bytes: &[u8], n_elements: usize) -> Vec<f32> {
+    let mut out = vec![0f32; n_elements];
+    for (bi, block) in bytes.chunks_exact(20).enumerate() {
+        let scale = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+        let min = f16_to_f32(u16::from_le_bytes([block[2], block[3]]));
+        for j in 0..16 {
+            let byte = block[4 + j];
+            let lo = (byte & 0x0F) as f32;
+            let hi = (byte >> 4) as f32;
+            let base = bi * 32;
+            out[base + j] = lo * scale + min;
+            out[base + 16 + j] = hi * scale + min;
+        }
+    }
+    out
+}
+
 /// Dequantize a Q8_0 block stream to f32. Block: 2 bytes f16 scale + 32
 /// signed i8 values, `value = qs[j] * scale`.
 pub fn dequantize_q8_0(bytes: &[u8], n_elements: usize) -> Vec<f32> {
@@ -359,6 +398,7 @@ pub fn dequantize_for(dtype: GgmlDtype, bytes: &[u8], n_elements: usize) -> Vec<
         GgmlDtype::F32 => dequantize_f32(bytes, n_elements),
         GgmlDtype::F16 => dequantize_f16(bytes, n_elements),
         GgmlDtype::Q4_0 => dequantize_q4_0(bytes, n_elements),
+        GgmlDtype::Q4_1 => dequantize_q4_1(bytes, n_elements),
         GgmlDtype::Q8_0 => dequantize_q8_0(bytes, n_elements),
     }
 }

@@ -39,7 +39,7 @@ use std::fs::File;
 use std::io::BufReader;
 use wgpu::BindGroupEntry;
 
-use crate::config::{config_from_gguf, Qwen2Config};
+use crate::config::{config_from_gguf, Architecture, Qwen2Config};
 use crate::engine::Engine;
 use crate::gguf::GgufReader;
 use crate::pool::Pool;
@@ -480,6 +480,46 @@ fn gguf_matmul<R: std::io::Read + std::io::Seek>(engine: &Engine, reader: &mut G
     Ok(load_matmul_weight_gguf(engine, name, &shape, info.dtype(), &bytes))
 }
 
+/// Inverse of llama.cpp `convert_hf_to_gguf.py`'s `LlamaModel.permute()`,
+/// applied row-wise (dtype-agnostic: every row of a GGUF matmul weight is
+/// the same number of bytes regardless of quant format, so this reorders
+/// whole `bytes_per_row` chunks, never touching intra-row block encoding).
+/// See `config.rs`'s module doc comment for the derivation and the
+/// empirical check against SmolLM2-360M-Instruct's own GGUF. Applied only
+/// to `attn_q.weight` (`n_heads = config.num_heads`) and `attn_k.weight`
+/// (`n_heads = config.num_kv_heads`) for `Architecture::Llama`; a no-op for
+/// Qwen2/Qwen3, which are never passed through this function.
+fn unpermute_rope_rows(bytes: &[u8], n_heads: usize, head_dim: usize, out_dim: usize) -> Vec<u8> {
+    assert_eq!(bytes.len() % out_dim, 0, "unpermute_rope_rows: bytes.len() not a multiple of out_dim");
+    assert_eq!(n_heads * head_dim, out_dim, "unpermute_rope_rows: n_heads * head_dim != out_dim");
+    let bytes_per_row = bytes.len() / out_dim;
+    let half = head_dim / 2;
+    let mut out = vec![0u8; bytes.len()];
+    for h in 0..n_heads {
+        let base = h * head_dim;
+        for row in 0..head_dim {
+            let p = if row < half { 2 * row } else { 2 * (row - half) + 1 };
+            let src = (base + p) * bytes_per_row;
+            let dst = (base + row) * bytes_per_row;
+            out[dst..dst + bytes_per_row].copy_from_slice(&bytes[src..src + bytes_per_row]);
+        }
+    }
+    out
+}
+
+/// Like [`gguf_matmul`], but un-permutes RoPE row order first when
+/// `config.architecture == Architecture::Llama` (see
+/// [`unpermute_rope_rows`]). `n_heads` is the tensor's own head count:
+/// `config.num_heads` for `attn_q.weight`, `config.num_kv_heads` for
+/// `attn_k.weight`.
+fn gguf_matmul_qk<R: std::io::Read + std::io::Seek>(engine: &Engine, reader: &mut GgufReader<R>, name: &str, config: &Qwen2Config, n_heads: usize) -> Result<MatMulWeight> {
+    let info = reader.tensor_info(name).with_context(|| format!("missing tensor {name}"))?.clone();
+    let shape = info.shape();
+    let bytes = reader.tensor_data(name)?;
+    let bytes = if config.architecture == Architecture::Llama { unpermute_rope_rows(&bytes, n_heads, config.head_dim, shape[0]) } else { bytes };
+    Ok(load_matmul_weight_gguf(engine, name, &shape, info.dtype(), &bytes))
+}
+
 impl GpuModel {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn load(engine: &Engine, gguf_path: &str, fast_kernels: bool) -> Result<Self> {
@@ -535,9 +575,9 @@ impl GpuModel {
             };
             layers.push(LayerWeights {
                 attn_norm: gguf_f32(engine, &mut reader, &format!("{p}.attn_norm.weight"))?,
-                q_w: gguf_matmul(engine, &mut reader, &format!("{p}.attn_q.weight"))?,
+                q_w: gguf_matmul_qk(engine, &mut reader, &format!("{p}.attn_q.weight"), &config, config.num_heads)?,
                 q_b,
-                k_w: gguf_matmul(engine, &mut reader, &format!("{p}.attn_k.weight"))?,
+                k_w: gguf_matmul_qk(engine, &mut reader, &format!("{p}.attn_k.weight"), &config, config.num_kv_heads)?,
                 k_b,
                 v_w: gguf_matmul(engine, &mut reader, &format!("{p}.attn_v.weight"))?,
                 v_b,
