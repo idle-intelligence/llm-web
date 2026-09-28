@@ -34,6 +34,19 @@ enum Kernel {
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
+enum EngineKind {
+    /// The wgpu forward pass (model.rs) - default, unchanged behavior.
+    Gpu,
+    /// The single-threaded CPU forward pass (cpu.rs) - see
+    /// crates/lean/docs (cpu-fallback plan). Skips the two long-context
+    /// agent-tool-calling fixture cases by default (`long_tools_single`/
+    /// `long_tools_multiturn`, 2225/2354 prompt tokens) - the CPU rung's
+    /// per-token cost makes those minutes-long on this reference kernel;
+    /// pass `--long` to include them anyway.
+    Cpu,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
 enum Check {
     /// Default: the fixture-parity loop this file has always run.
     Fixture,
@@ -64,6 +77,15 @@ struct Args {
     /// Which native check to run instead of the default fixture loop.
     #[arg(long, value_enum, default_value_t = Check::Fixture)]
     check: Check,
+    /// Which forward-pass rung to run: `gpu` (wgpu, model.rs) or `cpu`
+    /// (single-threaded, cpu.rs).
+    #[arg(long, value_enum, default_value_t = EngineKind::Gpu)]
+    engine: EngineKind,
+    /// Include the long-context agent-tool-calling fixture cases
+    /// (`long_tools_single`/`long_tools_multiturn`) on the CPU engine. No
+    /// effect on `--engine gpu`, which always runs every case.
+    #[arg(long, default_value_t = false)]
+    long: bool,
 }
 
 #[derive(Deserialize)]
@@ -75,10 +97,19 @@ struct Top20 {
 #[derive(Deserialize)]
 struct Case {
     name: String,
-    prompt: String,
+    #[serde(default)]
+    prompt: Option<String>,
     input_ids: Vec<u32>,
     prefill_top20: Top20,
     greedy_continuation: Vec<u32>,
+    /// True for the long-context agent-tool-calling cases (see
+    /// `reference/gen_fixture.py`'s `LONG_TOKEN_CASES`, and
+    /// `tests/fixture_parity.rs`'s `Case` doc comment): `input_ids` is
+    /// already the fully tools-chat-templated prompt, and there is no
+    /// `prompt` field to retokenize from (this crate's `chat_template.rs`
+    /// has no tools support).
+    #[serde(default)]
+    no_retokenize: bool,
 }
 
 #[derive(Deserialize)]
@@ -157,6 +188,94 @@ fn run_generation(engine: &lean::engine::Engine, model: &GpuModel, token_ids: &[
     );
 
     (prefill_logits, got_tokens, prefill_ms / seq as f64, decode_ms_total / n_tokens as f64)
+}
+
+/// CPU mirror of `run_generation`: prefill then greedy-decode `n_tokens`
+/// against a fresh `CpuKvCache`, timing prefill/decode separately. No
+/// `Pool`/dispatch-count bookkeeping (there is no GPU dispatch here) and no
+/// `pollster::block_on` (the CPU forward functions are plain synchronous
+/// calls, not futures) - otherwise the same contract as `run_generation`.
+fn run_generation_cpu(model: &lean::cpu::CpuModel, token_ids: &[u32], n_tokens: usize) -> (Vec<f32>, Vec<u32>, f64, f64) {
+    let seq = token_ids.len() as u32;
+    let max_ctx = seq + n_tokens as u32 + 4;
+    let mut cache = lean::cpu::CpuKvCache::new(&model.config, max_ctx as usize);
+
+    let prefill_start = Instant::now();
+    let logits = lean::cpu::forward_prefill(model, &mut cache, token_ids);
+    let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
+    let prefill_logits = logits.clone();
+
+    let mut next_id = argmax(&logits);
+    let mut got_tokens = Vec::with_capacity(n_tokens);
+    let mut decode_ms_total = 0f64;
+    for _ in 0..n_tokens {
+        got_tokens.push(next_id);
+        let decode_start = Instant::now();
+        next_id = lean::cpu::forward_decode_step_argmax(model, &mut cache, next_id);
+        decode_ms_total += decode_start.elapsed().as_secs_f64() * 1000.0;
+    }
+
+    (prefill_logits, got_tokens, prefill_ms / seq as f64, decode_ms_total / n_tokens as f64)
+}
+
+/// `--engine cpu`'s fixture loop: same checks as the GPU path's inline loop
+/// in `main` (tokenization match, prefill top-20 vs fixture, greedy
+/// continuation match), driven through `run_generation_cpu` instead of
+/// `run_generation`. Kept as its own function (rather than threading an
+/// `EngineKind` through `run_generation`/`main`'s loop) since the two
+/// engines take different model types (`CpuModel` vs `GpuModel`) with no
+/// shared trait yet - see this crate's CPU-fallback plan on that being a
+/// possible follow-up once both rungs are proven out.
+fn run_fixture_cpu(gguf_path: &str, tokenizer: &Tokenizer, chat_template: &str, fixture: &Fixture, n_tokens: usize, include_long: bool) -> Result<()> {
+    let load_start = Instant::now();
+    let model = lean::cpu::CpuModel::load(gguf_path)?;
+    eprintln!("loaded CPU model in {:?}", load_start.elapsed());
+
+    println!("engine=cpu  case            seq  tok_match  top1_match  top20_maxdiff  prefill_ms/tok  decode_ms/tok");
+    let mut all_ok = true;
+    for case in &fixture.cases {
+        if !include_long && case.name.starts_with("long_tools") {
+            println!("engine=cpu  {:<12} skipped (pass --long to include)", case.name);
+            continue;
+        }
+        let ids_match = if case.no_retokenize {
+            true // no `prompt` field to retokenize from - see Case's doc comment
+        } else {
+            let our_ids = tokenize_prompt(tokenizer, chat_template, case.prompt.as_deref().unwrap_or_default())?;
+            let m = our_ids == case.input_ids;
+            if !m {
+                eprintln!("[{}] TOKENIZATION MISMATCH: ours={our_ids:?} fixture={:?}", case.name, case.input_ids);
+            }
+            m
+        };
+
+        let (prefill_logits, got_tokens, prefill_ms_per_tok, decode_ms_per_tok) = run_generation_cpu(&model, &case.input_ids, n_tokens);
+
+        let got_top20 = top_k(&prefill_logits, 20);
+        let top1_match = got_top20[0].0 == case.prefill_top20.ids[0];
+        let mut max_abs_diff = 0f32;
+        for (i, &id) in case.prefill_top20.ids.iter().enumerate() {
+            let diff = (prefill_logits[id as usize] - case.prefill_top20.values[i]).abs();
+            max_abs_diff = max_abs_diff.max(diff);
+        }
+        let tokens_match = got_tokens == case.greedy_continuation[..n_tokens.min(case.greedy_continuation.len())];
+
+        println!(
+            "engine=cpu  {:<12} {:>4}  ids={ids_match:<5}  tok={tokens_match:<5}  top1={top1_match:<5}  top20_maxdiff={max_abs_diff:.6}  prefill={prefill_ms_per_tok:.2}  decode={decode_ms_per_tok:.2}",
+            case.name, case.input_ids.len()
+        );
+        if !ids_match || !tokens_match {
+            all_ok = false;
+            eprintln!("[{}] got tokens:      {got_tokens:?}", case.name);
+            eprintln!("[{}] fixture tokens:  {:?}", case.name, case.greedy_continuation);
+        }
+    }
+
+    if !all_ok {
+        anyhow::bail!("one or more fixture cases failed (see stderr above)");
+    }
+    println!("all fixture cases passed (engine=cpu)");
+    Ok(())
 }
 
 /// `--check kv-snapshot`: prefill(prefix) -> snapshot -> restore into a
@@ -287,6 +406,22 @@ fn main() -> Result<()> {
     let tokenizer = Tokenizer::from_file(&tokenizer_json).map_err(|e| anyhow::anyhow!("loading {tokenizer_json}: {e}"))?;
     let chat_template = read_chat_template(&tokenizer_config_json)?;
 
+    if args.engine == EngineKind::Cpu {
+        if let Some(prompt) = &args.prompt {
+            let token_ids = tokenize_prompt(&tokenizer, &chat_template, prompt)?;
+            println!("tokenized prompt into {} ids: {token_ids:?}", token_ids.len());
+            let model = lean::cpu::CpuModel::load(&args.gguf)?;
+            let (_, got_tokens, prefill_ms_per_tok, decode_ms_per_tok) = run_generation_cpu(&model, &token_ids, args.tokens);
+            let text = tokenizer.decode(&got_tokens, true).map_err(|e| anyhow::anyhow!("tokenizer decode failed: {e}"))?;
+            println!("continuation: {text}");
+            println!("prefill: {prefill_ms_per_tok:.2}ms/token, decode: {decode_ms_per_tok:.2}ms/token");
+            return Ok(());
+        }
+        let fixture_json = std::fs::read_to_string(&args.fixture).with_context(|| format!("reading fixture {}", args.fixture))?;
+        let fixture: Fixture = serde_json::from_str(&fixture_json)?;
+        return run_fixture_cpu(&args.gguf, &tokenizer, &chat_template, &fixture, args.tokens, args.long);
+    }
+
     let engine = lean::engine::Engine::new()?;
     let load_start = Instant::now();
     let model = GpuModel::load(&engine, &args.gguf, args.kernel == Kernel::Fast)?;
@@ -323,11 +458,16 @@ fn main() -> Result<()> {
     println!("kernel={:?}  case            seq  tok_match  top1_match  top20_maxdiff  prefill_ms/tok  decode_ms/tok", args.kernel);
     let mut all_ok = true;
     for case in &fixture.cases {
-        let our_ids = tokenize_prompt(&tokenizer, &chat_template, &case.prompt)?;
-        let ids_match = our_ids == case.input_ids;
-        if !ids_match {
-            eprintln!("[{}] TOKENIZATION MISMATCH: ours={our_ids:?} fixture={:?}", case.name, case.input_ids);
-        }
+        let ids_match = if case.no_retokenize {
+            true
+        } else {
+            let our_ids = tokenize_prompt(&tokenizer, &chat_template, case.prompt.as_deref().unwrap_or_default())?;
+            let m = our_ids == case.input_ids;
+            if !m {
+                eprintln!("[{}] TOKENIZATION MISMATCH: ours={our_ids:?} fixture={:?}", case.name, case.input_ids);
+            }
+            m
+        };
 
         let (prefill_logits, got_tokens, prefill_ms_per_tok, decode_ms_per_tok) = run_generation(&engine, &model, &case.input_ids, args.tokens);
 
