@@ -6,3 +6,4 @@ eval/results/*.log
 scripts/headless/out/
 crates/lean/www/model/
 crates/lean/www/model_qwen3/
+crates/lean/www/model_qwen3_1_7b/
