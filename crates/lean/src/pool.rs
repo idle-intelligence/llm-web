@@ -102,6 +102,17 @@ impl Pool {
         self.buffers.borrow().values().map(|b| b.size()).sum()
     }
 
+    /// Debug-only: the `n` largest pooled buffers by size, as
+    /// `(key, bytes)`. Added for this session's memory investigation
+    /// (docs/runs/2026-09-28-lean-decode-breakdown.md) - not used by any
+    /// non-debug caller.
+    pub fn debug_top_buffers(&self, n: usize) -> Vec<(String, u64)> {
+        let mut v: Vec<(String, u64)> = self.buffers.borrow().iter().map(|(k, b)| (k.clone(), b.size())).collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1));
+        v.truncate(n);
+        v
+    }
+
     fn bump_generation(&self) {
         self.generation.set(self.generation.get() + 1);
         self.alloc_count.set(self.alloc_count.get() + 1);

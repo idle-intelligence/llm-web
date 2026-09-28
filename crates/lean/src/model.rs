@@ -1610,21 +1610,44 @@ pub async fn forward_prefill(engine: &Engine, model: &GpuModel, cache: &mut KvCa
         pass = engine.begin_pass(&mut encoder, "prefill");
     }
 
-    let normed_final = rmsnorm(engine, pool, &mut pass, "out_norm", &x, &model.out_norm, seq, hidden, cfg.rms_norm_eps);
-    let logits = linear(engine, pool, &mut pass, "lm_head", &normed_final, seq, hidden, &model.lm_head, &model.zero_bias_vocab, cfg.vocab_size as u32, false);
-    // Only the last position's row feeds the next token (see this fn's
-    // return value below), so only it needs masking - `row_offset =
-    // (seq-1)*vocab` into the `[seq, vocab]` logits buffer.
+    // Only the last position's row ever feeds the next token (this fn's
+    // documented return value is just that one row's logits - every caller
+    // already only reads `all_logits[(seq-1)*vocab..]`), so slice `x` down
+    // to that one row here, BEFORE `out_norm`/`lm_head`, instead of running
+    // the final RMSNorm and the lm-head matmul over all `seq` rows and
+    // throwing away `seq - 1` of them. `x` is `[seq, hidden]` row-major
+    // (embed_gather's/every layer's convention), so the last row is a
+    // contiguous `hidden`-f32 byte range at the end of the buffer - one
+    // `copy_buffer_to_buffer` (encoder-level, hence the pass close/reopen -
+    // same pattern as `scatter_kv_gpu`'s calls above).
+    //
+    // This matters far more than it looks: `lm_head` is a `[hidden,
+    // vocab_size]` matmul, and `output.weight` on this crate's official
+    // GGUFs is the naive/no-fast-path Q6_K kernel or an un-tiled Q4_0/Q8_0
+    // path at the vocab sizes involved (151936 for Qwen2.5/Qwen3) - running
+    // it at `rows = seq` instead of `rows = 1` multiplied both its compute
+    // and its output buffer size by `seq` for no benefit. Measured on
+    // Qwen2.5-0.5B-Instruct (native, `LEAN_DEBUG_POOL_TOP`): the `lm_head`
+    // scratch buffer alone was 1.43GB at `seq = 2225` before this fix -
+    // this crate's single largest scratch allocation, dwarfing everything
+    // else in `Pool` (see docs/runs/2026-09-28-lean-decode-breakdown.md).
+    let last_row = pool.data("prefill_last_row", hidden as usize);
+    drop(pass);
+    encoder.copy_buffer_to_buffer(&x, ((seq - 1) * hidden * 4) as u64, &last_row, 0, (hidden * 4) as u64);
+    pass = engine.begin_pass(&mut encoder, "prefill");
+
+    let normed_final = rmsnorm(engine, pool, &mut pass, "out_norm", &last_row, &model.out_norm, 1, hidden, cfg.rms_norm_eps);
+    let logits = linear(engine, pool, &mut pass, "lm_head", &normed_final, 1, hidden, &model.lm_head, &model.zero_bias_vocab, cfg.vocab_size as u32, false);
     if let Some(mask) = mask {
-        mask_logits_gpu(engine, pool, &mut pass, "prefill_mask", &logits, mask, cfg.vocab_size as u32, (seq - 1) * cfg.vocab_size as u32);
+        mask_logits_gpu(engine, pool, &mut pass, "prefill_mask", &logits, mask, cfg.vocab_size as u32, 0);
     }
     drop(pass);
 
     engine.queue.submit(Some(encoder.finish()));
     let vocab = cfg.vocab_size;
-    let all_logits = engine.read_buffer(&logits, (seq as usize) * vocab).await;
+    let all_logits = engine.read_buffer(&logits, vocab).await;
     cache.kv_len = seq;
-    all_logits[(seq as usize - 1) * vocab..].to_vec()
+    all_logits
 }
 
 /// Applies an allowed-token bitset to one row of `logits` (`vocab` wide, at
