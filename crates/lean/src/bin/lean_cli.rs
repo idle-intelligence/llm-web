@@ -86,6 +86,13 @@ struct Args {
     /// effect on `--engine gpu`, which always runs every case.
     #[arg(long, default_value_t = false)]
     long: bool,
+    /// Opt-in: use the integer-dot-product (`dot4I8Packed`) decode matvec
+    /// kernels instead of the f32 ones, when the adapter's
+    /// `packed_4x8_integer_dot_product` WGSL language feature is present
+    /// (see `Engine::has_dp4`). No effect if the capability isn't reported.
+    /// Default `false` - see docs/runs/2026-09-28-lean-perf-2.md session 6.
+    #[arg(long, default_value_t = false)]
+    dp4: bool,
 }
 
 #[derive(Deserialize)]
@@ -423,9 +430,15 @@ fn main() -> Result<()> {
     }
 
     let engine = lean::engine::Engine::new()?;
+    if args.dp4 {
+        if !engine.has_dp4 {
+            eprintln!("--dp4 requested but adapter does not report packed_4x8_integer_dot_product; falling back to f32 decode kernels");
+        }
+        engine.dp4_decode.set(true);
+    }
     let load_start = Instant::now();
     let model = GpuModel::load(&engine, &args.gguf, args.kernel == Kernel::Fast)?;
-    eprintln!("loaded model in {:?} (kernel={:?})", load_start.elapsed(), args.kernel);
+    eprintln!("loaded model in {:?} (kernel={:?}, has_dp4={}, dp4_decode={})", load_start.elapsed(), args.kernel, engine.has_dp4, engine.dp4_decode.get());
     eprintln!(
         "config: layers={} hidden={} heads={} kv_heads={} head_dim={} intermediate={} vocab={} eps={} theta={}",
         model.config.num_layers, model.config.hidden_size, model.config.num_heads, model.config.num_kv_heads, model.config.head_dim, model.config.intermediate_size, model.config.vocab_size, model.config.rms_norm_eps, model.config.rope_theta
