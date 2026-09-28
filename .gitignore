@@ -5,3 +5,4 @@ target/
 eval/results/*.log
 scripts/headless/out/
 crates/lean/www/model/
+crates/lean/www/model_qwen3/
