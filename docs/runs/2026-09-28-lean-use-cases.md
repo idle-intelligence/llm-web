@@ -1,7 +1,7 @@
-# lean engine: benchmarks against TC's own consumer use cases
+# lean engine: benchmarks against the project's own consumer use cases
 
 Follow-on to `docs/runs/2026-09-28-lean-perf.md` and
-`docs/runs/2026-09-28-lean-qwen3.md`. Scope: for each of TC's current
+`docs/runs/2026-09-28-lean-qwen3.md`. Scope: for each of the project's current
 projects, find the model that project actually uses (or the closest
 non-exotic substitute), run it through the lean engine (`crates/lean`, this
 repo), and report benchmarks next to the reference engines those projects
@@ -43,8 +43,7 @@ parametrized for Qwen3-0.6B; `www/cpu.html` already covered Qwen2.5-0.5B).
   --enable-features=Vulkan,WebGPU --use-angle=metal`, served locally via
   `python3 -m http.server` rooted at `crates/lean/` (lean pages) or
   `llm-web/web/` (the wllama demo) or a scratch directory (the WebLLM page).
-  Locks (`/Users/tc/.claude/jobs/f13f376f/tmp/locked gpu ... locked
-  browser ...`) held around every browser/GPU run.
+  A GPU/browser lock was held around every browser/GPU run.
 - Models, all under `~/Code/idle-intelligence/models` via `hf download`
   (plain User-Agent, no email):
   - Qwen2.5-0.5B-Instruct, `qwen2.5-0.5b-instruct-q4_0.gguf` (Q4_0, Q8_0
@@ -63,7 +62,7 @@ parametrized for Qwen3-0.6B; `www/cpu.html` already covered Qwen2.5-0.5B).
     build, not this GGUF).
   - `idle-intelligence/llm-of-life-lora`'s `lora-a-rules-300.bin`
     (read from `~/Code/idle-intelligence/llm-life/artifacts/`, the path
-    TC's own llm-life repo keeps it at - not copied into this repo).
+    llm-life's own artifacts directory keeps it at - not copied into this repo).
 - Hub API check (`GET api/models/bartowski/<repo>`, siblings list): both
   `bartowski/SmolLM2-360M-Instruct-GGUF` and
   `bartowski/SmolLM2-1.7B-Instruct-GGUF` ship `Q4_0.gguf` and `Q8_0.gguf`
@@ -183,7 +182,7 @@ Median: 20.7 tok/s. Download: 270,590,880 bytes (~271 MB, matches the
 page's own "~271 MB" label).
 
 Lean engine candidates, same chat protocol, next to the wllama baseline
-(download size next to speed, per TC's 2026-09-28 addition):
+(download size next to speed):
 
 | model | quant | download bytes | rung | prefill | decode |
 |---|---|---:|---|---:|---:|
