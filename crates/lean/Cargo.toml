@@ -63,3 +63,7 @@ tokenizers = { workspace = true, features = ["unstable_wasm", "fancy-regex"] }
 [[bin]]
 name = "lean-cli"
 path = "src/bin/lean_cli.rs"
+
+[[bin]]
+name = "lean-bench-usecases"
+path = "src/bin/lean_bench_usecases.rs"
