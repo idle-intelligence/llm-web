@@ -14,7 +14,7 @@
 //
 // Every wasm/js loading URL below carries `?v=ENGINE_BUILD`, bumped in the
 // same commit as any wasm/model rebuild - see docs/runs/2026-09-28-lean-web.md.
-const ENGINE_BUILD = "2026-09-29-01";
+const ENGINE_BUILD = "2026-09-29-02";
 
 const params = new URLSearchParams(location.search);
 const modelKey = params.get("model") || "05b";
@@ -69,7 +69,7 @@ async function main() {
   const c = fixture.cases.find((x) => x.name === (caseName === "long" ? "long_tools_single" : "short"));
   if (!c) throw new Error(`fixture case not found for case=${caseName}`);
 
-  const [ggufBytes, tokenizerJson, tokenizerCfgJson] = await Promise.all([
+  let [ggufBytes, tokenizerJson, tokenizerCfgJson] = await Promise.all([
     fetchBytes(cfg.gguf),
     fetchText(cfg.tokenizer),
     fetchText(cfg.tokenizerCfg),
@@ -80,6 +80,7 @@ async function main() {
   const maxCtx = c.input_ids.length + steps + 64;
   const loadStart = performance.now();
   engine.load(ggufBytes, tokenizerJson, tokenizerCfgJson, maxCtx);
+  ggufBytes = null; // drop this session's reference to the fetched Uint8Array/ArrayBuffer now that load() (synchronous - every tensor is already uploaded) has returned, so the JS heap can reclaim it - see web.rs's JsBytesReader doc comment.
   const loadMs = performance.now() - loadStart;
   log(`[lean] model loaded in ${loadMs.toFixed(0)}ms: ${engine.info()}`);
 

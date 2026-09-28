@@ -9,7 +9,7 @@
 //
 // Every wasm/js loading URL below carries `?v=ENGINE_BUILD`, bumped in the
 // same commit as any wasm/model rebuild - see docs/runs/2026-09-28-lean-cpu.md.
-const ENGINE_BUILD = "2026-09-29-cpu-01";
+const ENGINE_BUILD = "2026-09-29-cpu-02";
 
 const params = new URLSearchParams(location.search);
 const local = params.get("local") !== "0"; // local model files by default - see this dir's model/
@@ -50,7 +50,7 @@ async function main() {
   const fixture = JSON.parse(await fetchText(`../reference/fixture.json?v=${ENGINE_BUILD}`));
 
   const fetchStart = performance.now();
-  const [ggufBytes, tokenizerJson, tokenizerCfgJson] = await Promise.all([
+  let [ggufBytes, tokenizerJson, tokenizerCfgJson] = await Promise.all([
     fetchBytes(ggufUrl),
     fetchText(tokenizerUrl),
     fetchText(tokenizerCfgUrl),
@@ -60,6 +60,7 @@ async function main() {
   const engine = LeanEngineCpu.create();
   const loadStart = performance.now();
   engine.load(ggufBytes, tokenizerJson, tokenizerCfgJson, 2500);
+  ggufBytes = null; // drop this session's reference to the fetched Uint8Array/ArrayBuffer now that load() (synchronous - every tensor is already uploaded) has returned, so the JS heap can reclaim it - see web.rs's JsBytesReader doc comment.
   log(`[lean-cpu] model loaded in ${(performance.now() - loadStart).toFixed(0)}ms: ${engine.info()}`);
 
   function argmaxJs(arr) {

@@ -10,7 +10,7 @@
 //
 // Every wasm/js loading URL below carries `?v=ENGINE_BUILD`, bumped in the
 // same commit as any wasm/model rebuild - see docs/runs/2026-09-28-lean-web.md.
-const ENGINE_BUILD = "2026-09-29-01";
+const ENGINE_BUILD = "2026-09-29-02";
 
 const HF_GGUF = "https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q8_0.gguf";
 const HF_TOKENIZER = "https://huggingface.co/Qwen/Qwen3-0.6B/resolve/main/tokenizer.json";
@@ -48,7 +48,7 @@ async function main() {
   const fixture = JSON.parse(await fetchText(`../reference/fixture_qwen3.json?v=${ENGINE_BUILD}`));
 
   const fetchStart = performance.now();
-  const [ggufBytes, tokenizerJson, tokenizerCfgJson] = await Promise.all([
+  let [ggufBytes, tokenizerJson, tokenizerCfgJson] = await Promise.all([
     fetchBytes(ggufUrl),
     fetchText(tokenizerUrl),
     fetchText(tokenizerCfgUrl),
@@ -62,6 +62,7 @@ async function main() {
   // max_ctx: longest fixture case (long_tools_single, 2225 prompt tokens)
   // plus its 32-token continuation, plus headroom.
   engine.load(ggufBytes, tokenizerJson, tokenizerCfgJson, 2300);
+  ggufBytes = null; // drop this session's reference to the fetched Uint8Array/ArrayBuffer now that load() (synchronous - every tensor is already uploaded) has returned, so the JS heap can reclaim it - see web.rs's JsBytesReader doc comment.
   log(`[lean] model loaded in ${(performance.now() - loadStart).toFixed(0)}ms: ${engine.info()}`);
 
   let allMatch = true;
