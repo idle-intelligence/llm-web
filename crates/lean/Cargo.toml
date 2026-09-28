@@ -25,6 +25,11 @@ web = [
     "dep:console_error_panic_hook",
     "getrandom/wasm_js",
 ]
+# Dev-only: forces cpu_kernels' aarch64 dot kernels to the scalar fallback
+# even when compiled for aarch64, so the NEON-vs-scalar delta can be
+# measured with the same lean-cli binary otherwise unchanged - see
+# docs/runs/2026-09-28-lean-cpu.md.
+force_scalar = []
 
 [dependencies]
 anyhow = { workspace = true }

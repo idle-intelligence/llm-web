@@ -183,11 +183,13 @@ mod simd128 {
     use super::{f16_to_f32, QK};
     use std::arch::wasm32::*;
 
+    /// `vals`' 16 lanes, already-signed i8 (Q8_0's raw bytes), converted to
+    /// f32 and dotted against `x`. No offset applied - see
+    /// `dot16_unsigned_nibbles` for the Q4_0 case, which needs one.
     #[inline]
-    unsafe fn dot16_signed_u8(vals: v128, x: &[f32]) -> f32 {
-        let signed = i8x16_sub(vals, i8x16_splat(8));
-        let lo16 = i16x8_extend_low_i8x16(signed);
-        let hi16 = i16x8_extend_high_i8x16(signed);
+    unsafe fn dot16_signed_i8(vals: v128, x: &[f32]) -> f32 {
+        let lo16 = i16x8_extend_low_i8x16(vals);
+        let hi16 = i16x8_extend_high_i8x16(vals);
         let lo32a = i32x4_extend_low_i16x8(lo16);
         let lo32b = i32x4_extend_high_i16x8(lo16);
         let hi32a = i32x4_extend_low_i16x8(hi16);
@@ -207,12 +209,26 @@ mod simd128 {
         f32x4_extract_lane::<0>(acc) + f32x4_extract_lane::<1>(acc) + f32x4_extract_lane::<2>(acc) + f32x4_extract_lane::<3>(acc)
     }
 
+    /// `vals`' 16 lanes, each an unsigned nibble value `[0, 15]` (Q4_0's
+    /// packed weights), offset by `-8` to the signed weight range before
+    /// converting to f32 - the bug this comment guards against: reusing
+    /// `dot16_signed_i8`'s already-signed path here (or its own path for
+    /// Q8_0) silently corrupts one or the other, since only Q4_0's nibbles
+    /// need the offset (caught by `tests::q8_dispatch_matches_scalar_reference`
+    /// on a real wasm32+simd128 run under wasmtime - this file's dispatch
+    /// wrapper looked identical for both dtypes in an earlier version and
+    /// wasn't).
+    #[inline]
+    unsafe fn dot16_unsigned_nibbles(vals: v128, x: &[f32]) -> f32 {
+        dot16_signed_i8(i8x16_sub(vals, i8x16_splat(8)), x)
+    }
+
     fn dot_q4_0_block(block: &[u8], x: &[f32]) -> f32 {
         unsafe {
             let raw = v128_load(block[2..18].as_ptr() as *const v128);
             let lo = v128_and(raw, u8x16_splat(0x0F));
             let hi = u8x16_shr(raw, 4);
-            dot16_signed_u8(lo, &x[0..16]) + dot16_signed_u8(hi, &x[16..32])
+            dot16_unsigned_nibbles(lo, &x[0..16]) + dot16_unsigned_nibbles(hi, &x[16..32])
         }
     }
 
@@ -230,7 +246,7 @@ mod simd128 {
         unsafe {
             let a = v128_load(qs.as_ptr() as *const v128);
             let b = v128_load(qs.as_ptr().add(16) as *const v128);
-            dot16_signed_u8(a, &x[0..16]) + dot16_signed_u8(b, &x[16..32])
+            dot16_signed_i8(a, &x[0..16]) + dot16_signed_i8(b, &x[16..32])
         }
     }
 
@@ -252,9 +268,13 @@ mod simd128 {
 /// runtime.
 #[inline]
 pub fn dot_q4_0(bytes: &[u8], x: &[f32]) -> f32 {
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_arch = "aarch64", not(feature = "force_scalar")))]
     {
         neon::dot_q4_0(bytes, x)
+    }
+    #[cfg(all(target_arch = "aarch64", feature = "force_scalar"))]
+    {
+        dot_q4_0_scalar(bytes, x)
     }
     #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
     {
@@ -270,9 +290,13 @@ pub fn dot_q4_0(bytes: &[u8], x: &[f32]) -> f32 {
 /// `blocks_per_row * 32`). Same dispatch rule as `dot_q4_0`.
 #[inline]
 pub fn dot_q8_0(bytes: &[u8], x: &[f32]) -> f32 {
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_arch = "aarch64", not(feature = "force_scalar")))]
     {
         neon::dot_q8_0(bytes, x)
+    }
+    #[cfg(all(target_arch = "aarch64", feature = "force_scalar"))]
+    {
+        dot_q8_0_scalar(bytes, x)
     }
     #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
     {
