@@ -1,4 +1,4 @@
-//! Q4_0/Q8_0 dot-product kernels for the CPU rung (`cpu.rs`): one row of
+//! Q4_0/Q8_0/Q6_K dot-product kernels for the CPU rung (`cpu.rs`): one row of
 //! GGUF block bytes (exactly as they sit on disk - see `quant.rs`'s doc
 //! comment on the shared block convention) dotted against an f32 activation
 //! vector of the same length. Three implementations behind `cfg`, selected
@@ -32,9 +32,71 @@
 //! kernels are written fresh against this crate's own Q4_0/Q8_0 layout.
 
 const QK: usize = 32;
+const QK6K: usize = 256;
 
 fn f16_to_f32(bits: u16) -> f32 {
     half::f16::from_bits(bits).to_f32()
+}
+
+/// Scalar reference Q6_K dot: one 210-byte super-block (128 `ql` + 64 `qh` +
+/// 16 signed-i8 `scales` + 2-byte f16 `d`) against 256 activations, matching
+/// `gguf::dequantize_q6_k`'s convention exactly - see that fn's doc comment
+/// for the block-halves/`is`/scale-offset derivation.
+#[inline]
+#[allow(dead_code)] // always used by tests; used as the fallback impl on non-aarch64/non-simd128 targets
+fn dot_q6_k_scalar(bytes: &[u8], x: &[f32]) -> f32 {
+    let mut acc = 0f32;
+    for (bi, block) in bytes.chunks_exact(210).enumerate() {
+        let ql_all = &block[0..128];
+        let qh_all = &block[128..192];
+        let sc_all = &block[192..208];
+        let d = f16_to_f32(u16::from_le_bytes([block[208], block[209]]));
+        let x_base = bi * QK6K;
+        let mut s = 0f32;
+        for half in 0..2usize {
+            let ql = &ql_all[half * 64..half * 64 + 64];
+            let qh = &qh_all[half * 32..half * 32 + 32];
+            let sc = &sc_all[half * 8..half * 8 + 8];
+            let x_half = &x[x_base + half * 128..x_base + half * 128 + 128];
+            for l in 0..32usize {
+                let is = l / 16;
+                let q1 = ((ql[l] & 0x0F) | ((qh[l] & 3) << 4)) as i32 - 32;
+                let q2 = ((ql[l + 32] & 0x0F) | (((qh[l] >> 2) & 3) << 4)) as i32 - 32;
+                let q3 = ((ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4)) as i32 - 32;
+                let q4 = ((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) as i32 - 32;
+                s += (sc[is] as i8) as f32 * q1 as f32 * x_half[l];
+                s += (sc[is + 2] as i8) as f32 * q2 as f32 * x_half[32 + l];
+                s += (sc[is + 4] as i8) as f32 * q3 as f32 * x_half[64 + l];
+                s += (sc[is + 6] as i8) as f32 * q4 as f32 * x_half[96 + l];
+            }
+        }
+        acc += s * d;
+    }
+    acc
+}
+
+/// Unpacks one Q6_K half-block's four 32-value signed-weight groups
+/// (`q - 32`, same convention as `dot_q6_k_scalar`) into `i8` scratch
+/// arrays. The bit-assembly step (nibble | 2-bit field) doesn't vectorize
+/// onto a single fixed shift/mask the way Q4_0/Q8_0's do, so both SIMD
+/// paths below share this scalar unpack and only vectorize the actual
+/// multiply-widen-accumulate against `x` (via each arch's existing 16-lane
+/// signed-i8 dot helper), same op split as `dot_q4_0`'s dequant-then-dot
+/// shape.
+#[inline]
+#[allow(dead_code)] // used by the neon/simd128 modules, which don't both compile on every target
+fn unpack_q6k_half(ql: &[u8], qh: &[u8]) -> ([i8; 32], [i8; 32], [i8; 32], [i8; 32]) {
+    let mut q1 = [0i8; 32];
+    let mut q2 = [0i8; 32];
+    let mut q3 = [0i8; 32];
+    let mut q4 = [0i8; 32];
+    for l in 0..32usize {
+        q1[l] = (((ql[l] & 0x0F) | ((qh[l] & 3) << 4)) as i32 - 32) as i8;
+        q2[l] = (((ql[l + 32] & 0x0F) | (((qh[l] >> 2) & 3) << 4)) as i32 - 32) as i8;
+        q3[l] = (((ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4)) as i32 - 32) as i8;
+        q4[l] = (((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) as i32 - 32) as i8;
+    }
+    (q1, q2, q3, q4)
 }
 
 /// Scalar reference Q4_0 dot: one 18-byte block (2-byte f16 scale + 16
@@ -176,6 +238,43 @@ mod neon {
         }
         acc
     }
+
+    /// One Q6_K super-block dotted against 256 activations: scalar bit
+    /// unpack (`super::unpack_q6k_half`) into four 32-value `i8` groups per
+    /// half-block, each group's two 16-value sub-ranges (`is = l/16`, its own
+    /// `scales` entry) dotted via the existing 16-lane `dot16_signed_i8`
+    /// widen helper - see `super::unpack_q6k_half`'s doc comment on why the
+    /// unpack itself stays scalar.
+    pub(super) fn dot_q6_k(bytes: &[u8], x: &[f32]) -> f32 {
+        let mut acc = 0f32;
+        for (bi, block) in bytes.chunks_exact(210).enumerate() {
+            let ql_all = &block[0..128];
+            let qh_all = &block[128..192];
+            let sc_all = &block[192..208];
+            let d = f16_to_f32(u16::from_le_bytes([block[208], block[209]]));
+            let x_base = bi * super::QK6K;
+            let mut s = 0f32;
+            for half in 0..2usize {
+                let ql = &ql_all[half * 64..half * 64 + 64];
+                let qh = &qh_all[half * 32..half * 32 + 32];
+                let sc = &sc_all[half * 8..half * 8 + 8];
+                let x_half = &x[x_base + half * 128..x_base + half * 128 + 128];
+                let (q1, q2, q3, q4) = super::unpack_q6k_half(ql, qh);
+                unsafe {
+                    s += (sc[0] as i8) as f32 * dot16_signed_i8(vld1q_s8(q1[0..16].as_ptr()), &x_half[0..16]);
+                    s += (sc[1] as i8) as f32 * dot16_signed_i8(vld1q_s8(q1[16..32].as_ptr()), &x_half[16..32]);
+                    s += (sc[2] as i8) as f32 * dot16_signed_i8(vld1q_s8(q2[0..16].as_ptr()), &x_half[32..48]);
+                    s += (sc[3] as i8) as f32 * dot16_signed_i8(vld1q_s8(q2[16..32].as_ptr()), &x_half[48..64]);
+                    s += (sc[4] as i8) as f32 * dot16_signed_i8(vld1q_s8(q3[0..16].as_ptr()), &x_half[64..80]);
+                    s += (sc[5] as i8) as f32 * dot16_signed_i8(vld1q_s8(q3[16..32].as_ptr()), &x_half[80..96]);
+                    s += (sc[6] as i8) as f32 * dot16_signed_i8(vld1q_s8(q4[0..16].as_ptr()), &x_half[96..112]);
+                    s += (sc[7] as i8) as f32 * dot16_signed_i8(vld1q_s8(q4[16..32].as_ptr()), &x_half[112..128]);
+                }
+            }
+            acc += s * d;
+        }
+        acc
+    }
 }
 
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
@@ -259,6 +358,41 @@ mod simd128 {
         }
         acc
     }
+
+    /// wasm simd128 mirror of `neon::dot_q6_k`: scalar bit unpack
+    /// (`super::unpack_q6k_half`), then `dot16_signed_i8` (already-signed,
+    /// no nibble offset needed since the unpack already applied `- 32`) for
+    /// each 16-value sub-range's widen-and-accumulate.
+    pub(super) fn dot_q6_k(bytes: &[u8], x: &[f32]) -> f32 {
+        let mut acc = 0f32;
+        for (bi, block) in bytes.chunks_exact(210).enumerate() {
+            let ql_all = &block[0..128];
+            let qh_all = &block[128..192];
+            let sc_all = &block[192..208];
+            let d = f16_to_f32(u16::from_le_bytes([block[208], block[209]]));
+            let x_base = bi * super::QK6K;
+            let mut s = 0f32;
+            for half in 0..2usize {
+                let ql = &ql_all[half * 64..half * 64 + 64];
+                let qh = &qh_all[half * 32..half * 32 + 32];
+                let sc = &sc_all[half * 8..half * 8 + 8];
+                let x_half = &x[x_base + half * 128..x_base + half * 128 + 128];
+                let (q1, q2, q3, q4) = super::unpack_q6k_half(ql, qh);
+                unsafe {
+                    s += (sc[0] as i8) as f32 * dot16_signed_i8(v128_load(q1[0..16].as_ptr() as *const v128), &x_half[0..16]);
+                    s += (sc[1] as i8) as f32 * dot16_signed_i8(v128_load(q1[16..32].as_ptr() as *const v128), &x_half[16..32]);
+                    s += (sc[2] as i8) as f32 * dot16_signed_i8(v128_load(q2[0..16].as_ptr() as *const v128), &x_half[32..48]);
+                    s += (sc[3] as i8) as f32 * dot16_signed_i8(v128_load(q2[16..32].as_ptr() as *const v128), &x_half[48..64]);
+                    s += (sc[4] as i8) as f32 * dot16_signed_i8(v128_load(q3[0..16].as_ptr() as *const v128), &x_half[64..80]);
+                    s += (sc[5] as i8) as f32 * dot16_signed_i8(v128_load(q3[16..32].as_ptr() as *const v128), &x_half[80..96]);
+                    s += (sc[6] as i8) as f32 * dot16_signed_i8(v128_load(q4[0..16].as_ptr() as *const v128), &x_half[96..112]);
+                    s += (sc[7] as i8) as f32 * dot16_signed_i8(v128_load(q4[16..32].as_ptr() as *const v128), &x_half[112..128]);
+                }
+            }
+            acc += s * d;
+        }
+        acc
+    }
 }
 
 /// One row's Q4_0 block bytes dotted against `x` (`x.len()` must equal
@@ -305,6 +439,28 @@ pub fn dot_q8_0(bytes: &[u8], x: &[f32]) -> f32 {
     #[cfg(not(any(target_arch = "aarch64", all(target_arch = "wasm32", target_feature = "simd128"))))]
     {
         dot_q8_0_scalar(bytes, x)
+    }
+}
+
+/// One row's Q6_K block bytes dotted against `x` (`x.len()` must equal
+/// `blocks_per_row * 256`). Same dispatch rule as `dot_q4_0`/`dot_q8_0`.
+#[inline]
+pub fn dot_q6_k(bytes: &[u8], x: &[f32]) -> f32 {
+    #[cfg(all(target_arch = "aarch64", not(feature = "force_scalar")))]
+    {
+        neon::dot_q6_k(bytes, x)
+    }
+    #[cfg(all(target_arch = "aarch64", feature = "force_scalar"))]
+    {
+        dot_q6_k_scalar(bytes, x)
+    }
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    {
+        simd128::dot_q6_k(bytes, x)
+    }
+    #[cfg(not(any(target_arch = "aarch64", all(target_arch = "wasm32", target_feature = "simd128"))))]
+    {
+        dot_q6_k_scalar(bytes, x)
     }
 }
 
@@ -356,5 +512,31 @@ mod tests {
         let scalar = dot_q8_0_scalar(&bytes, &x);
         let dispatched = dot_q8_0(&bytes, &x);
         assert!((scalar - dispatched).abs() < 1e-3, "scalar={scalar} dispatched={dispatched}");
+    }
+
+    fn synth_q6k_block(seed: u32) -> Vec<u8> {
+        let mut block = vec![0u8; 210];
+        for (i, b) in block[0..192].iter_mut().enumerate() {
+            *b = ((i as u32 * 13 + seed * 37) % 256) as u8;
+        }
+        for (i, b) in block[192..208].iter_mut().enumerate() {
+            *b = ((i as i32 * 17 + seed as i32 * 11) % 256 - 128) as i8 as u8;
+        }
+        let d = half::f16::from_f32(0.02 + (seed % 5) as f32 * 0.01);
+        block[208..210].copy_from_slice(&d.to_le_bytes());
+        block
+    }
+
+    #[test]
+    fn q6k_dispatch_matches_scalar_reference() {
+        let n_blocks = 3;
+        let mut bytes = Vec::new();
+        for bi in 0..n_blocks {
+            bytes.extend(synth_q6k_block(bi as u32));
+        }
+        let x: Vec<f32> = (0..n_blocks * 256).map(|i| (i as f32) * 0.005 - 1.0).collect();
+        let scalar = dot_q6_k_scalar(&bytes, &x);
+        let dispatched = dot_q6_k(&bytes, &x);
+        assert!((scalar - dispatched).abs() < 1e-2, "scalar={scalar} dispatched={dispatched}");
     }
 }

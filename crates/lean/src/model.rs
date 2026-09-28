@@ -44,6 +44,7 @@ use crate::engine::Engine;
 use crate::gguf::GgufReader;
 use crate::pool::Pool;
 use crate::quant::{load_embedding_table_gguf, load_matmul_weight_gguf, EmbeddingTable, MatMulWeight};
+use crate::gguf::GgmlDtype;
 
 /// Row-count (`M`) threshold above which the tiled Q4_0 matmul
 /// (`linear_q4_tiled.wgsl`) is used for prefill; below it, the naive
@@ -562,8 +563,8 @@ impl GpuModel {
         let embed_shape = embed_info.shape();
         let embed_dtype = embed_info.dtype();
         anyhow::ensure!(
-            matches!(embed_dtype, crate::gguf::GgmlDtype::Q4_0 | crate::gguf::GgmlDtype::Q8_0),
-            "expected token_embd.weight to be Q4_0 or Q8_0, got {embed_dtype:?}"
+            matches!(embed_dtype, GgmlDtype::Q4_0 | GgmlDtype::Q8_0 | GgmlDtype::Q6_K),
+            "expected token_embd.weight to be Q4_0, Q8_0 or Q6_K, got {embed_dtype:?}"
         );
         let embed_bytes = reader.tensor_data("token_embd.weight")?;
         // Tied embeddings (`config.tied_embeddings`, e.g. Qwen3-0.6B/1.7B):
@@ -746,6 +747,30 @@ fn linear(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder, key:
                     let bg = pool.bind_group(&ckey, &engine.linear_q8, &entries);
                     engine.dispatch(encoder, &engine.linear_q8, &bg, (chunk.rows.div_ceil(16), rows.div_ceil(16), 1), &ckey);
                 }
+            }
+        }
+        MatMulWeight::Q6_K { chunks, blocks_per_row, out_dim: n_total } => {
+            // Naive kernel only (see linear_q6k.wgsl's doc comment) - Q6_K
+            // is only ever token_embd/output.weight in this crate's models,
+            // one matmul per forward, not worth a fast-path yet.
+            for chunk in chunks {
+                let ckey = format!("{key}.{}", chunk.row_start);
+                let dims = pool.uniform(&format!("{ckey}.dims"), LinearQDims { m: rows, k: in_dim, n: chunk.rows, act: 0, blocks_per_row: *blocks_per_row, n_offset: chunk.row_start, n_total: *n_total, _p2: 0 });
+                let bg = pool.bind_group(
+                    &ckey,
+                    &engine.linear_q6k,
+                    &[
+                        BindGroupEntry { binding: 0, resource: x.as_entire_binding() },
+                        BindGroupEntry { binding: 1, resource: chunk.ql.as_entire_binding() },
+                        BindGroupEntry { binding: 2, resource: chunk.qh.as_entire_binding() },
+                        BindGroupEntry { binding: 3, resource: chunk.scales.as_entire_binding() },
+                        BindGroupEntry { binding: 4, resource: chunk.d.as_entire_binding() },
+                        BindGroupEntry { binding: 5, resource: b.as_entire_binding() },
+                        BindGroupEntry { binding: 6, resource: out.as_entire_binding() },
+                        BindGroupEntry { binding: 7, resource: dims.as_entire_binding() },
+                    ],
+                );
+                engine.dispatch(encoder, &engine.linear_q6k, &bg, (chunk.rows.div_ceil(16), rows.div_ceil(16), 1), &ckey);
             }
         }
         MatMulWeight::Q4_0 { chunks, blocks_per_row, out_dim: n_total } => {
@@ -980,9 +1005,28 @@ fn embed_gather(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder
     let hidden = model.config.hidden_size as u32;
     let ids_buf = pool.upload_u32("embed.ids", token_ids);
     let out = pool.data("embed.out", (rows * hidden) as usize);
+    if let EmbeddingTable::Q6_K(t) = &model.embed {
+        let dims = pool.uniform("embed.dims", GatherDims { rows, hidden, blocks_per_row: t.blocks_per_row, _p0: 0 });
+        let bg = pool.bind_group(
+            "embed",
+            &engine.embed_gather_q6k,
+            &[
+                BindGroupEntry { binding: 0, resource: ids_buf.as_entire_binding() },
+                BindGroupEntry { binding: 1, resource: t.ql.as_entire_binding() },
+                BindGroupEntry { binding: 2, resource: t.qh.as_entire_binding() },
+                BindGroupEntry { binding: 3, resource: t.scales.as_entire_binding() },
+                BindGroupEntry { binding: 4, resource: t.d.as_entire_binding() },
+                BindGroupEntry { binding: 5, resource: out.as_entire_binding() },
+                BindGroupEntry { binding: 6, resource: dims.as_entire_binding() },
+            ],
+        );
+        engine.dispatch(encoder, &engine.embed_gather_q6k, &bg, ((rows * hidden).div_ceil(256), 1, 1), "embed");
+        return out;
+    }
     let (pipeline, table) = match &model.embed {
         EmbeddingTable::Q4_0(t) => (&engine.embed_gather_q4, t),
         EmbeddingTable::Q8_0(t) => (&engine.embed_gather_q8, t),
+        EmbeddingTable::Q6_K(_) => unreachable!("handled above"),
     };
     let dims = pool.uniform("embed.dims", GatherDims { rows, hidden, blocks_per_row: table.blocks_per_row, _p0: 0 });
     let bg = pool.bind_group(

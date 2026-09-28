@@ -126,18 +126,22 @@ fn read_gguf_value<R: Read + Seek>(reader: &mut R, value_type: u32) -> Result<Gg
 /// GGUFs (bartowski's llama.cpp quantize run bumps a handful of
 /// `ffn_down.weight` tensors, at both SmolLM2 sizes, from Q4_0 to Q4_1 for
 /// quality - verified against the file's own tensor dtypes, not assumed;
-/// see `config.rs`'s module doc comment). Anything else (K-quants) is still
-/// rejected - SmolLM2-1.7B-Instruct's own "Q4_0" GGUF additionally carries
-/// a Q6_K `token_embd.weight`, which this crate does not read (the same
-/// gap already flagged for Qwen2.5-3B-Instruct's GGUF); that model's Q4_0
-/// file is not loadable here, only its Q8_0 file (pure Q8_0, no K-quants).
+/// see `config.rs`'s module doc comment). `Q6_K` (14) was added for
+/// Qwen2.5-3B-Instruct's official "q4_0" GGUF, which carries at least one
+/// of `token_embd.weight`/`output.weight` at Q6_K residency (llama.cpp's
+/// quantizer keeps the embedding/output tensors at higher precision even
+/// in a "Q4_0" quant run) - the same gap already flagged for
+/// SmolLM2-1.7B-Instruct's "Q4_0" GGUF (also Q6_K `token_embd.weight`),
+/// now closed for both. Any other K-quant is still rejected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(non_camel_case_types)]
 pub enum GgmlDtype {
     F32,
     F16,
     Q4_0,
     Q4_1,
     Q8_0,
+    Q6_K,
 }
 
 impl GgmlDtype {
@@ -148,7 +152,8 @@ impl GgmlDtype {
             2 => Ok(Self::Q4_0),
             3 => Ok(Self::Q4_1),
             8 => Ok(Self::Q8_0),
-            other => bail!("unsupported GGML dtype code: {other} (this crate only reads F32/F16/Q4_0/Q4_1/Q8_0)"),
+            14 => Ok(Self::Q6_K),
+            other => bail!("unsupported GGML dtype code: {other} (this crate only reads F32/F16/Q4_0/Q4_1/Q8_0/Q6_K)"),
         }
     }
 
@@ -167,6 +172,10 @@ impl GgmlDtype {
             Self::Q8_0 => {
                 let num_blocks = num_elements / 32;
                 num_blocks.checked_mul(34) // 2 (f16 scale) + 32 (i8)
+            }
+            Self::Q6_K => {
+                let num_blocks = num_elements / 256;
+                num_blocks.checked_mul(210) // 128 (ql) + 64 (qh) + 16 (i8 scales) + 2 (f16 d)
             }
         }
         .context("tensor size overflow")
@@ -385,6 +394,48 @@ pub fn dequantize_q8_0(bytes: &[u8], n_elements: usize) -> Vec<f32> {
     out
 }
 
+/// Dequantize a Q6_K block stream to f32. Block (llama.cpp `block_q6_K`,
+/// 256-value super-block): 128 bytes `ql` (low 4 bits of every 6-bit
+/// weight), 64 bytes `qh` (high 2 bits, two per byte), 16 signed-i8
+/// `scales` (one per 16-value sub-block), 2 bytes f16 `d` (the
+/// super-block's own scale) - `value = d * scales[is] * (q - 32)` where `q`
+/// is the reassembled 6-bit unsigned value `(ql_nibble | (qh_bits << 4))`
+/// in `[0, 63)`. Ported straight from llama.cpp's `dequantize_row_q6_K`
+/// (`ggml/src/ggml-quants.c`): each super-block is walked in two 128-value
+/// halves (`ql`/`qh` advance 64/32 bytes, `scales` 8 entries, per half);
+/// within a half, 32 `l` indices each decode 4 output values at `l`,
+/// `l+32`, `l+64`, `l+96` from `ql[l]`'s two nibbles and `ql[l+32]`'s two
+/// nibbles, `qh[l]`'s four 2-bit fields, and `scales[l/16 + {0,2,4,6}]`.
+pub fn dequantize_q6_k(bytes: &[u8], n_elements: usize) -> Vec<f32> {
+    const QK_K: usize = 256;
+    let mut out = vec![0f32; n_elements];
+    for (bi, block) in bytes.chunks_exact(210).enumerate() {
+        let ql_all = &block[0..128];
+        let qh_all = &block[128..192];
+        let sc_all = &block[192..208];
+        let d = f16_to_f32(u16::from_le_bytes([block[208], block[209]]));
+        let out_base = bi * QK_K;
+        for half in 0..2usize {
+            let ql = &ql_all[half * 64..half * 64 + 64];
+            let qh = &qh_all[half * 32..half * 32 + 32];
+            let sc = &sc_all[half * 8..half * 8 + 8];
+            let y_base = out_base + half * 128;
+            for l in 0..32usize {
+                let is = l / 16;
+                let q1 = ((ql[l] & 0x0F) | ((qh[l] & 3) << 4)) as i32 - 32;
+                let q2 = ((ql[l + 32] & 0x0F) | (((qh[l] >> 2) & 3) << 4)) as i32 - 32;
+                let q3 = ((ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4)) as i32 - 32;
+                let q4 = ((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) as i32 - 32;
+                out[y_base + l] = d * (sc[is] as i8) as f32 * q1 as f32;
+                out[y_base + 32 + l] = d * (sc[is + 2] as i8) as f32 * q2 as f32;
+                out[y_base + 64 + l] = d * (sc[is + 4] as i8) as f32 * q3 as f32;
+                out[y_base + 96 + l] = d * (sc[is + 6] as i8) as f32 * q4 as f32;
+            }
+        }
+    }
+    out
+}
+
 pub fn dequantize_f16(bytes: &[u8], n_elements: usize) -> Vec<f32> {
     (0..n_elements).map(|i| f16_to_f32(u16::from_le_bytes([bytes[2 * i], bytes[2 * i + 1]]))).collect()
 }
@@ -400,5 +451,6 @@ pub fn dequantize_for(dtype: GgmlDtype, bytes: &[u8], n_elements: usize) -> Vec<
         GgmlDtype::Q4_0 => dequantize_q4_0(bytes, n_elements),
         GgmlDtype::Q4_1 => dequantize_q4_1(bytes, n_elements),
         GgmlDtype::Q8_0 => dequantize_q8_0(bytes, n_elements),
+        GgmlDtype::Q6_K => dequantize_q6_k(bytes, n_elements),
     }
 }

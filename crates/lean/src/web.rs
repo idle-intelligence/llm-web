@@ -394,8 +394,8 @@ impl LeanEngineCpu {
         LeanEngineCpu { model: None, cache: None, tokenizer: None, chat_template: None }
     }
 
-    /// Parses `gguf_bytes` into a CPU-resident model (Q4_0/Q8_0 tensor bytes
-    /// held as-is - see `cpu.rs`'s doc comment) and allocates a
+    /// Parses `gguf_bytes` into a CPU-resident model (Q4_0/Q8_0/Q6_K tensor
+    /// bytes held as-is - see `cpu.rs`'s doc comment) and allocates a
     /// `CpuKvCache` sized to `max_ctx`. Same signature as `LeanEngine::load`
     /// minus the `Result` needing to report GPU-adapter failures.
     #[wasm_bindgen(js_name = load)]

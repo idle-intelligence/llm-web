@@ -2,9 +2,9 @@
 //! rung in `model.rs`. Same op list, same config (`Qwen2Config`), same GGUF parsing
 //! (`GgufReader`), same tokenizer/chat-template code as the GPU path - only
 //! the destination of each weight tensor differs: a plain `Vec<u8>` holding
-//! the GGUF's on-disk Q4_0/Q8_0 block bytes unchanged (no repack, no
+//! the GGUF's on-disk Q4_0/Q8_0/Q6_K block bytes unchanged (no repack, no
 //! dequantize-to-f32-then-requantize), dequantized in-kernel per dot
-//! product by `cpu_kernels::dot_q4_0`/`dot_q8_0`. This is a second rung, not
+//! product by `cpu_kernels::dot_q4_0`/`dot_q8_0`/`dot_q6_k`. This is a second rung, not
 //! a second model definition: everything architecture-specific lives in
 //! `config.rs`/`gguf.rs`, shared unchanged with `model.rs`'s GPU path.
 //!
@@ -21,7 +21,7 @@ use anyhow::{Context, Result};
 use std::io::{Read, Seek};
 
 use crate::config::{config_from_gguf, Qwen2Config};
-use crate::cpu_kernels::{dot_q4_0, dot_q8_0};
+use crate::cpu_kernels::{dot_q4_0, dot_q6_k, dot_q8_0};
 use crate::gguf::{dequantize_for, GgmlDtype, GgufReader};
 
 /// A CPU-resident matmul weight (`shape = [out_dim, in_dim]`), holding the
@@ -30,10 +30,12 @@ use crate::gguf::{dequantize_for, GgmlDtype, GgufReader};
 /// path, here left exactly as read). F32/F16 tensors are dequantized once at
 /// load time (same as the GPU path's `gguf_f32` helper) since there is no
 /// per-dot-product win to chasing their (already dense) bytes further.
+#[allow(non_camel_case_types)]
 pub enum CpuWeight {
     F32 { data: Vec<f32>, out_dim: usize, in_dim: usize },
     Q4_0 { bytes: Vec<u8>, out_dim: usize, in_dim: usize, blocks_per_row: usize },
     Q8_0 { bytes: Vec<u8>, out_dim: usize, in_dim: usize, blocks_per_row: usize },
+    Q6_K { bytes: Vec<u8>, out_dim: usize, in_dim: usize, blocks_per_row: usize },
 }
 
 impl CpuWeight {
@@ -42,13 +44,14 @@ impl CpuWeight {
             CpuWeight::F32 { out_dim, in_dim, .. } => (*out_dim, *in_dim),
             CpuWeight::Q4_0 { out_dim, in_dim, .. } => (*out_dim, *in_dim),
             CpuWeight::Q8_0 { out_dim, in_dim, .. } => (*out_dim, *in_dim),
+            CpuWeight::Q6_K { out_dim, in_dim, .. } => (*out_dim, *in_dim),
         }
     }
 
     /// Row `row`'s output value: dot product of that output row's weights
     /// against `x` (`x.len() == in_dim`). One row = one output scalar - the
-    /// same op boundary `linear_q4.wgsl`/`linear_q8.wgsl`'s per-thread work
-    /// unit uses on the GPU path.
+    /// same op boundary `linear_q4.wgsl`/`linear_q8.wgsl`/`linear_q6k.wgsl`'s
+    /// per-thread work unit uses on the GPU path.
     #[inline]
     fn dot_row(&self, row: usize, x: &[f32]) -> f32 {
         match self {
@@ -63,6 +66,10 @@ impl CpuWeight {
             CpuWeight::Q8_0 { bytes, blocks_per_row, .. } => {
                 let bytes_per_row = blocks_per_row * 34;
                 dot_q8_0(&bytes[row * bytes_per_row..(row + 1) * bytes_per_row], x)
+            }
+            CpuWeight::Q6_K { bytes, blocks_per_row, .. } => {
+                let bytes_per_row = blocks_per_row * 210;
+                dot_q6_k(&bytes[row * bytes_per_row..(row + 1) * bytes_per_row], x)
             }
         }
     }
@@ -158,15 +165,17 @@ struct CpuLayer {
     k_norm: Option<Vec<f32>>,
 }
 
+#[allow(non_camel_case_types)]
 enum CpuEmbed {
     Q4_0 { bytes: Vec<u8>, blocks_per_row: usize, hidden: usize },
     Q8_0 { bytes: Vec<u8>, blocks_per_row: usize, hidden: usize },
+    Q6_K { bytes: Vec<u8>, blocks_per_row: usize, hidden: usize },
 }
 
 impl CpuEmbed {
     /// Dequantizes one vocab row (`token_id`) to a dense `[hidden]` f32
     /// vector - the CPU op boundary matching `embed_gather_q4.wgsl`/
-    /// `embed_gather_q8.wgsl`.
+    /// `embed_gather_q8.wgsl`/`embed_gather_q6k.wgsl`.
     fn row(&self, token_id: u32) -> Vec<f32> {
         match self {
             CpuEmbed::Q4_0 { bytes, blocks_per_row, hidden } => {
@@ -178,6 +187,11 @@ impl CpuEmbed {
                 let bytes_per_row = blocks_per_row * 34;
                 let start = token_id as usize * bytes_per_row;
                 crate::gguf::dequantize_q8_0(&bytes[start..start + bytes_per_row], *hidden)
+            }
+            CpuEmbed::Q6_K { bytes, blocks_per_row, hidden } => {
+                let bytes_per_row = blocks_per_row * 210;
+                let start = token_id as usize * bytes_per_row;
+                crate::gguf::dequantize_q6_k(&bytes[start..start + bytes_per_row], *hidden)
             }
         }
     }
@@ -207,6 +221,7 @@ fn gguf_weight<R: Read + Seek>(reader: &mut GgufReader<R>, name: &str) -> Result
     Ok(match info.dtype() {
         GgmlDtype::Q4_0 => CpuWeight::Q4_0 { bytes, out_dim, in_dim, blocks_per_row: in_dim / 32 },
         GgmlDtype::Q8_0 => CpuWeight::Q8_0 { bytes, out_dim, in_dim, blocks_per_row: in_dim / 32 },
+        GgmlDtype::Q6_K => CpuWeight::Q6_K { bytes, out_dim, in_dim, blocks_per_row: in_dim / 256 },
         other => CpuWeight::F32 { data: dequantize_for(other, &bytes, out_dim * in_dim), out_dim, in_dim },
     })
 }
@@ -232,17 +247,22 @@ impl CpuModel {
         let embed_info = reader.tensor_info("token_embd.weight").context("missing token_embd.weight")?.clone();
         let embed_shape = embed_info.shape();
         let embed_dtype = embed_info.dtype();
-        anyhow::ensure!(matches!(embed_dtype, GgmlDtype::Q4_0 | GgmlDtype::Q8_0), "expected token_embd.weight to be Q4_0 or Q8_0, got {embed_dtype:?}");
+        anyhow::ensure!(
+            matches!(embed_dtype, GgmlDtype::Q4_0 | GgmlDtype::Q8_0 | GgmlDtype::Q6_K),
+            "expected token_embd.weight to be Q4_0, Q8_0 or Q6_K, got {embed_dtype:?}"
+        );
         let hidden = embed_shape[1];
         let embed_bytes = reader.tensor_data("token_embd.weight")?;
         let tied_lm_head = config.tied_embeddings.then(|| match embed_dtype {
             GgmlDtype::Q4_0 => CpuWeight::Q4_0 { bytes: embed_bytes.clone(), out_dim: embed_shape[0], in_dim: hidden, blocks_per_row: hidden / 32 },
             GgmlDtype::Q8_0 => CpuWeight::Q8_0 { bytes: embed_bytes.clone(), out_dim: embed_shape[0], in_dim: hidden, blocks_per_row: hidden / 32 },
+            GgmlDtype::Q6_K => CpuWeight::Q6_K { bytes: embed_bytes.clone(), out_dim: embed_shape[0], in_dim: hidden, blocks_per_row: hidden / 256 },
             _ => unreachable!(),
         });
         let embed = match embed_dtype {
             GgmlDtype::Q4_0 => CpuEmbed::Q4_0 { bytes: embed_bytes, blocks_per_row: hidden / 32, hidden },
             GgmlDtype::Q8_0 => CpuEmbed::Q8_0 { bytes: embed_bytes, blocks_per_row: hidden / 32, hidden },
+            GgmlDtype::Q6_K => CpuEmbed::Q6_K { bytes: embed_bytes, blocks_per_row: hidden / 256, hidden },
             _ => unreachable!(),
         };
 
