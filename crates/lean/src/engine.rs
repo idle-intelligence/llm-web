@@ -45,6 +45,18 @@ pub struct Engine {
     pub attn_decode: wgpu::ComputePipeline,
     /// Same shader as `attn_decode`, `HEAD_DIM` overridden to 128 (Qwen3).
     pub attn_decode_128: wgpu::ComputePipeline,
+    /// Split-K ("flash-decoding") pass 1: `shaders/attn_decode_split.wgsl`,
+    /// `HEAD_DIM` = 64. Used instead of `attn_decode` once `kv_len` is long
+    /// enough that splitting one head's KV range across multiple workgroups
+    /// is worth the second pass - see `model.rs::attn_decode`'s
+    /// `num_splits` gate.
+    pub attn_decode_split: wgpu::ComputePipeline,
+    /// Same shader as `attn_decode_split`, `HEAD_DIM` overridden to 128.
+    pub attn_decode_split_128: wgpu::ComputePipeline,
+    /// Split-K pass 2: `shaders/attn_decode_reduce.wgsl`, `HEAD_DIM` = 64.
+    pub attn_decode_reduce: wgpu::ComputePipeline,
+    /// Same shader as `attn_decode_reduce`, `HEAD_DIM` overridden to 128.
+    pub attn_decode_reduce_128: wgpu::ComputePipeline,
     pub add_inplace: wgpu::ComputePipeline,
     pub silu_mul: wgpu::ComputePipeline,
     /// Single-workgroup argmax over the logits vector -> one u32 output.
@@ -136,6 +148,10 @@ impl Engine {
             attn_prefill: make_pipeline(&device, "attn_prefill", include_str!("shaders/attn_prefill.wgsl")),
             attn_decode: make_pipeline_with_constants(&device, "attn_decode", include_str!("shaders/attn_decode.wgsl"), &[("HEAD_DIM", 64.0)]),
             attn_decode_128: make_pipeline_with_constants(&device, "attn_decode_128", include_str!("shaders/attn_decode.wgsl"), &[("HEAD_DIM", 128.0)]),
+            attn_decode_split: make_pipeline_with_constants(&device, "attn_decode_split", include_str!("shaders/attn_decode_split.wgsl"), &[("HEAD_DIM", 64.0)]),
+            attn_decode_split_128: make_pipeline_with_constants(&device, "attn_decode_split_128", include_str!("shaders/attn_decode_split.wgsl"), &[("HEAD_DIM", 128.0)]),
+            attn_decode_reduce: make_pipeline_with_constants(&device, "attn_decode_reduce", include_str!("shaders/attn_decode_reduce.wgsl"), &[("HEAD_DIM", 64.0)]),
+            attn_decode_reduce_128: make_pipeline_with_constants(&device, "attn_decode_reduce_128", include_str!("shaders/attn_decode_reduce.wgsl"), &[("HEAD_DIM", 128.0)]),
             add_inplace: make_pipeline(&device, "add_inplace", include_str!("shaders/add_inplace.wgsl")),
             silu_mul: make_pipeline(&device, "silu_mul", include_str!("shaders/silu_mul.wgsl")),
             argmax: make_pipeline(&device, "argmax", include_str!("shaders/argmax.wgsl")),

@@ -132,6 +132,26 @@ struct AttnDecodeDims {
 }
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct AttnDecodeSplitDims {
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    kv_len: u32,
+    max_ctx: u32,
+    scale: f32,
+    chunk: u32,
+    _p0: u32,
+}
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct AttnDecodeReduceDims {
+    n_heads: u32,
+    head_dim: u32,
+    num_splits: u32,
+    _p0: u32,
+}
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct GatherDims {
     rows: u32,
     hidden: u32,
@@ -1025,36 +1045,122 @@ fn attn_prefill(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder
     out
 }
 
+/// Split-K ("flash-decoding") threshold: below this `kv_len`, one
+/// workgroup's O(kv_len) sequential loop (`attn_decode.wgsl`) is already
+/// cheap and splitting it would only add the second (reduce) pass's
+/// overhead for nothing - matches `shaders/attn_decode_split.wgsl`'s own
+/// per-workgroup chunk size. Above it, the single-workgroup-per-head loop
+/// becomes the decode step's latency floor even though the GPU has far more
+/// concurrent-workgroup capacity than `n_heads` uses, and splitting each
+/// head's KV range across `num_splits` workgroups lets that capacity
+/// actually shorten the loop. Chosen from `kv_len` alone (a workload-size
+/// fact), never from a timing measurement.
+const SPLIT_CHUNK: u32 = 128;
+/// Upper bound on split count and the partial-result buffers' per-head
+/// stride; must match `MAX_SPLITS` in `attn_decode_split.wgsl` and
+/// `attn_decode_reduce.wgsl` exactly. Fixed so those buffers never need to
+/// regrow as `kv_len` grows one token per decode step.
+const MAX_SPLITS: u32 = 32;
+
+/// `kv_len <= SPLIT_CHUNK` returns `(1, kv_len)` (no split: `attn_decode`
+/// picks the single-workgroup kernel). Otherwise `num_splits =
+/// min(MAX_SPLITS, ceil(kv_len / SPLIT_CHUNK))` and `chunk =
+/// ceil(kv_len / num_splits)` (recomputed from the actual split count so the
+/// chunks partition `[0, kv_len)` exactly, with no split ever going idle).
+fn decode_split_plan(kv_len: u32) -> (u32, u32) {
+    if kv_len <= SPLIT_CHUNK {
+        return (1, kv_len.max(1));
+    }
+    let num_splits = kv_len.div_ceil(SPLIT_CHUNK).min(MAX_SPLITS);
+    let chunk = kv_len.div_ceil(num_splits).max(1);
+    (num_splits, chunk)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn attn_decode(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder, key: &str, q: &wgpu::Buffer, k_cache: &wgpu::Buffer, v_cache: &wgpu::Buffer, kv_len: u32, max_ctx: u32, cfg: &Qwen2Config) -> wgpu::Buffer {
     let hidden = (cfg.num_heads * cfg.head_dim) as u32;
     let out = pool.data(&format!("{key}.out"), hidden as usize);
     let scale = 1.0 / (cfg.head_dim as f32).sqrt();
-    let dims = pool.uniform(
-        &format!("{key}.dims"),
-        AttnDecodeDims { n_heads: cfg.num_heads as u32, n_kv_heads: cfg.num_kv_heads as u32, head_dim: cfg.head_dim as u32, kv_len, max_ctx, scale, _p0: 0, _p1: 0 },
-    );
-    // attn_decode.wgsl/attn_decode_128.wgsl have `workgroup_size` and a
-    // per-thread-owns-one-output-dim design compile-time-fixed to
-    // head_dim=64/128 respectively - see engine.rs's doc comment on
-    // `attn_decode_128`. Picked by `cfg.head_dim`, not a runtime parameter.
-    let pipeline = match cfg.head_dim {
-        64 => &engine.attn_decode,
-        128 => &engine.attn_decode_128,
+    let n_heads = cfg.num_heads as u32;
+    let head_dim = cfg.head_dim as u32;
+
+    let (num_splits, chunk) = decode_split_plan(kv_len);
+    if num_splits <= 1 {
+        // Short context: the plain single-workgroup-per-head kernel, exactly
+        // as before this change (no split/reduce overhead).
+        let dims = pool.uniform(
+            &format!("{key}.dims"),
+            AttnDecodeDims { n_heads, n_kv_heads: cfg.num_kv_heads as u32, head_dim, kv_len, max_ctx, scale, _p0: 0, _p1: 0 },
+        );
+        // attn_decode.wgsl/attn_decode_128.wgsl have `workgroup_size` and a
+        // per-thread-owns-one-output-dim design compile-time-fixed to
+        // head_dim=64/128 respectively - see engine.rs's doc comment on
+        // `attn_decode_128`. Picked by `cfg.head_dim`, not a runtime parameter.
+        let pipeline = match cfg.head_dim {
+            64 => &engine.attn_decode,
+            128 => &engine.attn_decode_128,
+            other => panic!("attn_decode: unsupported head_dim {other} (only 64/Qwen2.5 and 128/Qwen3 have a compiled kernel)"),
+        };
+        let bg = pool.bind_group(
+            key,
+            pipeline,
+            &[
+                BindGroupEntry { binding: 0, resource: q.as_entire_binding() },
+                BindGroupEntry { binding: 1, resource: k_cache.as_entire_binding() },
+                BindGroupEntry { binding: 2, resource: v_cache.as_entire_binding() },
+                BindGroupEntry { binding: 3, resource: out.as_entire_binding() },
+                BindGroupEntry { binding: 4, resource: dims.as_entire_binding() },
+            ],
+        );
+        engine.dispatch(encoder, pipeline, &bg, (n_heads, 1, 1), key);
+        return out;
+    }
+
+    // Long context: split-K pass 1 (partial online-softmax per (head, split))
+    // then pass 2 (reduce) into the same `out` buffer as the short-context
+    // path, so callers never need to know which path ran.
+    let (split_pipeline, reduce_pipeline) = match cfg.head_dim {
+        64 => (&engine.attn_decode_split, &engine.attn_decode_reduce),
+        128 => (&engine.attn_decode_split_128, &engine.attn_decode_reduce_128),
         other => panic!("attn_decode: unsupported head_dim {other} (only 64/Qwen2.5 and 128/Qwen3 have a compiled kernel)"),
     };
-    let bg = pool.bind_group(
-        key,
-        pipeline,
+
+    let partial_m = pool.data(&format!("{key}.partial_m"), (n_heads * MAX_SPLITS) as usize);
+    let partial_l = pool.data(&format!("{key}.partial_l"), (n_heads * MAX_SPLITS) as usize);
+    let partial_acc = pool.data(&format!("{key}.partial_acc"), (n_heads * MAX_SPLITS * head_dim) as usize);
+
+    let split_dims = pool.uniform(
+        &format!("{key}.split_dims"),
+        AttnDecodeSplitDims { n_heads, n_kv_heads: cfg.num_kv_heads as u32, head_dim, kv_len, max_ctx, scale, chunk, _p0: 0 },
+    );
+    let split_bg = pool.bind_group(
+        &format!("{key}.split"),
+        split_pipeline,
         &[
             BindGroupEntry { binding: 0, resource: q.as_entire_binding() },
             BindGroupEntry { binding: 1, resource: k_cache.as_entire_binding() },
             BindGroupEntry { binding: 2, resource: v_cache.as_entire_binding() },
-            BindGroupEntry { binding: 3, resource: out.as_entire_binding() },
-            BindGroupEntry { binding: 4, resource: dims.as_entire_binding() },
+            BindGroupEntry { binding: 3, resource: partial_m.as_entire_binding() },
+            BindGroupEntry { binding: 4, resource: partial_l.as_entire_binding() },
+            BindGroupEntry { binding: 5, resource: partial_acc.as_entire_binding() },
+            BindGroupEntry { binding: 6, resource: split_dims.as_entire_binding() },
         ],
     );
-    engine.dispatch(encoder, pipeline, &bg, (cfg.num_heads as u32, 1, 1), key);
+    engine.dispatch(encoder, split_pipeline, &split_bg, (n_heads, num_splits, 1), &format!("{key}.split"));
+
+    let reduce_dims = pool.uniform(&format!("{key}.reduce_dims"), AttnDecodeReduceDims { n_heads, head_dim, num_splits, _p0: 0 });
+    let reduce_bg = pool.bind_group(
+        &format!("{key}.reduce"),
+        reduce_pipeline,
+        &[
+            BindGroupEntry { binding: 0, resource: partial_m.as_entire_binding() },
+            BindGroupEntry { binding: 1, resource: partial_l.as_entire_binding() },
+            BindGroupEntry { binding: 2, resource: partial_acc.as_entire_binding() },
+            BindGroupEntry { binding: 3, resource: out.as_entire_binding() },
+            BindGroupEntry { binding: 4, resource: reduce_dims.as_entire_binding() },
+        ],
+    );
+    engine.dispatch(encoder, reduce_pipeline, &reduce_bg, (n_heads, 1, 1), &format!("{key}.reduce"));
     out
 }
 
