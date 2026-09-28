@@ -5,6 +5,8 @@
 
 pub mod chat_template;
 pub mod config;
+pub mod cpu;
+pub mod cpu_kernels;
 pub mod engine;
 pub mod gguf;
 pub mod lora;
