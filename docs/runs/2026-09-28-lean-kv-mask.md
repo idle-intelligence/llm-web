@@ -1,8 +1,6 @@
 # lean engine: KV snapshot/restore + per-step logit mask
 
-Two engine features for the Sonos MCP agent and llm-life consumers (see
-`~/Code/tracker/projects/llm-web/consumers-2026-09-28.md`, gap list items 1
-and 2): resident-prefix KV snapshot/restore/export/import, and a per-step
+Two engine features for the Sonos MCP agent and llm-life consumers: resident-prefix KV snapshot/restore/export/import, and a per-step
 GPU logit mask for constrained decoding. Crate `crates/lean`. Native
 reference and gate: `lean-cli`, `cargo test -p lean --release -- --ignored
 fixture_parity`.
