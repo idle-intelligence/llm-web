@@ -747,11 +747,13 @@ impl GpuModel {
     /// row-major, already read back to the CPU.
     pub async fn lm_head_sliced(&self, engine: &Engine, hidden_states: &wgpu::Buffer, rows: u32, token_ids: &[u32]) -> Vec<f32> {
         let mut encoder = engine.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("lm_head_sliced") });
-        let (gathered, hidden_dim) = gather_dequant_head_rows(engine, &self.pool, &mut encoder, "head_slice", &self.lm_head, token_ids);
         let n = token_ids.len() as u32;
+        let mut pass = engine.begin_pass(&mut encoder, "lm_head_sliced");
+        let (gathered, hidden_dim) = gather_dequant_head_rows(engine, &self.pool, &mut pass, "head_slice", &self.lm_head, token_ids);
         let w = MatMulWeight::F32 { w: gathered };
         let zero_b = zero_bias(engine, &self.pool, "head_slice.bias", n);
-        let logits = linear(engine, &self.pool, &mut encoder, "head_slice.linear", hidden_states, rows, hidden_dim, &w, &zero_b, n, false);
+        let logits = linear(engine, &self.pool, &mut pass, "head_slice.linear", hidden_states, rows, hidden_dim, &w, &zero_b, n, false);
+        drop(pass);
         engine.queue.submit(Some(encoder.finish()));
         engine.read_buffer(&logits, (rows * n) as usize).await
     }
@@ -792,7 +794,7 @@ struct QuantActDims {
 /// dispatch (see those shaders' headers). Caller must have already checked
 /// `engine.has_dp4`. Buffers are cached per `key` in `pool` like every other
 /// per-call-site buffer.
-fn quantize_activation(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder, key: &str, x: &wgpu::Buffer, in_dim: u32) -> (wgpu::Buffer, wgpu::Buffer) {
+fn quantize_activation(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &str, x: &wgpu::Buffer, in_dim: u32) -> (wgpu::Buffer, wgpu::Buffer) {
     let blocks = in_dim / 32;
     let act_q = pool.data(&format!("{key}.act_q"), (blocks * 8) as usize);
     let act_scale = pool.data(&format!("{key}.act_scale"), blocks as usize);
@@ -808,12 +810,12 @@ fn quantize_activation(engine: &Engine, pool: &Pool, encoder: &mut wgpu::Command
             BindGroupEntry { binding: 3, resource: dims.as_entire_binding() },
         ],
     );
-    engine.dispatch(encoder, pipeline, &bg, (blocks, 1, 1), key);
+    engine.dispatch(pass, pipeline, &bg, (blocks, 1, 1), key);
     (act_q, act_scale)
 }
 
 #[allow(clippy::too_many_arguments)]
-fn linear(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder, key: &str, x: &wgpu::Buffer, rows: u32, in_dim: u32, w: &MatMulWeight, b: &wgpu::Buffer, out_dim: u32, fast: bool) -> wgpu::Buffer {
+fn linear(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &str, x: &wgpu::Buffer, rows: u32, in_dim: u32, w: &MatMulWeight, b: &wgpu::Buffer, out_dim: u32, fast: bool) -> wgpu::Buffer {
     let out = pool.data(&format!("{key}.out"), (rows * out_dim) as usize);
     let wgs = (out_dim.div_ceil(16), rows.div_ceil(16), 1);
     match w {
@@ -830,7 +832,7 @@ fn linear(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder, key:
                     BindGroupEntry { binding: 4, resource: dims.as_entire_binding() },
                 ],
             );
-            engine.dispatch(encoder, &engine.linear, &bg, wgs, key);
+            engine.dispatch(pass, &engine.linear, &bg, wgs, key);
         }
         MatMulWeight::Q8_0 { chunks, blocks_per_row, out_dim: n_total } => {
             // Q8_0-resident weights appear on every tensor for Qwen3's
@@ -843,7 +845,7 @@ fn linear(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder, key:
             // writing its own column range of `out` (see linear_q8.wgsl's
             // Dims doc comment).
             let dp4 = fast && rows == 1 && engine.has_dp4 && engine.dp4_decode.get();
-            let act_q_scale = dp4.then(|| quantize_activation(engine, pool, encoder, &format!("{key}.q8dp4"), x, in_dim));
+            let act_q_scale = dp4.then(|| quantize_activation(engine, pool, pass, &format!("{key}.q8dp4"), x, in_dim));
             for chunk in chunks {
                 let ckey = format!("{key}.{}", chunk.row_start);
                 let dims = pool.uniform(&format!("{ckey}.dims"), LinearQDims { m: rows, k: in_dim, n: chunk.rows, act: 0, blocks_per_row: *blocks_per_row, n_offset: chunk.row_start, n_total: *n_total, _p2: 0 });
@@ -859,7 +861,7 @@ fn linear(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder, key:
                     ];
                     let pipeline = engine.linear_q8_decode_dp4.as_ref().expect("dp4 gated on has_dp4");
                     let bg = pool.bind_group(&format!("{ckey}.decode_dp4"), pipeline, &entries);
-                    engine.dispatch(encoder, pipeline, &bg, (chunk.rows.div_ceil(4), 1, 1), &ckey);
+                    engine.dispatch(pass, pipeline, &bg, (chunk.rows.div_ceil(4), 1, 1), &ckey);
                     continue;
                 }
                 let entries = [
@@ -874,17 +876,17 @@ fn linear(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder, key:
                     // Decode: coalesced matvec, same kernel shape as
                     // linear_q4_decode below, adapted to Q8_0 blocks.
                     let bg = pool.bind_group(&format!("{ckey}.decode"), &engine.linear_q8_decode, &entries);
-                    engine.dispatch(encoder, &engine.linear_q8_decode, &bg, (chunk.rows.div_ceil(4), 1, 1), &ckey);
+                    engine.dispatch(pass, &engine.linear_q8_decode, &bg, (chunk.rows.div_ceil(4), 1, 1), &ckey);
                 } else if fast && rows >= TILED_MIN_ROWS {
                     // Prefill (M >= 16): register-blocked tiled kernel (see
                     // linear_q4_tiled_rb.wgsl's header) - Q8_0 prefill had
                     // no tiled kernel before this session, only the naive
                     // one below.
                     let bg = pool.bind_group(&format!("{ckey}.tiled_rb"), &engine.linear_q8_tiled_rb, &entries);
-                    engine.dispatch(encoder, &engine.linear_q8_tiled_rb, &bg, (chunk.rows.div_ceil(32), rows.div_ceil(32), 1), &ckey);
+                    engine.dispatch(pass, &engine.linear_q8_tiled_rb, &bg, (chunk.rows.div_ceil(32), rows.div_ceil(32), 1), &ckey);
                 } else {
                     let bg = pool.bind_group(&ckey, &engine.linear_q8, &entries);
-                    engine.dispatch(encoder, &engine.linear_q8, &bg, (chunk.rows.div_ceil(16), rows.div_ceil(16), 1), &ckey);
+                    engine.dispatch(pass, &engine.linear_q8, &bg, (chunk.rows.div_ceil(16), rows.div_ceil(16), 1), &ckey);
                 }
             }
         }
@@ -909,12 +911,12 @@ fn linear(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder, key:
                         BindGroupEntry { binding: 7, resource: dims.as_entire_binding() },
                     ],
                 );
-                engine.dispatch(encoder, &engine.linear_q6k, &bg, (chunk.rows.div_ceil(16), rows.div_ceil(16), 1), &ckey);
+                engine.dispatch(pass, &engine.linear_q6k, &bg, (chunk.rows.div_ceil(16), rows.div_ceil(16), 1), &ckey);
             }
         }
         MatMulWeight::Q4_0 { chunks, blocks_per_row, out_dim: n_total } => {
             let dp4 = fast && rows == 1 && engine.has_dp4 && engine.dp4_decode.get();
-            let act_q_scale = dp4.then(|| quantize_activation(engine, pool, encoder, &format!("{key}.q4dp4"), x, in_dim));
+            let act_q_scale = dp4.then(|| quantize_activation(engine, pool, pass, &format!("{key}.q4dp4"), x, in_dim));
             for chunk in chunks {
                 let ckey = format!("{key}.{}", chunk.row_start);
                 let dims = pool.uniform(&format!("{ckey}.dims"), LinearQDims { m: rows, k: in_dim, n: chunk.rows, act: 0, blocks_per_row: *blocks_per_row, n_offset: chunk.row_start, n_total: *n_total, _p2: 0 });
@@ -930,7 +932,7 @@ fn linear(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder, key:
                     ];
                     let pipeline = engine.linear_q4_decode_dp4.as_ref().expect("dp4 gated on has_dp4");
                     let bg = pool.bind_group(&format!("{ckey}.decode_dp4"), pipeline, &entries);
-                    engine.dispatch(encoder, pipeline, &bg, (chunk.rows.div_ceil(4), 1, 1), &ckey);
+                    engine.dispatch(pass, pipeline, &bg, (chunk.rows.div_ceil(4), 1, 1), &ckey);
                     continue;
                 }
                 let entries = [
@@ -946,18 +948,18 @@ fn linear(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder, key:
                     // of `rows`, kept for the fixture-parity gate and as the
                     // fallback when a fast kernel's correctness is in doubt.
                     let bg = pool.bind_group(&ckey, &engine.linear_q4, &entries);
-                    engine.dispatch(encoder, &engine.linear_q4, &bg, (chunk.rows.div_ceil(16), rows.div_ceil(16), 1), &ckey);
+                    engine.dispatch(pass, &engine.linear_q4, &bg, (chunk.rows.div_ceil(16), rows.div_ceil(16), 1), &ckey);
                 } else if rows == 1 {
                     // Decode: coalesced matvec (llm-wasm's shader_q4_matvec_coalesced.wgsl port).
                     let bg = pool.bind_group(&format!("{ckey}.decode"), &engine.linear_q4_decode, &entries);
-                    engine.dispatch(encoder, &engine.linear_q4_decode, &bg, (chunk.rows.div_ceil(4), 1, 1), &ckey);
+                    engine.dispatch(pass, &engine.linear_q4_decode, &bg, (chunk.rows.div_ceil(4), 1, 1), &ckey);
                 } else if (TILED_MIN_ROWS..PREFILL_RB_MAX_ROWS).contains(&rows) {
                     // Prefill, TILED_MIN_ROWS <= M < PREFILL_RB_MAX_ROWS:
                     // register-blocked 32x32/TK=16 kernel (see
                     // linear_q4_tiled_rb.wgsl's header) - faster than the
                     // bigger tile below at short-to-medium prefill lengths.
                     let bg = pool.bind_group(&format!("{ckey}.tiled_rb"), &engine.linear_q4_tiled_rb, &entries);
-                    engine.dispatch(encoder, &engine.linear_q4_tiled_rb, &bg, (chunk.rows.div_ceil(32), rows.div_ceil(32), 1), &ckey);
+                    engine.dispatch(pass, &engine.linear_q4_tiled_rb, &bg, (chunk.rows.div_ceil(32), rows.div_ceil(32), 1), &ckey);
                 } else if rows >= PREFILL_RB_MAX_ROWS {
                     // Prefill (M >= PREFILL_RB_MAX_ROWS): tiled matmul
                     // (llm-wasm's shader_q4_tiled.wgsl port). llm-wasm
@@ -969,13 +971,13 @@ fn linear(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder, key:
                     // smaller register-blocked tile above (see
                     // PREFILL_RB_MAX_ROWS's own doc comment).
                     let bg = pool.bind_group(&format!("{ckey}.tiled"), &engine.linear_q4_tiled, &entries);
-                    engine.dispatch(encoder, &engine.linear_q4_tiled, &bg, (chunk.rows.div_ceil(64), rows.div_ceil(64), 1), &ckey);
+                    engine.dispatch(pass, &engine.linear_q4_tiled, &bg, (chunk.rows.div_ceil(64), rows.div_ceil(64), 1), &ckey);
                 } else {
                     // 2 <= M < 16: below the tiled kernel's break-even point
                     // and not the M=1 shape the coalesced matvec assumes -
                     // fall back to the naive per-element kernel.
                     let bg = pool.bind_group(&format!("{ckey}.naive_small_m"), &engine.linear_q4, &entries);
-                    engine.dispatch(encoder, &engine.linear_q4, &bg, (chunk.rows.div_ceil(16), rows.div_ceil(16), 1), &ckey);
+                    engine.dispatch(pass, &engine.linear_q4, &bg, (chunk.rows.div_ceil(16), rows.div_ceil(16), 1), &ckey);
                 }
             }
         }
@@ -998,12 +1000,12 @@ fn zero_bias(engine: &Engine, pool: &Pool, key: &str, len: u32) -> wgpu::Buffer 
 /// `proj.b` at upload time: see `lora.rs`). Two plain F32 `linear()` calls
 /// plus one `add_inplace`, no dedicated LoRA kernel.
 #[allow(clippy::too_many_arguments)]
-fn apply_lora_proj(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder, key: &str, x: &wgpu::Buffer, rows: u32, in_dim: u32, out_buf: &wgpu::Buffer, out_dim: u32, proj: &crate::lora::LoraProj) {
+fn apply_lora_proj(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &str, x: &wgpu::Buffer, rows: u32, in_dim: u32, out_buf: &wgpu::Buffer, out_dim: u32, proj: &crate::lora::LoraProj) {
     let zero_r = zero_bias(engine, pool, &format!("{key}.zr"), proj.rank);
-    let ab = linear(engine, pool, encoder, &format!("{key}.a"), x, rows, in_dim, &proj.a, &zero_r, proj.rank, false);
+    let ab = linear(engine, pool, pass, &format!("{key}.a"), x, rows, in_dim, &proj.a, &zero_r, proj.rank, false);
     let zero_o = zero_bias(engine, pool, &format!("{key}.zo"), out_dim);
-    let delta = linear(engine, pool, encoder, &format!("{key}.b"), &ab, rows, proj.rank, &proj.b, &zero_o, out_dim, false);
-    add_inplace(engine, pool, encoder, &format!("{key}.add"), out_buf, &delta, rows * out_dim);
+    let delta = linear(engine, pool, pass, &format!("{key}.b"), &ab, rows, proj.rank, &proj.b, &zero_o, out_dim, false);
+    add_inplace(engine, pool, pass, &format!("{key}.add"), out_buf, &delta, rows * out_dim);
 }
 
 /// `linear()` plus, when `lora` is `Some`, that projection's LoRA delta
@@ -1014,7 +1016,7 @@ fn apply_lora_proj(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEnco
 fn linear_lora(
     engine: &Engine,
     pool: &Pool,
-    encoder: &mut wgpu::CommandEncoder,
+    pass: &mut wgpu::ComputePass<'_>,
     key: &str,
     x: &wgpu::Buffer,
     rows: u32,
@@ -1025,15 +1027,15 @@ fn linear_lora(
     fast: bool,
     lora: Option<&crate::lora::LoraProj>,
 ) -> wgpu::Buffer {
-    let out = linear(engine, pool, encoder, key, x, rows, in_dim, w, b, out_dim, fast);
+    let out = linear(engine, pool, pass, key, x, rows, in_dim, w, b, out_dim, fast);
     if let Some(proj) = lora {
-        apply_lora_proj(engine, pool, encoder, &format!("{key}.lora"), x, rows, in_dim, &out, out_dim, proj);
+        apply_lora_proj(engine, pool, pass, &format!("{key}.lora"), x, rows, in_dim, &out, out_dim, proj);
     }
     out
 }
 
 #[allow(clippy::too_many_arguments)]
-fn rmsnorm(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder, key: &str, x: &wgpu::Buffer, scale: &wgpu::Buffer, rows: u32, dim: u32, eps: f32) -> wgpu::Buffer {
+fn rmsnorm(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &str, x: &wgpu::Buffer, scale: &wgpu::Buffer, rows: u32, dim: u32, eps: f32) -> wgpu::Buffer {
     let out = pool.data(&format!("{key}.out"), (rows * dim) as usize);
     let dims = pool.uniform(&format!("{key}.dims"), RmsDims { rows, dim, eps, _p0: 0 });
     let bg = pool.bind_group(
@@ -1046,12 +1048,12 @@ fn rmsnorm(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder, key
             BindGroupEntry { binding: 3, resource: dims.as_entire_binding() },
         ],
     );
-    engine.dispatch(encoder, &engine.rmsnorm, &bg, (rows.div_ceil(64), 1, 1), key);
+    engine.dispatch(pass, &engine.rmsnorm, &bg, (rows.div_ceil(64), 1, 1), key);
     out
 }
 
 #[allow(clippy::too_many_arguments)]
-fn rope(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder, key: &str, buf: &wgpu::Buffer, cos: &wgpu::Buffer, sin: &wgpu::Buffer, rows: u32, heads: u32, head_dim: u32, pos_base: u32) {
+fn rope(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &str, buf: &wgpu::Buffer, cos: &wgpu::Buffer, sin: &wgpu::Buffer, rows: u32, heads: u32, head_dim: u32, pos_base: u32) {
     let dims = pool.uniform(&format!("{key}.dims"), RopeDims { rows, heads, head_dim, pos_base });
     let bg = pool.bind_group(
         key,
@@ -1064,14 +1066,14 @@ fn rope(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder, key: &
         ],
     );
     let half = head_dim / 2;
-    engine.dispatch(encoder, &engine.rope, &bg, ((rows * heads * half).div_ceil(64), 1, 1), key);
+    engine.dispatch(pass, &engine.rope, &bg, ((rows * heads * half).div_ceil(64), 1, 1), key);
 }
 
 /// Same RoPE as `rope()` but each row's absolute position comes from a
 /// caller-supplied buffer (`ForwardSpec::positions`) instead of a
 /// contiguous `pos_base + row` run: see `shaders/rope_positions.wgsl`.
 #[allow(clippy::too_many_arguments)]
-fn rope_positions(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder, key: &str, buf: &wgpu::Buffer, cos: &wgpu::Buffer, sin: &wgpu::Buffer, positions: &wgpu::Buffer, rows: u32, heads: u32, head_dim: u32) {
+fn rope_positions(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &str, buf: &wgpu::Buffer, cos: &wgpu::Buffer, sin: &wgpu::Buffer, positions: &wgpu::Buffer, rows: u32, heads: u32, head_dim: u32) {
     let dims = pool.uniform(&format!("{key}.dims"), RopePosDims { rows, heads, head_dim, _p0: 0 });
     let bg = pool.bind_group(
         key,
@@ -1085,10 +1087,10 @@ fn rope_positions(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncod
         ],
     );
     let half = head_dim / 2;
-    engine.dispatch(encoder, &engine.rope_positions, &bg, ((rows * heads * half).div_ceil(64), 1, 1), key);
+    engine.dispatch(pass, &engine.rope_positions, &bg, ((rows * heads * half).div_ceil(64), 1, 1), key);
 }
 
-fn add_inplace(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder, key: &str, a: &wgpu::Buffer, b: &wgpu::Buffer, len: u32) {
+fn add_inplace(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &str, a: &wgpu::Buffer, b: &wgpu::Buffer, len: u32) {
     let (gx, gy, stride_x) = grid1d(len);
     let dims = pool.uniform(&format!("{key}.dims"), AddDims { len, stride_x, _p1: 0, _p2: 0 });
     let bg = pool.bind_group(
@@ -1100,12 +1102,12 @@ fn add_inplace(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder,
             BindGroupEntry { binding: 2, resource: dims.as_entire_binding() },
         ],
     );
-    engine.dispatch(encoder, &engine.add_inplace, &bg, (gx, gy, 1), key);
+    engine.dispatch(pass, &engine.add_inplace, &bg, (gx, gy, 1), key);
 }
 
 /// SwiGLU over a fused `[rows, 2*hidden]` gate/up matmul output (see
 /// `gguf_matmul_concat2`'s doc comment and `silu_mul_fused.wgsl`).
-fn silu_mul_fused(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder, key: &str, gate_up: &wgpu::Buffer, rows: u32, hidden: u32) -> wgpu::Buffer {
+fn silu_mul_fused(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &str, gate_up: &wgpu::Buffer, rows: u32, hidden: u32) -> wgpu::Buffer {
     let out = pool.data(&format!("{key}.out"), (rows * hidden) as usize);
     let (gx, gy, stride_x) = grid1d(rows * hidden);
     let dims = pool.uniform(&format!("{key}.dims"), SiluDims { rows, hidden, stride_x, _p1: 0 });
@@ -1118,7 +1120,7 @@ fn silu_mul_fused(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncod
             BindGroupEntry { binding: 2, resource: dims.as_entire_binding() },
         ],
     );
-    engine.dispatch(encoder, &engine.silu_mul_fused, &bg, (gx, gy, 1), key);
+    engine.dispatch(pass, &engine.silu_mul_fused, &bg, (gx, gy, 1), key);
     out
 }
 
@@ -1126,7 +1128,7 @@ fn silu_mul_fused(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncod
 fn qkv_proj(
     engine: &Engine,
     pool: &Pool,
-    encoder: &mut wgpu::CommandEncoder,
+    pass: &mut wgpu::ComputePass<'_>,
     key: &str,
     x: &wgpu::Buffer,
     rows: u32,
@@ -1138,9 +1140,9 @@ fn qkv_proj(
     let hidden = cfg.hidden_size as u32;
     let q_dim = (cfg.num_heads * cfg.head_dim) as u32;
     let kv_dim = (cfg.num_kv_heads * cfg.head_dim) as u32;
-    let q = linear_lora(engine, pool, encoder, &format!("{key}.q"), x, rows, hidden, &layer.q_w, &layer.q_b, q_dim, fast, lora.map(|l| &l.q));
-    let k = linear_lora(engine, pool, encoder, &format!("{key}.k"), x, rows, hidden, &layer.k_w, &layer.k_b, kv_dim, fast, lora.map(|l| &l.k));
-    let v = linear_lora(engine, pool, encoder, &format!("{key}.v"), x, rows, hidden, &layer.v_w, &layer.v_b, kv_dim, fast, lora.map(|l| &l.v));
+    let q = linear_lora(engine, pool, pass, &format!("{key}.q"), x, rows, hidden, &layer.q_w, &layer.q_b, q_dim, fast, lora.map(|l| &l.q));
+    let k = linear_lora(engine, pool, pass, &format!("{key}.k"), x, rows, hidden, &layer.k_w, &layer.k_b, kv_dim, fast, lora.map(|l| &l.k));
+    let v = linear_lora(engine, pool, pass, &format!("{key}.v"), x, rows, hidden, &layer.v_w, &layer.v_b, kv_dim, fast, lora.map(|l| &l.v));
     // Qwen3 only (`layer.q_norm`/`k_norm` set): per-head RMSNorm on q/k
     // before RoPE. `q`/`k` are `[rows, heads*head_dim]` row-major, so
     // reinterpreting the same flat buffer as `[rows*heads, head_dim]` for
@@ -1148,28 +1150,28 @@ fn qkv_proj(
     // dedicated per-head kernel needed (see the qwen3 survey's open
     // question, resolved this way).
     let q = match &layer.q_norm {
-        Some(scale) => rmsnorm(engine, pool, encoder, &format!("{key}.qnorm"), &q, scale, rows * cfg.num_heads as u32, cfg.head_dim as u32, cfg.rms_norm_eps),
+        Some(scale) => rmsnorm(engine, pool, pass, &format!("{key}.qnorm"), &q, scale, rows * cfg.num_heads as u32, cfg.head_dim as u32, cfg.rms_norm_eps),
         None => q,
     };
     let k = match &layer.k_norm {
-        Some(scale) => rmsnorm(engine, pool, encoder, &format!("{key}.knorm"), &k, scale, rows * cfg.num_kv_heads as u32, cfg.head_dim as u32, cfg.rms_norm_eps),
+        Some(scale) => rmsnorm(engine, pool, pass, &format!("{key}.knorm"), &k, scale, rows * cfg.num_kv_heads as u32, cfg.head_dim as u32, cfg.rms_norm_eps),
         None => k,
     };
     (q, k, v)
 }
 
 #[allow(clippy::too_many_arguments)]
-fn mlp(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder, key: &str, x: &wgpu::Buffer, rows: u32, cfg: &Qwen2Config, layer: &LayerWeights, fast: bool) -> wgpu::Buffer {
+fn mlp(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &str, x: &wgpu::Buffer, rows: u32, cfg: &Qwen2Config, layer: &LayerWeights, fast: bool) -> wgpu::Buffer {
     let hidden = cfg.hidden_size as u32;
     let inter = cfg.intermediate_size as u32;
     // Fused gate/up matmul (see gguf_matmul_concat2's doc comment): one
     // linear() dispatch (per weight chunk) instead of two, at every M.
-    let gate_up = linear(engine, pool, encoder, &format!("{key}.gate_up"), x, rows, hidden, &layer.gate_up_w, &layer.gate_up_b, 2 * inter, fast);
-    let gated = silu_mul_fused(engine, pool, encoder, &format!("{key}.silu"), &gate_up, rows, inter);
-    linear(engine, pool, encoder, &format!("{key}.down"), &gated, rows, inter, &layer.down_w, &layer.down_b, hidden, fast)
+    let gate_up = linear(engine, pool, pass, &format!("{key}.gate_up"), x, rows, hidden, &layer.gate_up_w, &layer.gate_up_b, 2 * inter, fast);
+    let gated = silu_mul_fused(engine, pool, pass, &format!("{key}.silu"), &gate_up, rows, inter);
+    linear(engine, pool, pass, &format!("{key}.down"), &gated, rows, inter, &layer.down_w, &layer.down_b, hidden, fast)
 }
 
-fn embed_gather(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder, model: &GpuModel, token_ids: &[u32]) -> wgpu::Buffer {
+fn embed_gather(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, model: &GpuModel, token_ids: &[u32]) -> wgpu::Buffer {
     let rows = token_ids.len() as u32;
     let hidden = model.config.hidden_size as u32;
     let ids_buf = pool.upload_u32("embed.ids", token_ids);
@@ -1190,7 +1192,7 @@ fn embed_gather(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder
                 BindGroupEntry { binding: 6, resource: dims.as_entire_binding() },
             ],
         );
-        engine.dispatch(encoder, &engine.embed_gather_q6k, &bg, (gx, gy, 1), "embed");
+        engine.dispatch(pass, &engine.embed_gather_q6k, &bg, (gx, gy, 1), "embed");
         return out;
     }
     let (pipeline, table) = match &model.embed {
@@ -1210,7 +1212,7 @@ fn embed_gather(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder
             BindGroupEntry { binding: 4, resource: dims.as_entire_binding() },
         ],
     );
-    engine.dispatch(encoder, pipeline, &bg, (gx, gy, 1), "embed");
+    engine.dispatch(pass, pipeline, &bg, (gx, gy, 1), "embed");
     out
 }
 
@@ -1235,7 +1237,7 @@ fn scatter_kv_gpu(encoder: &mut wgpu::CommandEncoder, cache_buf: &wgpu::Buffer, 
 }
 
 #[allow(clippy::too_many_arguments)]
-fn attn_prefill(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder, key: &str, q: &wgpu::Buffer, k: &wgpu::Buffer, v: &wgpu::Buffer, seq: u32, cfg: &Qwen2Config) -> wgpu::Buffer {
+fn attn_prefill(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &str, q: &wgpu::Buffer, k: &wgpu::Buffer, v: &wgpu::Buffer, seq: u32, cfg: &Qwen2Config) -> wgpu::Buffer {
     // Concatenated-heads width (`num_heads * head_dim`): equal to
     // `cfg.hidden_size` for Qwen2 (head_dim is derived that way) but *not*
     // for Qwen3, where head_dim=128 is explicit and 16*128=2048 != 1024 -
@@ -1260,7 +1262,7 @@ fn attn_prefill(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder
     );
     // wg.y = query tile index (256 rows/tile, see attn_prefill.wgsl's doc
     // comment on why this scales with `seq` instead of a fixed dispatch).
-    engine.dispatch(encoder, &engine.attn_prefill, &bg, (cfg.num_heads as u32, seq.div_ceil(256), 1), key);
+    engine.dispatch(pass, &engine.attn_prefill, &bg, (cfg.num_heads as u32, seq.div_ceil(256), 1), key);
     out
 }
 
@@ -1296,7 +1298,7 @@ fn decode_split_plan(kv_len: u32) -> (u32, u32) {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn attn_decode(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder, key: &str, q: &wgpu::Buffer, k_cache: &wgpu::Buffer, v_cache: &wgpu::Buffer, kv_len: u32, max_ctx: u32, cfg: &Qwen2Config) -> wgpu::Buffer {
+fn attn_decode(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &str, q: &wgpu::Buffer, k_cache: &wgpu::Buffer, v_cache: &wgpu::Buffer, kv_len: u32, max_ctx: u32, cfg: &Qwen2Config) -> wgpu::Buffer {
     let hidden = (cfg.num_heads * cfg.head_dim) as u32;
     let out = pool.data(&format!("{key}.out"), hidden as usize);
     let scale = 1.0 / (cfg.head_dim as f32).sqrt();
@@ -1331,7 +1333,7 @@ fn attn_decode(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder,
                 BindGroupEntry { binding: 4, resource: dims.as_entire_binding() },
             ],
         );
-        engine.dispatch(encoder, pipeline, &bg, (n_heads, 1, 1), key);
+        engine.dispatch(pass, pipeline, &bg, (n_heads, 1, 1), key);
         return out;
     }
 
@@ -1365,7 +1367,7 @@ fn attn_decode(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder,
             BindGroupEntry { binding: 6, resource: split_dims.as_entire_binding() },
         ],
     );
-    engine.dispatch(encoder, split_pipeline, &split_bg, (n_heads, num_splits, 1), &format!("{key}.split"));
+    engine.dispatch(pass, split_pipeline, &split_bg, (n_heads, num_splits, 1), &format!("{key}.split"));
 
     let reduce_dims = pool.uniform(&format!("{key}.reduce_dims"), AttnDecodeReduceDims { n_heads, head_dim, num_splits, _p0: 0 });
     let reduce_bg = pool.bind_group(
@@ -1379,7 +1381,7 @@ fn attn_decode(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder,
             BindGroupEntry { binding: 4, resource: reduce_dims.as_entire_binding() },
         ],
     );
-    engine.dispatch(encoder, reduce_pipeline, &reduce_bg, (n_heads, 1, 1), &format!("{key}.reduce"));
+    engine.dispatch(pass, reduce_pipeline, &reduce_bg, (n_heads, 1, 1), &format!("{key}.reduce"));
     out
 }
 
@@ -1388,7 +1390,7 @@ fn attn_decode(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder,
 /// `k_cache`/`v_cache`, gated by an explicit bitset instead of an implicit
 /// causal rule: see `shaders/attn_chunk_masked.wgsl`.
 #[allow(clippy::too_many_arguments)]
-fn attn_chunk_masked(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder, key: &str, q: &wgpu::Buffer, k_cache: &wgpu::Buffer, v_cache: &wgpu::Buffer, mask: &wgpu::Buffer, t: u32, kv_total: u32, max_ctx: u32, cfg: &Qwen2Config) -> wgpu::Buffer {
+fn attn_chunk_masked(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &str, q: &wgpu::Buffer, k_cache: &wgpu::Buffer, v_cache: &wgpu::Buffer, mask: &wgpu::Buffer, t: u32, kv_total: u32, max_ctx: u32, cfg: &Qwen2Config) -> wgpu::Buffer {
     let hidden = (cfg.num_heads * cfg.head_dim) as u32;
     let out = pool.data(&format!("{key}.out"), (t * hidden) as usize);
     let scale = 1.0 / (cfg.head_dim as f32).sqrt();
@@ -1408,7 +1410,7 @@ fn attn_chunk_masked(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEn
             BindGroupEntry { binding: 5, resource: dims.as_entire_binding() },
         ],
     );
-    engine.dispatch(encoder, &engine.attn_chunk_masked, &bg, (cfg.num_heads as u32, t.div_ceil(256), 1), key);
+    engine.dispatch(pass, &engine.attn_chunk_masked, &bg, (cfg.num_heads as u32, t.div_ceil(256), 1), key);
     out
 }
 
@@ -1419,7 +1421,7 @@ fn attn_chunk_masked(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEn
 /// Returns the buffer and `hidden` (the caller already knows `hidden`, but
 /// returning it here keeps this fn self-contained for a future non-Qwen2
 /// caller). See `shaders/gather_dequant_q8_rows.wgsl`.
-fn gather_dequant_head_rows(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder, key: &str, w: &MatMulWeight, token_ids: &[u32]) -> (wgpu::Buffer, u32) {
+fn gather_dequant_head_rows(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &str, w: &MatMulWeight, token_ids: &[u32]) -> (wgpu::Buffer, u32) {
     let (chunks, blocks_per_row) = match w {
         MatMulWeight::Q8_0 { chunks, blocks_per_row, .. } => (chunks, *blocks_per_row),
         _ => panic!("gather_dequant_head_rows: lm_head must be Q8_0"),
@@ -1444,7 +1446,7 @@ fn gather_dequant_head_rows(engine: &Engine, pool: &Pool, encoder: &mut wgpu::Co
                 BindGroupEntry { binding: 4, resource: dims.as_entire_binding() },
             ],
         );
-        engine.dispatch(encoder, &engine.gather_dequant_q8_rows, &bg, (hidden.div_ceil(64), 1, 1), &ckey);
+        engine.dispatch(pass, &engine.gather_dequant_q8_rows, &bg, (hidden.div_ceil(64), 1, 1), &ckey);
     }
     (out, hidden)
 }
@@ -1460,41 +1462,52 @@ pub async fn forward_prefill(engine: &Engine, model: &GpuModel, cache: &mut KvCa
     let pool = &model.pool;
 
     let mut encoder = engine.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("prefill") });
-    let x = embed_gather(engine, pool, &mut encoder, model, token_ids);
+    // One open ComputePass per layer-half instead of one per dispatch: see
+    // `Engine::dispatch`'s doc comment. `scatter_kv_gpu`'s
+    // `copy_buffer_to_buffer` calls are encoder-level (not pass-level), so
+    // the pass must close before them and reopen after - two passes per
+    // layer instead of ~15.
+    let mut pass = engine.begin_pass(&mut encoder, "prefill");
+    let x = embed_gather(engine, pool, &mut pass, model, token_ids);
 
     for (i, layer) in model.layers.iter().enumerate() {
         let key = format!("layer{i}");
-        let normed = rmsnorm(engine, pool, &mut encoder, &format!("{key}.norm"), &x, &layer.attn_norm, seq, hidden, cfg.rms_norm_eps);
+        let normed = rmsnorm(engine, pool, &mut pass, &format!("{key}.norm"), &x, &layer.attn_norm, seq, hidden, cfg.rms_norm_eps);
         let lora_layer = model.lora.as_ref().map(|l| &l.layers[i]);
-        let (q, k, v) = qkv_proj(engine, pool, &mut encoder, &format!("{key}.qkv"), &normed, seq, cfg, layer, model.fast_kernels, lora_layer);
-        rope(engine, pool, &mut encoder, &format!("{key}.ropeq"), &q, cos, sin, seq, cfg.num_heads as u32, cfg.head_dim as u32, 0);
-        rope(engine, pool, &mut encoder, &format!("{key}.ropek"), &k, cos, sin, seq, cfg.num_kv_heads as u32, cfg.head_dim as u32, 0);
-        let attn_out = attn_prefill(engine, pool, &mut encoder, &format!("{key}.attn"), &q, &k, &v, seq, cfg);
+        let (q, k, v) = qkv_proj(engine, pool, &mut pass, &format!("{key}.qkv"), &normed, seq, cfg, layer, model.fast_kernels, lora_layer);
+        rope(engine, pool, &mut pass, &format!("{key}.ropeq"), &q, cos, sin, seq, cfg.num_heads as u32, cfg.head_dim as u32, 0);
+        rope(engine, pool, &mut pass, &format!("{key}.ropek"), &k, cos, sin, seq, cfg.num_kv_heads as u32, cfg.head_dim as u32, 0);
+        let attn_out = attn_prefill(engine, pool, &mut pass, &format!("{key}.attn"), &q, &k, &v, seq, cfg);
+        drop(pass);
         scatter_kv_gpu(&mut encoder, &cache.k[i], &k, seq, cfg, 0, cache.max_ctx);
         scatter_kv_gpu(&mut encoder, &cache.v[i], &v, seq, cfg, 0, cache.max_ctx);
+        pass = engine.begin_pass(&mut encoder, "prefill");
 
         let attn_dim = (cfg.num_heads * cfg.head_dim) as u32;
-        let o = linear_lora(engine, pool, &mut encoder, &format!("{key}.wo"), &attn_out, seq, attn_dim, &layer.o_w, &layer.o_b, hidden, model.fast_kernels, lora_layer.map(|l| &l.o));
-        add_inplace(engine, pool, &mut encoder, &format!("{key}.add1"), &x, &o, seq * hidden);
+        let o = linear_lora(engine, pool, &mut pass, &format!("{key}.wo"), &attn_out, seq, attn_dim, &layer.o_w, &layer.o_b, hidden, model.fast_kernels, lora_layer.map(|l| &l.o));
+        add_inplace(engine, pool, &mut pass, &format!("{key}.add1"), &x, &o, seq * hidden);
 
-        let ffn_normed = rmsnorm(engine, pool, &mut encoder, &format!("{key}.ffnnorm"), &x, &layer.ffn_norm, seq, hidden, cfg.rms_norm_eps);
-        let mlp_out = mlp(engine, pool, &mut encoder, &format!("{key}.mlp"), &ffn_normed, seq, cfg, layer, model.fast_kernels);
-        add_inplace(engine, pool, &mut encoder, &format!("{key}.add2"), &x, &mlp_out, seq * hidden);
+        let ffn_normed = rmsnorm(engine, pool, &mut pass, &format!("{key}.ffnnorm"), &x, &layer.ffn_norm, seq, hidden, cfg.rms_norm_eps);
+        let mlp_out = mlp(engine, pool, &mut pass, &format!("{key}.mlp"), &ffn_normed, seq, cfg, layer, model.fast_kernels);
+        add_inplace(engine, pool, &mut pass, &format!("{key}.add2"), &x, &mlp_out, seq * hidden);
 
         // Flush per layer - see `Engine::flush_encoder`'s doc comment for
         // why a single encoder covering every layer hangs on Metal at
         // Qwen3-0.6B's depth (28 layers).
+        drop(pass);
         engine.flush_encoder(&mut encoder, "prefill");
+        pass = engine.begin_pass(&mut encoder, "prefill");
     }
 
-    let normed_final = rmsnorm(engine, pool, &mut encoder, "out_norm", &x, &model.out_norm, seq, hidden, cfg.rms_norm_eps);
-    let logits = linear(engine, pool, &mut encoder, "lm_head", &normed_final, seq, hidden, &model.lm_head, &model.zero_bias_vocab, cfg.vocab_size as u32, false);
+    let normed_final = rmsnorm(engine, pool, &mut pass, "out_norm", &x, &model.out_norm, seq, hidden, cfg.rms_norm_eps);
+    let logits = linear(engine, pool, &mut pass, "lm_head", &normed_final, seq, hidden, &model.lm_head, &model.zero_bias_vocab, cfg.vocab_size as u32, false);
     // Only the last position's row feeds the next token (see this fn's
     // return value below), so only it needs masking - `row_offset =
     // (seq-1)*vocab` into the `[seq, vocab]` logits buffer.
     if let Some(mask) = mask {
-        mask_logits_gpu(engine, pool, &mut encoder, "prefill_mask", &logits, mask, cfg.vocab_size as u32, (seq - 1) * cfg.vocab_size as u32);
+        mask_logits_gpu(engine, pool, &mut pass, "prefill_mask", &logits, mask, cfg.vocab_size as u32, (seq - 1) * cfg.vocab_size as u32);
     }
+    drop(pass);
 
     engine.queue.submit(Some(encoder.finish()));
     let vocab = cfg.vocab_size;
@@ -1510,7 +1523,7 @@ pub async fn forward_prefill(engine: &Engine, model: &GpuModel, cache: &mut KvCa
 /// then has exactly the same dispatch sequence (and result) as before this
 /// feature existed.
 #[allow(clippy::too_many_arguments)]
-fn mask_logits_gpu(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder, key: &str, logits: &wgpu::Buffer, mask: &wgpu::Buffer, vocab: u32, row_offset: u32) {
+fn mask_logits_gpu(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &str, logits: &wgpu::Buffer, mask: &wgpu::Buffer, vocab: u32, row_offset: u32) {
     let dims = pool.uniform(&format!("{key}.dims"), MaskDims { n: vocab, offset: row_offset, _p0: 0, _p1: 0 });
     // Not `pool.bind_group`: a caller driving constrained decoding uploads a
     // *different* mask buffer every step (a fresh `wgpu::Buffer`, not a
@@ -1530,10 +1543,10 @@ fn mask_logits_gpu(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEnco
             BindGroupEntry { binding: 2, resource: dims.as_entire_binding() },
         ],
     );
-    engine.dispatch(encoder, &engine.mask_logits, &bg, (vocab.div_ceil(256), 1, 1), key);
+    engine.dispatch(pass, &engine.mask_logits, &bg, (vocab.div_ceil(256), 1, 1), key);
 }
 
-fn argmax_gpu(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder, key: &str, logits: &wgpu::Buffer, vocab: u32) -> wgpu::Buffer {
+fn argmax_gpu(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &str, logits: &wgpu::Buffer, vocab: u32) -> wgpu::Buffer {
     let out = pool.data(&format!("{key}.out"), 1);
     let dims = pool.uniform(&format!("{key}.dims"), ArgmaxDims { n: vocab, _p0: 0, _p1: 0, _p2: 0 });
     let bg = pool.bind_group(
@@ -1545,7 +1558,7 @@ fn argmax_gpu(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder, 
             BindGroupEntry { binding: 2, resource: dims.as_entire_binding() },
         ],
     );
-    engine.dispatch(encoder, &engine.argmax, &bg, (1, 1, 1), key);
+    engine.dispatch(pass, &engine.argmax, &bg, (1, 1, 1), key);
     out
 }
 
@@ -1561,27 +1574,42 @@ fn decode_layers(engine: &Engine, model: &GpuModel, encoder: &mut wgpu::CommandE
     let pool = &model.pool;
     let pos = cache.kv_len;
 
-    let x = embed_gather(engine, pool, encoder, model, &[token_id]);
+    // One open ComputePass per layer-half instead of one per dispatch (same
+    // rationale as `forward_prefill` - see `Engine::dispatch`'s doc
+    // comment): decode's per-step dispatch count doesn't scale with
+    // kv_len, but at ~15 dispatches/layer every one was still its own
+    // `MTLComputeCommandEncoder` session before this change (532
+    // single-dispatch passes/step measured on Qwen2.5-3B, 36 layers).
+    // `scatter_kv_gpu`'s two `copy_buffer_to_buffer` calls are
+    // encoder-level, so the pass closes for them and reopens right after -
+    // no pass boundary otherwise, including across the layer loop (a
+    // layer's tail dispatches and the next layer's head dispatches share
+    // one pass).
+    let mut pass = engine.begin_pass(encoder, "decode");
+    let x = embed_gather(engine, pool, &mut pass, model, &[token_id]);
 
     for (i, layer) in model.layers.iter().enumerate() {
         let key = format!("dec_layer{i}");
-        let normed = rmsnorm(engine, pool, encoder, &format!("{key}.norm"), &x, &layer.attn_norm, 1, hidden, cfg.rms_norm_eps);
+        let normed = rmsnorm(engine, pool, &mut pass, &format!("{key}.norm"), &x, &layer.attn_norm, 1, hidden, cfg.rms_norm_eps);
         let lora_layer = model.lora.as_ref().map(|l| &l.layers[i]);
-        let (q, k, v) = qkv_proj(engine, pool, encoder, &format!("{key}.qkv"), &normed, 1, cfg, layer, model.fast_kernels, lora_layer);
-        rope(engine, pool, encoder, &format!("{key}.ropeq"), &q, cos, sin, 1, cfg.num_heads as u32, cfg.head_dim as u32, pos);
-        rope(engine, pool, encoder, &format!("{key}.ropek"), &k, cos, sin, 1, cfg.num_kv_heads as u32, cfg.head_dim as u32, pos);
+        let (q, k, v) = qkv_proj(engine, pool, &mut pass, &format!("{key}.qkv"), &normed, 1, cfg, layer, model.fast_kernels, lora_layer);
+        rope(engine, pool, &mut pass, &format!("{key}.ropeq"), &q, cos, sin, 1, cfg.num_heads as u32, cfg.head_dim as u32, pos);
+        rope(engine, pool, &mut pass, &format!("{key}.ropek"), &k, cos, sin, 1, cfg.num_kv_heads as u32, cfg.head_dim as u32, pos);
 
+        drop(pass);
         scatter_kv_gpu(encoder, &cache.k[i], &k, 1, cfg, pos, cache.max_ctx);
         scatter_kv_gpu(encoder, &cache.v[i], &v, 1, cfg, pos, cache.max_ctx);
-        let attn_out = attn_decode(engine, pool, encoder, &format!("{key}.attn"), &q, &cache.k[i], &cache.v[i], pos + 1, cache.max_ctx, cfg);
+        pass = engine.begin_pass(encoder, "decode");
+
+        let attn_out = attn_decode(engine, pool, &mut pass, &format!("{key}.attn"), &q, &cache.k[i], &cache.v[i], pos + 1, cache.max_ctx, cfg);
 
         let attn_dim = (cfg.num_heads * cfg.head_dim) as u32;
-        let o = linear_lora(engine, pool, encoder, &format!("{key}.wo"), &attn_out, 1, attn_dim, &layer.o_w, &layer.o_b, hidden, model.fast_kernels, lora_layer.map(|l| &l.o));
-        add_inplace(engine, pool, encoder, &format!("{key}.add1"), &x, &o, hidden);
+        let o = linear_lora(engine, pool, &mut pass, &format!("{key}.wo"), &attn_out, 1, attn_dim, &layer.o_w, &layer.o_b, hidden, model.fast_kernels, lora_layer.map(|l| &l.o));
+        add_inplace(engine, pool, &mut pass, &format!("{key}.add1"), &x, &o, hidden);
 
-        let ffn_normed = rmsnorm(engine, pool, encoder, &format!("{key}.ffnnorm"), &x, &layer.ffn_norm, 1, hidden, cfg.rms_norm_eps);
-        let mlp_out = mlp(engine, pool, encoder, &format!("{key}.mlp"), &ffn_normed, 1, cfg, layer, model.fast_kernels);
-        add_inplace(engine, pool, encoder, &format!("{key}.add2"), &x, &mlp_out, hidden);
+        let ffn_normed = rmsnorm(engine, pool, &mut pass, &format!("{key}.ffnnorm"), &x, &layer.ffn_norm, 1, hidden, cfg.rms_norm_eps);
+        let mlp_out = mlp(engine, pool, &mut pass, &format!("{key}.mlp"), &ffn_normed, 1, cfg, layer, model.fast_kernels);
+        add_inplace(engine, pool, &mut pass, &format!("{key}.add2"), &x, &mlp_out, hidden);
 
         // No per-layer flush here (unlike `forward_prefill`'s per-layer
         // flush, which exists to bound the *seq_len*-scaled dispatch count
@@ -1597,11 +1625,12 @@ fn decode_layers(engine: &Engine, model: &GpuModel, encoder: &mut wgpu::CommandE
         // dispatch volume - removed.
     }
 
-    let normed_final = rmsnorm(engine, pool, encoder, "dec_out_norm", &x, &model.out_norm, 1, hidden, cfg.rms_norm_eps);
-    let logits = linear(engine, pool, encoder, "dec_lm_head", &normed_final, 1, hidden, &model.lm_head, &model.zero_bias_vocab, cfg.vocab_size as u32, model.fast_kernels);
+    let normed_final = rmsnorm(engine, pool, &mut pass, "dec_out_norm", &x, &model.out_norm, 1, hidden, cfg.rms_norm_eps);
+    let logits = linear(engine, pool, &mut pass, "dec_lm_head", &normed_final, 1, hidden, &model.lm_head, &model.zero_bias_vocab, cfg.vocab_size as u32, model.fast_kernels);
     if let Some(mask) = mask {
-        mask_logits_gpu(engine, pool, encoder, "dec_mask", &logits, mask, cfg.vocab_size as u32, 0);
+        mask_logits_gpu(engine, pool, &mut pass, "dec_mask", &logits, mask, cfg.vocab_size as u32, 0);
     }
+    drop(pass);
     logits
 }
 
@@ -1635,7 +1664,9 @@ pub async fn forward_decode_step(engine: &Engine, model: &GpuModel, cache: &mut 
 pub async fn forward_decode_step_argmax(engine: &Engine, model: &GpuModel, cache: &mut KvCache, token_id: u32, cos: &wgpu::Buffer, sin: &wgpu::Buffer, mask: Option<&wgpu::Buffer>) -> u32 {
     let mut encoder = engine.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("decode_argmax") });
     let logits = decode_layers(engine, model, &mut encoder, cache, token_id, cos, sin, mask);
-    let idx = argmax_gpu(engine, &model.pool, &mut encoder, "dec_argmax", &logits, model.config.vocab_size as u32);
+    let mut pass = engine.begin_pass(&mut encoder, "decode_argmax");
+    let idx = argmax_gpu(engine, &model.pool, &mut pass, "dec_argmax", &logits, model.config.vocab_size as u32);
+    drop(pass);
     engine.queue.submit(Some(encoder.finish()));
     cache.kv_len += 1;
     engine.read_u32(&idx).await
@@ -1730,33 +1761,42 @@ pub async fn forward_chunk_spec(engine: &Engine, model: &GpuModel, cache: &mut K
     let mask_buf = pool.upload_u32("chunk.mask", mask_bits);
 
     let mut encoder = engine.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("chunk") });
-    let x = embed_gather(engine, pool, &mut encoder, model, token_ids);
+    // Same pass-batching as `forward_prefill`/`decode_layers` - see
+    // `Engine::dispatch`'s doc comment.
+    let mut pass = engine.begin_pass(&mut encoder, "chunk");
+    let x = embed_gather(engine, pool, &mut pass, model, token_ids);
 
     for (i, layer) in model.layers.iter().enumerate() {
         let key = format!("chunk_layer{i}");
         let lora_layer = model.lora.as_ref().map(|l| &l.layers[i]);
-        let normed = rmsnorm(engine, pool, &mut encoder, &format!("{key}.norm"), &x, &layer.attn_norm, t, hidden, cfg.rms_norm_eps);
-        let (q, k, v) = qkv_proj(engine, pool, &mut encoder, &format!("{key}.qkv"), &normed, t, cfg, layer, model.fast_kernels, lora_layer);
-        rope_positions(engine, pool, &mut encoder, &format!("{key}.ropeq"), &q, cos, sin, &pos_buf, t, cfg.num_heads as u32, cfg.head_dim as u32);
-        rope_positions(engine, pool, &mut encoder, &format!("{key}.ropek"), &k, cos, sin, &pos_buf, t, cfg.num_kv_heads as u32, cfg.head_dim as u32);
+        let normed = rmsnorm(engine, pool, &mut pass, &format!("{key}.norm"), &x, &layer.attn_norm, t, hidden, cfg.rms_norm_eps);
+        let (q, k, v) = qkv_proj(engine, pool, &mut pass, &format!("{key}.qkv"), &normed, t, cfg, layer, model.fast_kernels, lora_layer);
+        rope_positions(engine, pool, &mut pass, &format!("{key}.ropeq"), &q, cos, sin, &pos_buf, t, cfg.num_heads as u32, cfg.head_dim as u32);
+        rope_positions(engine, pool, &mut pass, &format!("{key}.ropek"), &k, cos, sin, &pos_buf, t, cfg.num_kv_heads as u32, cfg.head_dim as u32);
 
+        drop(pass);
         scatter_kv_gpu(&mut encoder, &cache.k[i], &k, t, cfg, prefix_len, cache.max_ctx);
         scatter_kv_gpu(&mut encoder, &cache.v[i], &v, t, cfg, prefix_len, cache.max_ctx);
-        let attn_out = attn_chunk_masked(engine, pool, &mut encoder, &format!("{key}.attn"), &q, &cache.k[i], &cache.v[i], &mask_buf, t, kv_total, cache.max_ctx, cfg);
+        pass = engine.begin_pass(&mut encoder, "chunk");
+
+        let attn_out = attn_chunk_masked(engine, pool, &mut pass, &format!("{key}.attn"), &q, &cache.k[i], &cache.v[i], &mask_buf, t, kv_total, cache.max_ctx, cfg);
 
         let attn_dim = (cfg.num_heads * cfg.head_dim) as u32;
-        let o = linear_lora(engine, pool, &mut encoder, &format!("{key}.wo"), &attn_out, t, attn_dim, &layer.o_w, &layer.o_b, hidden, model.fast_kernels, lora_layer.map(|l| &l.o));
-        add_inplace(engine, pool, &mut encoder, &format!("{key}.add1"), &x, &o, t * hidden);
+        let o = linear_lora(engine, pool, &mut pass, &format!("{key}.wo"), &attn_out, t, attn_dim, &layer.o_w, &layer.o_b, hidden, model.fast_kernels, lora_layer.map(|l| &l.o));
+        add_inplace(engine, pool, &mut pass, &format!("{key}.add1"), &x, &o, t * hidden);
 
-        let ffn_normed = rmsnorm(engine, pool, &mut encoder, &format!("{key}.ffnnorm"), &x, &layer.ffn_norm, t, hidden, cfg.rms_norm_eps);
-        let mlp_out = mlp(engine, pool, &mut encoder, &format!("{key}.mlp"), &ffn_normed, t, cfg, layer, model.fast_kernels);
-        add_inplace(engine, pool, &mut encoder, &format!("{key}.add2"), &x, &mlp_out, t * hidden);
+        let ffn_normed = rmsnorm(engine, pool, &mut pass, &format!("{key}.ffnnorm"), &x, &layer.ffn_norm, t, hidden, cfg.rms_norm_eps);
+        let mlp_out = mlp(engine, pool, &mut pass, &format!("{key}.mlp"), &ffn_normed, t, cfg, layer, model.fast_kernels);
+        add_inplace(engine, pool, &mut pass, &format!("{key}.add2"), &x, &mlp_out, t * hidden);
 
         // See `Engine::flush_encoder`'s doc comment.
+        drop(pass);
         engine.flush_encoder(&mut encoder, "chunk");
+        pass = engine.begin_pass(&mut encoder, "chunk");
     }
 
-    let normed_final = rmsnorm(engine, pool, &mut encoder, "chunk_out_norm", &x, &model.out_norm, t, hidden, cfg.rms_norm_eps);
+    let normed_final = rmsnorm(engine, pool, &mut pass, "chunk_out_norm", &x, &model.out_norm, t, hidden, cfg.rms_norm_eps);
+    drop(pass);
 
     engine.queue.submit(Some(encoder.finish()));
     cache.kv_len = kv_total;
@@ -1792,7 +1832,9 @@ mod grid1d_tests {
         let a_buf = engine.buf_f32(&a, "grid1d_test.a");
         let b_buf = engine.buf_f32(&b, "grid1d_test.b");
         let mut encoder = engine.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        add_inplace(&engine, &pool, &mut encoder, "grid1d_test.add", &a_buf, &b_buf, total);
+        let mut pass = engine.begin_pass(&mut encoder, "test");
+        add_inplace(&engine, &pool, &mut pass, "grid1d_test.add", &a_buf, &b_buf, total);
+        drop(pass);
         engine.queue.submit(Some(encoder.finish()));
         let got = pollster::block_on(engine.read_buffer(&a_buf, total as usize));
         for i in [0usize, 12345, (total / 2) as usize, (total - 1) as usize] {
@@ -1811,7 +1853,9 @@ mod grid1d_tests {
         let gate_up: Vec<f32> = (0..rows * 2 * hidden).map(|i| ((i as f32) * 0.0091).cos() * 3.0).collect();
         let gate_up_buf = engine.buf_f32(&gate_up, "grid1d_test.gate_up");
         let mut encoder = engine.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        let out = silu_mul_fused(&engine, &pool, &mut encoder, "grid1d_test.silu", &gate_up_buf, rows, hidden);
+        let mut pass = engine.begin_pass(&mut encoder, "test");
+        let out = silu_mul_fused(&engine, &pool, &mut pass, "grid1d_test.silu", &gate_up_buf, rows, hidden);
+        drop(pass);
         engine.queue.submit(Some(encoder.finish()));
         let got = pollster::block_on(engine.read_buffer(&out, (rows * hidden) as usize));
         let check = |row: u32, c: u32| {

@@ -299,12 +299,25 @@ impl Engine {
         self.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &layout, entries })
     }
 
-    pub fn dispatch(&self, encoder: &mut wgpu::CommandEncoder, pipeline: &wgpu::ComputePipeline, bind_group: &wgpu::BindGroup, wgs: (u32, u32, u32), label: &str) {
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some(label), timestamp_writes: None });
+    /// Records one dispatch into an already-open `pass`. Callers batch many
+    /// dispatches into one `wgpu::ComputePass` (see model.rs's orchestrator
+    /// functions) rather than opening a pass per dispatch: on native Metal,
+    /// ending and beginning a `MTLComputeCommandEncoder` per dispatch is a
+    /// real, measured cost (profiled with `sample` on a 3B-model decode
+    /// step: ~69% of wall time inside `wgpu_core`'s device-wait path at 532
+    /// single-dispatch passes/step - docs/runs/2026-09-28-lean-decode-breakdown.md).
+    /// A `label` is still accepted for call-site readability but no longer
+    /// used to name a pass (the caller's `begin_compute_pass` call names the
+    /// batch instead).
+    pub fn dispatch(&self, pass: &mut wgpu::ComputePass, pipeline: &wgpu::ComputePipeline, bind_group: &wgpu::BindGroup, wgs: (u32, u32, u32), _label: &str) {
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, bind_group, &[]);
         pass.dispatch_workgroups(wgs.0, wgs.1, wgs.2);
         self.dispatch_count.set(self.dispatch_count.get() + 1);
+    }
+
+    pub fn begin_pass<'e>(&self, encoder: &'e mut wgpu::CommandEncoder, label: &str) -> wgpu::ComputePass<'e> {
+        encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some(label), timestamp_writes: None })
     }
 
     /// Submits `encoder`'s recorded work, replaces it with a fresh encoder
