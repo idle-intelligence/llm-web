@@ -305,10 +305,13 @@ struct LayerWeights {
     o_w: MatMulWeight,
     o_b: wgpu::Buffer, // zero, attn_output has no bias
     ffn_norm: wgpu::Buffer,
-    gate_w: MatMulWeight,
-    gate_b: wgpu::Buffer, // zero
-    up_w: MatMulWeight,
-    up_b: wgpu::Buffer, // zero
+    /// `ffn_gate.weight` and `ffn_up.weight` concatenated at load time into
+    /// one `[2*intermediate_size, hidden_size]` weight (see
+    /// `gguf_matmul_concat2`'s doc comment) - one `linear()` dispatch
+    /// produces both halves, consumed by `silu_mul_fused` instead of two
+    /// separate matmuls into two separate buffers.
+    gate_up_w: MatMulWeight,
+    gate_up_b: wgpu::Buffer, // zero, len 2*intermediate_size
     down_w: MatMulWeight,
     down_b: wgpu::Buffer, // zero
     /// Qwen3-only (`cfg.qk_norm`): per-head RMSNorm gamma, `[head_dim]`
@@ -516,6 +519,32 @@ fn gguf_matmul<R: std::io::Read + std::io::Seek>(engine: &Engine, reader: &mut G
     Ok(load_matmul_weight_gguf(engine, name, &shape, info.dtype(), &bytes))
 }
 
+/// Step 3 of this session's brief (QKV/gate-up fusion): loads two
+/// same-shape, same-dtype matmul weights (`ffn_gate.weight`/
+/// `ffn_up.weight`) and concatenates their raw on-disk bytes end to end
+/// (tensor `a`'s rows first, then tensor `b`'s) before repacking, producing
+/// one `MatMulWeight` covering both. This is valid because a Q4_0/Q8_0
+/// tensor's bytes are already row-major, block-contiguous per output row
+/// (see `quant.rs::chunk_rows`'s doc comment): concatenating two tensors'
+/// byte streams with identical `bytes_per_row` (guaranteed here by the
+/// `in_dim`/dtype equality check) is bit-identical to loading one tensor
+/// whose rows are `a`'s rows followed by `b`'s - no dequantize/requantize
+/// round trip, no reshuffling beyond the byte-level `extend_from_slice`.
+/// One `linear()` call against the result produces both tensors' outputs
+/// in one dispatch instead of two; downstream (`silu_mul_fused.wgsl`)
+/// reads the fused `[rows, 2*out_dim_each]` layout directly.
+fn gguf_matmul_concat2<R: std::io::Read + std::io::Seek>(engine: &Engine, reader: &mut GgufReader<R>, name_a: &str, name_b: &str, label: &str) -> Result<MatMulWeight> {
+    let info_a = reader.tensor_info(name_a).with_context(|| format!("missing tensor {name_a}"))?.clone();
+    let info_b = reader.tensor_info(name_b).with_context(|| format!("missing tensor {name_b}"))?.clone();
+    let (shape_a, shape_b) = (info_a.shape(), info_b.shape());
+    anyhow::ensure!(info_a.dtype() == info_b.dtype(), "gguf_matmul_concat2: {name_a} dtype {:?} != {name_b} dtype {:?}", info_a.dtype(), info_b.dtype());
+    anyhow::ensure!(shape_a[1] == shape_b[1], "gguf_matmul_concat2: {name_a} in_dim {} != {name_b} in_dim {}", shape_a[1], shape_b[1]);
+    let mut bytes = reader.tensor_data(name_a)?;
+    bytes.extend_from_slice(&reader.tensor_data(name_b)?);
+    let shape = vec![shape_a[0] + shape_b[0], shape_a[1]];
+    Ok(load_matmul_weight_gguf(engine, label, &shape, info_a.dtype(), &bytes))
+}
+
 /// Inverse of llama.cpp `convert_hf_to_gguf.py`'s `LlamaModel.permute()`,
 /// applied row-wise (dtype-agnostic: every row of a GGUF matmul weight is
 /// the same number of bytes regardless of quant format, so this reorders
@@ -620,10 +649,8 @@ impl GpuModel {
                 o_w: gguf_matmul(engine, &mut reader, &format!("{p}.attn_output.weight"))?,
                 o_b: engine.buf_f32(&vec![0f32; config.hidden_size], "o_b_zero"),
                 ffn_norm: gguf_f32(engine, &mut reader, &format!("{p}.ffn_norm.weight"))?,
-                gate_w: gguf_matmul(engine, &mut reader, &format!("{p}.ffn_gate.weight"))?,
-                gate_b: engine.buf_f32(&vec![0f32; config.intermediate_size], "gate_b_zero"),
-                up_w: gguf_matmul(engine, &mut reader, &format!("{p}.ffn_up.weight"))?,
-                up_b: engine.buf_f32(&vec![0f32; config.intermediate_size], "up_b_zero"),
+                gate_up_w: gguf_matmul_concat2(engine, &mut reader, &format!("{p}.ffn_gate.weight"), &format!("{p}.ffn_up.weight"), &format!("{p}.ffn_gate_up.weight"))?,
+                gate_up_b: engine.buf_f32(&vec![0f32; 2 * config.intermediate_size], "gate_up_b_zero"),
                 down_w: gguf_matmul(engine, &mut reader, &format!("{p}.ffn_down.weight"))?,
                 down_b: engine.buf_f32(&vec![0f32; config.hidden_size], "down_b_zero"),
                 q_norm,
@@ -968,21 +995,21 @@ fn add_inplace(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder,
     engine.dispatch(encoder, &engine.add_inplace, &bg, (len.div_ceil(256), 1, 1), key);
 }
 
-#[allow(clippy::too_many_arguments)]
-fn silu_mul(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder, key: &str, gate: &wgpu::Buffer, up: &wgpu::Buffer, rows: u32, hidden: u32) -> wgpu::Buffer {
+/// SwiGLU over a fused `[rows, 2*hidden]` gate/up matmul output (see
+/// `gguf_matmul_concat2`'s doc comment and `silu_mul_fused.wgsl`).
+fn silu_mul_fused(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder, key: &str, gate_up: &wgpu::Buffer, rows: u32, hidden: u32) -> wgpu::Buffer {
     let out = pool.data(&format!("{key}.out"), (rows * hidden) as usize);
     let dims = pool.uniform(&format!("{key}.dims"), SiluDims { rows, hidden, _p0: 0, _p1: 0 });
     let bg = pool.bind_group(
         key,
-        &engine.silu_mul,
+        &engine.silu_mul_fused,
         &[
-            BindGroupEntry { binding: 0, resource: gate.as_entire_binding() },
-            BindGroupEntry { binding: 1, resource: up.as_entire_binding() },
-            BindGroupEntry { binding: 2, resource: out.as_entire_binding() },
-            BindGroupEntry { binding: 3, resource: dims.as_entire_binding() },
+            BindGroupEntry { binding: 0, resource: gate_up.as_entire_binding() },
+            BindGroupEntry { binding: 1, resource: out.as_entire_binding() },
+            BindGroupEntry { binding: 2, resource: dims.as_entire_binding() },
         ],
     );
-    engine.dispatch(encoder, &engine.silu_mul, &bg, ((rows * hidden).div_ceil(256), 1, 1), key);
+    engine.dispatch(encoder, &engine.silu_mul_fused, &bg, ((rows * hidden).div_ceil(256), 1, 1), key);
     out
 }
 
@@ -1026,9 +1053,10 @@ fn qkv_proj(
 fn mlp(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder, key: &str, x: &wgpu::Buffer, rows: u32, cfg: &Qwen2Config, layer: &LayerWeights, fast: bool) -> wgpu::Buffer {
     let hidden = cfg.hidden_size as u32;
     let inter = cfg.intermediate_size as u32;
-    let gate = linear(engine, pool, encoder, &format!("{key}.gate"), x, rows, hidden, &layer.gate_w, &layer.gate_b, inter, fast);
-    let up = linear(engine, pool, encoder, &format!("{key}.up"), x, rows, hidden, &layer.up_w, &layer.up_b, inter, fast);
-    let gated = silu_mul(engine, pool, encoder, &format!("{key}.silu"), &gate, &up, rows, inter);
+    // Fused gate/up matmul (see gguf_matmul_concat2's doc comment): one
+    // linear() dispatch (per weight chunk) instead of two, at every M.
+    let gate_up = linear(engine, pool, encoder, &format!("{key}.gate_up"), x, rows, hidden, &layer.gate_up_w, &layer.gate_up_b, 2 * inter, fast);
+    let gated = silu_mul_fused(engine, pool, encoder, &format!("{key}.silu"), &gate_up, rows, inter);
     linear(engine, pool, encoder, &format!("{key}.down"), &gated, rows, inter, &layer.down_w, &layer.down_b, hidden, fast)
 }
 
