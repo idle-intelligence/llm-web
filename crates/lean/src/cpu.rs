@@ -1,7 +1,5 @@
 //! Single-threaded CPU forward pass: the CPU fallback rung below the WebGPU
-//! rung in `model.rs` (see
-//! `~/Code/tracker/projects/llm-web/cpu-fallback-plan-2026-09-28.md`, step
-//! list 1-4). Same op list, same config (`Qwen2Config`), same GGUF parsing
+//! rung in `model.rs`. Same op list, same config (`Qwen2Config`), same GGUF parsing
 //! (`GgufReader`), same tokenizer/chat-template code as the GPU path - only
 //! the destination of each weight tensor differs: a plain `Vec<u8>` holding
 //! the GGUF's on-disk Q4_0/Q8_0 block bytes unchanged (no repack, no
