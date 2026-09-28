@@ -48,7 +48,7 @@ fn main(@builtin(workgroup_id) wg_id: vec3<u32>, @builtin(local_invocation_id) l
     q_shared[tid] = q[h * hd + tid];
     workgroupBarrier();
 
-    var m: f32 = -3.4028235e38; // -f32::MAX
+    var m: f32 = -1e30; // effectively -infinity for this kernel's score range; see attn_prefill.wgsl's comment on why not -f32::MAX's literal
     var l: f32 = 0.0;
     var acc: f32 = 0.0; // this thread owns output dimension `tid`
 
@@ -58,7 +58,7 @@ fn main(@builtin(workgroup_id) wg_id: vec3<u32>, @builtin(local_invocation_id) l
             break;
         }
         let key = tile_start + tid;
-        var raw: f32 = -3.4028235e38;
+        var raw: f32 = -1e30;
         if (key < dims.kv_len) {
             var dot: f32 = 0.0;
             let k_base = (kv_head * dims.max_ctx + key) * hd;

@@ -685,7 +685,9 @@ fn attn_prefill(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder
             BindGroupEntry { binding: 4, resource: dims.as_entire_binding() },
         ],
     );
-    engine.dispatch(encoder, &engine.attn_prefill, &bg, (cfg.num_heads as u32, 1, 1), key);
+    // wg.y = query tile index (256 rows/tile, see attn_prefill.wgsl's doc
+    // comment on why this scales with `seq` instead of a fixed dispatch).
+    engine.dispatch(encoder, &engine.attn_prefill, &bg, (cfg.num_heads as u32, seq.div_ceil(256), 1), key);
     out
 }
 
