@@ -15,9 +15,13 @@
 //! snapshot-export + import + restore round trip of the same cache (the
 //! time a resident-prefix image saves a consumer that keys a KV snapshot by
 //! its own prompt/tool-schema hash - see the engine consumer survey's gap
-//! #1). (3) is timing-only, like the wasm harness's own `long_1000` case -
-//! `attn_prefill.wgsl`'s `MAX_SEQ` cap means a from-scratch ~1000-token
-//! prefill's *logits* are not asserted correct here, only timed.
+//! #1). (3) is timing-only (no reference logits for this synthetic
+//! prompt) but no longer length-limited: the attn_prefill.wgsl/
+//! attn_decode.wgsl MAX_SEQ=256 / scratch[2048] caps this comment used to
+//! reference are gone (see docs/runs/2026-09-28-lean-long-context.md);
+//! (1)'s prefix/suffix split now uses the fixture's longest case (2225+
+//! tokens) specifically to exercise a restored prefix past those old
+//! caps.
 
 use lean::engine::Engine;
 use lean::model::{build_rope_tables, forward_decode_step, forward_prefill, forward_prefill_suffix, GpuModel, KvCache, KvSnapshot};
@@ -70,8 +74,14 @@ fn kv_snapshot_restore_matches_full_prefill_and_round_trips() {
 
     let fixture_json = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/reference/fixture.json")).expect("reading fixture.json");
     let fixture: Fixture = serde_json::from_str(&fixture_json).expect("parsing fixture.json");
-    // The "long" case (86 tokens) gives both halves a real chunk of context.
-    let all_ids = fixture.cases.iter().find(|c| c.input_ids.len() == 86).expect("fixture has an 86-token case").input_ids.clone();
+    // The fixture's longest case (one of the long-context Sonos-agent
+    // cases, 2225/2354 tokens - see reference/gen_fixture.py's
+    // LONG_TOKEN_CASES) so both halves' restored prefix clears
+    // attn_prefill.wgsl/attn_decode.wgsl's old 256/2048 caps by a wide
+    // margin - this used to be the 86-token "long" case (split 43/43,
+    // nowhere near those caps) before this session's long-context fixtures
+    // existed.
+    let all_ids = fixture.cases.iter().max_by_key(|c| c.input_ids.len()).expect("fixture has cases").input_ids.clone();
     let split = all_ids.len() / 2;
     let prefix = &all_ids[..split];
     let suffix = &all_ids[split..];
@@ -176,9 +186,10 @@ fn kv_snapshot_timing_1000_token_prefix() {
     let cos_buf = engine.buf_f32(&cos, "rope_cos");
     let sin_buf = engine.buf_f32(&sin, "rope_sin");
 
-    // Full prefill from scratch (timing only - attn_prefill.wgsl's MAX_SEQ
-    // cap means logits at this length are not asserted correct, matching
-    // the wasm harness's own long_1000 case).
+    // Full prefill from scratch (timing only - no reference logits exist
+    // for this synthetic prompt to assert against, matching the wasm
+    // harness's own long_1500 case; the prefill itself is full-length
+    // correct since the attention length caps were fixed).
     model.pool.reset();
     let mut cache = KvCache::new(&engine, &model.config, max_ctx);
     let full_start = Instant::now();
