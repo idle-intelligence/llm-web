@@ -43,7 +43,7 @@ use crate::config::{config_from_gguf, Qwen2Config};
 use crate::engine::Engine;
 use crate::gguf::GgufReader;
 use crate::pool::Pool;
-use crate::quant::{load_matmul_weight_gguf, load_q4_embedding_gguf, MatMulWeight, Q4EmbeddingTable};
+use crate::quant::{load_embedding_table_gguf, load_matmul_weight_gguf, EmbeddingTable, MatMulWeight};
 
 /// Row-count (`M`) threshold above which the tiled Q4_0 matmul
 /// (`linear_q4_tiled.wgsl`) is used for prefill; below it, the naive
@@ -275,11 +275,16 @@ struct LayerWeights {
     up_b: wgpu::Buffer, // zero
     down_w: MatMulWeight,
     down_b: wgpu::Buffer, // zero
+    /// Qwen3-only (`cfg.qk_norm`): per-head RMSNorm gamma, `[head_dim]`
+    /// each, applied to q/k right after projection, before RoPE. `None` for
+    /// Qwen2 layers.
+    q_norm: Option<wgpu::Buffer>,
+    k_norm: Option<wgpu::Buffer>,
 }
 
 pub struct GpuModel {
     pub config: Qwen2Config,
-    embed: Q4EmbeddingTable,
+    embed: EmbeddingTable,
     layers: Vec<LayerWeights>,
     out_norm: wgpu::Buffer,
     lm_head: MatMulWeight,
@@ -495,22 +500,47 @@ impl GpuModel {
 
         let embed_info = reader.tensor_info("token_embd.weight").context("missing token_embd.weight")?.clone();
         let embed_shape = embed_info.shape();
-        anyhow::ensure!(embed_info.dtype() == crate::gguf::GgmlDtype::Q4_0, "expected token_embd.weight to be Q4_0, got {:?}", embed_info.dtype());
+        let embed_dtype = embed_info.dtype();
+        anyhow::ensure!(
+            matches!(embed_dtype, crate::gguf::GgmlDtype::Q4_0 | crate::gguf::GgmlDtype::Q8_0),
+            "expected token_embd.weight to be Q4_0 or Q8_0, got {embed_dtype:?}"
+        );
         let embed_bytes = reader.tensor_data("token_embd.weight")?;
-        let embed = load_q4_embedding_gguf(engine, "token_embd", &embed_shape, &embed_bytes);
+        // Tied embeddings (`config.tied_embeddings`, e.g. Qwen3-0.6B/1.7B):
+        // the lm head is built from the *same* bytes, straight through
+        // `load_matmul_weight_gguf`'s row-chunking path (so it still splits
+        // across bindings under the device's storage-buffer-binding limit
+        // exactly like an untied `output.weight` would) - built before the
+        // embedding-gather table below so both share `embed_bytes` while
+        // it's still resident, then it's dropped once, not read twice from
+        // disk.
+        let tied_lm_head = config.tied_embeddings.then(|| load_matmul_weight_gguf(engine, "token_embd(lm_head)", &embed_shape, embed_dtype, &embed_bytes));
+        let embed = load_embedding_table_gguf(engine, "token_embd", &embed_shape, embed_dtype, &embed_bytes);
         drop(embed_bytes);
 
         let mut layers = Vec::with_capacity(config.num_layers);
         for i in 0..config.num_layers {
             let p = format!("blk.{i}");
+            let (q_b, k_b, v_b) = if config.has_qkv_bias {
+                (gguf_f32(engine, &mut reader, &format!("{p}.attn_q.bias"))?, gguf_f32(engine, &mut reader, &format!("{p}.attn_k.bias"))?, gguf_f32(engine, &mut reader, &format!("{p}.attn_v.bias"))?)
+            } else {
+                let q_dim = (config.num_heads * config.head_dim) as usize;
+                let kv_dim = (config.num_kv_heads * config.head_dim) as usize;
+                (engine.buf_f32(&vec![0f32; q_dim], "q_b_zero"), engine.buf_f32(&vec![0f32; kv_dim], "k_b_zero"), engine.buf_f32(&vec![0f32; kv_dim], "v_b_zero"))
+            };
+            let (q_norm, k_norm) = if config.qk_norm {
+                (Some(gguf_f32(engine, &mut reader, &format!("{p}.attn_q_norm.weight"))?), Some(gguf_f32(engine, &mut reader, &format!("{p}.attn_k_norm.weight"))?))
+            } else {
+                (None, None)
+            };
             layers.push(LayerWeights {
                 attn_norm: gguf_f32(engine, &mut reader, &format!("{p}.attn_norm.weight"))?,
                 q_w: gguf_matmul(engine, &mut reader, &format!("{p}.attn_q.weight"))?,
-                q_b: gguf_f32(engine, &mut reader, &format!("{p}.attn_q.bias"))?,
+                q_b,
                 k_w: gguf_matmul(engine, &mut reader, &format!("{p}.attn_k.weight"))?,
-                k_b: gguf_f32(engine, &mut reader, &format!("{p}.attn_k.bias"))?,
+                k_b,
                 v_w: gguf_matmul(engine, &mut reader, &format!("{p}.attn_v.weight"))?,
-                v_b: gguf_f32(engine, &mut reader, &format!("{p}.attn_v.bias"))?,
+                v_b,
                 o_w: gguf_matmul(engine, &mut reader, &format!("{p}.attn_output.weight"))?,
                 o_b: engine.buf_f32(&vec![0f32; config.hidden_size], "o_b_zero"),
                 ffn_norm: gguf_f32(engine, &mut reader, &format!("{p}.ffn_norm.weight"))?,
@@ -520,11 +550,16 @@ impl GpuModel {
                 up_b: engine.buf_f32(&vec![0f32; config.intermediate_size], "up_b_zero"),
                 down_w: gguf_matmul(engine, &mut reader, &format!("{p}.ffn_down.weight"))?,
                 down_b: engine.buf_f32(&vec![0f32; config.hidden_size], "down_b_zero"),
+                q_norm,
+                k_norm,
             });
         }
 
         let out_norm = gguf_f32(engine, &mut reader, "output_norm.weight")?;
-        let lm_head = gguf_matmul(engine, &mut reader, "output.weight")?;
+        let lm_head = match tied_lm_head {
+            Some(w) => w,
+            None => gguf_matmul(engine, &mut reader, "output.weight")?,
+        };
         let zero_bias_vocab = engine.buf_f32(&vec![0f32; config.vocab_size], "zero_bias_vocab");
 
         // `reader` (and its underlying `File`) drops here - two-phase
@@ -843,10 +878,25 @@ fn qkv_proj(
     lora: Option<&crate::lora::LoraLayer>,
 ) -> (wgpu::Buffer, wgpu::Buffer, wgpu::Buffer) {
     let hidden = cfg.hidden_size as u32;
+    let q_dim = (cfg.num_heads * cfg.head_dim) as u32;
     let kv_dim = (cfg.num_kv_heads * cfg.head_dim) as u32;
-    let q = linear_lora(engine, pool, encoder, &format!("{key}.q"), x, rows, hidden, &layer.q_w, &layer.q_b, hidden, fast, lora.map(|l| &l.q));
+    let q = linear_lora(engine, pool, encoder, &format!("{key}.q"), x, rows, hidden, &layer.q_w, &layer.q_b, q_dim, fast, lora.map(|l| &l.q));
     let k = linear_lora(engine, pool, encoder, &format!("{key}.k"), x, rows, hidden, &layer.k_w, &layer.k_b, kv_dim, fast, lora.map(|l| &l.k));
     let v = linear_lora(engine, pool, encoder, &format!("{key}.v"), x, rows, hidden, &layer.v_w, &layer.v_b, kv_dim, fast, lora.map(|l| &l.v));
+    // Qwen3 only (`layer.q_norm`/`k_norm` set): per-head RMSNorm on q/k
+    // before RoPE. `q`/`k` are `[rows, heads*head_dim]` row-major, so
+    // reinterpreting the same flat buffer as `[rows*heads, head_dim]` for
+    // `rmsnorm()` normalizes each head's slice independently in place - no
+    // dedicated per-head kernel needed (see the qwen3 survey's open
+    // question, resolved this way).
+    let q = match &layer.q_norm {
+        Some(scale) => rmsnorm(engine, pool, encoder, &format!("{key}.qnorm"), &q, scale, rows * cfg.num_heads as u32, cfg.head_dim as u32, cfg.rms_norm_eps),
+        None => q,
+    };
+    let k = match &layer.k_norm {
+        Some(scale) => rmsnorm(engine, pool, encoder, &format!("{key}.knorm"), &k, scale, rows * cfg.num_kv_heads as u32, cfg.head_dim as u32, cfg.rms_norm_eps),
+        None => k,
+    };
     (q, k, v)
 }
 
@@ -865,19 +915,23 @@ fn embed_gather(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder
     let hidden = model.config.hidden_size as u32;
     let ids_buf = pool.upload_u32("embed.ids", token_ids);
     let out = pool.data("embed.out", (rows * hidden) as usize);
-    let dims = pool.uniform("embed.dims", GatherDims { rows, hidden, blocks_per_row: model.embed.blocks_per_row, _p0: 0 });
+    let (pipeline, table) = match &model.embed {
+        EmbeddingTable::Q4_0(t) => (&engine.embed_gather_q4, t),
+        EmbeddingTable::Q8_0(t) => (&engine.embed_gather_q8, t),
+    };
+    let dims = pool.uniform("embed.dims", GatherDims { rows, hidden, blocks_per_row: table.blocks_per_row, _p0: 0 });
     let bg = pool.bind_group(
         "embed",
-        &engine.embed_gather_q4,
+        pipeline,
         &[
             BindGroupEntry { binding: 0, resource: ids_buf.as_entire_binding() },
-            BindGroupEntry { binding: 1, resource: model.embed.qs.as_entire_binding() },
-            BindGroupEntry { binding: 2, resource: model.embed.scales.as_entire_binding() },
+            BindGroupEntry { binding: 1, resource: table.qs.as_entire_binding() },
+            BindGroupEntry { binding: 2, resource: table.scales.as_entire_binding() },
             BindGroupEntry { binding: 3, resource: out.as_entire_binding() },
             BindGroupEntry { binding: 4, resource: dims.as_entire_binding() },
         ],
     );
-    engine.dispatch(encoder, &engine.embed_gather_q4, &bg, ((rows * hidden).div_ceil(256), 1, 1), "embed");
+    engine.dispatch(encoder, pipeline, &bg, ((rows * hidden).div_ceil(256), 1, 1), "embed");
     out
 }
 
@@ -903,7 +957,11 @@ fn scatter_kv_gpu(encoder: &mut wgpu::CommandEncoder, cache_buf: &wgpu::Buffer, 
 
 #[allow(clippy::too_many_arguments)]
 fn attn_prefill(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder, key: &str, q: &wgpu::Buffer, k: &wgpu::Buffer, v: &wgpu::Buffer, seq: u32, cfg: &Qwen2Config) -> wgpu::Buffer {
-    let hidden = cfg.hidden_size as u32;
+    // Concatenated-heads width (`num_heads * head_dim`): equal to
+    // `cfg.hidden_size` for Qwen2 (head_dim is derived that way) but *not*
+    // for Qwen3, where head_dim=128 is explicit and 16*128=2048 != 1024 -
+    // see `qkv_proj`'s doc comment on the same distinction.
+    let hidden = (cfg.num_heads * cfg.head_dim) as u32;
     let out = pool.data(&format!("{key}.out"), (seq * hidden) as usize);
     let scale = 1.0 / (cfg.head_dim as f32).sqrt();
     let dims = pool.uniform(
@@ -929,7 +987,7 @@ fn attn_prefill(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder
 
 #[allow(clippy::too_many_arguments)]
 fn attn_decode(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder, key: &str, q: &wgpu::Buffer, k_cache: &wgpu::Buffer, v_cache: &wgpu::Buffer, kv_len: u32, max_ctx: u32, cfg: &Qwen2Config) -> wgpu::Buffer {
-    let hidden = cfg.hidden_size as u32;
+    let hidden = (cfg.num_heads * cfg.head_dim) as u32;
     let out = pool.data(&format!("{key}.out"), hidden as usize);
     let scale = 1.0 / (cfg.head_dim as f32).sqrt();
     let dims = pool.uniform(
@@ -957,7 +1015,7 @@ fn attn_decode(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder,
 /// causal rule: see `shaders/attn_chunk_masked.wgsl`.
 #[allow(clippy::too_many_arguments)]
 fn attn_chunk_masked(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder, key: &str, q: &wgpu::Buffer, k_cache: &wgpu::Buffer, v_cache: &wgpu::Buffer, mask: &wgpu::Buffer, t: u32, kv_total: u32, max_ctx: u32, cfg: &Qwen2Config) -> wgpu::Buffer {
-    let hidden = cfg.hidden_size as u32;
+    let hidden = (cfg.num_heads * cfg.head_dim) as u32;
     let out = pool.data(&format!("{key}.out"), (t * hidden) as usize);
     let scale = 1.0 / (cfg.head_dim as f32).sqrt();
     let dims = pool.uniform(
@@ -1041,7 +1099,8 @@ pub async fn forward_prefill(engine: &Engine, model: &GpuModel, cache: &mut KvCa
         scatter_kv_gpu(&mut encoder, &cache.k[i], &k, seq, cfg, 0, cache.max_ctx);
         scatter_kv_gpu(&mut encoder, &cache.v[i], &v, seq, cfg, 0, cache.max_ctx);
 
-        let o = linear_lora(engine, pool, &mut encoder, &format!("{key}.wo"), &attn_out, seq, hidden, &layer.o_w, &layer.o_b, hidden, model.fast_kernels, lora_layer.map(|l| &l.o));
+        let attn_dim = (cfg.num_heads * cfg.head_dim) as u32;
+        let o = linear_lora(engine, pool, &mut encoder, &format!("{key}.wo"), &attn_out, seq, attn_dim, &layer.o_w, &layer.o_b, hidden, model.fast_kernels, lora_layer.map(|l| &l.o));
         add_inplace(engine, pool, &mut encoder, &format!("{key}.add1"), &x, &o, seq * hidden);
 
         let ffn_normed = rmsnorm(engine, pool, &mut encoder, &format!("{key}.ffnnorm"), &x, &layer.ffn_norm, seq, hidden, cfg.rms_norm_eps);
@@ -1137,7 +1196,8 @@ fn decode_layers(engine: &Engine, model: &GpuModel, encoder: &mut wgpu::CommandE
         scatter_kv_gpu(encoder, &cache.v[i], &v, 1, cfg, pos, cache.max_ctx);
         let attn_out = attn_decode(engine, pool, encoder, &format!("{key}.attn"), &q, &cache.k[i], &cache.v[i], pos + 1, cache.max_ctx, cfg);
 
-        let o = linear_lora(engine, pool, encoder, &format!("{key}.wo"), &attn_out, 1, hidden, &layer.o_w, &layer.o_b, hidden, model.fast_kernels, lora_layer.map(|l| &l.o));
+        let attn_dim = (cfg.num_heads * cfg.head_dim) as u32;
+        let o = linear_lora(engine, pool, encoder, &format!("{key}.wo"), &attn_out, 1, attn_dim, &layer.o_w, &layer.o_b, hidden, model.fast_kernels, lora_layer.map(|l| &l.o));
         add_inplace(engine, pool, encoder, &format!("{key}.add1"), &x, &o, hidden);
 
         let ffn_normed = rmsnorm(engine, pool, encoder, &format!("{key}.ffnnorm"), &x, &layer.ffn_norm, 1, hidden, cfg.rms_norm_eps);
@@ -1292,7 +1352,8 @@ pub async fn forward_chunk_spec(engine: &Engine, model: &GpuModel, cache: &mut K
         scatter_kv_gpu(&mut encoder, &cache.v[i], &v, t, cfg, prefix_len, cache.max_ctx);
         let attn_out = attn_chunk_masked(engine, pool, &mut encoder, &format!("{key}.attn"), &q, &cache.k[i], &cache.v[i], &mask_buf, t, kv_total, cache.max_ctx, cfg);
 
-        let o = linear_lora(engine, pool, &mut encoder, &format!("{key}.wo"), &attn_out, t, hidden, &layer.o_w, &layer.o_b, hidden, model.fast_kernels, lora_layer.map(|l| &l.o));
+        let attn_dim = (cfg.num_heads * cfg.head_dim) as u32;
+        let o = linear_lora(engine, pool, &mut encoder, &format!("{key}.wo"), &attn_out, t, attn_dim, &layer.o_w, &layer.o_b, hidden, model.fast_kernels, lora_layer.map(|l| &l.o));
         add_inplace(engine, pool, &mut encoder, &format!("{key}.add1"), &x, &o, t * hidden);
 
         let ffn_normed = rmsnorm(engine, pool, &mut encoder, &format!("{key}.ffnnorm"), &x, &layer.ffn_norm, t, hidden, cfg.rms_norm_eps);
