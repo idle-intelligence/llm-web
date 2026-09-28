@@ -44,6 +44,26 @@ CASES = [
     ("non_english", "Quelle est la capitale de l'Allemagne, et pourquoi cette ville a-t-elle été choisie ?"),
 ]
 
+# Long-context cases: the Sonos MCP agent's real (messages, tools) inputs,
+# already chat-templated and tokenized once (with the *same* HF tokenizer,
+# `apply_chat_template(..., tools=tools)`) into
+# `fixtures/reference/rendered/<name>.tokens.json` at the repo root - see
+# `fixtures/reference/inputs/README.md`. Reused here (not re-rendered) so
+# this script doesn't need to grow tool-calling chat-template support just
+# to exercise long sequences; these cases carry no `prompt` string and
+# `fixture_parity.rs`/the browser harness skip the
+# tokenizer-reproduces-input_ids check for them, feeding `input_ids`
+# straight into prefill instead. Chosen as the two longest real cases that
+# clear the old attn_prefill.wgsl MAX_SEQ=256 / attn_decode.wgsl
+# scratch[2048] caps by a wide margin (2225, 2354 tokens; `04_tools_all` at
+# 8140 tokens is timing-only elsewhere, not worth this script's per-case
+# 32-token greedy decode cost).
+LONG_TOKEN_CASES = [
+    ("long_tools_single", "fixtures/reference/rendered/02_tools_single.tokens.json"),
+    ("long_tools_multiturn", "fixtures/reference/rendered/03_tools_multiturn.tokens.json"),
+]
+REPO_ROOT = Path(__file__).resolve().parents[3]
+
 torch.manual_seed(0)
 
 tok = AutoTokenizer.from_pretrained(TOKENIZER_DIR)
@@ -55,13 +75,8 @@ model = AutoModelForCausalLM.from_pretrained(
 )
 model.eval()
 
-cases_out = []
-for name, prompt in CASES:
-    messages = [{"role": "user", "content": prompt}]
-    input_ids = tok.apply_chat_template(messages, add_generation_prompt=True, return_tensors="pt", return_dict=False)
-    if not torch.is_tensor(input_ids):
-        input_ids = torch.tensor(input_ids)
-
+def run_case(name, input_ids_list, prompt=None):
+    input_ids = torch.tensor([input_ids_list])
     with torch.no_grad():
         out = model(input_ids)
         logits_last = out.logits[0, -1, :].float()
@@ -80,7 +95,6 @@ for name, prompt in CASES:
 
     case = {
         "name": name,
-        "prompt": prompt,
         "input_ids": input_ids[0].tolist(),
         "prefill_top20": {
             "ids": top.indices.tolist(),
@@ -89,8 +103,29 @@ for name, prompt in CASES:
         "greedy_continuation": continuation,
         "continuation_text": tok.decode(continuation, skip_special_tokens=True),
     }
+    if prompt is not None:
+        case["prompt"] = prompt
+    else:
+        case["no_retokenize"] = True
+    return case
+
+
+cases_out = []
+for name, prompt in CASES:
+    messages = [{"role": "user", "content": prompt}]
+    input_ids = tok.apply_chat_template(messages, add_generation_prompt=True, return_tensors="pt", return_dict=False)
+    if torch.is_tensor(input_ids):
+        input_ids = input_ids[0].tolist()
+    case = run_case(name, input_ids, prompt=prompt)
     cases_out.append(case)
-    print(f"[{name}] seq={len(case['input_ids'])} top1={top.indices[0].item()} continuation={case['continuation_text'][:80]!r}")
+    print(f"[{name}] seq={len(case['input_ids'])} top1={case['prefill_top20']['ids'][0]} continuation={case['continuation_text'][:80]!r}")
+
+for name, rel_path in LONG_TOKEN_CASES:
+    tokens_path = REPO_ROOT / rel_path
+    input_ids_list = json.loads(tokens_path.read_text())
+    case = run_case(name, input_ids_list)
+    cases_out.append(case)
+    print(f"[{name}] seq={len(case['input_ids'])} top1={case['prefill_top20']['ids'][0]} continuation={case['continuation_text'][:80]!r}")
 
 fixture = {
     "source": "transformers.AutoModelForCausalLM.from_pretrained(..., gguf_file=...) dequantized on load",

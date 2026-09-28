@@ -12,8 +12,14 @@
 //!
 //! Checks, for every case in the fixture, both kernel paths
 //! (`fast_kernels = false` and `true`): our own tokenizer + chat-template
-//! path reproduces the fixture's `input_ids`, prefill top-20 logits agree
-//! within 1e-3, and the 32-token greedy continuation is identical.
+//! path reproduces the fixture's `input_ids` (skipped for `no_retokenize`
+//! cases - see `Case`'s doc comment), prefill top-20 logits agree within
+//! 1e-3, and the 32-token greedy continuation is identical. Includes two
+//! long-context cases (`long_tools_single`/`long_tools_multiturn`, 2225/
+//! 2354 prompt tokens - the Sonos MCP agent's real tool-calling inputs)
+//! well past attn_prefill.wgsl/attn_decode.wgsl's old fixed-size caps
+//! (256/2048), added alongside the length-independent kernel rewrite - see
+//! docs/runs/2026-09-28-lean-long-context.md.
 
 use lean::chat_template::{read_chat_template, render_user_prompt};
 use lean::engine::Engine;
@@ -30,10 +36,17 @@ struct Top20 {
 #[derive(Deserialize)]
 struct Case {
     name: String,
-    prompt: String,
+    #[serde(default)]
+    prompt: Option<String>,
     input_ids: Vec<u32>,
     prefill_top20: Top20,
     greedy_continuation: Vec<u32>,
+    /// True for the long-context cases (see `reference/gen_fixture.py`'s
+    /// `LONG_TOKEN_CASES`): `input_ids` come from the Sonos MCP agent's
+    /// real, already-tools-chat-templated prompts, not from re-rendering
+    /// `prompt` through this crate's (tools-less) `chat_template.rs`.
+    #[serde(default)]
+    no_retokenize: bool,
 }
 
 #[derive(Deserialize)]
@@ -68,9 +81,19 @@ fn fixture_parity_both_kernel_paths() {
     for fast_kernels in [false, true] {
         let model = GpuModel::load(&engine, &gguf_path, fast_kernels).expect("loading model");
         for case in &fixture.cases {
-            let rendered = render_user_prompt(&chat_template, &case.prompt).unwrap();
-            let our_ids: Vec<u32> = tokenizer.encode(rendered, false).unwrap().get_ids().to_vec();
-            assert_eq!(our_ids, case.input_ids, "[fast={fast_kernels} case={}] tokenization mismatch", case.name);
+            // `no_retokenize` cases (the Sonos MCP agent's real long
+            // tool-calling inputs) are pre-tokenized with the full HF
+            // `apply_chat_template(..., tools=...)` path, which this
+            // crate's `chat_template.rs` deliberately doesn't implement
+            // (single-user-turn, no-tools scope only - see its header) -
+            // so there's no re-render to check for these; `input_ids` feeds
+            // prefill directly instead.
+            if !case.no_retokenize {
+                let prompt = case.prompt.as_deref().expect("case has neither prompt nor no_retokenize");
+                let rendered = render_user_prompt(&chat_template, prompt).unwrap();
+                let our_ids: Vec<u32> = tokenizer.encode(rendered, false).unwrap().get_ids().to_vec();
+                assert_eq!(our_ids, case.input_ids, "[fast={fast_kernels} case={}] tokenization mismatch", case.name);
+            }
 
             model.pool.reset();
             let seq = case.input_ids.len() as u32;
