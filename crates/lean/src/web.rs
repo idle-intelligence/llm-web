@@ -218,6 +218,31 @@ impl LeanEngine {
         }
     }
 
+    /// GPU-resident byte counts, broken down by category (see
+    /// `GpuModel::weight_gpu_bytes`/`KvCache::gpu_bytes`/
+    /// `Pool::resident_bytes`'s doc comments): `weightBytes` (fixed at
+    /// load, independent of context), `kvCacheBytes` (fixed at `max_ctx`,
+    /// independent of `kv_len`), `poolBytes` (per-forward scratch -
+    /// activations, RoPE tables, uniforms; settles to a fixed shape once a
+    /// given `(rows, kv_len-bucket)` combination has been seen once). Does
+    /// NOT include the wasm linear memory (`memory.buffer.byteLength`,
+    /// read directly from JS) or the JS-side GGUF `Uint8Array`/`Vec<u8>`
+    /// copies, which this method has no visibility into - a caller
+    /// combines this with `performance.memory`/`wasm.memory` for the full
+    /// picture. Added for this session's browser memory investigation
+    /// (docs/runs/2026-09-28-lean-decode-breakdown.md).
+    #[wasm_bindgen(js_name = gpuMemoryInfo)]
+    pub fn gpu_memory_info(&self) -> Result<String, JsError> {
+        let model = self.model.as_ref().ok_or_else(|| JsError::new("load() must be called first"))?;
+        let cache = self.cache.as_ref().ok_or_else(|| JsError::new("load() must be called first"))?;
+        Ok(serde_json::json!({
+            "weightBytes": model.weight_gpu_bytes(),
+            "kvCacheBytes": cache.gpu_bytes(),
+            "poolBytes": model.pool.resident_bytes(),
+        })
+        .to_string())
+    }
+
     /// Renders + tokenizes `prompt` through the model's chat template, same
     /// as `generate()`, but returns the raw token ids instead of running
     /// generation - the low-level entry point a consumer's own prefix/suffix

@@ -399,6 +399,13 @@ impl KvCache {
         KvCache { k, v, max_ctx, kv_len: 0, num_kv_heads: config.num_kv_heads as u32, head_dim: config.head_dim as u32 }
     }
 
+    /// Sum of every layer's K+V buffer size, at this cache's `max_ctx` (the
+    /// buffers are allocated at full `max_ctx` up front - see `new` above -
+    /// so this is constant across the cache's lifetime, not `kv_len`-scaled).
+    pub fn gpu_bytes(&self) -> u64 {
+        self.k.iter().map(|b| b.size()).sum::<u64>() + self.v.iter().map(|b| b.size()).sum::<u64>()
+    }
+
     /// Reads back positions `[0, kv_len)` of every layer's K/V buffers,
     /// compacted (no `max_ctx` padding) into a max_ctx-independent snapshot
     /// that can be restored into a cache with a *different* `max_ctx` (e.g.
@@ -739,6 +746,40 @@ impl GpuModel {
         self.lora.is_some()
     }
 
+    /// Sum of every persistent weight buffer's GPU size (embed table,
+    /// per-layer norms/matmuls, lm head) - the model's fixed GPU residency,
+    /// independent of `kv_len`/context. Does not include `KvCache` (see
+    /// `KvCache::gpu_bytes`) or `Pool`'s per-forward scratch (see
+    /// `Pool::resident_bytes`) - a caller wanting total GPU footprint sums
+    /// all three. Added for this session's browser memory investigation
+    /// (docs/runs/2026-09-28-lean-decode-breakdown.md).
+    pub fn weight_gpu_bytes(&self) -> u64 {
+        let mut total = self.embed.gpu_bytes() + self.out_norm.size() + self.lm_head.gpu_bytes() + self.zero_bias_vocab.size();
+        for l in &self.layers {
+            total += l.attn_norm.size()
+                + l.q_w.gpu_bytes()
+                + l.q_b.size()
+                + l.k_w.gpu_bytes()
+                + l.k_b.size()
+                + l.v_w.gpu_bytes()
+                + l.v_b.size()
+                + l.o_w.gpu_bytes()
+                + l.o_b.size()
+                + l.ffn_norm.size()
+                + l.gate_up_w.gpu_bytes()
+                + l.gate_up_b.size()
+                + l.down_w.gpu_bytes()
+                + l.down_b.size();
+            if let Some(b) = &l.q_norm {
+                total += b.size();
+            }
+            if let Some(b) = &l.k_norm {
+                total += b.size();
+            }
+        }
+        total
+    }
+
     /// Logits for a caller-chosen subset of vocab ids, at every row of
     /// `hidden_states`: the sliced lm-head mechanism (this crate's
     /// consumer survey, gap #5): llm-life reads exactly `[dead, alive]`
@@ -778,6 +819,63 @@ pub fn build_rope_tables(head_dim: usize, theta: f32, max_pos: usize) -> (Vec<f3
     (cos, sin)
 }
 
+/// Maps a per-layer call-site key (`"layer5.mlp.gate_up"`,
+/// `"dec_layer12.attn"`) onto the SAME string for every layer
+/// (`"layer.mlp.gate_up"`, `"dec_layer.attn"`) by stripping the trailing
+/// digits off the key's first `.`-delimited segment. Used ONLY for
+/// `Pool::data`/`Pool::uniform`/`Pool::upload_*` calls (the actual
+/// scratch-buffer allocations), never for `Pool::bind_group` calls, which
+/// must stay keyed per layer (each layer's bind group references that
+/// layer's own weight tensor - a different GPU buffer every layer - so a
+/// shared bind-group cache entry would silently keep pointing at whichever
+/// layer built it first).
+///
+/// Why sharing the underlying buffer across layers is safe: every scratch
+/// buffer this maps (rmsnorm's output, q/k/v, attention output, the fused
+/// gate/up matmul's output, etc.) is written by one dispatch and consumed
+/// by the next within the SAME layer's own dispatch chain, then dead -
+/// nothing downstream of layer `i` ever reads layer `i`'s copy of e.g.
+/// "layer.mlp.gate_up.out" after layer `i`'s own `silu_mul_fused` call
+/// consumes it. `forward_prefill`/`decode_layers`/`forward_chunk_spec`
+/// record every layer's dispatches into the SAME open `wgpu::ComputePass`
+/// (or the same command encoder) in program order, and a WebGPU/wgpu
+/// compute pass guarantees a later dispatch observes an earlier one's
+/// writes to a resource it reads or writes - the same guarantee every
+/// intra-layer chain here already depends on (rmsnorm's output feeding
+/// straight into qkv's input, RoPE mutating q/k in place, etc.). So layer
+/// `i+1`'s write to the shared buffer cannot execute (in program order)
+/// until after layer `i`'s last read of it has already been recorded and
+/// therefore already executes first.
+///
+/// Root cause this fixes: before this function existed, every layer got
+/// its OWN distinct `Pool`-cached buffer for these call sites (Pool is
+/// grow-only and never frees - see pool.rs's module doc), so one prefill
+/// over a long prompt permanently pinned `num_layers` copies of every
+/// per-layer scratch buffer, sized to that prompt's length, for the rest
+/// of the page's life. Measured on Qwen2.5-0.5B-Instruct (24 layers,
+/// hidden 896): `Pool::resident_bytes()` after a 2225-token prefill was
+/// 5.69GB, of which the great majority is these per-layer duplicates (a
+/// single layer's worth of scratch at that shape is a small fraction of
+/// that) - see docs/runs/2026-09-28-lean-decode-breakdown.md's memory
+/// section. On the far larger Qwen2.5-3B (36 layers, hidden 2048,
+/// intermediate 11008) this is the dominant cause of the multi-GB browser
+/// renderer footprint that produced swap thrashing during this session's
+/// long-context timing runs - not a kernel or dispatch-count regression.
+fn scratch_key(key: &str) -> std::borrow::Cow<'_, str> {
+    let (head, rest) = match key.split_once('.') {
+        Some((h, r)) => (h, Some(r)),
+        None => (key, None),
+    };
+    let stripped = head.trim_end_matches(|c: char| c.is_ascii_digit());
+    if stripped == head {
+        return std::borrow::Cow::Borrowed(key);
+    }
+    match rest {
+        Some(r) => std::borrow::Cow::Owned(format!("{stripped}.{r}")),
+        None => std::borrow::Cow::Owned(stripped.to_string()),
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct QuantActDims {
@@ -795,10 +893,11 @@ struct QuantActDims {
 /// `engine.has_dp4`. Buffers are cached per `key` in `pool` like every other
 /// per-call-site buffer.
 fn quantize_activation(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &str, x: &wgpu::Buffer, in_dim: u32) -> (wgpu::Buffer, wgpu::Buffer) {
+    let skey = scratch_key(key);
     let blocks = in_dim / 32;
-    let act_q = pool.data(&format!("{key}.act_q"), (blocks * 8) as usize);
-    let act_scale = pool.data(&format!("{key}.act_scale"), blocks as usize);
-    let dims = pool.uniform(&format!("{key}.qdims"), QuantActDims { k: in_dim, blocks, _p0: 0, _p1: 0 });
+    let act_q = pool.data(&format!("{skey}.act_q"), (blocks * 8) as usize);
+    let act_scale = pool.data(&format!("{skey}.act_scale"), blocks as usize);
+    let dims = pool.uniform(&format!("{skey}.qdims"), QuantActDims { k: in_dim, blocks, _p0: 0, _p1: 0 });
     let pipeline = engine.quantize_act_q8.as_ref().expect("quantize_activation called without has_dp4");
     let bg = pool.bind_group(
         key,
@@ -816,11 +915,12 @@ fn quantize_activation(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePas
 
 #[allow(clippy::too_many_arguments)]
 fn linear(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &str, x: &wgpu::Buffer, rows: u32, in_dim: u32, w: &MatMulWeight, b: &wgpu::Buffer, out_dim: u32, fast: bool) -> wgpu::Buffer {
-    let out = pool.data(&format!("{key}.out"), (rows * out_dim) as usize);
+    let skey = scratch_key(key);
+    let out = pool.data(&format!("{skey}.out"), (rows * out_dim) as usize);
     let wgs = (out_dim.div_ceil(16), rows.div_ceil(16), 1);
     match w {
         MatMulWeight::F32 { w } => {
-            let dims = pool.uniform(&format!("{key}.dims"), LinearDims { m: rows, k: in_dim, n: out_dim, act: 0 });
+            let dims = pool.uniform(&format!("{skey}.dims"), LinearDims { m: rows, k: in_dim, n: out_dim, act: 0 });
             let bg = pool.bind_group(
                 key,
                 &engine.linear,
@@ -845,10 +945,11 @@ fn linear(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &
             // writing its own column range of `out` (see linear_q8.wgsl's
             // Dims doc comment).
             let dp4 = fast && rows == 1 && engine.has_dp4 && engine.dp4_decode.get();
-            let act_q_scale = dp4.then(|| quantize_activation(engine, pool, pass, &format!("{key}.q8dp4"), x, in_dim));
+            let act_q_scale = dp4.then(|| quantize_activation(engine, pool, pass, &format!("{skey}.q8dp4"), x, in_dim));
             for chunk in chunks {
                 let ckey = format!("{key}.{}", chunk.row_start);
-                let dims = pool.uniform(&format!("{ckey}.dims"), LinearQDims { m: rows, k: in_dim, n: chunk.rows, act: 0, blocks_per_row: *blocks_per_row, n_offset: chunk.row_start, n_total: *n_total, _p2: 0 });
+                let sckey = scratch_key(&ckey);
+                let dims = pool.uniform(&format!("{sckey}.dims"), LinearQDims { m: rows, k: in_dim, n: chunk.rows, act: 0, blocks_per_row: *blocks_per_row, n_offset: chunk.row_start, n_total: *n_total, _p2: 0 });
                 if let Some((act_q, act_scale)) = &act_q_scale {
                     let entries = [
                         BindGroupEntry { binding: 0, resource: act_q.as_entire_binding() },
@@ -896,7 +997,8 @@ fn linear(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &
             // one matmul per forward, not worth a fast-path yet.
             for chunk in chunks {
                 let ckey = format!("{key}.{}", chunk.row_start);
-                let dims = pool.uniform(&format!("{ckey}.dims"), LinearQDims { m: rows, k: in_dim, n: chunk.rows, act: 0, blocks_per_row: *blocks_per_row, n_offset: chunk.row_start, n_total: *n_total, _p2: 0 });
+                let sckey = scratch_key(&ckey);
+                let dims = pool.uniform(&format!("{sckey}.dims"), LinearQDims { m: rows, k: in_dim, n: chunk.rows, act: 0, blocks_per_row: *blocks_per_row, n_offset: chunk.row_start, n_total: *n_total, _p2: 0 });
                 let bg = pool.bind_group(
                     &ckey,
                     &engine.linear_q6k,
@@ -916,10 +1018,11 @@ fn linear(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &
         }
         MatMulWeight::Q4_0 { chunks, blocks_per_row, out_dim: n_total } => {
             let dp4 = fast && rows == 1 && engine.has_dp4 && engine.dp4_decode.get();
-            let act_q_scale = dp4.then(|| quantize_activation(engine, pool, pass, &format!("{key}.q4dp4"), x, in_dim));
+            let act_q_scale = dp4.then(|| quantize_activation(engine, pool, pass, &format!("{skey}.q4dp4"), x, in_dim));
             for chunk in chunks {
                 let ckey = format!("{key}.{}", chunk.row_start);
-                let dims = pool.uniform(&format!("{ckey}.dims"), LinearQDims { m: rows, k: in_dim, n: chunk.rows, act: 0, blocks_per_row: *blocks_per_row, n_offset: chunk.row_start, n_total: *n_total, _p2: 0 });
+                let sckey = scratch_key(&ckey);
+                let dims = pool.uniform(&format!("{sckey}.dims"), LinearQDims { m: rows, k: in_dim, n: chunk.rows, act: 0, blocks_per_row: *blocks_per_row, n_offset: chunk.row_start, n_total: *n_total, _p2: 0 });
                 if let Some((act_q, act_scale)) = &act_q_scale {
                     let entries = [
                         BindGroupEntry { binding: 0, resource: act_q.as_entire_binding() },
@@ -1036,8 +1139,9 @@ fn linear_lora(
 
 #[allow(clippy::too_many_arguments)]
 fn rmsnorm(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &str, x: &wgpu::Buffer, scale: &wgpu::Buffer, rows: u32, dim: u32, eps: f32) -> wgpu::Buffer {
-    let out = pool.data(&format!("{key}.out"), (rows * dim) as usize);
-    let dims = pool.uniform(&format!("{key}.dims"), RmsDims { rows, dim, eps, _p0: 0 });
+    let skey = scratch_key(key);
+    let out = pool.data(&format!("{skey}.out"), (rows * dim) as usize);
+    let dims = pool.uniform(&format!("{skey}.dims"), RmsDims { rows, dim, eps, _p0: 0 });
     let bg = pool.bind_group(
         key,
         &engine.rmsnorm,
@@ -1054,7 +1158,8 @@ fn rmsnorm(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: 
 
 #[allow(clippy::too_many_arguments)]
 fn rope(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &str, buf: &wgpu::Buffer, cos: &wgpu::Buffer, sin: &wgpu::Buffer, rows: u32, heads: u32, head_dim: u32, pos_base: u32) {
-    let dims = pool.uniform(&format!("{key}.dims"), RopeDims { rows, heads, head_dim, pos_base });
+    let skey = scratch_key(key);
+    let dims = pool.uniform(&format!("{skey}.dims"), RopeDims { rows, heads, head_dim, pos_base });
     let bg = pool.bind_group(
         key,
         &engine.rope,
@@ -1074,7 +1179,8 @@ fn rope(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &st
 /// contiguous `pos_base + row` run: see `shaders/rope_positions.wgsl`.
 #[allow(clippy::too_many_arguments)]
 fn rope_positions(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &str, buf: &wgpu::Buffer, cos: &wgpu::Buffer, sin: &wgpu::Buffer, positions: &wgpu::Buffer, rows: u32, heads: u32, head_dim: u32) {
-    let dims = pool.uniform(&format!("{key}.dims"), RopePosDims { rows, heads, head_dim, _p0: 0 });
+    let skey = scratch_key(key);
+    let dims = pool.uniform(&format!("{skey}.dims"), RopePosDims { rows, heads, head_dim, _p0: 0 });
     let bg = pool.bind_group(
         key,
         &engine.rope_positions,
@@ -1091,8 +1197,9 @@ fn rope_positions(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>
 }
 
 fn add_inplace(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &str, a: &wgpu::Buffer, b: &wgpu::Buffer, len: u32) {
+    let skey = scratch_key(key);
     let (gx, gy, stride_x) = grid1d(len);
-    let dims = pool.uniform(&format!("{key}.dims"), AddDims { len, stride_x, _p1: 0, _p2: 0 });
+    let dims = pool.uniform(&format!("{skey}.dims"), AddDims { len, stride_x, _p1: 0, _p2: 0 });
     let bg = pool.bind_group(
         key,
         &engine.add_inplace,
@@ -1108,9 +1215,10 @@ fn add_inplace(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, k
 /// SwiGLU over a fused `[rows, 2*hidden]` gate/up matmul output (see
 /// `gguf_matmul_concat2`'s doc comment and `silu_mul_fused.wgsl`).
 fn silu_mul_fused(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &str, gate_up: &wgpu::Buffer, rows: u32, hidden: u32) -> wgpu::Buffer {
-    let out = pool.data(&format!("{key}.out"), (rows * hidden) as usize);
+    let skey = scratch_key(key);
+    let out = pool.data(&format!("{skey}.out"), (rows * hidden) as usize);
     let (gx, gy, stride_x) = grid1d(rows * hidden);
-    let dims = pool.uniform(&format!("{key}.dims"), SiluDims { rows, hidden, stride_x, _p1: 0 });
+    let dims = pool.uniform(&format!("{skey}.dims"), SiluDims { rows, hidden, stride_x, _p1: 0 });
     let bg = pool.bind_group(
         key,
         &engine.silu_mul_fused,
@@ -1243,10 +1351,11 @@ fn attn_prefill(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, 
     // for Qwen3, where head_dim=128 is explicit and 16*128=2048 != 1024 -
     // see `qkv_proj`'s doc comment on the same distinction.
     let hidden = (cfg.num_heads * cfg.head_dim) as u32;
-    let out = pool.data(&format!("{key}.out"), (seq * hidden) as usize);
+    let skey = scratch_key(key);
+    let out = pool.data(&format!("{skey}.out"), (seq * hidden) as usize);
     let scale = 1.0 / (cfg.head_dim as f32).sqrt();
     let dims = pool.uniform(
-        &format!("{key}.dims"),
+        &format!("{skey}.dims"),
         AttnPrefillDims { seq, n_heads: cfg.num_heads as u32, n_kv_heads: cfg.num_kv_heads as u32, head_dim: cfg.head_dim as u32, scale, _p0: 0, _p1: 0, _p2: 0 },
     );
     let bg = pool.bind_group(
@@ -1300,7 +1409,8 @@ fn decode_split_plan(kv_len: u32) -> (u32, u32) {
 #[allow(clippy::too_many_arguments)]
 fn attn_decode(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &str, q: &wgpu::Buffer, k_cache: &wgpu::Buffer, v_cache: &wgpu::Buffer, kv_len: u32, max_ctx: u32, cfg: &Qwen2Config) -> wgpu::Buffer {
     let hidden = (cfg.num_heads * cfg.head_dim) as u32;
-    let out = pool.data(&format!("{key}.out"), hidden as usize);
+    let skey = scratch_key(key);
+    let out = pool.data(&format!("{skey}.out"), hidden as usize);
     let scale = 1.0 / (cfg.head_dim as f32).sqrt();
     let n_heads = cfg.num_heads as u32;
     let head_dim = cfg.head_dim as u32;
@@ -1310,7 +1420,7 @@ fn attn_decode(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, k
         // Short context: the plain single-workgroup-per-head kernel, exactly
         // as before this change (no split/reduce overhead).
         let dims = pool.uniform(
-            &format!("{key}.dims"),
+            &format!("{skey}.dims"),
             AttnDecodeDims { n_heads, n_kv_heads: cfg.num_kv_heads as u32, head_dim, kv_len, max_ctx, scale, _p0: 0, _p1: 0 },
         );
         // attn_decode.wgsl/attn_decode_128.wgsl have `workgroup_size` and a
@@ -1346,12 +1456,12 @@ fn attn_decode(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, k
         other => panic!("attn_decode: unsupported head_dim {other} (only 64/Qwen2.5 and 128/Qwen3 have a compiled kernel)"),
     };
 
-    let partial_m = pool.data(&format!("{key}.partial_m"), (n_heads * MAX_SPLITS) as usize);
-    let partial_l = pool.data(&format!("{key}.partial_l"), (n_heads * MAX_SPLITS) as usize);
-    let partial_acc = pool.data(&format!("{key}.partial_acc"), (n_heads * MAX_SPLITS * head_dim) as usize);
+    let partial_m = pool.data(&format!("{skey}.partial_m"), (n_heads * MAX_SPLITS) as usize);
+    let partial_l = pool.data(&format!("{skey}.partial_l"), (n_heads * MAX_SPLITS) as usize);
+    let partial_acc = pool.data(&format!("{skey}.partial_acc"), (n_heads * MAX_SPLITS * head_dim) as usize);
 
     let split_dims = pool.uniform(
-        &format!("{key}.split_dims"),
+        &format!("{skey}.split_dims"),
         AttnDecodeSplitDims { n_heads, n_kv_heads: cfg.num_kv_heads as u32, head_dim, kv_len, max_ctx, scale, chunk, _p0: 0 },
     );
     let split_bg = pool.bind_group(
@@ -1369,7 +1479,7 @@ fn attn_decode(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, k
     );
     engine.dispatch(pass, split_pipeline, &split_bg, (n_heads, num_splits, 1), &format!("{key}.split"));
 
-    let reduce_dims = pool.uniform(&format!("{key}.reduce_dims"), AttnDecodeReduceDims { n_heads, head_dim, num_splits, _p0: 0 });
+    let reduce_dims = pool.uniform(&format!("{skey}.reduce_dims"), AttnDecodeReduceDims { n_heads, head_dim, num_splits, _p0: 0 });
     let reduce_bg = pool.bind_group(
         &format!("{key}.reduce"),
         reduce_pipeline,
@@ -1392,10 +1502,11 @@ fn attn_decode(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, k
 #[allow(clippy::too_many_arguments)]
 fn attn_chunk_masked(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &str, q: &wgpu::Buffer, k_cache: &wgpu::Buffer, v_cache: &wgpu::Buffer, mask: &wgpu::Buffer, t: u32, kv_total: u32, max_ctx: u32, cfg: &Qwen2Config) -> wgpu::Buffer {
     let hidden = (cfg.num_heads * cfg.head_dim) as u32;
-    let out = pool.data(&format!("{key}.out"), (t * hidden) as usize);
+    let skey = scratch_key(key);
+    let out = pool.data(&format!("{skey}.out"), (t * hidden) as usize);
     let scale = 1.0 / (cfg.head_dim as f32).sqrt();
     let dims = pool.uniform(
-        &format!("{key}.dims"),
+        &format!("{skey}.dims"),
         AttnChunkDims { t, n_heads: cfg.num_heads as u32, n_kv_heads: cfg.num_kv_heads as u32, head_dim: cfg.head_dim as u32, kv_total, max_ctx, scale, _p0: 0 },
     );
     let bg = pool.bind_group(

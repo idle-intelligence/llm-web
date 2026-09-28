@@ -268,6 +268,17 @@ impl EmbeddingTable {
             EmbeddingTable::Q6_K(_) => panic!("EmbeddingTable::table: Q6_K has no QEmbeddingTable - match on EmbeddingTable directly"),
         }
     }
+
+    /// Total GPU-resident bytes of this table's own buffers - see
+    /// `MatMulWeight::gpu_bytes`'s doc comment for why this is tracked
+    /// separately from `Pool::resident_bytes` (weights vs per-forward
+    /// scratch).
+    pub fn gpu_bytes(&self) -> u64 {
+        match self {
+            EmbeddingTable::Q4_0(t) | EmbeddingTable::Q8_0(t) => t.qs.size() + t.scales.size(),
+            EmbeddingTable::Q6_K(t) => t.ql.size() + t.qh.size() + t.scales.size() + t.d.size(),
+        }
+    }
 }
 
 /// Not chunked like `load_matmul_weight_gguf`'s Q4_0/Q8_0 weights: every
