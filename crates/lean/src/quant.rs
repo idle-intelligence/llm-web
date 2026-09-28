@@ -135,10 +135,12 @@ pub fn load_matmul_weight_gguf(engine: &Engine, label: &str, shape: &[usize], dt
     }
 }
 
-/// Same Q4_0-resident buffers, but exposed for the embedding-gather kernel
-/// (`token_embd.weight`, tied to the lm head), which needs `qs`/`scales`
-/// directly rather than through `MatMulWeight`'s linear-kernel bind group.
-pub struct Q4EmbeddingTable {
+/// Q4_0/Q8_0-resident buffers for the embedding-gather kernel
+/// (`token_embd.weight`), which needs `qs`/`scales` directly rather than
+/// through `MatMulWeight`'s linear-kernel bind group. One struct shared by
+/// both quant kinds - `EmbeddingTable` picks the WGSL pipeline
+/// (`embed_gather_q4`/`embed_gather_q8`) at the call site in `model.rs`.
+pub struct QEmbeddingTable {
     pub qs: wgpu::Buffer,
     pub scales: wgpu::Buffer,
     pub blocks_per_row: u32,
@@ -146,23 +148,52 @@ pub struct Q4EmbeddingTable {
     pub vocab: u32,
 }
 
-/// Not chunked like `load_matmul_weight_gguf`'s Q4_0/Q8_0 weights: this
-/// model's `token_embd.weight` (~68MB packed) fits in one binding under
-/// every WebGPU adapter this crate targets. If a larger vocab/hidden size
-/// ever pushes it over a device's `max_storage_buffer_binding_size`,
-/// `embed_gather_q4.wgsl` would need the same chunk-dispatch treatment
+pub enum EmbeddingTable {
+    Q4_0(QEmbeddingTable),
+    Q8_0(QEmbeddingTable),
+}
+
+impl EmbeddingTable {
+    pub fn table(&self) -> &QEmbeddingTable {
+        match self {
+            EmbeddingTable::Q4_0(t) | EmbeddingTable::Q8_0(t) => t,
+        }
+    }
+}
+
+/// Not chunked like `load_matmul_weight_gguf`'s Q4_0/Q8_0 weights: every
+/// model this crate targets so far has a `token_embd.weight` that fits in
+/// one binding under every WebGPU adapter this crate targets. If a larger
+/// vocab/hidden size ever pushes it over a device's
+/// `max_storage_buffer_binding_size`, `embed_gather_q4.wgsl`/
+/// `embed_gather_q8.wgsl` would need the same chunk-dispatch treatment
 /// `linear()` gets for `MatMulWeight`.
-pub fn load_q4_embedding_gguf(engine: &Engine, label: &str, shape: &[usize], bytes: &[u8]) -> Q4EmbeddingTable {
+pub fn load_embedding_table_gguf(engine: &Engine, label: &str, shape: &[usize], dtype: GgmlDtype, bytes: &[u8]) -> EmbeddingTable {
     let vocab = shape[0];
     let hidden = shape[1];
     let n_elements = vocab * hidden;
-    let (qs, scales) = split_q4_blocks(bytes, n_elements);
-    Q4EmbeddingTable {
-        qs: engine.buf_u32(&qs, &format!("{label}.qs")),
-        scales: engine.buf_f32(&scales, &format!("{label}.scales")),
-        blocks_per_row: (hidden / QK) as u32,
-        hidden: hidden as u32,
-        vocab: vocab as u32,
+    match dtype {
+        GgmlDtype::Q4_0 => {
+            let (qs, scales) = split_q4_blocks(bytes, n_elements);
+            EmbeddingTable::Q4_0(QEmbeddingTable {
+                qs: engine.buf_u32(&qs, &format!("{label}.qs")),
+                scales: engine.buf_f32(&scales, &format!("{label}.scales")),
+                blocks_per_row: (hidden / QK) as u32,
+                hidden: hidden as u32,
+                vocab: vocab as u32,
+            })
+        }
+        GgmlDtype::Q8_0 => {
+            let (qs, scales) = split_q8_blocks(bytes, n_elements);
+            EmbeddingTable::Q8_0(QEmbeddingTable {
+                qs: engine.buf_u32(&qs, &format!("{label}.qs")),
+                scales: engine.buf_f32(&scales, &format!("{label}.scales")),
+                blocks_per_row: (hidden / QK) as u32,
+                hidden: hidden as u32,
+                vocab: vocab as u32,
+            })
+        }
+        other => panic!("load_embedding_table_gguf: unsupported embedding dtype {other:?} (only Q4_0/Q8_0 embedding tables are implemented)"),
     }
 }
 

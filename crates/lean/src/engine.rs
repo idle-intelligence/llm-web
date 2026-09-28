@@ -19,6 +19,9 @@ pub struct Engine {
     /// when comparing the two - see docs/runs/2026-09-28-lean-perf.md.
     dispatch_count: Cell<u64>,
     pub embed_gather_q4: wgpu::ComputePipeline,
+    /// Q8_0 counterpart of `embed_gather_q4` (`shaders/embed_gather_q8.wgsl`)
+    /// - Qwen3's official GGUFs ship no Q4_0 quant, only Q8_0 (qwen3 survey).
+    pub embed_gather_q8: wgpu::ComputePipeline,
     pub rmsnorm: wgpu::ComputePipeline,
     pub rope: wgpu::ComputePipeline,
     pub linear: wgpu::ComputePipeline,
@@ -107,6 +110,7 @@ impl Engine {
 
         Ok(Engine {
             embed_gather_q4: make_pipeline(&device, "embed_gather_q4", include_str!("shaders/embed_gather_q4.wgsl")),
+            embed_gather_q8: make_pipeline(&device, "embed_gather_q8", include_str!("shaders/embed_gather_q8.wgsl")),
             rmsnorm: make_pipeline(&device, "rmsnorm", include_str!("shaders/rmsnorm.wgsl")),
             rope: make_pipeline(&device, "rope", include_str!("shaders/rope_neox.wgsl")),
             linear: make_pipeline(&device, "linear", include_str!("shaders/linear.wgsl")),
