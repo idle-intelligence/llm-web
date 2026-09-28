@@ -13,7 +13,7 @@
 // shared-memory use no longer depends on `kv_len` at all. Per-thread state
 // across tiles is just a scalar running max/sum (`m`/`l`) plus one scalar
 // accumulator (`acc`, since thread `tid` owns output dimension `tid` and
-// `WG == head_dim`) — same running-softmax update flash attention uses,
+// `WG == head_dim`): same running-softmax update flash attention uses,
 // applied one `WG`-wide tile of keys at a time instead of one key at a
 // time (attn_prefill.wgsl's per-thread version, which has no shared memory
 // to batch into, updates one key at a time instead).
@@ -21,7 +21,7 @@
 // KV cache layout (load-bearing, documented here since this is the
 // kernel that defines it): [n_kv_heads, max_ctx, head_dim], head-major,
 // contiguous per head, written once per decode step at `[kv_head, kv_len,
-// :]` — see model.rs's `KvCache`. No causal mask needed: decode's single
+// :]`: see model.rs's `KvCache`. No causal mask needed: decode's single
 // query is always the newest position, so it attends to every key in
 // [0, kv_len).
 const WG: u32 = 64u; // head_dim for Qwen2.5-0.5B; must equal dims.head_dim at dispatch.

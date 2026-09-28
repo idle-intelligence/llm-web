@@ -2,14 +2,14 @@
 //
 // Previous version capped `seq` at a fixed `MAX_SEQ = 256` private `scores`
 // array (one workgroup per head, one thread per query position, so only
-// query rows 0..255 ever got dispatched at all — rows >= 256 silently
+// query rows 0..255 ever got dispatched at all: rows >= 256 silently
 // produced no attention output). The Sonos MCP agent's real prompts run
 // 1,000-2,000 tokens (see fixtures/reference/rendered/02_tools_single.txt
 // at 2225 tokens), so that cap made every long-prompt prefill wrong, not
 // just slow.
 //
 // Fix: flash-attention-style online (running) softmax, dispatched over a
-// 2D grid `(n_heads, ceil(seq/256))` instead of `(n_heads, 1)` — each
+// 2D grid `(n_heads, ceil(seq/256))` instead of `(n_heads, 1)`: each
 // workgroup owns one 256-row query tile of one head, one thread per row
 // (`i = wg.y * 256 + lid.x`), so the number of GPU threads in flight scales
 // with `seq` instead of staying fixed at `n_heads * 256`. An earlier
@@ -21,7 +21,7 @@
 // ~2,200-2,400 token Sonos-agent prompts (fixture cases
 // `long_tools_single`/`long_tools_multiturn`); this dispatch shape is the
 // fix. Each thread keeps only a scalar running max/sum plus a
-// `head_dim`-sized accumulator in registers for its one row — no per-row
+// `head_dim`-sized accumulator in registers for its one row: no per-row
 // storage of all `j <= i` scores, so per-thread memory is O(head_dim)
 // regardless of sequence length. Same online-softmax update as
 // attn_decode.wgsl's per-tile version, applied per-key instead of per-tile

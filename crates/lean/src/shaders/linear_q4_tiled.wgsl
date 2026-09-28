@@ -1,5 +1,5 @@
 // Adapted from llm-wasm/src/wgsl/shader_q4_tiled.wgsl (Q4_0 Tiled Matmul,
-// M>1/prefill, native-only — see that file's header for the full
+// M>1/prefill, native-only: see that file's header for the full
 // weight-reuse rationale and the TM=TN=64/MICRO=4/"v3" tuning history).
 // Two differences from the llm-wasm original: (1) bias is folded in here
 // (`b[n]`) so this kernel satisfies the same linear-layer contract as
@@ -21,8 +21,8 @@
 // and the inner product loop uses `dot()` over 8 vec4 groups instead of 32
 // scalar multiply-adds. The Q4_0 dequant itself is now done by one thread
 // per output row (`tid < 64u`, one `vec4<u32>` load = the whole 16-byte
-// block) instead of 4 threads each loading one of its 4 words — fewer,
-// larger transactions instead of many small ones — while every thread
+// block) instead of 4 threads each loading one of its 4 words: fewer,
+// larger transactions instead of many small ones: while every thread
 // still participates in the `x_tile` vec4 load in the same iteration (no
 // added barrier for keeping both groups busy). Dequant math/mapping
 // (nibble -> k_local index) is byte-for-byte the same as before, just
