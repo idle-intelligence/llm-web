@@ -47,6 +47,11 @@ pub struct Engine {
     /// across rows outweighs the tile/barrier overhead: see the shader's
     /// doc comment for llm-wasm's own measured regression at small M.
     pub linear_q4_tiled: wgpu::ComputePipeline,
+    /// See `linear_q4_tiled_rb.wgsl`'s header: register-blocked 32x32/TK=16
+    /// alternative to `linear_q4_tiled`, size-gated in `model.rs::linear`.
+    pub linear_q4_tiled_rb: wgpu::ComputePipeline,
+    /// See `linear_q8_tiled_rb.wgsl`'s header: same scheme for Q8_0.
+    pub linear_q8_tiled_rb: wgpu::ComputePipeline,
     /// Coalesced Q4_0 matvec (decode, M=1): ported from llm-wasm's
     /// shader_q4_matvec_coalesced.wgsl. The fast decode kernel; it uses no
     /// cooperative-group extension, so it runs on any WebGPU adapter.
@@ -162,6 +167,8 @@ impl Engine {
             linear_q8_decode: make_pipeline(&device, "linear_q8_decode", include_str!("shaders/linear_q8_decode.wgsl")),
             linear_q6k: make_pipeline(&device, "linear_q6k", include_str!("shaders/linear_q6k.wgsl")),
             linear_q4_tiled: make_pipeline(&device, "linear_q4_tiled", include_str!("shaders/linear_q4_tiled.wgsl")),
+            linear_q4_tiled_rb: make_pipeline(&device, "linear_q4_tiled_rb", include_str!("shaders/linear_q4_tiled_rb.wgsl")),
+            linear_q8_tiled_rb: make_pipeline(&device, "linear_q8_tiled_rb", include_str!("shaders/linear_q8_tiled_rb.wgsl")),
             linear_q4_decode: make_pipeline(&device, "linear_q4_decode", include_str!("shaders/linear_q4_decode.wgsl")),
             attn_prefill: make_pipeline(&device, "attn_prefill", include_str!("shaders/attn_prefill.wgsl")),
             attn_decode: make_pipeline_with_constants(&device, "attn_decode", include_str!("shaders/attn_decode.wgsl"), &[("HEAD_DIM", 64.0)]),
