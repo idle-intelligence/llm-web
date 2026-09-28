@@ -30,6 +30,14 @@ struct ChatMessage<'a> {
 /// add_generation_prompt=True)`.
 pub fn render_user_prompt(chat_template: &str, prompt: &str) -> Result<String> {
     let mut env = Environment::new();
+    // Qwen3's chat_template calls Python string methods (`.startswith`,
+    // `.endswith`, `.split`, `.strip`, `.lstrip`, `.rstrip`) that plain
+    // minijinja doesn't implement - minijinja-contrib's pycompat callback
+    // adds them (and Python-style negative-step slicing) without changing
+    // how a template with none of these calls (Qwen2.5's) renders: this is
+    // additive, so Qwen2.5's `render_user_prompt` output is unaffected -
+    // see `renders_default_system_plus_user_turn` below, unchanged.
+    env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
     env.add_template("chat", chat_template).context("parsing chat_template")?;
     let tmpl = env.get_template("chat").unwrap();
     let messages = vec![ChatMessage { role: "user", content: prompt }];

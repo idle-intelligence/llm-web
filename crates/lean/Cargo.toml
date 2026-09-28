@@ -43,6 +43,7 @@ js-sys = { workspace = true, optional = true }
 web-sys = { workspace = true, optional = true }
 console_error_panic_hook = { workspace = true, optional = true }
 getrandom = { workspace = true, optional = true }
+minijinja-contrib = { version = "2.24.0", features = ["pycompat"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 pollster = "0.3"
