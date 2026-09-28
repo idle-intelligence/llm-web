@@ -1,0 +1,11 @@
+# wasm32 SIMD128 unconditionally: every browser this crate targets supports
+# it (Chrome 91+, Firefox 89+, Safari 16.4+), so there's no capability
+# branch worth having - see crates/lean/src/cpu_kernels.rs's module doc
+# comment and the CPU-fallback plan
+# (~/Code/tracker/projects/llm-web/cpu-fallback-plan-2026-09-28.md), which
+# calls for compiling simd128 into every wasm build rather than gating it
+# behind a runtime check. This makes `target_feature = "simd128"` a valid
+# compile-time `cfg` for any wasm32-unknown-unknown build from this
+# workspace, native (Metal/NEON) builds are unaffected.
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "target-feature=+simd128"]
