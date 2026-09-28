@@ -67,6 +67,38 @@ const TILED_MIN_ROWS: u32 = 16;
 /// re-measuring if it turned out not to.
 const PREFILL_RB_MAX_ROWS: u32 = 512;
 
+/// WebGPU's `max_compute_workgroups_per_dimension`: 65535 on every backend
+/// (spec-mandated minimum-and-typical value, not a per-device tuned
+/// number - `wgpu::Limits::default()` and this project's adapters alike
+/// report exactly this for the dimension). A single-dimension dispatch of
+/// a wide 1-D elementwise kernel (`add_inplace`/`silu_mul_fused`/the
+/// embedding gathers) can exceed this at long-context prefill on models
+/// with a wide `intermediate_size` - found on Qwen2.5-3B-Instruct
+/// (`intermediate_size` 11008): `silu_mul_fused`'s dispatch,
+/// `(rows*intermediate_size).div_ceil(256)`, is 65,532 groups at
+/// `rows`=1524 and 65,575 at `rows`=1525 - the actual cause of a native
+/// wgpu panic ("Encoder is invalid" at `CommandEncoder::finish`, no
+/// specific validation message surfaced) that this constant's use in
+/// `grid1d` below fixes, by folding into a second grid dimension instead
+/// of ever exceeding it in one.
+const MAX_WORKGROUPS_PER_DIM: u32 = 65535;
+
+/// `(x, y, stride_x)` dispatch shape for a 1-D elementwise kernel over
+/// `total` elements at `@workgroup_size(256)`, safe against
+/// `MAX_WORKGROUPS_PER_DIM` regardless of how large `total` gets: `x` is
+/// capped at the limit and any remainder folds into `y`. `stride_x = x *
+/// 256` is passed through the kernel's own Dims uniform (see
+/// `AddDims`/`SiluDims`/`GatherDims`'s `stride_x` field) so its shader can
+/// recover the flat element index as `gid.y * stride_x + gid.x` instead of
+/// just `gid.x` - chosen from `total` alone (a shape property), identical
+/// on every device and every call at the same shape, never autotuned.
+fn grid1d(total: u32) -> (u32, u32, u32) {
+    let groups = total.div_ceil(256).max(1);
+    let x = groups.min(MAX_WORKGROUPS_PER_DIM);
+    let y = groups.div_ceil(x);
+    (x, y, x * 256)
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct LinearDims {
@@ -94,7 +126,10 @@ struct LinearQDims {
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct AddDims {
     len: u32,
-    _p0: u32,
+    /// See `grid1d`'s doc comment: `x * 256` for the dispatch that used
+    /// this Dims value, so the shader can recover the flat index from a
+    /// 2-D grid instead of assuming `gid.x` alone spans `len`.
+    stride_x: u32,
     _p1: u32,
     _p2: u32,
 }
@@ -119,7 +154,8 @@ struct RopeDims {
 struct SiluDims {
     rows: u32,
     hidden: u32,
-    _p0: u32,
+    /// See `AddDims::stride_x`'s doc comment.
+    stride_x: u32,
     _p1: u32,
 }
 #[repr(C)]
@@ -172,7 +208,8 @@ struct GatherDims {
     rows: u32,
     hidden: u32,
     blocks_per_row: u32,
-    _p0: u32,
+    /// See `AddDims::stride_x`'s doc comment.
+    stride_x: u32,
 }
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -1052,7 +1089,8 @@ fn rope_positions(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncod
 }
 
 fn add_inplace(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder, key: &str, a: &wgpu::Buffer, b: &wgpu::Buffer, len: u32) {
-    let dims = pool.uniform(&format!("{key}.dims"), AddDims { len, _p0: 0, _p1: 0, _p2: 0 });
+    let (gx, gy, stride_x) = grid1d(len);
+    let dims = pool.uniform(&format!("{key}.dims"), AddDims { len, stride_x, _p1: 0, _p2: 0 });
     let bg = pool.bind_group(
         key,
         &engine.add_inplace,
@@ -1062,14 +1100,15 @@ fn add_inplace(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder,
             BindGroupEntry { binding: 2, resource: dims.as_entire_binding() },
         ],
     );
-    engine.dispatch(encoder, &engine.add_inplace, &bg, (len.div_ceil(256), 1, 1), key);
+    engine.dispatch(encoder, &engine.add_inplace, &bg, (gx, gy, 1), key);
 }
 
 /// SwiGLU over a fused `[rows, 2*hidden]` gate/up matmul output (see
 /// `gguf_matmul_concat2`'s doc comment and `silu_mul_fused.wgsl`).
 fn silu_mul_fused(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder, key: &str, gate_up: &wgpu::Buffer, rows: u32, hidden: u32) -> wgpu::Buffer {
     let out = pool.data(&format!("{key}.out"), (rows * hidden) as usize);
-    let dims = pool.uniform(&format!("{key}.dims"), SiluDims { rows, hidden, _p0: 0, _p1: 0 });
+    let (gx, gy, stride_x) = grid1d(rows * hidden);
+    let dims = pool.uniform(&format!("{key}.dims"), SiluDims { rows, hidden, stride_x, _p1: 0 });
     let bg = pool.bind_group(
         key,
         &engine.silu_mul_fused,
@@ -1079,7 +1118,7 @@ fn silu_mul_fused(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncod
             BindGroupEntry { binding: 2, resource: dims.as_entire_binding() },
         ],
     );
-    engine.dispatch(encoder, &engine.silu_mul_fused, &bg, ((rows * hidden).div_ceil(256), 1, 1), key);
+    engine.dispatch(encoder, &engine.silu_mul_fused, &bg, (gx, gy, 1), key);
     out
 }
 
@@ -1135,8 +1174,9 @@ fn embed_gather(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder
     let hidden = model.config.hidden_size as u32;
     let ids_buf = pool.upload_u32("embed.ids", token_ids);
     let out = pool.data("embed.out", (rows * hidden) as usize);
+    let (gx, gy, stride_x) = grid1d(rows * hidden);
     if let EmbeddingTable::Q6_K(t) = &model.embed {
-        let dims = pool.uniform("embed.dims", GatherDims { rows, hidden, blocks_per_row: t.blocks_per_row, _p0: 0 });
+        let dims = pool.uniform("embed.dims", GatherDims { rows, hidden, blocks_per_row: t.blocks_per_row, stride_x });
         let bg = pool.bind_group(
             "embed",
             &engine.embed_gather_q6k,
@@ -1150,7 +1190,7 @@ fn embed_gather(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder
                 BindGroupEntry { binding: 6, resource: dims.as_entire_binding() },
             ],
         );
-        engine.dispatch(encoder, &engine.embed_gather_q6k, &bg, ((rows * hidden).div_ceil(256), 1, 1), "embed");
+        engine.dispatch(encoder, &engine.embed_gather_q6k, &bg, (gx, gy, 1), "embed");
         return out;
     }
     let (pipeline, table) = match &model.embed {
@@ -1158,7 +1198,7 @@ fn embed_gather(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder
         EmbeddingTable::Q8_0(t) => (&engine.embed_gather_q8, t),
         EmbeddingTable::Q6_K(_) => unreachable!("handled above"),
     };
-    let dims = pool.uniform("embed.dims", GatherDims { rows, hidden, blocks_per_row: table.blocks_per_row, _p0: 0 });
+    let dims = pool.uniform("embed.dims", GatherDims { rows, hidden, blocks_per_row: table.blocks_per_row, stride_x });
     let bg = pool.bind_group(
         "embed",
         pipeline,
@@ -1170,7 +1210,7 @@ fn embed_gather(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder
             BindGroupEntry { binding: 4, resource: dims.as_entire_binding() },
         ],
     );
-    engine.dispatch(encoder, pipeline, &bg, ((rows * hidden).div_ceil(256), 1, 1), "embed");
+    engine.dispatch(encoder, pipeline, &bg, (gx, gy, 1), "embed");
     out
 }
 
@@ -1721,4 +1761,70 @@ pub async fn forward_chunk_spec(engine: &Engine, model: &GpuModel, cache: &mut K
     engine.queue.submit(Some(encoder.finish()));
     cache.kv_len = kv_total;
     normed_final
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod grid1d_tests {
+    //! Regression coverage for the M=1525 crash on Qwen2.5-3B-Instruct
+    //! (native wgpu panic, "Encoder is invalid" at `CommandEncoder::finish`,
+    //! caused by `silu_mul_fused`'s 1-D dispatch exceeding
+    //! `max_compute_workgroups_per_dimension` (65535) at
+    //! `(rows*intermediate_size).div_ceil(256)`). Runs `add_inplace`/
+    //! `silu_mul_fused` directly at more than `MAX_WORKGROUPS_PER_DIM*256`
+    //! elements (so `grid1d` must produce `y > 1`) and checks the GPU
+    //! result against a plain CPU computation of the same op.
+    use super::*;
+    use crate::engine::Engine;
+    use crate::pool::Pool;
+
+    fn engine_and_pool() -> (Engine, Pool) {
+        let engine = Engine::new().expect("wgpu device for grid1d test");
+        let pool = Pool::new(engine.device.clone(), engine.queue.clone());
+        (engine, pool)
+    }
+
+    #[test]
+    fn add_inplace_beyond_max_workgroups_matches_cpu() {
+        let (engine, pool) = engine_and_pool();
+        let total: u32 = MAX_WORKGROUPS_PER_DIM * 256 + 4321; // forces grid1d's y > 1
+        let a: Vec<f32> = (0..total).map(|i| (i as f32) * 0.5 - 100.0).collect();
+        let b: Vec<f32> = (0..total).map(|i| ((i as f32) * 0.0173).sin()).collect();
+        let a_buf = engine.buf_f32(&a, "grid1d_test.a");
+        let b_buf = engine.buf_f32(&b, "grid1d_test.b");
+        let mut encoder = engine.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        add_inplace(&engine, &pool, &mut encoder, "grid1d_test.add", &a_buf, &b_buf, total);
+        engine.queue.submit(Some(encoder.finish()));
+        let got = pollster::block_on(engine.read_buffer(&a_buf, total as usize));
+        for i in [0usize, 12345, (total / 2) as usize, (total - 1) as usize] {
+            let expected = a[i] + b[i];
+            assert!((got[i] - expected).abs() < 1e-4, "index {i}: got {} expected {expected}", got[i]);
+        }
+    }
+
+    #[test]
+    fn silu_mul_fused_beyond_max_workgroups_matches_cpu() {
+        let (engine, pool) = engine_and_pool();
+        let hidden: u32 = 4096;
+        // rows*hidden must exceed MAX_WORKGROUPS_PER_DIM*256 to force y > 1.
+        let rows: u32 = (MAX_WORKGROUPS_PER_DIM * 256) / hidden + 2;
+        assert!(rows * hidden > MAX_WORKGROUPS_PER_DIM * 256);
+        let gate_up: Vec<f32> = (0..rows * 2 * hidden).map(|i| ((i as f32) * 0.0091).cos() * 3.0).collect();
+        let gate_up_buf = engine.buf_f32(&gate_up, "grid1d_test.gate_up");
+        let mut encoder = engine.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        let out = silu_mul_fused(&engine, &pool, &mut encoder, "grid1d_test.silu", &gate_up_buf, rows, hidden);
+        engine.queue.submit(Some(encoder.finish()));
+        let got = pollster::block_on(engine.read_buffer(&out, (rows * hidden) as usize));
+        let check = |row: u32, c: u32| {
+            let id = (row * hidden + c) as usize;
+            let base = (row * 2 * hidden) as usize;
+            let gate = gate_up[base + c as usize];
+            let up = gate_up[base + hidden as usize + c as usize];
+            let expected = (gate / (1.0 + (-gate).exp())) * up;
+            assert!((got[id] - expected).abs() < 1e-3, "row {row} col {c}: got {} expected {expected}", got[id]);
+        };
+        check(0, 0);
+        check(0, hidden - 1);
+        check(rows / 2, hidden / 2);
+        check(rows - 1, hidden - 1);
+    }
 }

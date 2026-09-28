@@ -5,7 +5,11 @@
 // dequantizing the full table — same block layout/convention as
 // linear_q4.wgsl (`quant.rs::split_q4_blocks`): nibble j < 16 -> low nibble,
 // j >= 16 -> high nibble of byte (j % 16), `value = (nibble - 8) * scale`.
-struct Dims { rows: u32, hidden: u32, blocks_per_row: u32, _p0: u32 };
+// Dispatched over a 2-D grid when `rows*hidden` needs more than
+// `max_compute_workgroups_per_dimension` (65535) groups at this shader's
+// workgroup_size(256) - see `model.rs::grid1d`'s doc comment. `stride_x` is
+// that dispatch's x-dimension group count times 256.
+struct Dims { rows: u32, hidden: u32, blocks_per_row: u32, stride_x: u32 };
 
 @group(0) @binding(0) var<storage, read> token_ids: array<u32>;
 @group(0) @binding(1) var<storage, read> qs: array<u32>;
@@ -15,7 +19,7 @@ struct Dims { rows: u32, hidden: u32, blocks_per_row: u32, _p0: u32 };
 
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let id = gid.x;
+    let id = gid.y * dims.stride_x + gid.x;
     let total = dims.rows * dims.hidden;
     if (id >= total) {
         return;
