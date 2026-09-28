@@ -2,10 +2,11 @@
 //! (SmolLM2-360M-Instruct, `general.architecture = llama` - see
 //! `reference/gen_fixture_llama.py`). Same shape as `fixture_parity_qwen3.rs`,
 //! looping over the Q4_0 and Q8_0 GGUF/fixture pairs instead of Qwen3's
-//! kernel-variant loop (SmolLM2's own Q4_0/Q8_0 releases are the two quant
-//! formats this crate reads at all - no K-quant support - and each has
-//! its own quantization noise, so each gets its own fixture rather than
-//! reusing one across both).
+//! kernel-variant loop (SmolLM2-360M-Instruct's own Q4_0/Q8_0 releases are
+//! pure Q4_0/Q8_0, no K-quant tensors - unlike SmolLM2-1.7B-Instruct's,
+//! see `fixture_parity_llama_1_7b.rs`'s doc comment) - and each has its own
+//! quantization noise, so each gets its own fixture rather than reusing one
+//! across both.
 //!
 //! Ignored by default because it needs the actual GGUF + tokenizer files
 //! on disk, which are never committed to this repo. Run explicitly:

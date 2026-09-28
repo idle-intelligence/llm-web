@@ -3,10 +3,10 @@
 //! `general.architecture = llama` - see `reference/gen_fixture_llama.py`).
 //! Q8_0 only, unlike `fixture_parity_llama_360m.rs`: SmolLM2-1.7B-Instruct's
 //! "Q4_0" GGUF carries a Q6_K `token_embd.weight` (verified against the
-//! file - see `gguf.rs`'s `GgmlDtype` doc comment), a K-quant this crate
-//! does not read, so that file fails to load at all (the same class of gap
-//! already flagged for Qwen2.5-3B-Instruct's GGUF). Its Q8_0 GGUF is pure
-//! Q8_0 (no K-quants), so it loads and is covered here.
+//! file - see `gguf.rs`'s `GgmlDtype` doc comment) - this crate can now
+//! read Q6_K (see `fixture_parity_qwen25_3b.rs`), so that file should load,
+//! but it isn't downloaded/fixture-generated as part of this change; its
+//! Q8_0 GGUF (pure Q8_0, no K-quants) is what's covered here.
 //!
 //! Ignored by default because it needs the actual GGUF + tokenizer files
 //! on disk, which are never committed to this repo. Run explicitly:
