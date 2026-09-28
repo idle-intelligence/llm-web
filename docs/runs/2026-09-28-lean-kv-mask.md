@@ -18,7 +18,7 @@ fixture_parity`.
 - Kernel path: `fast_kernels = true` on both native and browser.
 - Native: macOS 26.3.1, Metal backend via wgpu 26, `LEAN_GGUF`/
   `LEAN_TOKENIZER_DIR` pointed at
-  `~/Code/idle-intelligence/models/{gguf/Qwen2.5-0.5B-Instruct-GGUF,hf/Qwen2.5-0.5B-Instruct}`.
+  the local models directory (GGUF and tokenizer).
 - Browser: Playwright-bundled Chromium (headless), `--enable-unsafe-webgpu
   --enable-features=Vulkan,WebGPU --use-angle=metal`, model served locally
   (`?local=1`) from `python3 -m http.server` rooted at `crates/lean/`.

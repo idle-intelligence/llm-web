@@ -19,12 +19,12 @@
 //!
 //! Kernel shape (block-wise unpack -> widen -> multiply-accumulate ->
 //! horizontal sum -> scale) follows llama.cpp's `ggml-cpu` NEON/wasm-simd128
-//! dot kernels structurally. TC's own two prior CPU-SIMD efforts are the
+//! dot kernels structurally. the project's own two prior CPU-SIMD efforts are the
 //! direct reference points for the target ISA and the general approach, not
-//! ported code: the wasm128 half of TC's unmerged `~/Code/candle` branch
+//! ported code: the wasm128 half of the author's unmerged candle branch
 //! `wasm-simd-opt` (`src/cpu/simd128.rs`'s `vec_dot_f32_4col`, commit
 //! `e52128fc`) already prototypes a widen-and-multiply-add wasm SIMD128 dot
-//! product against this same GGUF block family, and TC's t0-web CPU
+//! product against this same GGUF block family, and t0-web's CPU
 //! (ndarray) build demonstrated the simd128-vs-scalar win on this class of
 //! hardware (`t0-web/docs/runs/2026-09-22-cpu-simd.md`) - but t0 gets its
 //! speedup from a `matrixmultiply` rustflag, not a hand-written kernel, so

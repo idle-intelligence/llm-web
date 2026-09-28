@@ -44,7 +44,7 @@ parametrized for Qwen3-0.6B; `www/cpu.html` already covered Qwen2.5-0.5B).
   `python3 -m http.server` rooted at `crates/lean/` (lean pages) or
   `llm-web/web/` (the wllama demo) or a scratch directory (the WebLLM page).
   A GPU/browser lock was held around every browser/GPU run.
-- Models, all under `~/Code/idle-intelligence/models` via `hf download`
+- Models, all in a local models directory via `hf download`
   (plain User-Agent, no email):
   - Qwen2.5-0.5B-Instruct, `qwen2.5-0.5b-instruct-q4_0.gguf` (Q4_0, Q8_0
     `output.weight`), 428,730,208 bytes, tokenizer `Qwen/Qwen2.5-0.5B-Instruct`.
@@ -61,7 +61,7 @@ parametrized for Qwen3-0.6B; `www/cpu.html` already covered Qwen2.5-0.5B).
     only - the browser baseline for this row is WebLLM's own MLC-format
     build, not this GGUF).
   - `idle-intelligence/llm-of-life-lora`'s `lora-a-rules-300.bin`
-    (read from `~/Code/idle-intelligence/llm-life/artifacts/`, the path
+    (read from the llm-life repository's artifacts, the path
     llm-life's own artifacts directory keeps it at - not copied into this repo).
 - Hub API check (`GET api/models/bartowski/<repo>`, siblings list): both
   `bartowski/SmolLM2-360M-Instruct-GGUF` and

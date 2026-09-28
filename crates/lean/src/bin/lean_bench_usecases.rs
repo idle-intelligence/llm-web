@@ -1,4 +1,4 @@
-//! Two native benchmarks for TC's own consumer shapes (docs/runs/2026-09-28-lean-use-cases.md),
+//! Two native benchmarks for the project's own consumer shapes (docs/runs/2026-09-28-lean-use-cases.md),
 //! neither of which the plain `lean-cli --prompt` chat-protocol path covers:
 //!
 //! - `life-cells`: llm-life variant A's real shape — the rules prefix
