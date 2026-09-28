@@ -16,7 +16,7 @@
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 
-use std::io::Cursor;
+use std::io::{Read, Seek, SeekFrom};
 
 use tokenizers::Tokenizer;
 
@@ -24,6 +24,67 @@ use crate::chat_template::{chat_template_from_config_json, render_user_prompt};
 use crate::cpu::{forward_decode_step_argmax as cpu_decode_step_argmax, forward_prefill as cpu_forward_prefill, CpuKvCache, CpuModel};
 use crate::engine::Engine;
 use crate::model::{build_mask_bitset, build_rope_tables, forward_decode_step_argmax, forward_prefill, forward_prefill_suffix, GpuModel, KvCache, KvSnapshot};
+
+/// `Read + Seek` adapter over a JS-owned `js_sys::Uint8Array`, so the whole
+/// GGUF file never has to be copied into a wasm-side `Vec<u8>` just to
+/// parse it. `GgufReader`/`GpuModel::load_from_reader` already read the
+/// file through a handful of small `tensor_data()`-sized windows (one
+/// tensor at a time, dropped right after that tensor's GPU upload - see
+/// `model.rs::load_from_reader`'s doc comment); this reader makes each of
+/// those windows a `Uint8Array::subarray().copy_to()` straight out of the
+/// JS heap, instead of reading from an in-wasm-memory mirror of the entire
+/// file. `data` is a *view* over the caller's `ArrayBuffer` (no copy at
+/// construction) - the only bytes that ever cross into wasm linear memory
+/// are the ones `read()` actually copies, each buffer transient and freed
+/// right after its caller (`tensor_data`) is done with it. This is the fix
+/// for the ~2.5x wasm-memory blowup after model load documented in
+/// docs/runs/2026-09-28-lean-decode-breakdown.md's Session 3: before this,
+/// `LeanEngine::load`'s `Vec<u8>` parameter forced wasm-bindgen to copy the
+/// entire fetched file into wasm memory up front, on top of the JS-side
+/// `Uint8Array` the fetch already produced - two full-file-sized copies
+/// alive at once, and wasm memory never shrinks back down after that peak.
+struct JsBytesReader {
+    data: js_sys::Uint8Array,
+    pos: u64,
+    len: u64,
+}
+
+impl JsBytesReader {
+    fn new(data: js_sys::Uint8Array) -> Self {
+        let len = data.length() as u64;
+        Self { data, pos: 0, len }
+    }
+}
+
+impl Read for JsBytesReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let remaining = self.len.saturating_sub(self.pos);
+        let n = (buf.len() as u64).min(remaining) as usize;
+        if n == 0 {
+            return Ok(0);
+        }
+        let start = self.pos as u32;
+        let end = start + n as u32;
+        self.data.subarray(start, end).copy_to(&mut buf[..n]);
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl Seek for JsBytesReader {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        let new_pos = match pos {
+            SeekFrom::Start(p) => p as i64,
+            SeekFrom::End(p) => self.len as i64 + p,
+            SeekFrom::Current(p) => self.pos as i64 + p,
+        };
+        if new_pos < 0 {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "JsBytesReader: seek before byte 0"));
+        }
+        self.pos = new_pos as u64;
+        Ok(self.pos)
+    }
+}
 
 /// `mask_bits` is this crate's packed bitset format (`build_mask_bitset`/
 /// `buildMaskBitset`) - an empty vec means "no mask" (unmasked path, byte-
@@ -87,16 +148,21 @@ impl LeanEngine {
         Ok(LeanEngine { engine, model: None, cache: None, cos_buf: None, sin_buf: None, tokenizer: None, chat_template: None })
     }
 
-    /// Parses `gguf_bytes` (the whole GGUF file, fetched by JS) and uploads
-    /// every weight to the GPU (two-phase loading: `gguf_bytes` and the
-    /// `Cursor`/`GgufReader` wrapping it are dropped inside
-    /// `GpuModel::load_from_reader` before this call returns, well before
-    /// `max_ctx`'s KV cache is allocated). `tokenizer_json`/
-    /// `tokenizer_config_json` are the two files' contents as strings.
-    /// `max_ctx` bounds the KV cache (prompt + max_new_tokens must fit).
+    /// Parses `gguf_bytes` (the whole GGUF file, fetched by JS, passed as a
+    /// `Uint8Array` view rather than a `Vec<u8>` so wasm-bindgen never has to
+    /// copy it into wasm linear memory up front - see `JsBytesReader`'s doc
+    /// comment) and uploads every weight to the GPU (two-phase loading: only
+    /// one tensor's raw bytes are ever resident in wasm memory at a time,
+    /// dropped right after that tensor's GPU upload inside
+    /// `GpuModel::load_from_reader`, well before `max_ctx`'s KV cache is
+    /// allocated). `tokenizer_json`/`tokenizer_config_json` are the two
+    /// files' contents as strings. `max_ctx` bounds the KV cache (prompt +
+    /// max_new_tokens must fit). The caller should drop its own reference to
+    /// `gguf_bytes`'s backing `ArrayBuffer` right after this call returns so
+    /// the JS heap can reclaim it too (see `www/main.js`'s call site).
     #[wasm_bindgen(js_name = load)]
-    pub fn load(&mut self, gguf_bytes: Vec<u8>, tokenizer_json: String, tokenizer_config_json: String, max_ctx: u32) -> Result<(), JsError> {
-        let model = GpuModel::load_from_reader(&self.engine, Cursor::new(gguf_bytes), true)
+    pub fn load(&mut self, gguf_bytes: js_sys::Uint8Array, tokenizer_json: String, tokenizer_config_json: String, max_ctx: u32) -> Result<(), JsError> {
+        let model = GpuModel::load_from_reader(&self.engine, JsBytesReader::new(gguf_bytes), true)
             .map_err(|e| JsError::new(&format!("failed to load model: {e}")))?;
         let cache = KvCache::new(&self.engine, &model.config, max_ctx);
         let (cos, sin) = build_rope_tables(model.config.head_dim, model.config.rope_theta, max_ctx as usize);
@@ -419,13 +485,16 @@ impl LeanEngineCpu {
         LeanEngineCpu { model: None, cache: None, tokenizer: None, chat_template: None }
     }
 
-    /// Parses `gguf_bytes` into a CPU-resident model (Q4_0/Q8_0/Q6_K tensor
-    /// bytes held as-is - see `cpu.rs`'s doc comment) and allocates a
+    /// Parses `gguf_bytes` (a `Uint8Array` view, same reasoning as
+    /// `LeanEngine::load`) into a CPU-resident model (Q4_0/Q8_0/Q6_K tensor
+    /// bytes held as-is - see `cpu.rs`'s doc comment, this is the one rung
+    /// that legitimately needs its own resident copy of the quantized
+    /// bytes, since it computes directly off them) and allocates a
     /// `CpuKvCache` sized to `max_ctx`. Same signature as `LeanEngine::load`
     /// minus the `Result` needing to report GPU-adapter failures.
     #[wasm_bindgen(js_name = load)]
-    pub fn load(&mut self, gguf_bytes: Vec<u8>, tokenizer_json: String, tokenizer_config_json: String, max_ctx: u32) -> Result<(), JsError> {
-        let model = CpuModel::load_from_reader(Cursor::new(gguf_bytes)).map_err(|e| JsError::new(&format!("failed to load model: {e}")))?;
+    pub fn load(&mut self, gguf_bytes: js_sys::Uint8Array, tokenizer_json: String, tokenizer_config_json: String, max_ctx: u32) -> Result<(), JsError> {
+        let model = CpuModel::load_from_reader(JsBytesReader::new(gguf_bytes)).map_err(|e| JsError::new(&format!("failed to load model: {e}")))?;
         let cache = CpuKvCache::new(&model.config, max_ctx as usize);
         let tokenizer = Tokenizer::from_bytes(tokenizer_json.as_bytes()).map_err(|e| JsError::new(&format!("failed to load tokenizer.json: {e}")))?;
         let chat_template = chat_template_from_config_json(&tokenizer_config_json).map_err(|e| JsError::new(&format!("{e}")))?;
