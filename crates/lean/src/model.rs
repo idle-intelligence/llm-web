@@ -1364,10 +1364,18 @@ fn decode_layers(engine: &Engine, model: &GpuModel, encoder: &mut wgpu::CommandE
         let mlp_out = mlp(engine, pool, encoder, &format!("{key}.mlp"), &ffn_normed, 1, cfg, layer, model.fast_kernels);
         add_inplace(engine, pool, encoder, &format!("{key}.add2"), &x, &mlp_out, hidden);
 
-        // See `Engine::flush_encoder`'s doc comment - same per-layer-encoder
-        // fix as `forward_prefill`, needed here too since decode also
-        // records every layer into one encoder/submit.
-        engine.flush_encoder(encoder, "decode");
+        // No per-layer flush here (unlike `forward_prefill`'s per-layer
+        // flush, which exists to bound the *seq_len*-scaled dispatch count
+        // that caused the native `device.poll` timeout documented on
+        // `Engine::flush_encoder`). Decode's dispatch count is independent
+        // of kv_len and stays in the low hundreds even at the split-K path's
+        // worst case (measured: 364-508 total across a whole decode step
+        // depending on model/context - see this session's run doc), well
+        // under the threshold that produced that timeout. Profiling (this
+        // session's run doc) measured a per-layer flush+blocking-wait here
+        // costing ~30% of decode time on Qwen2.5-0.5B (submit/poll overhead
+        // multiplied by layer count) for zero correctness benefit at this
+        // dispatch volume - removed.
     }
 
     let normed_final = rmsnorm(engine, pool, encoder, "dec_out_norm", &x, &model.out_norm, 1, hidden, cfg.rms_norm_eps);
