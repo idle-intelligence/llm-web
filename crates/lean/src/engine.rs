@@ -1,7 +1,7 @@
 //! Owns the wgpu device/queue and compute pipelines. Ported from
 //! `t0-web/crates/t0-fast/src/engine.rs` almost verbatim (device init,
 //! `make_pipeline`, `buf_*` helpers, `dispatch`, the single `read_buffer`
-//! async readback) — swapped in this crate's own kernel set (Qwen2 decoder
+//! async readback): swapped in this crate's own kernel set (Qwen2 decoder
 //! ops instead of t0's forecaster ops). Every pipeline uses an
 //! auto-derived (`layout: None`) bind group layout, group 0, bindings in
 //! declaration order matching each `.wgsl` file.
@@ -24,12 +24,12 @@ pub struct Engine {
     pub linear: wgpu::ComputePipeline,
     pub linear_q4: wgpu::ComputePipeline,
     pub linear_q8: wgpu::ComputePipeline,
-    /// Tiled Q4_0 matmul (prefill, M>1) — ported from llm-wasm's
+    /// Tiled Q4_0 matmul (prefill, M>1): ported from llm-wasm's
     /// shader_q4_tiled.wgsl. Only faster than `linear_q4` once weight reuse
-    /// across rows outweighs the tile/barrier overhead — see the shader's
+    /// across rows outweighs the tile/barrier overhead: see the shader's
     /// doc comment for llm-wasm's own measured regression at small M.
     pub linear_q4_tiled: wgpu::ComputePipeline,
-    /// Coalesced Q4_0 matvec (decode, M=1) — ported from llm-wasm's
+    /// Coalesced Q4_0 matvec (decode, M=1): ported from llm-wasm's
     /// shader_q4_matvec_coalesced.wgsl. The fast decode kernel; it uses no
     /// cooperative-group extension, so it runs on any WebGPU adapter.
     pub linear_q4_decode: wgpu::ComputePipeline,
@@ -87,7 +87,7 @@ impl Engine {
             .await
             .map_err(|e| anyhow::anyhow!("no wgpu adapter: {e}"))?;
         // wgpu::Limits::default() caps max_storage_buffer_binding_size at
-        // 128MB — too small for this model's lm_head/embedding Q8_0/Q4_0
+        // 128MB: too small for this model's lm_head/embedding Q8_0/Q4_0
         // buffers in one binding (e.g. output.weight's Q8_0 qs buffer is
         // ~130MB). Request the adapter's own limits instead (native Metal
         // supports far more); a wasm build will need to cap this at
@@ -199,7 +199,7 @@ impl Engine {
     }
 
     /// One copy-to-staging + map + read. NEVER call this crate's equivalent
-    /// of `.into_data()` synchronously in WASM (deadlocks the browser) —
+    /// of `.into_data()` synchronously in WASM (deadlocks the browser) :
     /// this is the only readback path, always awaited.
     pub async fn read_buffer(&self, buf: &wgpu::Buffer, len_f32: usize) -> Vec<f32> {
         let size = (len_f32 * 4) as u64;

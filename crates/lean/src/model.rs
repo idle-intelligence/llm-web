@@ -184,10 +184,10 @@ struct GatherRowsDims {
 }
 
 /// Caller-supplied positions and attention topology for `forward_chunk_spec`
-/// — the mechanism behind llm-life variant A/B's per-cell RoPE restart and
+///: the mechanism behind llm-life variant A/B's per-cell RoPE restart and
 /// block-diagonal/sparse masks (this crate's consumer survey, gap #5).
 /// `ForwardSpec::default()` (no positions, no mask) means "continue the
-/// resident cache causally" — the same behavior `forward_prefill_suffix`
+/// resident cache causally": the same behavior `forward_prefill_suffix`
 /// already gives, expressed generically.
 #[derive(Default, Clone)]
 pub struct ForwardSpec {
@@ -208,8 +208,8 @@ impl ForwardSpec {
         self
     }
 
-    /// `allowed[i * cols + j]` — a plain `bool` mask, `rows` query positions
-    /// by `cols = prefix_len + rows` keys — packed into this crate's bitset
+    /// `allowed[i * cols + j]`: a plain `bool` mask, `rows` query positions
+    /// by `cols = prefix_len + rows` keys: packed into this crate's bitset
     /// format. The convenience form for a caller building a mask as
     /// `Vec<bool>` (llm-life's `Chunk::allowed`, for instance) rather than
     /// bit-packing it themselves.
@@ -226,7 +226,7 @@ impl ForwardSpec {
 
 /// Packs a row-major `[rows, cols]` bool mask into this crate's bitset
 /// format (32 entries per `u32`, bit `idx % 32` of word `idx / 32`, `idx =
-/// row * cols + col`) — shared by `ForwardSpec::with_allowed` and any
+/// row * cols + col`): shared by `ForwardSpec::with_allowed` and any
 /// caller building the same shape directly.
 pub fn pack_bool_mask(allowed: &[bool], rows: usize, cols: usize) -> Vec<u32> {
     assert_eq!(allowed.len(), rows * cols, "pack_bool_mask: allowed.len() must be rows*cols");
@@ -241,7 +241,7 @@ pub fn pack_bool_mask(allowed: &[bool], rows: usize, cols: usize) -> Vec<u32> {
 
 /// The default mask `forward_chunk_spec` builds when `ForwardSpec::allowed_bits`
 /// is `None`: query row `i` (0-based within the chunk) may attend every
-/// resident-prefix key plus its own chunk keys `[0, i]` — i.e. plain causal
+/// resident-prefix key plus its own chunk keys `[0, i]`: i.e. plain causal
 /// continuation of a `prefix_len`-long resident cache, the same topology
 /// `forward_prefill_suffix` already gives without an explicit mask.
 pub fn build_prefix_causal_bits(prefix_len: u32, t: u32) -> Vec<u32> {
@@ -291,7 +291,7 @@ pub struct GpuModel {
     pub fast_kernels: bool,
     pub pool: Pool,
     /// Runtime LoRA, applied alongside the frozen Q4_0 base on every
-    /// subsequent forward call (q/k/v/o only — see `lora.rs`'s module doc).
+    /// subsequent forward call (q/k/v/o only: see `lora.rs`'s module doc).
     /// `None` means no adapter: identical dispatch sequence to before this
     /// feature existed. Switchable/removable via `apply_lora`/`clear_lora`
     /// with no base reload.
@@ -546,7 +546,7 @@ impl GpuModel {
     }
 
     /// Loads and applies a runtime LoRA adapter (LLMLIFE2 format, see
-    /// `lora.rs`), replacing any adapter loaded earlier — adapters don't
+    /// `lora.rs`), replacing any adapter loaded earlier: adapters don't
     /// stack. Does not touch the base weights.
     pub fn apply_lora(&mut self, engine: &Engine, bytes: &[u8]) -> Result<()> {
         let adapter = crate::lora::LoraAdapter::from_bytes(engine, bytes, self.config.num_layers)?;
@@ -554,7 +554,7 @@ impl GpuModel {
         Ok(())
     }
 
-    /// Removes the currently-applied LoRA adapter, if any — subsequent
+    /// Removes the currently-applied LoRA adapter, if any: subsequent
     /// forward calls run the frozen base only, with no base reload.
     pub fn clear_lora(&mut self) {
         self.lora = None;
@@ -565,7 +565,7 @@ impl GpuModel {
     }
 
     /// Logits for a caller-chosen subset of vocab ids, at every row of
-    /// `hidden_states` — the sliced lm-head mechanism (this crate's
+    /// `hidden_states`: the sliced lm-head mechanism (this crate's
     /// consumer survey, gap #5): llm-life reads exactly `[dead, alive]`
     /// logits at every cell's answer position instead of materializing a
     /// `[rows, vocab_size]` buffer. Returns `[rows, token_ids.len()]`,
@@ -693,7 +693,7 @@ fn linear(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder, key:
 }
 
 /// A pool-owned all-zero bias buffer of `len` f32s. LoRA's two internal
-/// matmuls (`x -> rank`, `rank -> out`) have no bias of their own —
+/// matmuls (`x -> rank`, `rank -> out`) have no bias of their own :
 /// `linear()` always takes one, so this is cheaper than adding a
 /// bias-optional code path to that shared helper.
 fn zero_bias(engine: &Engine, pool: &Pool, key: &str, len: u32) -> wgpu::Buffer {
@@ -704,7 +704,7 @@ fn zero_bias(engine: &Engine, pool: &Pool, key: &str, len: u32) -> wgpu::Buffer 
 
 /// Adds one LoRA projection's delta onto `out_buf` in place: `out_buf +=
 /// (x @ proj.a) @ proj.b` (the `alpha/rank` scale is already folded into
-/// `proj.b` at upload time — see `lora.rs`). Two plain F32 `linear()` calls
+/// `proj.b` at upload time: see `lora.rs`). Two plain F32 `linear()` calls
 /// plus one `add_inplace`, no dedicated LoRA kernel.
 #[allow(clippy::too_many_arguments)]
 fn apply_lora_proj(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder, key: &str, x: &wgpu::Buffer, rows: u32, in_dim: u32, out_buf: &wgpu::Buffer, out_dim: u32, proj: &crate::lora::LoraProj) {
@@ -716,7 +716,7 @@ fn apply_lora_proj(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEnco
 }
 
 /// `linear()` plus, when `lora` is `Some`, that projection's LoRA delta
-/// added in place onto the result — the single call site every q/k/v/o
+/// added in place onto the result: the single call site every q/k/v/o
 /// projection in this file goes through, so LoRA is applied uniformly
 /// across prefill, decode and the chunked/masked forward path.
 #[allow(clippy::too_many_arguments)]
@@ -778,7 +778,7 @@ fn rope(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder, key: &
 
 /// Same RoPE as `rope()` but each row's absolute position comes from a
 /// caller-supplied buffer (`ForwardSpec::positions`) instead of a
-/// contiguous `pos_base + row` run — see `shaders/rope_positions.wgsl`.
+/// contiguous `pos_base + row` run: see `shaders/rope_positions.wgsl`.
 #[allow(clippy::too_many_arguments)]
 fn rope_positions(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder, key: &str, buf: &wgpu::Buffer, cos: &wgpu::Buffer, sin: &wgpu::Buffer, positions: &wgpu::Buffer, rows: u32, heads: u32, head_dim: u32) {
     let dims = pool.uniform(&format!("{key}.dims"), RopePosDims { rows, heads, head_dim, _p0: 0 });
@@ -954,7 +954,7 @@ fn attn_decode(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder,
 /// Pluggable-mask GQA attention over a resident-prefix KV cache: `t` query
 /// rows attend `kv_total = prefix_len + t` keys already scattered into
 /// `k_cache`/`v_cache`, gated by an explicit bitset instead of an implicit
-/// causal rule — see `shaders/attn_chunk_masked.wgsl`.
+/// causal rule: see `shaders/attn_chunk_masked.wgsl`.
 #[allow(clippy::too_many_arguments)]
 fn attn_chunk_masked(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder, key: &str, q: &wgpu::Buffer, k_cache: &wgpu::Buffer, v_cache: &wgpu::Buffer, mask: &wgpu::Buffer, t: u32, kv_total: u32, max_ctx: u32, cfg: &Qwen2Config) -> wgpu::Buffer {
     let hidden = cfg.hidden_size as u32;
@@ -981,7 +981,7 @@ fn attn_chunk_masked(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEn
 }
 
 /// Gathers + dequantizes `token_ids` (absolute vocab ids) out of `w` (must
-/// be `MatMulWeight::Q8_0` — this model's lm head) into a small contiguous
+/// be `MatMulWeight::Q8_0`: this model's lm head) into a small contiguous
 /// F32 `[token_ids.len(), hidden]` buffer, one dispatch per id (llm-life's
 /// sliced sets are 1-2 ids; not worth a multi-row-per-dispatch path yet).
 /// Returns the buffer and `hidden` (the caller already knows `hidden`, but
@@ -1230,7 +1230,7 @@ pub async fn forward_prefill_suffix(engine: &Engine, model: &GpuModel, cache: &m
 }
 
 /// Runs one chunk of `token_ids` against the cache's resident prefix
-/// (`cache.kv_len` positions, already populated — typically by an earlier
+/// (`cache.kv_len` positions, already populated: typically by an earlier
 /// `forward_prefill`/`forward_prefill_suffix` call, then rewound with
 /// `KvCache::snapshot`/`restore` so the next chunk starts from the same
 /// prefix) with caller-supplied positions and attention topology
@@ -1241,10 +1241,10 @@ pub async fn forward_prefill_suffix(engine: &Engine, model: &GpuModel, cache: &m
 /// is the block-diagonal mask) and variant B's sparse 9-key stencil.
 ///
 /// Returns the **hidden states** (`[t, hidden]`, post `output_norm`, pre
-/// lm-head — not logits): callers needing only a few vocab ids' logits at
+/// lm-head: not logits): callers needing only a few vocab ids' logits at
 /// every position should slice with `GpuModel::lm_head_sliced` rather than
 /// materializing a full `[t, vocab]` buffer (see that fn's doc comment).
-/// Leaves `cache.kv_len` at `prefix_len + t` — call `KvCache::snapshot`
+/// Leaves `cache.kv_len` at `prefix_len + t`: call `KvCache::snapshot`
 /// before this and `KvCache::restore` after reading the result back if the
 /// next chunk should start from the same prefix again (llm-life's own
 /// per-chunk rewind, `LifeEngine::step_ids_a`'s pattern in the Burn

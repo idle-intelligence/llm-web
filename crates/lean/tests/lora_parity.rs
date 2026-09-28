@@ -100,7 +100,7 @@ fn lora_and_sliced_head_match_reference() {
 /// mask and per-block RoPE restart, must give the *same* answer per cell as
 /// forwarding each cell alone against the same prefix (`KvCache::snapshot`/
 /// `restore` rewinding between cells, exactly `LifeEngine::step_ids_a`'s
-/// pattern in the Burn engine). No PyTorch reference needed here — this is
+/// pattern in the Burn engine). No PyTorch reference needed here: this is
 /// the packing's own numerical-invisibility property (model.rs's
 /// `forward_chunk_spec` doc comment), checked directly.
 #[test]

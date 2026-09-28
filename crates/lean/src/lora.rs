@@ -7,9 +7,8 @@
 //! (`tools/merge/lora_io.py`). This is the format actually published today
 //! (`idle-intelligence/llm-of-life-lora` on Hugging Face carries
 //! `lora-a-norules-300.bin`, `lora-a-rules-300.bin`, `lora-b-16-s3-300.bin`,
-//! `lora-b-32.bin` — all LLMLIFE2, not safetensors; the PEFT/safetensors
-//! conversion is v2-plan work that has not landed yet, see
-//! `~/Code/tracker/projects/llm-life/v2-plan.md` §1):
+//! `lora-b-32.bin`: all LLMLIFE2, not safetensors; the PEFT/safetensors
+//! conversion has not landed yet):
 //!
 //! ```text
 //! 8 bytes  magic "LLMLIFE2"
@@ -24,15 +23,15 @@
 //! always, then `[gate, up]` iff `mlp`, in that order: `a` (`[in_features,
 //! rank]`) then `b` (`[rank, out_features]`).
 //!
-//! This crate only ever applies the q/k/v/o deltas — `mlp`-adapted files are
+//! This crate only ever applies the q/k/v/o deltas: `mlp`-adapted files are
 //! rejected up front rather than silently ignoring the gate/up tensors.
 //!
 //! Merge math: `delta(x) = (x @ a) @ b * (alpha / rank)`, added to the base
-//! projection's output — `y = W_q4 * x + scale * B * (A * x)`. The `alpha /
+//! projection's output: `y = W_q4 * x + scale * B * (A * x)`. The `alpha /
 //! rank` scale is folded into `b` once at upload time (a scalar multiply
 //! commutes into either factor of a two-matrix product), so applying a
 //! LoRA delta on the GPU is exactly two plain F32 `linear()` calls plus one
-//! `add_inplace` — no dedicated scale kernel needed.
+//! `add_inplace`: no dedicated scale kernel needed.
 
 use anyhow::{ensure, Context, Result};
 
@@ -85,7 +84,7 @@ struct RawLayer {
     o: RawProj,
 }
 
-/// Parsed LLMLIFE2 file, before GPU upload — the part that's unit-testable
+/// Parsed LLMLIFE2 file, before GPU upload: the part that's unit-testable
 /// without a wgpu device.
 #[derive(Debug)]
 pub struct RawLoraAdapter {
@@ -155,8 +154,8 @@ pub struct LoraProj {
 /// `linear()`'s `MatMulWeight::F32` path expects `w` in PyTorch/GGUF
 /// `[out, in]` row-major layout (`shaders/linear.wgsl`'s doc comment: "row n
 /// = output channel n"). The LLMLIFE2 file stores `a` as `[in_features,
-/// rank]` and `b` as `[rank, out_features]` — the natural `x @ a`, `(..) @
-/// b` orientation, i.e. `[in, out]` for both — so both need transposing to
+/// rank]` and `b` as `[rank, out_features]`: the natural `x @ a`, `(..) @
+/// b` orientation, i.e. `[in, out]` for both: so both need transposing to
 /// `[out, in]` once at upload time, not at every forward call.
 fn transpose(data: &[f32], rows: usize, cols: usize) -> Vec<f32> {
     let mut out = vec![0f32; data.len()];
@@ -195,7 +194,7 @@ pub struct LoraLayer {
 
 /// A fully GPU-resident LoRA adapter, one [`LoraLayer`] per transformer
 /// block. Applying it (`GpuModel::apply_lora`) does not touch the base
-/// Q4_0 weights at all — the base stays frozen and the delta is added to
+/// Q4_0 weights at all: the base stays frozen and the delta is added to
 /// each projection's output on every subsequent forward call. Switching
 /// adapters or clearing (`GpuModel::clear_lora`) needs no base reload.
 pub struct LoraAdapter {
@@ -219,7 +218,7 @@ impl LoraAdapter {
         Self { layers }
     }
 
-    /// Parse + upload in one call — the entry point `web.rs`'s `loadLora`
+    /// Parse + upload in one call: the entry point `web.rs`'s `loadLora`
     /// and `lean-cli`'s native checks use.
     pub fn from_bytes(engine: &Engine, bytes: &[u8], num_layers: usize) -> Result<Self> {
         let raw = RawLoraAdapter::parse(bytes, num_layers)?;
