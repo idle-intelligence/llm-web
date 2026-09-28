@@ -47,6 +47,17 @@ pub struct Engine {
     /// caller-supplied bitset, in place on the logits buffer, before
     /// argmax/readback - see `model.rs::mask_logits_gpu`.
     pub mask_logits: wgpu::ComputePipeline,
+    /// Per-row absolute-position RoPE (`shaders/rope_positions.wgsl`) - the
+    /// caller-supplied-position-ids mechanism (llm-life's per-cell RoPE
+    /// restart), see `model.rs::rope_positions`.
+    pub rope_positions: wgpu::ComputePipeline,
+    /// Pluggable-mask GQA attention over a resident-prefix KV cache
+    /// (`shaders/attn_chunk_masked.wgsl`) - see `model.rs::attn_chunk_masked`.
+    pub attn_chunk_masked: wgpu::ComputePipeline,
+    /// Gathers + dequantizes selected rows of a Q8_0 weight (the sliced
+    /// lm-head mechanism, `shaders/gather_dequant_q8_rows.wgsl`) - see
+    /// `model.rs::gather_dequant_head_rows`.
+    pub gather_dequant_q8_rows: wgpu::ComputePipeline,
 }
 
 fn make_pipeline(device: &wgpu::Device, label: &str, src: &str) -> wgpu::ComputePipeline {
@@ -109,6 +120,9 @@ impl Engine {
             silu_mul: make_pipeline(&device, "silu_mul", include_str!("shaders/silu_mul.wgsl")),
             argmax: make_pipeline(&device, "argmax", include_str!("shaders/argmax.wgsl")),
             mask_logits: make_pipeline(&device, "mask_logits", include_str!("shaders/mask_logits.wgsl")),
+            rope_positions: make_pipeline(&device, "rope_positions", include_str!("shaders/rope_positions.wgsl")),
+            attn_chunk_masked: make_pipeline(&device, "attn_chunk_masked", include_str!("shaders/attn_chunk_masked.wgsl")),
+            gather_dequant_q8_rows: make_pipeline(&device, "gather_dequant_q8_rows", include_str!("shaders/gather_dequant_q8_rows.wgsl")),
             device,
             queue,
             dispatch_count: Cell::new(0),

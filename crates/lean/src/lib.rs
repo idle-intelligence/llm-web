@@ -7,6 +7,7 @@ pub mod chat_template;
 pub mod config;
 pub mod engine;
 pub mod gguf;
+pub mod lora;
 pub mod model;
 pub mod pool;
 pub mod quant;

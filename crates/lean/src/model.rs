@@ -154,6 +154,109 @@ struct MaskDims {
     _p0: u32,
     _p1: u32,
 }
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct RopePosDims {
+    rows: u32,
+    heads: u32,
+    head_dim: u32,
+    _p0: u32,
+}
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct AttnChunkDims {
+    t: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    kv_total: u32,
+    max_ctx: u32,
+    scale: f32,
+    _p0: u32,
+}
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct GatherRowsDims {
+    n_selected: u32,
+    k: u32,
+    blocks_per_row: u32,
+    out_row_offset: u32,
+}
+
+/// Caller-supplied positions and attention topology for `forward_chunk_spec`
+/// — the mechanism behind llm-life variant A/B's per-cell RoPE restart and
+/// block-diagonal/sparse masks (this crate's consumer survey, gap #5).
+/// `ForwardSpec::default()` (no positions, no mask) means "continue the
+/// resident cache causally" — the same behavior `forward_prefill_suffix`
+/// already gives, expressed generically.
+#[derive(Default, Clone)]
+pub struct ForwardSpec {
+    /// One absolute position per token, same length as the chunk. `None`
+    /// means "continue counting from the cache's current `kv_len`" (plain
+    /// causal continuation).
+    pub positions: Option<Vec<u32>>,
+    /// Packed bitset (`build_mask_bitset`-style, 32 bits/word), row-major
+    /// `[t, prefix_len + t]`: bit `(i, j)` set means query row `i` may
+    /// attend key `j`. `None` means "causal over the resident prefix plus
+    /// this chunk" (`build_prefix_causal_bits`).
+    pub allowed_bits: Option<Vec<u32>>,
+}
+
+impl ForwardSpec {
+    pub fn with_positions(mut self, positions: Vec<u32>) -> Self {
+        self.positions = Some(positions);
+        self
+    }
+
+    /// `allowed[i * cols + j]` — a plain `bool` mask, `rows` query positions
+    /// by `cols = prefix_len + rows` keys — packed into this crate's bitset
+    /// format. The convenience form for a caller building a mask as
+    /// `Vec<bool>` (llm-life's `Chunk::allowed`, for instance) rather than
+    /// bit-packing it themselves.
+    pub fn with_allowed(mut self, allowed: &[bool], rows: usize, cols: usize) -> Self {
+        self.allowed_bits = Some(pack_bool_mask(allowed, rows, cols));
+        self
+    }
+
+    pub fn with_allowed_bits(mut self, bits: Vec<u32>) -> Self {
+        self.allowed_bits = Some(bits);
+        self
+    }
+}
+
+/// Packs a row-major `[rows, cols]` bool mask into this crate's bitset
+/// format (32 entries per `u32`, bit `idx % 32` of word `idx / 32`, `idx =
+/// row * cols + col`) — shared by `ForwardSpec::with_allowed` and any
+/// caller building the same shape directly.
+pub fn pack_bool_mask(allowed: &[bool], rows: usize, cols: usize) -> Vec<u32> {
+    assert_eq!(allowed.len(), rows * cols, "pack_bool_mask: allowed.len() must be rows*cols");
+    let mut bits = vec![0u32; (rows * cols).div_ceil(32)];
+    for (idx, &a) in allowed.iter().enumerate() {
+        if a {
+            bits[idx / 32] |= 1u32 << (idx % 32);
+        }
+    }
+    bits
+}
+
+/// The default mask `forward_chunk_spec` builds when `ForwardSpec::allowed_bits`
+/// is `None`: query row `i` (0-based within the chunk) may attend every
+/// resident-prefix key plus its own chunk keys `[0, i]` — i.e. plain causal
+/// continuation of a `prefix_len`-long resident cache, the same topology
+/// `forward_prefill_suffix` already gives without an explicit mask.
+pub fn build_prefix_causal_bits(prefix_len: u32, t: u32) -> Vec<u32> {
+    let cols = prefix_len + t;
+    let total = (t as usize) * (cols as usize);
+    let mut bits = vec![0u32; total.div_ceil(32)];
+    for i in 0..t {
+        let allowed_upto = prefix_len + i + 1; // this row may attend [0, allowed_upto)
+        for j in 0..allowed_upto {
+            let idx = (i * cols + j) as usize;
+            bits[idx / 32] |= 1u32 << (idx % 32);
+        }
+    }
+    bits
+}
 
 struct LayerWeights {
     attn_norm: wgpu::Buffer,
@@ -187,6 +290,12 @@ pub struct GpuModel {
     /// single `GpuModel` doesn't mix the two - the fixture check runs both.
     pub fast_kernels: bool,
     pub pool: Pool,
+    /// Runtime LoRA, applied alongside the frozen Q4_0 base on every
+    /// subsequent forward call (q/k/v/o only — see `lora.rs`'s module doc).
+    /// `None` means no adapter: identical dispatch sequence to before this
+    /// feature existed. Switchable/removable via `apply_lora`/`clear_lora`
+    /// with no base reload.
+    pub lora: Option<crate::lora::LoraAdapter>,
 }
 
 /// One KV cache buffer pair per layer. See this file's top doc comment for
@@ -423,7 +532,53 @@ impl GpuModel {
         // only the GPU-resident buffers built above.
         drop(reader);
 
-        Ok(GpuModel { config, embed, layers, out_norm, lm_head, zero_bias_vocab, fast_kernels, pool: Pool::new(engine.device.clone(), engine.queue.clone()) })
+        Ok(GpuModel {
+            config,
+            embed,
+            layers,
+            out_norm,
+            lm_head,
+            zero_bias_vocab,
+            fast_kernels,
+            pool: Pool::new(engine.device.clone(), engine.queue.clone()),
+            lora: None,
+        })
+    }
+
+    /// Loads and applies a runtime LoRA adapter (LLMLIFE2 format, see
+    /// `lora.rs`), replacing any adapter loaded earlier — adapters don't
+    /// stack. Does not touch the base weights.
+    pub fn apply_lora(&mut self, engine: &Engine, bytes: &[u8]) -> Result<()> {
+        let adapter = crate::lora::LoraAdapter::from_bytes(engine, bytes, self.config.num_layers)?;
+        self.lora = Some(adapter);
+        Ok(())
+    }
+
+    /// Removes the currently-applied LoRA adapter, if any — subsequent
+    /// forward calls run the frozen base only, with no base reload.
+    pub fn clear_lora(&mut self) {
+        self.lora = None;
+    }
+
+    pub fn has_lora(&self) -> bool {
+        self.lora.is_some()
+    }
+
+    /// Logits for a caller-chosen subset of vocab ids, at every row of
+    /// `hidden_states` — the sliced lm-head mechanism (this crate's
+    /// consumer survey, gap #5): llm-life reads exactly `[dead, alive]`
+    /// logits at every cell's answer position instead of materializing a
+    /// `[rows, vocab_size]` buffer. Returns `[rows, token_ids.len()]`,
+    /// row-major, already read back to the CPU.
+    pub async fn lm_head_sliced(&self, engine: &Engine, hidden_states: &wgpu::Buffer, rows: u32, token_ids: &[u32]) -> Vec<f32> {
+        let mut encoder = engine.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("lm_head_sliced") });
+        let (gathered, hidden_dim) = gather_dequant_head_rows(engine, &self.pool, &mut encoder, "head_slice", &self.lm_head, token_ids);
+        let n = token_ids.len() as u32;
+        let w = MatMulWeight::F32 { w: gathered };
+        let zero_b = zero_bias(engine, &self.pool, "head_slice.bias", n);
+        let logits = linear(engine, &self.pool, &mut encoder, "head_slice.linear", hidden_states, rows, hidden_dim, &w, &zero_b, n, false);
+        engine.queue.submit(Some(encoder.finish()));
+        engine.read_buffer(&logits, (rows * n) as usize).await
     }
 }
 
@@ -537,6 +692,55 @@ fn linear(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder, key:
     out
 }
 
+/// A pool-owned all-zero bias buffer of `len` f32s. LoRA's two internal
+/// matmuls (`x -> rank`, `rank -> out`) have no bias of their own —
+/// `linear()` always takes one, so this is cheaper than adding a
+/// bias-optional code path to that shared helper.
+fn zero_bias(engine: &Engine, pool: &Pool, key: &str, len: u32) -> wgpu::Buffer {
+    let buf = pool.data(key, len as usize);
+    engine.queue.write_buffer(&buf, 0, bytemuck::cast_slice(&vec![0f32; len as usize]));
+    buf
+}
+
+/// Adds one LoRA projection's delta onto `out_buf` in place: `out_buf +=
+/// (x @ proj.a) @ proj.b` (the `alpha/rank` scale is already folded into
+/// `proj.b` at upload time — see `lora.rs`). Two plain F32 `linear()` calls
+/// plus one `add_inplace`, no dedicated LoRA kernel.
+#[allow(clippy::too_many_arguments)]
+fn apply_lora_proj(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder, key: &str, x: &wgpu::Buffer, rows: u32, in_dim: u32, out_buf: &wgpu::Buffer, out_dim: u32, proj: &crate::lora::LoraProj) {
+    let zero_r = zero_bias(engine, pool, &format!("{key}.zr"), proj.rank);
+    let ab = linear(engine, pool, encoder, &format!("{key}.a"), x, rows, in_dim, &proj.a, &zero_r, proj.rank, false);
+    let zero_o = zero_bias(engine, pool, &format!("{key}.zo"), out_dim);
+    let delta = linear(engine, pool, encoder, &format!("{key}.b"), &ab, rows, proj.rank, &proj.b, &zero_o, out_dim, false);
+    add_inplace(engine, pool, encoder, &format!("{key}.add"), out_buf, &delta, rows * out_dim);
+}
+
+/// `linear()` plus, when `lora` is `Some`, that projection's LoRA delta
+/// added in place onto the result — the single call site every q/k/v/o
+/// projection in this file goes through, so LoRA is applied uniformly
+/// across prefill, decode and the chunked/masked forward path.
+#[allow(clippy::too_many_arguments)]
+fn linear_lora(
+    engine: &Engine,
+    pool: &Pool,
+    encoder: &mut wgpu::CommandEncoder,
+    key: &str,
+    x: &wgpu::Buffer,
+    rows: u32,
+    in_dim: u32,
+    w: &MatMulWeight,
+    b: &wgpu::Buffer,
+    out_dim: u32,
+    fast: bool,
+    lora: Option<&crate::lora::LoraProj>,
+) -> wgpu::Buffer {
+    let out = linear(engine, pool, encoder, key, x, rows, in_dim, w, b, out_dim, fast);
+    if let Some(proj) = lora {
+        apply_lora_proj(engine, pool, encoder, &format!("{key}.lora"), x, rows, in_dim, &out, out_dim, proj);
+    }
+    out
+}
+
 #[allow(clippy::too_many_arguments)]
 fn rmsnorm(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder, key: &str, x: &wgpu::Buffer, scale: &wgpu::Buffer, rows: u32, dim: u32, eps: f32) -> wgpu::Buffer {
     let out = pool.data(&format!("{key}.out"), (rows * dim) as usize);
@@ -572,6 +776,27 @@ fn rope(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder, key: &
     engine.dispatch(encoder, &engine.rope, &bg, ((rows * heads * half).div_ceil(64), 1, 1), key);
 }
 
+/// Same RoPE as `rope()` but each row's absolute position comes from a
+/// caller-supplied buffer (`ForwardSpec::positions`) instead of a
+/// contiguous `pos_base + row` run — see `shaders/rope_positions.wgsl`.
+#[allow(clippy::too_many_arguments)]
+fn rope_positions(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder, key: &str, buf: &wgpu::Buffer, cos: &wgpu::Buffer, sin: &wgpu::Buffer, positions: &wgpu::Buffer, rows: u32, heads: u32, head_dim: u32) {
+    let dims = pool.uniform(&format!("{key}.dims"), RopePosDims { rows, heads, head_dim, _p0: 0 });
+    let bg = pool.bind_group(
+        key,
+        &engine.rope_positions,
+        &[
+            BindGroupEntry { binding: 0, resource: buf.as_entire_binding() },
+            BindGroupEntry { binding: 1, resource: cos.as_entire_binding() },
+            BindGroupEntry { binding: 2, resource: sin.as_entire_binding() },
+            BindGroupEntry { binding: 3, resource: positions.as_entire_binding() },
+            BindGroupEntry { binding: 4, resource: dims.as_entire_binding() },
+        ],
+    );
+    let half = head_dim / 2;
+    engine.dispatch(encoder, &engine.rope_positions, &bg, ((rows * heads * half).div_ceil(64), 1, 1), key);
+}
+
 fn add_inplace(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder, key: &str, a: &wgpu::Buffer, b: &wgpu::Buffer, len: u32) {
     let dims = pool.uniform(&format!("{key}.dims"), AddDims { len, _p0: 0, _p1: 0, _p2: 0 });
     let bg = pool.bind_group(
@@ -605,12 +830,23 @@ fn silu_mul(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder, ke
 }
 
 #[allow(clippy::too_many_arguments)]
-fn qkv_proj(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder, key: &str, x: &wgpu::Buffer, rows: u32, cfg: &Qwen2Config, layer: &LayerWeights, fast: bool) -> (wgpu::Buffer, wgpu::Buffer, wgpu::Buffer) {
+fn qkv_proj(
+    engine: &Engine,
+    pool: &Pool,
+    encoder: &mut wgpu::CommandEncoder,
+    key: &str,
+    x: &wgpu::Buffer,
+    rows: u32,
+    cfg: &Qwen2Config,
+    layer: &LayerWeights,
+    fast: bool,
+    lora: Option<&crate::lora::LoraLayer>,
+) -> (wgpu::Buffer, wgpu::Buffer, wgpu::Buffer) {
     let hidden = cfg.hidden_size as u32;
     let kv_dim = (cfg.num_kv_heads * cfg.head_dim) as u32;
-    let q = linear(engine, pool, encoder, &format!("{key}.q"), x, rows, hidden, &layer.q_w, &layer.q_b, hidden, fast);
-    let k = linear(engine, pool, encoder, &format!("{key}.k"), x, rows, hidden, &layer.k_w, &layer.k_b, kv_dim, fast);
-    let v = linear(engine, pool, encoder, &format!("{key}.v"), x, rows, hidden, &layer.v_w, &layer.v_b, kv_dim, fast);
+    let q = linear_lora(engine, pool, encoder, &format!("{key}.q"), x, rows, hidden, &layer.q_w, &layer.q_b, hidden, fast, lora.map(|l| &l.q));
+    let k = linear_lora(engine, pool, encoder, &format!("{key}.k"), x, rows, hidden, &layer.k_w, &layer.k_b, kv_dim, fast, lora.map(|l| &l.k));
+    let v = linear_lora(engine, pool, encoder, &format!("{key}.v"), x, rows, hidden, &layer.v_w, &layer.v_b, kv_dim, fast, lora.map(|l| &l.v));
     (q, k, v)
 }
 
@@ -715,6 +951,72 @@ fn attn_decode(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder,
     out
 }
 
+/// Pluggable-mask GQA attention over a resident-prefix KV cache: `t` query
+/// rows attend `kv_total = prefix_len + t` keys already scattered into
+/// `k_cache`/`v_cache`, gated by an explicit bitset instead of an implicit
+/// causal rule — see `shaders/attn_chunk_masked.wgsl`.
+#[allow(clippy::too_many_arguments)]
+fn attn_chunk_masked(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder, key: &str, q: &wgpu::Buffer, k_cache: &wgpu::Buffer, v_cache: &wgpu::Buffer, mask: &wgpu::Buffer, t: u32, kv_total: u32, max_ctx: u32, cfg: &Qwen2Config) -> wgpu::Buffer {
+    let hidden = cfg.hidden_size as u32;
+    let out = pool.data(&format!("{key}.out"), (t * hidden) as usize);
+    let scale = 1.0 / (cfg.head_dim as f32).sqrt();
+    let dims = pool.uniform(
+        &format!("{key}.dims"),
+        AttnChunkDims { t, n_heads: cfg.num_heads as u32, n_kv_heads: cfg.num_kv_heads as u32, head_dim: cfg.head_dim as u32, kv_total, max_ctx, scale, _p0: 0 },
+    );
+    let bg = pool.bind_group(
+        key,
+        &engine.attn_chunk_masked,
+        &[
+            BindGroupEntry { binding: 0, resource: q.as_entire_binding() },
+            BindGroupEntry { binding: 1, resource: k_cache.as_entire_binding() },
+            BindGroupEntry { binding: 2, resource: v_cache.as_entire_binding() },
+            BindGroupEntry { binding: 3, resource: mask.as_entire_binding() },
+            BindGroupEntry { binding: 4, resource: out.as_entire_binding() },
+            BindGroupEntry { binding: 5, resource: dims.as_entire_binding() },
+        ],
+    );
+    engine.dispatch(encoder, &engine.attn_chunk_masked, &bg, (cfg.num_heads as u32, t.div_ceil(256), 1), key);
+    out
+}
+
+/// Gathers + dequantizes `token_ids` (absolute vocab ids) out of `w` (must
+/// be `MatMulWeight::Q8_0` — this model's lm head) into a small contiguous
+/// F32 `[token_ids.len(), hidden]` buffer, one dispatch per id (llm-life's
+/// sliced sets are 1-2 ids; not worth a multi-row-per-dispatch path yet).
+/// Returns the buffer and `hidden` (the caller already knows `hidden`, but
+/// returning it here keeps this fn self-contained for a future non-Qwen2
+/// caller). See `shaders/gather_dequant_q8_rows.wgsl`.
+fn gather_dequant_head_rows(engine: &Engine, pool: &Pool, encoder: &mut wgpu::CommandEncoder, key: &str, w: &MatMulWeight, token_ids: &[u32]) -> (wgpu::Buffer, u32) {
+    let (chunks, blocks_per_row) = match w {
+        MatMulWeight::Q8_0 { chunks, blocks_per_row, .. } => (chunks, *blocks_per_row),
+        _ => panic!("gather_dequant_head_rows: lm_head must be Q8_0"),
+    };
+    let hidden = blocks_per_row * 32;
+    let n = token_ids.len() as u32;
+    let out = pool.data(&format!("{key}.out"), (n * hidden) as usize);
+    for (ti, &id) in token_ids.iter().enumerate() {
+        let chunk = chunks.iter().find(|c| id >= c.row_start && id < c.row_start + c.rows).unwrap_or_else(|| panic!("gather_dequant_head_rows: token id {id} out of range"));
+        let local_row = id - chunk.row_start;
+        let ckey = format!("{key}.{ti}");
+        let row_ids = pool.upload_u32(&format!("{ckey}.rowid"), &[local_row]);
+        let dims = pool.uniform(&format!("{ckey}.dims"), GatherRowsDims { n_selected: 1, k: hidden, blocks_per_row, out_row_offset: ti as u32 });
+        let bg = pool.bind_group(
+            &ckey,
+            &engine.gather_dequant_q8_rows,
+            &[
+                BindGroupEntry { binding: 0, resource: row_ids.as_entire_binding() },
+                BindGroupEntry { binding: 1, resource: chunk.qs.as_entire_binding() },
+                BindGroupEntry { binding: 2, resource: chunk.scales.as_entire_binding() },
+                BindGroupEntry { binding: 3, resource: out.as_entire_binding() },
+                BindGroupEntry { binding: 4, resource: dims.as_entire_binding() },
+            ],
+        );
+        engine.dispatch(encoder, &engine.gather_dequant_q8_rows, &bg, (hidden.div_ceil(64), 1, 1), &ckey);
+    }
+    (out, hidden)
+}
+
 /// Prefill: runs every layer over the whole prompt with causal attention
 /// (no cache read needed - attends directly over this call's own q/k/v),
 /// GPU-scatters every position's K/V into `cache`, and returns the last
@@ -731,14 +1033,15 @@ pub async fn forward_prefill(engine: &Engine, model: &GpuModel, cache: &mut KvCa
     for (i, layer) in model.layers.iter().enumerate() {
         let key = format!("layer{i}");
         let normed = rmsnorm(engine, pool, &mut encoder, &format!("{key}.norm"), &x, &layer.attn_norm, seq, hidden, cfg.rms_norm_eps);
-        let (q, k, v) = qkv_proj(engine, pool, &mut encoder, &format!("{key}.qkv"), &normed, seq, cfg, layer, model.fast_kernels);
+        let lora_layer = model.lora.as_ref().map(|l| &l.layers[i]);
+        let (q, k, v) = qkv_proj(engine, pool, &mut encoder, &format!("{key}.qkv"), &normed, seq, cfg, layer, model.fast_kernels, lora_layer);
         rope(engine, pool, &mut encoder, &format!("{key}.ropeq"), &q, cos, sin, seq, cfg.num_heads as u32, cfg.head_dim as u32, 0);
         rope(engine, pool, &mut encoder, &format!("{key}.ropek"), &k, cos, sin, seq, cfg.num_kv_heads as u32, cfg.head_dim as u32, 0);
         let attn_out = attn_prefill(engine, pool, &mut encoder, &format!("{key}.attn"), &q, &k, &v, seq, cfg);
         scatter_kv_gpu(&mut encoder, &cache.k[i], &k, seq, cfg, 0, cache.max_ctx);
         scatter_kv_gpu(&mut encoder, &cache.v[i], &v, seq, cfg, 0, cache.max_ctx);
 
-        let o = linear(engine, pool, &mut encoder, &format!("{key}.wo"), &attn_out, seq, hidden, &layer.o_w, &layer.o_b, hidden, model.fast_kernels);
+        let o = linear_lora(engine, pool, &mut encoder, &format!("{key}.wo"), &attn_out, seq, hidden, &layer.o_w, &layer.o_b, hidden, model.fast_kernels, lora_layer.map(|l| &l.o));
         add_inplace(engine, pool, &mut encoder, &format!("{key}.add1"), &x, &o, seq * hidden);
 
         let ffn_normed = rmsnorm(engine, pool, &mut encoder, &format!("{key}.ffnnorm"), &x, &layer.ffn_norm, seq, hidden, cfg.rms_norm_eps);
@@ -825,7 +1128,8 @@ fn decode_layers(engine: &Engine, model: &GpuModel, encoder: &mut wgpu::CommandE
     for (i, layer) in model.layers.iter().enumerate() {
         let key = format!("dec_layer{i}");
         let normed = rmsnorm(engine, pool, encoder, &format!("{key}.norm"), &x, &layer.attn_norm, 1, hidden, cfg.rms_norm_eps);
-        let (q, k, v) = qkv_proj(engine, pool, encoder, &format!("{key}.qkv"), &normed, 1, cfg, layer, model.fast_kernels);
+        let lora_layer = model.lora.as_ref().map(|l| &l.layers[i]);
+        let (q, k, v) = qkv_proj(engine, pool, encoder, &format!("{key}.qkv"), &normed, 1, cfg, layer, model.fast_kernels, lora_layer);
         rope(engine, pool, encoder, &format!("{key}.ropeq"), &q, cos, sin, 1, cfg.num_heads as u32, cfg.head_dim as u32, pos);
         rope(engine, pool, encoder, &format!("{key}.ropek"), &k, cos, sin, 1, cfg.num_kv_heads as u32, cfg.head_dim as u32, pos);
 
@@ -833,7 +1137,7 @@ fn decode_layers(engine: &Engine, model: &GpuModel, encoder: &mut wgpu::CommandE
         scatter_kv_gpu(encoder, &cache.v[i], &v, 1, cfg, pos, cache.max_ctx);
         let attn_out = attn_decode(engine, pool, encoder, &format!("{key}.attn"), &q, &cache.k[i], &cache.v[i], pos + 1, cache.max_ctx, cfg);
 
-        let o = linear(engine, pool, encoder, &format!("{key}.wo"), &attn_out, 1, hidden, &layer.o_w, &layer.o_b, hidden, model.fast_kernels);
+        let o = linear_lora(engine, pool, encoder, &format!("{key}.wo"), &attn_out, 1, hidden, &layer.o_w, &layer.o_b, hidden, model.fast_kernels, lora_layer.map(|l| &l.o));
         add_inplace(engine, pool, encoder, &format!("{key}.add1"), &x, &o, hidden);
 
         let ffn_normed = rmsnorm(engine, pool, encoder, &format!("{key}.ffnnorm"), &x, &layer.ffn_norm, 1, hidden, cfg.rms_norm_eps);
@@ -923,4 +1227,82 @@ pub async fn forward_prefill_suffix(engine: &Engine, model: &GpuModel, cache: &m
     engine.queue.submit(Some(encoder.finish()));
     cache.kv_len += 1;
     engine.read_buffer(&logits, model.config.vocab_size).await
+}
+
+/// Runs one chunk of `token_ids` against the cache's resident prefix
+/// (`cache.kv_len` positions, already populated — typically by an earlier
+/// `forward_prefill`/`forward_prefill_suffix` call, then rewound with
+/// `KvCache::snapshot`/`restore` so the next chunk starts from the same
+/// prefix) with caller-supplied positions and attention topology
+/// (`ForwardSpec`) instead of the fixed causal-continuation shape the other
+/// `forward_*` functions assume. This is the mechanism behind llm-life
+/// variant A's packed block-diagonal per-cell prompts (`spec.positions`
+/// restarts RoPE at the prefix length for every block; `spec.allowed_bits`
+/// is the block-diagonal mask) and variant B's sparse 9-key stencil.
+///
+/// Returns the **hidden states** (`[t, hidden]`, post `output_norm`, pre
+/// lm-head — not logits): callers needing only a few vocab ids' logits at
+/// every position should slice with `GpuModel::lm_head_sliced` rather than
+/// materializing a full `[t, vocab]` buffer (see that fn's doc comment).
+/// Leaves `cache.kv_len` at `prefix_len + t` — call `KvCache::snapshot`
+/// before this and `KvCache::restore` after reading the result back if the
+/// next chunk should start from the same prefix again (llm-life's own
+/// per-chunk rewind, `LifeEngine::step_ids_a`'s pattern in the Burn
+/// engine).
+pub async fn forward_chunk_spec(engine: &Engine, model: &GpuModel, cache: &mut KvCache, token_ids: &[u32], cos: &wgpu::Buffer, sin: &wgpu::Buffer, spec: &ForwardSpec) -> wgpu::Buffer {
+    let cfg = &model.config;
+    let t = token_ids.len() as u32;
+    let hidden = cfg.hidden_size as u32;
+    let pool = &model.pool;
+    let prefix_len = cache.kv_len;
+    let kv_total = prefix_len + t;
+    assert!(kv_total <= cache.max_ctx, "forward_chunk_spec: prefix_len {prefix_len} + t {t} exceeds max_ctx {}", cache.max_ctx);
+
+    let positions: Vec<u32> = match &spec.positions {
+        Some(p) => {
+            assert_eq!(p.len(), t as usize, "ForwardSpec positions must be one per token");
+            p.clone()
+        }
+        None => (0..t).map(|r| prefix_len + r).collect(),
+    };
+    let pos_buf = pool.upload_u32("chunk.positions", &positions);
+
+    let default_mask;
+    let mask_bits: &[u32] = match &spec.allowed_bits {
+        Some(b) => b,
+        None => {
+            default_mask = build_prefix_causal_bits(prefix_len, t);
+            &default_mask
+        }
+    };
+    let mask_buf = pool.upload_u32("chunk.mask", mask_bits);
+
+    let mut encoder = engine.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("chunk") });
+    let x = embed_gather(engine, pool, &mut encoder, model, token_ids);
+
+    for (i, layer) in model.layers.iter().enumerate() {
+        let key = format!("chunk_layer{i}");
+        let lora_layer = model.lora.as_ref().map(|l| &l.layers[i]);
+        let normed = rmsnorm(engine, pool, &mut encoder, &format!("{key}.norm"), &x, &layer.attn_norm, t, hidden, cfg.rms_norm_eps);
+        let (q, k, v) = qkv_proj(engine, pool, &mut encoder, &format!("{key}.qkv"), &normed, t, cfg, layer, model.fast_kernels, lora_layer);
+        rope_positions(engine, pool, &mut encoder, &format!("{key}.ropeq"), &q, cos, sin, &pos_buf, t, cfg.num_heads as u32, cfg.head_dim as u32);
+        rope_positions(engine, pool, &mut encoder, &format!("{key}.ropek"), &k, cos, sin, &pos_buf, t, cfg.num_kv_heads as u32, cfg.head_dim as u32);
+
+        scatter_kv_gpu(&mut encoder, &cache.k[i], &k, t, cfg, prefix_len, cache.max_ctx);
+        scatter_kv_gpu(&mut encoder, &cache.v[i], &v, t, cfg, prefix_len, cache.max_ctx);
+        let attn_out = attn_chunk_masked(engine, pool, &mut encoder, &format!("{key}.attn"), &q, &cache.k[i], &cache.v[i], &mask_buf, t, kv_total, cache.max_ctx, cfg);
+
+        let o = linear_lora(engine, pool, &mut encoder, &format!("{key}.wo"), &attn_out, t, hidden, &layer.o_w, &layer.o_b, hidden, model.fast_kernels, lora_layer.map(|l| &l.o));
+        add_inplace(engine, pool, &mut encoder, &format!("{key}.add1"), &x, &o, t * hidden);
+
+        let ffn_normed = rmsnorm(engine, pool, &mut encoder, &format!("{key}.ffnnorm"), &x, &layer.ffn_norm, t, hidden, cfg.rms_norm_eps);
+        let mlp_out = mlp(engine, pool, &mut encoder, &format!("{key}.mlp"), &ffn_normed, t, cfg, layer, model.fast_kernels);
+        add_inplace(engine, pool, &mut encoder, &format!("{key}.add2"), &x, &mlp_out, t * hidden);
+    }
+
+    let normed_final = rmsnorm(engine, pool, &mut encoder, "chunk_out_norm", &x, &model.out_norm, t, hidden, cfg.rms_norm_eps);
+
+    engine.queue.submit(Some(encoder.finish()));
+    cache.kv_len = kv_total;
+    normed_final
 }
