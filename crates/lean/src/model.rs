@@ -1982,11 +1982,22 @@ pub async fn forward_decode_step(engine: &Engine, model: &GpuModel, cache: &mut 
 #[allow(clippy::too_many_arguments)]
 pub async fn forward_decode_step_argmax(engine: &Engine, model: &GpuModel, cache: &mut KvCache, token_id: u32, cos: &wgpu::Buffer, sin: &wgpu::Buffer, mask: Option<&wgpu::Buffer>) -> u32 {
     let mut encoder = engine.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("decode_argmax") });
+    if engine.profiling_enabled() {
+        engine.reset_profile();
+    }
     let (_, idx) = decode_layers(engine, model, &mut encoder, cache, token_id, cos, sin, mask, true);
     let idx = idx.expect("decode_layers(argmax=true) always returns Some");
+    // Resolve on the same encoder as the profiled dispatches, before it's
+    // finished/submitted - see `Engine::resolve_profile`'s doc comment.
+    let profile = engine.resolve_profile(&mut encoder);
     engine.queue.submit(Some(encoder.finish()));
     cache.kv_len += 1;
-    engine.read_u32(&idx).await
+    let result = engine.read_u32(&idx).await;
+    if let Some((buf, count)) = profile {
+        let data = engine.read_profile(&buf, count).await;
+        crate::profile_report::record_step(&data);
+    }
+    result
 }
 
 /// Appends `token_ids` onto a cache already populated up to `cache.kv_len`

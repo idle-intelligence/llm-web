@@ -12,6 +12,7 @@ pub mod gguf;
 pub mod lora;
 pub mod model;
 pub mod pool;
+pub mod profile_report;
 pub mod quant;
 #[cfg(feature = "web")]
 pub mod web;

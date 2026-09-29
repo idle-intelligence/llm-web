@@ -193,6 +193,9 @@ fn run_generation(engine: &lean::engine::Engine, model: &GpuModel, token_ids: &[
         "seq={seq} prefill_dispatches={prefill_dispatches} ({:.1}/token) decode_dispatches_per_step={decode_dispatches_per_step}",
         prefill_dispatches as f64 / seq as f64
     );
+    if engine.profiling_enabled() {
+        lean::profile_report::report(n_tokens as u64);
+    }
 
     (prefill_logits, got_tokens, prefill_ms / seq as f64, decode_ms_total / n_tokens as f64)
 }

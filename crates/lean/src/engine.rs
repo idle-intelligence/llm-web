@@ -7,8 +7,25 @@
 //! declaration order matching each `.wgsl` file.
 
 use std::borrow::Cow;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use wgpu::util::DeviceExt;
+
+/// Opt-in per-dispatch GPU timing, default off. Set `LEAN_PROFILE_KERNELS=1`
+/// (native only - wasm's `std::env::var` always errs, which is the desired
+/// "never on in the browser" behavior) to request
+/// `Features::TIMESTAMP_QUERY | Features::TIMESTAMP_QUERY_INSIDE_PASSES` at
+/// device creation; silently stays off if the adapter doesn't report both
+/// (checked once here, never inferred from a device/vendor name - same rule
+/// as `has_dp4` above). See docs/runs/2026-09-29-lean-vs-llamacpp-profile.md
+/// for the kernel-time table this path was built to produce. Zero cost when
+/// disabled: `dispatch()`'s profiling branch is one `bool` check, and
+/// `profile_labels` stays an empty `Vec`.
+const PROFILE_ENV_VAR: &str = "LEAN_PROFILE_KERNELS";
+/// Max recorded dispatches/step (2 timestamps each) before profiling starts
+/// silently dropping further writes - comfortably above every model in this
+/// project's fixture set (largest measured: 508 dispatches/step,
+/// docs/runs/2026-09-28-lean-decode-breakdown.md).
+const PROFILE_QUERY_CAPACITY: u32 = 4096;
 
 pub struct Engine {
     pub device: wgpu::Device,
@@ -44,6 +61,14 @@ pub struct Engine {
     /// code), used to separate "more work" from "slower per-op overhead"
     /// when comparing the two - see docs/runs/2026-09-28-lean-perf.md.
     dispatch_count: Cell<u64>,
+    /// `Some` only when `LEAN_PROFILE_KERNELS=1` and the adapter granted both
+    /// timestamp features - see the module-level doc comment above.
+    query_set: Option<wgpu::QuerySet>,
+    timestamp_period: f32,
+    /// One label per recorded dispatch, in order - index `i` owns query
+    /// slots `2*i`/`2*i+1`. Cleared by `reset_profile()` at the start of
+    /// each profiled step.
+    profile_labels: RefCell<Vec<String>>,
     pub embed_gather_q4: wgpu::ComputePipeline,
     /// Q8_0 counterpart of `embed_gather_q4` (`shaders/embed_gather_q8.wgsl`)
     /// - Qwen3's official GGUFs ship no Q4_0 quant, only Q8_0 (qwen3 survey).
@@ -191,10 +216,14 @@ impl Engine {
         // whatever WebGPU's downlevel limits actually allow and split
         // large tensors across bindings if it doesn't.
         let adapter_limits = adapter.limits();
+        let want_profiling = std::env::var(PROFILE_ENV_VAR).as_deref() == Ok("1");
+        let profile_features = wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES;
+        let grant_profiling = want_profiling && adapter.features().contains(profile_features);
+        let required_features = if grant_profiling { profile_features } else { wgpu::Features::empty() };
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("lean"),
-                required_features: wgpu::Features::empty(),
+                required_features,
                 required_limits: adapter_limits,
                 memory_hints: wgpu::MemoryHints::Performance,
                 trace: wgpu::Trace::Off,
@@ -206,9 +235,21 @@ impl Engine {
             .wgsl_language_features()
             .contains(wgpu::WgslLanguageFeatures::Packed4x8IntegerDotProduct);
 
+        let query_set = grant_profiling.then(|| {
+            device.create_query_set(&wgpu::QuerySetDescriptor {
+                label: Some("lean_profile_timestamps"),
+                ty: wgpu::QueryType::Timestamp,
+                count: PROFILE_QUERY_CAPACITY,
+            })
+        });
+        let timestamp_period = queue.get_timestamp_period();
+
         Ok(Engine {
             has_dp4,
             dp4_decode: Cell::new(false),
+            query_set,
+            timestamp_period,
+            profile_labels: RefCell::new(Vec::new()),
             embed_gather_q4: make_pipeline(&device, "embed_gather_q4", include_str!("shaders/embed_gather_q4.wgsl")),
             embed_gather_q8: make_pipeline(&device, "embed_gather_q8", include_str!("shaders/embed_gather_q8.wgsl")),
             embed_gather_q6k: make_pipeline(&device, "embed_gather_q6k", include_str!("shaders/embed_gather_q6k.wgsl")),
@@ -312,8 +353,91 @@ impl Engine {
     pub fn dispatch(&self, pass: &mut wgpu::ComputePass, pipeline: &wgpu::ComputePipeline, bind_group: &wgpu::BindGroup, wgs: (u32, u32, u32), _label: &str) {
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, bind_group, &[]);
+        if let Some(qs) = &self.query_set {
+            let mut labels = self.profile_labels.borrow_mut();
+            let i = labels.len() as u32;
+            if i * 2 + 1 < PROFILE_QUERY_CAPACITY {
+                pass.write_timestamp(qs, i * 2);
+                pass.dispatch_workgroups(wgs.0, wgs.1, wgs.2);
+                pass.write_timestamp(qs, i * 2 + 1);
+                labels.push(_label.to_string());
+                self.dispatch_count.set(self.dispatch_count.get() + 1);
+                return;
+            }
+        }
         pass.dispatch_workgroups(wgs.0, wgs.1, wgs.2);
         self.dispatch_count.set(self.dispatch_count.get() + 1);
+    }
+
+    pub fn profiling_enabled(&self) -> bool {
+        self.query_set.is_some()
+    }
+
+    /// Clears the previous step's labels. Call once per profiled step,
+    /// before its dispatches.
+    pub fn reset_profile(&self) {
+        self.profile_labels.borrow_mut().clear();
+    }
+
+    /// Resolves this step's recorded timestamp pairs into a fresh buffer -
+    /// must be called on the same `encoder` the profiled dispatches were
+    /// recorded into, before that encoder is finished/submitted (query
+    /// resolution is an encoder-timeline command). Returns `None` when
+    /// profiling is off or nothing was recorded this step.
+    pub fn resolve_profile(&self, encoder: &mut wgpu::CommandEncoder) -> Option<(wgpu::Buffer, u32)> {
+        let qs = self.query_set.as_ref()?;
+        let count = self.profile_labels.borrow().len() as u32;
+        if count == 0 {
+            return None;
+        }
+        let resolve_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("profile_resolve"),
+            size: u64::from(count) * 2 * 8,
+            usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        encoder.resolve_query_set(qs, 0..count * 2, &resolve_buf, 0);
+        Some((resolve_buf, count))
+    }
+
+    /// Reads back `resolve_profile`'s buffer and returns `(label, gpu_ns)`
+    /// per dispatch, in dispatch order - the caller aggregates by label (see
+    /// `lean_cli.rs`'s `print_profile_table`). Async readback only, per this
+    /// crate's own rule (see `read_buffer`'s doc comment); the native
+    /// blocking `device.poll` below matches every other native-only readback
+    /// path in this file.
+    pub async fn read_profile(&self, resolve_buf: &wgpu::Buffer, count: u32) -> Vec<(String, f64)> {
+        let size = u64::from(count) * 2 * 8;
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("profile_staging"),
+            size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("profile_readback") });
+        encoder.copy_buffer_to_buffer(resolve_buf, 0, &staging, 0, size);
+        self.queue.submit(Some(encoder.finish()));
+
+        let slice = staging.slice(..);
+        let (tx, rx) = futures_channel::oneshot::channel();
+        slice.map_async(wgpu::MapMode::Read, move |res| {
+            let _ = tx.send(res);
+        });
+        #[cfg(not(target_arch = "wasm32"))]
+        self.device.poll(wgpu::PollType::Wait).expect("device poll failed");
+        rx.await.expect("map_async channel dropped").expect("buffer map failed");
+        let data = slice.get_mapped_range();
+        let raw: &[u64] = bytemuck::cast_slice(&data);
+        let labels = self.profile_labels.borrow();
+        let mut out = Vec::with_capacity(count as usize);
+        for i in 0..count as usize {
+            let ticks = raw[i * 2 + 1].saturating_sub(raw[i * 2]);
+            let ns = ticks as f64 * f64::from(self.timestamp_period);
+            out.push((labels[i].clone(), ns));
+        }
+        drop(data);
+        staging.unmap();
+        out
     }
 
     pub fn begin_pass<'e>(&self, encoder: &'e mut wgpu::CommandEncoder, label: &str) -> wgpu::ComputePass<'e> {
