@@ -14,7 +14,7 @@
 //
 // Every wasm/js loading URL below carries `?v=ENGINE_BUILD`, bumped in the
 // same commit as any wasm/model rebuild - see docs/runs/2026-09-28-lean-web.md.
-const ENGINE_BUILD = "2026-09-29-02";
+const ENGINE_BUILD = "2026-09-29-04";
 
 const params = new URLSearchParams(location.search);
 const modelKey = params.get("model") || "05b";
@@ -32,6 +32,18 @@ const MODELS = {
     gguf: "./model_qwen25_3b/qwen2.5-3b-instruct-q4_0.gguf",
     tokenizer: "./model_qwen25_3b/tokenizer.json",
     tokenizerCfg: "./model_qwen25_3b/tokenizer_config.json",
+    fixture: "../reference/fixture.json",
+  },
+  "qwen3_1_7b": {
+    gguf: "./model_qwen3_1_7b/Qwen3-1.7B-Q8_0.gguf",
+    tokenizer: "./model_qwen3_1_7b/tokenizer.json",
+    tokenizerCfg: "./model_qwen3_1_7b/tokenizer_config.json",
+    fixture: "../reference/fixture.json",
+  },
+  "smollm2_360m": {
+    gguf: "./model_smollm2_360m/model.gguf",
+    tokenizer: "./model_smollm2_360m/tokenizer.json",
+    tokenizerCfg: "./model_smollm2_360m/tokenizer_config.json",
     fixture: "../reference/fixture.json",
   },
 };

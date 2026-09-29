@@ -1701,8 +1701,13 @@ fn argmax_gpu(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, ke
 /// shared by `forward_decode_step` (full-logits readback, for samplers) and
 /// `forward_decode_step_argmax` (single-index readback, the fast path),
 /// so the two only differ in what they append after the layer stack.
+/// `argmax` selects whether the GPU argmax (`argmax_gpu`) is folded into this
+/// same still-open compute pass before it closes, so a greedy decode step
+/// opens no extra pass beyond this function's own one: `Some(idx_buffer)` is
+/// returned alongside the logits when requested, `None` otherwise (samplers
+/// that need the full vocab never pay for the extra dispatch).
 #[allow(clippy::too_many_arguments)]
-fn decode_layers(engine: &Engine, model: &GpuModel, encoder: &mut wgpu::CommandEncoder, cache: &mut KvCache, token_id: u32, cos: &wgpu::Buffer, sin: &wgpu::Buffer, mask: Option<&wgpu::Buffer>) -> wgpu::Buffer {
+fn decode_layers(engine: &Engine, model: &GpuModel, encoder: &mut wgpu::CommandEncoder, cache: &mut KvCache, token_id: u32, cos: &wgpu::Buffer, sin: &wgpu::Buffer, mask: Option<&wgpu::Buffer>, argmax: bool) -> (wgpu::Buffer, Option<wgpu::Buffer>) {
     let cfg = &model.config;
     let hidden = cfg.hidden_size as u32;
     let pool = &model.pool;
@@ -1764,8 +1769,9 @@ fn decode_layers(engine: &Engine, model: &GpuModel, encoder: &mut wgpu::CommandE
     if let Some(mask) = mask {
         mask_logits_gpu(engine, pool, &mut pass, "dec_mask", &logits, mask, cfg.vocab_size as u32, 0);
     }
+    let idx = argmax.then(|| argmax_gpu(engine, pool, &mut pass, "dec_argmax", &logits, cfg.vocab_size as u32));
     drop(pass);
-    logits
+    (logits, idx)
 }
 
 /// Decode one token against the cache (already populated up to
@@ -1779,7 +1785,7 @@ fn decode_layers(engine: &Engine, model: &GpuModel, encoder: &mut wgpu::CommandE
 /// applied.
 pub async fn forward_decode_step(engine: &Engine, model: &GpuModel, cache: &mut KvCache, token_id: u32, cos: &wgpu::Buffer, sin: &wgpu::Buffer, mask: Option<&wgpu::Buffer>) -> Vec<f32> {
     let mut encoder = engine.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("decode") });
-    let logits = decode_layers(engine, model, &mut encoder, cache, token_id, cos, sin, mask);
+    let (logits, _) = decode_layers(engine, model, &mut encoder, cache, token_id, cos, sin, mask, false);
     engine.queue.submit(Some(encoder.finish()));
     cache.kv_len += 1;
     engine.read_buffer(&logits, model.config.vocab_size).await
@@ -1797,10 +1803,8 @@ pub async fn forward_decode_step(engine: &Engine, model: &GpuModel, cache: &mut 
 #[allow(clippy::too_many_arguments)]
 pub async fn forward_decode_step_argmax(engine: &Engine, model: &GpuModel, cache: &mut KvCache, token_id: u32, cos: &wgpu::Buffer, sin: &wgpu::Buffer, mask: Option<&wgpu::Buffer>) -> u32 {
     let mut encoder = engine.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("decode_argmax") });
-    let logits = decode_layers(engine, model, &mut encoder, cache, token_id, cos, sin, mask);
-    let mut pass = engine.begin_pass(&mut encoder, "decode_argmax");
-    let idx = argmax_gpu(engine, &model.pool, &mut pass, "dec_argmax", &logits, model.config.vocab_size as u32);
-    drop(pass);
+    let (_, idx) = decode_layers(engine, model, &mut encoder, cache, token_id, cos, sin, mask, true);
+    let idx = idx.expect("decode_layers(argmax=true) always returns Some");
     engine.queue.submit(Some(encoder.finish()));
     cache.kv_len += 1;
     engine.read_u32(&idx).await
@@ -1835,12 +1839,12 @@ pub async fn forward_prefill_suffix(engine: &Engine, model: &GpuModel, cache: &m
     let (last, rest) = token_ids.split_last().expect("forward_prefill_suffix needs at least one token");
     for &tok in rest {
         let mut encoder = engine.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("prefill_suffix_step") });
-        let _ = decode_layers(engine, model, &mut encoder, cache, tok, cos, sin, None);
+        let _ = decode_layers(engine, model, &mut encoder, cache, tok, cos, sin, None, false);
         engine.queue.submit(Some(encoder.finish()));
         cache.kv_len += 1;
     }
     let mut encoder = engine.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("prefill_suffix_last") });
-    let logits = decode_layers(engine, model, &mut encoder, cache, *last, cos, sin, mask);
+    let (logits, _) = decode_layers(engine, model, &mut encoder, cache, *last, cos, sin, mask, false);
     engine.queue.submit(Some(encoder.finish()));
     cache.kv_len += 1;
     engine.read_buffer(&logits, model.config.vocab_size).await
