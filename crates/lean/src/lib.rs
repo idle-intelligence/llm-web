@@ -16,3 +16,13 @@ pub mod profile_report;
 pub mod quant;
 #[cfg(feature = "web")]
 pub mod web;
+
+/// wasm-bindgen-rayon's worker-pool bootstrap, re-exported so the page can
+/// call `await initThreadPool(navigator.hardwareConcurrency)` once (after
+/// wasm `init()`, before any `LeanEngineCpu` call) to size rayon's global
+/// pool on wasm - `cpu.rs`'s `linear_threads` then sees
+/// `rayon::current_num_threads() > 1` and takes the threaded path. Native
+/// builds never call this: rayon's own default pool sizing (`available_parallelism`)
+/// already applies without it.
+#[cfg(feature = "wasm-mt")]
+pub use wasm_bindgen_rayon::init_thread_pool;

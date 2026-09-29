@@ -80,8 +80,23 @@ impl CpuWeight {
 /// GPU kernel, computed as `rows * out_dim` independent dot products (no
 /// blocking/tiling: this is the reference-correctness rung, see this
 /// crate's CPU-fallback plan on why a fast CPU kernel is out of scope for
-/// this pass).
+/// this pass). Each output element `out[r*out_dim+c]` depends only on `x`'s
+/// row `r` and weight row `c`, never on any other output element - so
+/// splitting this loop across threads (see `linear_threads` below) changes
+/// only which thread computes which element, not the arithmetic each
+/// element does. Unlike a tree-reduction split, this makes the threaded and
+/// single-thread paths bit-for-bit identical, not just token-exact.
 fn linear(x: &[f32], rows: usize, in_dim: usize, w: &CpuWeight, b: &[f32], out_dim: usize) -> Vec<f32> {
+    #[cfg(feature = "threads")]
+    {
+        if let Some(out) = linear_threads(x, rows, in_dim, w, b, out_dim) {
+            return out;
+        }
+    }
+    linear_serial(x, rows, in_dim, w, b, out_dim)
+}
+
+fn linear_serial(x: &[f32], rows: usize, in_dim: usize, w: &CpuWeight, b: &[f32], out_dim: usize) -> Vec<f32> {
     let (w_out, w_in) = w.dims();
     debug_assert_eq!(w_out, out_dim);
     debug_assert_eq!(w_in, in_dim);
@@ -93,6 +108,46 @@ fn linear(x: &[f32], rows: usize, in_dim: usize, w: &CpuWeight, b: &[f32], out_d
         }
     }
     out
+}
+
+/// Threaded rung: the same `rows * out_dim` independent dot products as
+/// `linear_serial`, spread across rayon's global thread pool. Thread count
+/// is a pure capability read, never tuned or measured at runtime -
+/// `rayon::current_num_threads()` reflects `std::thread::available_parallelism()`
+/// on native (rayon's own default pool sizing) and whatever
+/// `initThreadPool(n)` set on wasm (`lib.rs`'s `wasm-mt`-gated re-export) -
+/// so this function makes no bandwidth/timing measurement of its own, only
+/// a capability check plus a fixed, shape-based minimum-work threshold
+/// (`MIN_WORK_PER_THREAD`) so small matvecs (e.g. a future small per-head
+/// op) aren't handed to the pool for less work than the dispatch itself
+/// costs. Returns `None` when the threaded path isn't worth taking
+/// (pool size 1, or below the threshold) so the caller falls back to
+/// `linear_serial` - same output either way, see `linear`'s doc comment on
+/// why the two paths are bit-identical, not just token-exact.
+#[cfg(feature = "threads")]
+fn linear_threads(x: &[f32], rows: usize, in_dim: usize, w: &CpuWeight, b: &[f32], out_dim: usize) -> Option<Vec<f32>> {
+    use rayon::prelude::*;
+
+    const MIN_WORK_PER_THREAD: usize = 64;
+
+    let (w_out, w_in) = w.dims();
+    debug_assert_eq!(w_out, out_dim);
+    debug_assert_eq!(w_in, in_dim);
+
+    let n_threads = rayon::current_num_threads();
+    let total = rows * out_dim;
+    if n_threads <= 1 || total < n_threads * MIN_WORK_PER_THREAD {
+        return None;
+    }
+
+    let mut out = vec![0f32; total];
+    out.par_iter_mut().enumerate().for_each(|(idx, o)| {
+        let r = idx / out_dim;
+        let c = idx % out_dim;
+        let xr = &x[r * in_dim..(r + 1) * in_dim];
+        *o = w.dot_row(c, xr) + b[c];
+    });
+    Some(out)
 }
 
 fn rmsnorm(x: &[f32], scale: &[f32], rows: usize, dim: usize, eps: f32) -> Vec<f32> {
@@ -521,4 +576,103 @@ pub fn forward_decode_step(model: &CpuModel, cache: &mut CpuKvCache, token_id: u
 /// way).
 pub fn forward_decode_step_argmax(model: &CpuModel, cache: &mut CpuKvCache, token_id: u32) -> u32 {
     argmax(&forward_decode_step(model, cache, token_id))
+}
+
+/// In-process parity gate for the threads rung, no GGUF/model needed - the
+/// fixture-level gate (`lean-cli --engine cpu` under `RAYON_NUM_THREADS=1`
+/// vs the default pool size, see docs/runs/2026-09-29-lean-threads.md) is
+/// the end-to-end check; this covers `linear()` itself, at both a
+/// decode-shaped (rows=1) and prefill-shaped (rows>1) size, against every
+/// weight dtype `linear_threads` dispatches over.
+#[cfg(all(test, feature = "threads"))]
+mod threads_tests {
+    use super::*;
+
+    fn synth_x(n: usize, seed: u32) -> Vec<f32> {
+        (0..n).map(|i| ((i as u32 * 7 + seed * 13) % 251) as f32 * 0.01 - 1.0).collect()
+    }
+
+    fn synth_f32_weight(out_dim: usize, in_dim: usize) -> CpuWeight {
+        let data = (0..out_dim * in_dim).map(|i| ((i as u32 * 3) % 251) as f32 * 0.005 - 0.6).collect();
+        CpuWeight::F32 { data, out_dim, in_dim }
+    }
+
+    fn synth_q4_weight(out_dim: usize, in_dim: usize) -> CpuWeight {
+        let blocks_per_row = in_dim / 32;
+        let bytes_per_row = blocks_per_row * 18;
+        let mut bytes = vec![0u8; out_dim * bytes_per_row];
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = ((i as u32 * 11 + 5) % 256) as u8;
+        }
+        // give every block a non-degenerate f16 scale (bytes[0..2] of each 18-byte block)
+        for row in 0..out_dim {
+            for block in 0..blocks_per_row {
+                let base = row * bytes_per_row + block * 18;
+                let scale = half::f16::from_f32(0.01 + (block % 5) as f32 * 0.004);
+                bytes[base..base + 2].copy_from_slice(&scale.to_le_bytes());
+            }
+        }
+        CpuWeight::Q4_0 { bytes, out_dim, in_dim, blocks_per_row }
+    }
+
+    /// Runs `linear` inside a fresh, scoped rayon pool of `n_threads` (never
+    /// touching the process-global pool), so this test controls thread count
+    /// deterministically instead of depending on `available_parallelism()`.
+    fn linear_with_pool(n_threads: usize, x: &[f32], rows: usize, in_dim: usize, w: &CpuWeight, b: &[f32], out_dim: usize) -> Vec<f32> {
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(n_threads).build().unwrap();
+        pool.install(|| linear(x, rows, in_dim, w, b, out_dim))
+    }
+
+    #[test]
+    fn decode_shaped_threads_match_single_thread() {
+        let (out_dim, in_dim) = (896, 896);
+        let w = synth_f32_weight(out_dim, in_dim);
+        let b = vec![0f32; out_dim];
+        let x = synth_x(in_dim, 1);
+        let single = linear_with_pool(1, &x, 1, in_dim, &w, &b, out_dim);
+        for n in [2usize, 4, 8] {
+            let threaded = linear_with_pool(n, &x, 1, in_dim, &w, &b, out_dim);
+            assert_eq!(single, threaded, "n_threads={n} diverged from single-thread (decode-shaped, F32)");
+        }
+    }
+
+    #[test]
+    fn prefill_shaped_threads_match_single_thread() {
+        let (out_dim, in_dim) = (896, 896);
+        let rows = 37;
+        let w = synth_f32_weight(out_dim, in_dim);
+        let b = vec![0f32; out_dim];
+        let x = synth_x(rows * in_dim, 2);
+        let single = linear_with_pool(1, &x, rows, in_dim, &w, &b, out_dim);
+        for n in [2usize, 4, 8] {
+            let threaded = linear_with_pool(n, &x, rows, in_dim, &w, &b, out_dim);
+            assert_eq!(single, threaded, "n_threads={n} diverged from single-thread (prefill-shaped, F32)");
+        }
+    }
+
+    #[test]
+    fn q4_0_weight_threads_match_single_thread() {
+        let (out_dim, in_dim) = (256, 256);
+        let w = synth_q4_weight(out_dim, in_dim);
+        let b = vec![0f32; out_dim];
+        let x = synth_x(in_dim, 3);
+        let single = linear_with_pool(1, &x, 1, in_dim, &w, &b, out_dim);
+        let threaded = linear_with_pool(8, &x, 1, in_dim, &w, &b, out_dim);
+        assert_eq!(single, threaded, "Q4_0 decode-shaped linear diverged under threads");
+    }
+
+    #[test]
+    fn below_threshold_falls_back_to_serial() {
+        // A tiny matrix (well under MIN_WORK_PER_THREAD * n_threads) must
+        // still produce the exact serial result even when a large pool is
+        // available - `linear_threads` should decline it, not divide it
+        // pointlessly across threads.
+        let (out_dim, in_dim) = (4, 8);
+        let w = synth_f32_weight(out_dim, in_dim);
+        let b = vec![0.1f32; out_dim];
+        let x = synth_x(in_dim, 4);
+        let single = linear_with_pool(1, &x, 1, in_dim, &w, &b, out_dim);
+        let threaded = linear_with_pool(8, &x, 1, in_dim, &w, &b, out_dim);
+        assert_eq!(single, threaded);
+    }
 }
