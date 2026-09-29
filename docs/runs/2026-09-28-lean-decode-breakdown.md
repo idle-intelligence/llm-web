@@ -787,3 +787,146 @@ meant to explain does not reproduce. All 8 fixture/KV/mask gates and the
 browser `allMatch` check remain as Session 4 left them (unaffected by this
 session, which only re-measured timing); no code changes were made this
 session.
+
+## Session 6: rmsnorm fix, Mac + browser side (2026-09-29)
+
+The rmsnorm one-workgroup-per-row fix (`docs/runs/2026-09-29-lean-rmsnorm.md`)
+was gated and timed only on the Linux/RTX 3080/Vulkan box. This session
+covers the Mac (Metal via wgpu) and the browser (headless Chromium/WebGPU),
+on the same commit (branch `lean-perf`, which merges the rmsnorm fix).
+
+**Method.** Native: `lean-cli --tokens 16 --kernel fast`, release build,
+5 runs per model/case, machine gated quiet before every run (1-minute
+`vm.loadavg` < 3, top non-`lean-cli` process < 40% CPU, no `rustc`/`cargo`/
+training-`python` running - confirmed throughout, loadavg stayed
+0.79-2.39, top process 0.6-30.1%). Browser: `wasm-pack build crates/lean
+--target web --out-dir pkg --no-default-features --features web`, served
+from a local `python3 -m http.server` in `crates/lean/`; served
+`pkg/lean_bg.wasm` bytes hashed (sha256
+`22d43615cc2a866f27549def9ad0638bc88a8f413c95233048b75f138e7e3531`) and
+confirmed to match the freshly built file before any run. `ENGINE_BUILD`
+bumped in every `crates/lean/www/*.js` loading URL this session (to
+`2026-09-29-06` for the wgpu-build pages, `cpu-05`/`cpu-qwen3-05` for the
+CPU-rung pages, unaffected by this fix but bumped for hygiene since they
+share the same `pkg/`). `www/index.html?local=1` run in Playwright's
+bundled headless Chromium (`--enable-unsafe-webgpu
+--enable-features=Vulkan,WebGPU --use-angle=metal`, never TC's own
+browser): `allMatch: true` - all 5 fixture cases token-match, KV
+snapshot/restore byte- and token-match, logit mask forces the exact target
+string. `decode_timing.html` (per-step timing harness, unchanged from
+Session 5) run 3 fresh page loads per model/case; Qwen2.5-3B run once
+through `scripts/run_mem_profile.py` (unmodified - it already waits on
+`window.__leanResult`, which `main_decode_timing.js` also sets, and kills
+only its own browser process tree if the footprint exceeds `--limit-gb`)
+to keep the 16GB Mac's renderer footprint bounded.
+
+Qwen2.5-3B's own fixture (`fixture_qwen25_3b.json`) has no
+`long_tools_single` case; rather than build a cross-tokenizer single-case
+fixture as Session 5 did on the 3080, this session used the model's own
+`long` case (seq 86) for the second native/browser cell, per the task's
+"short + long_tools_single or long" allowance.
+
+### Native decode ms/tok, Mac (Metal via wgpu), median of 5
+
+| model | case | median | min-max |
+|---|---|---:|---|
+| Qwen2.5-0.5B-Instruct | short | 15.18 | 13.79-18.15 |
+| Qwen2.5-0.5B-Instruct | long_tools_single | 24.79 | 24.68-24.81 |
+| Qwen2.5-3B-Instruct (official GGUF) | short | 101.74 | 95.14-105.14 |
+| Qwen2.5-3B-Instruct (official GGUF) | long | 93.76 | 93.20-94.28 |
+| Qwen3-1.7B (Q8_0) | short | 40.81 | 34.91-41.69 |
+| Qwen3-1.7B (Q8_0) | long_tools_single | 66.11 | 64.86-75.85 |
+| SmolLM2-360M-Instruct (Q4_0) | short | 16.52 | 16.39-18.30 |
+| SmolLM2-360M-Instruct (Q4_0) | long | 16.77 | 16.32-17.62 |
+
+`top1_match=true` on every case/run (40 runs total); `tok_match=false` at
+`--tokens 16` is expected, same convention as every prior session in this
+doc.
+
+Compared with Session 5's own commit-B column (RTX 3080/Vulkan, quiet
+machine): the 3080 decodes Qwen2.5-3B `short` at 118.36ms/tok and Qwen3-1.7B
+`long_tools_single` at 99.43ms/tok pre-rmsnorm-fix; this session's Mac
+numbers (101.74ms and 66.11ms respectively) are not a fair apples-to-apples
+comparison since they are a different GPU, a different session, and
+(unlike Session 5's box) do already include the rmsnorm fix - no Mac
+"before" binary was built this session to isolate the fix's own Mac
+speedup. The rmsnorm doc's own native gates and the browser `allMatch`
+check above are this session's Mac-side correctness evidence instead.
+
+### Browser decode timing (`decode_timing.html`), 3 fresh loads per case
+
+| model | case | promptLen | cold ms (3 loads) | warm median ms (3 loads) |
+|---|---|---:|---|---|
+| Qwen2.5-0.5B-Instruct | short | 36 | 14.6, 14.6, 14.4 | 11.1, 11.2, 11.2 |
+| Qwen2.5-0.5B-Instruct | long (long_tools_single) | 2225 | 22.9, 22.6, 22.8 | 18.5, 18.6, 18.5 |
+| SmolLM2-360M-Instruct (cross-tokenizer fixture) | short | 36 | 15.0, 15.1, 15.3 | 11.6, 11.5, 11.6 |
+| SmolLM2-360M-Instruct (cross-tokenizer fixture) | long | 2225 | 27.4, 27.6, 34.8 | 23.2, 23.2, 23.3 |
+| Qwen3-1.7B (Q8_0) | short | 36 | 38.9, 47.6, 40.1 | 28.0, 28.1, 28.0 |
+| Qwen3-1.7B (Q8_0) | long | 2225 | 92.2, 76.4, 80.0 | 88.6, 70.6, 68.9 |
+
+Qwen2.5-3B, guarded (`scripts/run_mem_profile.py --limit-gb 8`, one browser
+at a time, `case=short`, promptLen 36): loaded in 1312ms, prefill
+2427.5ms, decode cold 123.6ms, warm median 120.1ms over 16 steps, peak
+Chromium process-tree RSS 7.524GB - under the 8GB guard, no kill.
+
+Browser numbers track native closely for the small/mid models (0.5B warm
+11.1-11.2ms browser vs 15.18ms native-median-`short`/24.79ms
+native-median-`long_tools_single` - browser is faster here because
+`warm` excludes the shader-compile-inflated first step that native's
+per-run process start pays on every one of its 5 runs, not because the
+browser rung is actually faster). Qwen3-1.7B's `long` cold/warm spread
+(92.2/76.4/80.0 cold, 88.6/70.6/68.9 warm) is the noisiest cell measured
+this session, on both native (Qwen3-1.7B `long_tools_single` min-max
+64.86-75.85) and browser - consistent with each other, not a browser-only
+artifact.
+
+### `LEAN_PROFILE_KERNELS=1` on the Mac: not available
+
+`LEAN_PROFILE_KERNELS=1 ./target/release/lean-cli --gguf <Qwen2.5-0.5B> ...`
+produced no `kernel_profile` output. Reading `crates/lean/src/engine.rs`
+(the feature-gate: profiling is only granted when the adapter's
+`wgpu::Features` contains both `TIMESTAMP_QUERY` and
+`TIMESTAMP_QUERY_INSIDE_PASSES`) and `crates/lean/src/profile_report.rs`
+(`report()` silently returns with no output when its totals map is empty)
+confirms this is the designed silent-no-op path, not a crash: this
+session's Metal adapter did not grant both timestamp-query features, so
+no per-kernel breakdown is available on this Mac. (The same run's startup
+line reports `has_dp4=true, dp4_decode=false` - this adapter does expose
+the packed-4x8-integer-dot-product WGSL feature, but that lever is off by
+default per `docs/runs/2026-09-28-lean-perf-2.md` Session 6 and is
+unrelated to this session's rmsnorm question.)
+
+### Where the Mac's remaining decode time goes
+
+Without a per-kernel timestamp breakdown on this Mac, only the
+dispatch-count and cross-model comparison are available as evidence:
+
+- Decode dispatch count per step is unchanged by the rmsnorm fix (292 for
+  the three smaller models' short/long cases, 316 for the 2225-token
+  KV-cache-heavy cases) - identical to the dispatch counts already
+  reported in this doc's earlier sessions. The fix only changed each
+  rmsnorm dispatch's internal grid shape, not the dispatch count, matching
+  the rmsnorm doc's own "no prefill regression" finding.
+- Qwen2.5-3B decodes at 93.76-101.74ms/tok median on this Mac vs.
+  18.49-19.06ms/tok on the RTX 3080 post-fix (`docs/runs/2026-09-29-lean-rmsnorm.md`).
+  That gap (roughly 5-5.5x) is consistent with the raw compute/bandwidth
+  gap between a laptop-class Apple GPU and a desktop RTX 3080 - this
+  session found no Mac-specific bottleneck beyond what the hardware gap
+  already predicts, but also could not rule one in or out without the
+  timestamp-query breakdown Metal declined to grant here.
+- The rmsnorm doc's own remaining-bottleneck finding (`dec_lm_head`'s
+  Q6_K naive-kernel cost on Qwen2.5-3B, unaddressed by the rmsnorm fix)
+  is architecture-level, not GPU-vendor-specific, so it plausibly still
+  holds on the Mac's decode time - this session did not re-verify it here
+  since the Mac profiler path was unavailable.
+
+### Gate/build summary
+
+All 8 required native gates pass on the Mac this session
+(`fixture_parity`, `fixture_parity_qwen25_3b`, `fixture_parity_qwen3`,
+`fixture_parity_qwen3_1_7b`, `fixture_parity_llama_360m`,
+`fixture_parity_llama_1_7b`, `kv_snapshot` both cases, `logit_mask` all 3
+cases). `wasm-pack build --target web` succeeds; `www/index.html?local=1`
+reports `allMatch: true` against the freshly built and served
+`pkg/lean_bg.wasm`. No code changes were made this session - only
+`ENGINE_BUILD` bumps (crates/lean/www/*.js) and this doc section.
