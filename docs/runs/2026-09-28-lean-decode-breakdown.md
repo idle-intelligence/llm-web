@@ -1099,12 +1099,13 @@ page's own result object.
 | SmolLM2-360M-Instruct (Q4_0) | long | 14.52 | 11.70 | 11.69-11.74 |
 
 `top1_match=true` on every case/run in every sweep (20 runs total, plus the
-5-run `logit_mask` gate separately). No source/kernel changes landed
-between Session 7 and this session (the merge was docs-only), so every
-row's improvement over the Session 7 numbers reads as machine-quietness
-variance between the two sessions' runs, not a code effect - both sessions
-passed the same load-average gate, but Session 7 doesn't record the exact
-load-average value at measurement time to compare directly.
+5-run `logit_mask` gate separately). Correction: Session 7 was measured at
+35d54a2, before two code commits reached lean-perf through the merge 0635cc1:
+a555415 (skip uniform buffer writes whose bytes are unchanged) and 7d3df51
+(split-K chunk chosen by head_dim). The merge in this session was docs-only,
+but the Session 7 baseline predates those two, so the 10-20% gains above are
+mostly their effect (they gave 5-11% and 4-16% on the RTX 3080), with some
+run-to-run variance on top.
 
 ### Browser decode timing (`decode_timing.html`), 3 fresh loads per case, `steps=16`
 
