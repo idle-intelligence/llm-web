@@ -89,10 +89,13 @@ pub struct Engine {
     /// Q8_0-resident - not just the lm head (Qwen3's official GGUFs ship
     /// every tensor as Q8_0, no Q4_0 quant at all - see qwen3 survey).
     pub linear_q8_decode: wgpu::ComputePipeline,
-    /// Naive Q6_K matmul/matvec (`shaders/linear_q6k.wgsl`) - see that
-    /// file's doc comment on why no tiled/decode-specialized variant exists
-    /// yet.
+    /// Naive Q6_K matmul/matvec (`shaders/linear_q6k.wgsl`) - used for
+    /// prefill (M>1); decode (M=1) uses `linear_q6k_decode` below.
     pub linear_q6k: wgpu::ComputePipeline,
+    /// Coalesced Q6_K matvec (decode, M=1): same 128-thread,
+    /// rows-per-workgroup structure as `linear_q4_decode`/`linear_q8_decode`,
+    /// see `shaders/linear_q6k_decode.wgsl`'s header for the per-block split.
+    pub linear_q6k_decode: wgpu::ComputePipeline,
     /// Tiled Q4_0 matmul (prefill, M>1): ported from llm-wasm's
     /// shader_q4_tiled.wgsl. Only faster than `linear_q4` once weight reuse
     /// across rows outweighs the tile/barrier overhead: see the shader's
@@ -260,6 +263,7 @@ impl Engine {
             linear_q8: make_pipeline(&device, "linear_q8", include_str!("shaders/linear_q8.wgsl")),
             linear_q8_decode: make_pipeline(&device, "linear_q8_decode", include_str!("shaders/linear_q8_decode.wgsl")),
             linear_q6k: make_pipeline(&device, "linear_q6k", include_str!("shaders/linear_q6k.wgsl")),
+            linear_q6k_decode: make_pipeline(&device, "linear_q6k_decode", include_str!("shaders/linear_q6k_decode.wgsl")),
             linear_q4_tiled: make_pipeline(&device, "linear_q4_tiled", include_str!("shaders/linear_q4_tiled.wgsl")),
             linear_q4_tiled_rb: make_pipeline(&device, "linear_q4_tiled_rb", include_str!("shaders/linear_q4_tiled_rb.wgsl")),
             linear_q8_tiled_rb: make_pipeline(&device, "linear_q8_tiled_rb", include_str!("shaders/linear_q8_tiled_rb.wgsl")),

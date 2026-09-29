@@ -1066,28 +1066,33 @@ fn linear(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &
             }
         }
         MatMulWeight::Q6_K { chunks, blocks_per_row, out_dim: n_total } => {
-            // Naive kernel only (see linear_q6k.wgsl's doc comment) - Q6_K
-            // is only ever token_embd/output.weight in this crate's models,
-            // one matmul per forward, not worth a fast-path yet.
+            // Q6_K is only ever token_embd/output.weight in this crate's
+            // models, one matmul per forward - but decode (rows == 1) still
+            // gets the coalesced matvec below (see linear_q6k_decode.wgsl's
+            // header): the naive kernel below stayed at 7.6% of peak
+            // bandwidth on the official Qwen2.5-3B GGUF's Q6_K lm head
+            // (docs/runs/2026-09-29-lean-vs-llamacpp-profile.md).
             for chunk in chunks {
                 let ckey = format!("{key}.{}", chunk.row_start);
                 let sckey = scratch_key(&ckey);
                 let dims = pool.uniform(&format!("{sckey}.dims"), LinearQDims { m: rows, k: in_dim, n: chunk.rows, act: 0, blocks_per_row: *blocks_per_row, n_offset: chunk.row_start, n_total: *n_total, _p2: 0 });
-                let bg = pool.bind_group(
-                    &ckey,
-                    &engine.linear_q6k,
-                    &[
-                        BindGroupEntry { binding: 0, resource: x.as_entire_binding() },
-                        BindGroupEntry { binding: 1, resource: chunk.ql.as_entire_binding() },
-                        BindGroupEntry { binding: 2, resource: chunk.qh.as_entire_binding() },
-                        BindGroupEntry { binding: 3, resource: chunk.scales.as_entire_binding() },
-                        BindGroupEntry { binding: 4, resource: chunk.d.as_entire_binding() },
-                        BindGroupEntry { binding: 5, resource: b.as_entire_binding() },
-                        BindGroupEntry { binding: 6, resource: out.as_entire_binding() },
-                        BindGroupEntry { binding: 7, resource: dims.as_entire_binding() },
-                    ],
-                );
-                engine.dispatch(pass, &engine.linear_q6k, &bg, (chunk.rows.div_ceil(16), rows.div_ceil(16), 1), &ckey);
+                let entries = [
+                    BindGroupEntry { binding: 0, resource: x.as_entire_binding() },
+                    BindGroupEntry { binding: 1, resource: chunk.ql.as_entire_binding() },
+                    BindGroupEntry { binding: 2, resource: chunk.qh.as_entire_binding() },
+                    BindGroupEntry { binding: 3, resource: chunk.scales.as_entire_binding() },
+                    BindGroupEntry { binding: 4, resource: chunk.d.as_entire_binding() },
+                    BindGroupEntry { binding: 5, resource: b.as_entire_binding() },
+                    BindGroupEntry { binding: 6, resource: out.as_entire_binding() },
+                    BindGroupEntry { binding: 7, resource: dims.as_entire_binding() },
+                ];
+                if fast && rows == 1 {
+                    let bg = pool.bind_group(&format!("{ckey}.decode"), &engine.linear_q6k_decode, &entries);
+                    engine.dispatch(pass, &engine.linear_q6k_decode, &bg, (chunk.rows.div_ceil(4), 1, 1), &ckey);
+                } else {
+                    let bg = pool.bind_group(&ckey, &engine.linear_q6k, &entries);
+                    engine.dispatch(pass, &engine.linear_q6k, &bg, (chunk.rows.div_ceil(16), rows.div_ceil(16), 1), &ckey);
+                }
             }
         }
         MatMulWeight::Q4_0 { chunks, blocks_per_row, out_dim: n_total } => {
