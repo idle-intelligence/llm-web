@@ -151,9 +151,13 @@ mod neon {
     /// dotted against `x`. `nibble_mask`/`shift` pick low (`0x0F`, 0) or
     /// high (`0xF0`... done via `vshrq_n_u8`, so mask is always applied
     /// after an optional shift) nibbles - see the call sites below.
+    // SAFETY: caller must guarantee `x.len() >= 16` - this function reads
+    // `x[0..16]` via four unchecked `vld1q_f32` loads (4 lanes each) with no
+    // bounds check of its own.
     #[inline]
     #[target_feature(enable = "neon")]
     unsafe fn dot16_signed(vals_u8: uint8x16_t, x: &[f32]) -> f32 {
+        debug_assert!(x.len() >= 16, "dot16_signed: x.len()={} < 16", x.len());
         // vals_u8 lanes are already in [0, 15] (nibble value); subtract 8 to
         // get the signed weight, same as `(nibble as f32) - 8.0` above.
         let signed = vsubq_s8(vreinterpretq_s8_u8(vals_u8), vdupq_n_s8(8));
@@ -178,8 +182,14 @@ mod neon {
         vaddvq_f32(acc)
     }
 
+    // SAFETY: caller must guarantee `block.len() >= 18` (2-byte f16 scale +
+    // 16 packed nibble bytes) and `x.len() >= 32`; `block[2..18]` is sliced
+    // (panics on a short block) but the `vld1q_u8` load itself trusts that
+    // slice's length, and `dot16_signed` below trusts `x`'s length.
     #[target_feature(enable = "neon")]
     unsafe fn dot_q4_0_block(block: &[u8], x: &[f32]) -> f32 {
+        debug_assert!(block.len() >= 18, "dot_q4_0_block: block.len()={} < 18", block.len());
+        debug_assert!(x.len() >= 32, "dot_q4_0_block: x.len()={} < 32", x.len());
         let raw = vld1q_u8(block[2..18].as_ptr());
         let lo = vandq_u8(raw, vdupq_n_u8(0x0F));
         let hi = vshrq_n_u8(raw, 4);
@@ -197,16 +207,24 @@ mod neon {
         acc
     }
 
+    // SAFETY: caller must guarantee `qs.len() >= 32` (this reads two
+    // unchecked 16-byte NEON loads at offsets 0 and 16) and `x.len() >= 32`
+    // (sliced into two 16-element halves passed to `dot16_signed_i8`).
     #[target_feature(enable = "neon")]
     unsafe fn dot_q8_0_block(qs: &[u8], x: &[f32]) -> f32 {
+        debug_assert!(qs.len() >= 32, "dot_q8_0_block: qs.len()={} < 32", qs.len());
+        debug_assert!(x.len() >= 32, "dot_q8_0_block: x.len()={} < 32", x.len());
         let a = vld1q_s8(qs.as_ptr() as *const i8);
         let b = vld1q_s8(qs.as_ptr().add(16) as *const i8);
         dot16_signed_i8(a, &x[0..16]) + dot16_signed_i8(b, &x[16..32])
     }
 
+    // SAFETY: caller must guarantee `x.len() >= 16`, same contract as
+    // `dot16_signed` above (four unchecked 4-lane `vld1q_f32` loads).
     #[inline]
     #[target_feature(enable = "neon")]
     unsafe fn dot16_signed_i8(vals: int8x16_t, x: &[f32]) -> f32 {
+        debug_assert!(x.len() >= 16, "dot16_signed_i8: x.len()={} < 16", x.len());
         let lo16 = vmovl_s8(vget_low_s8(vals));
         let hi16 = vmovl_s8(vget_high_s8(vals));
         let lo32a = vmovl_s16(vget_low_s16(lo16));
@@ -285,8 +303,11 @@ mod simd128 {
     /// `vals`' 16 lanes, already-signed i8 (Q8_0's raw bytes), converted to
     /// f32 and dotted against `x`. No offset applied - see
     /// `dot16_unsigned_nibbles` for the Q4_0 case, which needs one.
+    // SAFETY: caller must guarantee `x.len() >= 16` - this reads `x[0..16]`
+    // via four unchecked `v128_load`s (4 lanes each) with no bounds check.
     #[inline]
     unsafe fn dot16_signed_i8(vals: v128, x: &[f32]) -> f32 {
+        debug_assert!(x.len() >= 16, "dot16_signed_i8: x.len()={} < 16", x.len());
         let lo16 = i16x8_extend_low_i8x16(vals);
         let hi16 = i16x8_extend_high_i8x16(vals);
         let lo32a = i32x4_extend_low_i16x8(lo16);
@@ -317,12 +338,19 @@ mod simd128 {
     /// on a real wasm32+simd128 run under wasmtime - this file's dispatch
     /// wrapper looked identical for both dtypes in an earlier version and
     /// wasn't).
+    // SAFETY: delegates to `dot16_signed_i8`, same `x.len() >= 16` contract.
     #[inline]
     unsafe fn dot16_unsigned_nibbles(vals: v128, x: &[f32]) -> f32 {
+        debug_assert!(x.len() >= 16, "dot16_unsigned_nibbles: x.len()={} < 16", x.len());
         dot16_signed_i8(i8x16_sub(vals, i8x16_splat(8)), x)
     }
 
+    // SAFETY: `block.len() >= 18` (2-byte f16 scale + 16 packed nibble
+    // bytes; `block[2..18]` is sliced first and panics if too short, but the
+    // `v128_load` itself trusts the slice) and `x.len() >= 32`.
     fn dot_q4_0_block(block: &[u8], x: &[f32]) -> f32 {
+        debug_assert!(block.len() >= 18, "dot_q4_0_block: block.len()={} < 18", block.len());
+        debug_assert!(x.len() >= 32, "dot_q4_0_block: x.len()={} < 32", x.len());
         unsafe {
             let raw = v128_load(block[2..18].as_ptr() as *const v128);
             let lo = v128_and(raw, u8x16_splat(0x0F));
@@ -341,7 +369,11 @@ mod simd128 {
         acc
     }
 
+    // SAFETY: `qs.len() >= 32` (two unchecked 16-byte `v128_load`s at
+    // offsets 0 and 16) and `x.len() >= 32`.
     fn dot_q8_0_block(qs: &[u8], x: &[f32]) -> f32 {
+        debug_assert!(qs.len() >= 32, "dot_q8_0_block: qs.len()={} < 32", qs.len());
+        debug_assert!(x.len() >= 32, "dot_q8_0_block: x.len()={} < 32", x.len());
         unsafe {
             let a = v128_load(qs.as_ptr() as *const v128);
             let b = v128_load(qs.as_ptr().add(16) as *const v128);
