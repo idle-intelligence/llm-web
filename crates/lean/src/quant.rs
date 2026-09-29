@@ -100,8 +100,12 @@ fn split_q4_blocks(bytes: &[u8], n_elements: usize) -> (Vec<u32>, Vec<f32>) {
 /// `scales` as its own pair of buffers. General mechanism (not special-cased
 /// to any one tensor) - a weight that already fits in one binding gets
 /// exactly one chunk, identical to the pre-chunking layout.
-fn chunk_rows(engine: &Engine, label: &str, bytes: &[u8], out_dim: usize, blocks_per_row: usize, bytes_per_row: usize, is_q8: bool) -> Vec<QChunk> {
+fn chunk_rows(engine: &Engine, label: &str, bytes: &[u8], out_dim: usize, blocks_per_row: usize, bytes_per_row: usize, is_q8: bool) -> anyhow::Result<Vec<QChunk>> {
     let limit = engine.max_storage_buffer_binding_size() as usize;
+    anyhow::ensure!(
+        bytes_per_row <= limit,
+        "{label}: one row ({bytes_per_row} bytes) exceeds this device's max_storage_buffer_binding_size ({limit} bytes); this weight cannot be chunked to fit"
+    );
     let rows_per_chunk = (limit / bytes_per_row).clamp(1, out_dim);
     let mut chunks = Vec::with_capacity(out_dim.div_ceil(rows_per_chunk));
     let mut row_start = 0usize;
@@ -123,7 +127,7 @@ fn chunk_rows(engine: &Engine, label: &str, bytes: &[u8], out_dim: usize, blocks
         });
         row_start += rows;
     }
-    chunks
+    Ok(chunks)
 }
 
 /// Splits a Q6_K block stream into GPU-friendly `u32`-packed arrays: `ql`
@@ -161,8 +165,12 @@ fn split_q6k_blocks(bytes: &[u8], n_elements: usize) -> (Vec<u32>, Vec<u32>, Vec
 /// Q6_K counterpart of `chunk_rows`: same row-aligned chunking under the
 /// device's `max_storage_buffer_binding_size`, but uploads the four
 /// `split_q6k_blocks` arrays per chunk instead of one `qs`/`scales` pair.
-fn chunk_rows_q6k(engine: &Engine, label: &str, bytes: &[u8], out_dim: usize, blocks_per_row: usize, bytes_per_row: usize) -> Vec<QChunk6K> {
+fn chunk_rows_q6k(engine: &Engine, label: &str, bytes: &[u8], out_dim: usize, blocks_per_row: usize, bytes_per_row: usize) -> anyhow::Result<Vec<QChunk6K>> {
     let limit = engine.max_storage_buffer_binding_size() as usize;
+    anyhow::ensure!(
+        bytes_per_row <= limit,
+        "{label}: one row ({bytes_per_row} bytes) exceeds this device's max_storage_buffer_binding_size ({limit} bytes); this weight cannot be chunked to fit"
+    );
     let rows_per_chunk = (limit / bytes_per_row).clamp(1, out_dim);
     let mut chunks = Vec::with_capacity(out_dim.div_ceil(rows_per_chunk));
     let mut row_start = 0usize;
@@ -182,7 +190,7 @@ fn chunk_rows_q6k(engine: &Engine, label: &str, bytes: &[u8], out_dim: usize, bl
         });
         row_start += rows;
     }
-    chunks
+    Ok(chunks)
 }
 
 /// Loads one matmul weight (`shape = [out_dim, in_dim]`, GGUF/PyTorch
@@ -193,24 +201,24 @@ fn chunk_rows_q6k(engine: &Engine, label: &str, bytes: &[u8], out_dim: usize, bl
 /// weights are split into row chunks by `chunk_rows` when they'd otherwise
 /// exceed the device's single-binding size limit (see that fn's doc
 /// comment); `linear()` in `model.rs` dispatches once per chunk.
-pub fn load_matmul_weight_gguf(engine: &Engine, label: &str, shape: &[usize], dtype: GgmlDtype, bytes: &[u8]) -> MatMulWeight {
+pub fn load_matmul_weight_gguf(engine: &Engine, label: &str, shape: &[usize], dtype: GgmlDtype, bytes: &[u8]) -> anyhow::Result<MatMulWeight> {
     let out_dim = shape[0];
     let in_dim = shape[1];
     let n_elements: usize = shape.iter().product();
-    match dtype {
+    Ok(match dtype {
         GgmlDtype::Q8_0 => {
             let blocks_per_row = in_dim / QK;
-            let chunks = chunk_rows(engine, label, bytes, out_dim, blocks_per_row, blocks_per_row * 34, true);
+            let chunks = chunk_rows(engine, label, bytes, out_dim, blocks_per_row, blocks_per_row * 34, true)?;
             MatMulWeight::Q8_0 { chunks, blocks_per_row: blocks_per_row as u32, out_dim: out_dim as u32 }
         }
         GgmlDtype::Q4_0 => {
             let blocks_per_row = in_dim / QK;
-            let chunks = chunk_rows(engine, label, bytes, out_dim, blocks_per_row, blocks_per_row * 18, false);
+            let chunks = chunk_rows(engine, label, bytes, out_dim, blocks_per_row, blocks_per_row * 18, false)?;
             MatMulWeight::Q4_0 { chunks, blocks_per_row: blocks_per_row as u32, out_dim: out_dim as u32 }
         }
         GgmlDtype::Q6_K => {
             let blocks_per_row = in_dim / QK6K;
-            let chunks = chunk_rows_q6k(engine, label, bytes, out_dim, blocks_per_row, blocks_per_row * Q6K_BLOCK_BYTES);
+            let chunks = chunk_rows_q6k(engine, label, bytes, out_dim, blocks_per_row, blocks_per_row * Q6K_BLOCK_BYTES)?;
             MatMulWeight::Q6_K { chunks, blocks_per_row: blocks_per_row as u32, out_dim: out_dim as u32 }
         }
         // Q4_1 is dequantized host-side straight to F32 rather than given
@@ -222,7 +230,7 @@ pub fn load_matmul_weight_gguf(engine: &Engine, label: &str, shape: &[usize], dt
             let data = crate::gguf::dequantize_for(dtype, bytes, n_elements);
             MatMulWeight::F32 { w: engine.buf_f32(&data, label) }
         }
-    }
+    })
 }
 
 /// Q4_0/Q8_0-resident buffers for the embedding-gather kernel

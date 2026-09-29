@@ -586,7 +586,7 @@ fn gguf_matmul<R: std::io::Read + std::io::Seek>(engine: &Engine, reader: &mut G
     let info = reader.tensor_info(name).with_context(|| format!("missing tensor {name}"))?.clone();
     let shape = info.shape();
     let bytes = reader.tensor_data(name)?;
-    Ok(load_matmul_weight_gguf(engine, name, &shape, info.dtype(), &bytes))
+    load_matmul_weight_gguf(engine, name, &shape, info.dtype(), &bytes)
 }
 
 /// Step 3 of this session's brief (QKV/gate-up fusion): loads two
@@ -612,7 +612,7 @@ fn gguf_matmul_concat2<R: std::io::Read + std::io::Seek>(engine: &Engine, reader
     let mut bytes = reader.tensor_data(name_a)?;
     bytes.extend_from_slice(&reader.tensor_data(name_b)?);
     let shape = vec![shape_a[0] + shape_b[0], shape_a[1]];
-    Ok(load_matmul_weight_gguf(engine, label, &shape, info_a.dtype(), &bytes))
+    load_matmul_weight_gguf(engine, label, &shape, info_a.dtype(), &bytes)
 }
 
 /// Inverse of llama.cpp `convert_hf_to_gguf.py`'s `LlamaModel.permute()`,
@@ -677,7 +677,7 @@ fn gguf_matmul_qkv_fused<R: std::io::Read + std::io::Seek>(engine: &Engine, read
     bytes.extend_from_slice(&bytes_k);
     bytes.extend_from_slice(&bytes_v);
     let shape = vec![shape_q[0] + shape_k[0] + shape_v[0], shape_q[1]];
-    Ok(Some(load_matmul_weight_gguf(engine, &format!("{p}.attn_qkv_fused.weight"), &shape, info_q.dtype(), &bytes)))
+    Ok(Some(load_matmul_weight_gguf(engine, &format!("{p}.attn_qkv_fused.weight"), &shape, info_q.dtype(), &bytes)?))
 }
 
 /// Like [`gguf_matmul`], but un-permutes RoPE row order first when
@@ -690,7 +690,7 @@ fn gguf_matmul_qk<R: std::io::Read + std::io::Seek>(engine: &Engine, reader: &mu
     let shape = info.shape();
     let bytes = reader.tensor_data(name)?;
     let bytes = if config.architecture == Architecture::Llama { unpermute_rope_rows(&bytes, n_heads, config.head_dim, shape[0]) } else { bytes };
-    Ok(load_matmul_weight_gguf(engine, name, &shape, info.dtype(), &bytes))
+    load_matmul_weight_gguf(engine, name, &shape, info.dtype(), &bytes)
 }
 
 impl GpuModel {
@@ -727,7 +727,7 @@ impl GpuModel {
         // embedding-gather table below so both share `embed_bytes` while
         // it's still resident, then it's dropped once, not read twice from
         // disk.
-        let tied_lm_head = config.tied_embeddings.then(|| load_matmul_weight_gguf(engine, "token_embd(lm_head)", &embed_shape, embed_dtype, &embed_bytes));
+        let tied_lm_head = config.tied_embeddings.then(|| load_matmul_weight_gguf(engine, "token_embd(lm_head)", &embed_shape, embed_dtype, &embed_bytes)).transpose()?;
         let embed = load_embedding_table_gguf(engine, "token_embd", &embed_shape, embed_dtype, &embed_bytes);
         drop(embed_bytes);
 
