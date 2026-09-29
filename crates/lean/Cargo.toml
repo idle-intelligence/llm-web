@@ -10,8 +10,16 @@ crate-type = ["cdylib", "rlib"]
 # Raw wgpu + hand-written WGSL only. No Burn, no CubeCL, no training - see
 # ~/.claude/projects/-Users-tc-Code/memory/project_lean_engine_direction.md.
 [features]
-default = []
+default = ["native-bin"]
 wasm = ["wgpu/webgpu"]
+# Native CLI binaries (lean-cli, lean-bench-usecases): pulls in pollster/clap,
+# which are not wasm32-safe. Gated behind a feature (rather than a bare
+# target cfg) and required-features on the [[bin]] entries below, so
+# `cargo build --target wasm32-unknown-unknown --no-default-features
+# --features web` skips the bins outright instead of failing to compile
+# them for wasm32. Included in `default` so a plain native `cargo build`/
+# `cargo clippy --all-targets` still builds both binaries.
+native-bin = ["dep:pollster", "dep:clap"]
 # Minimal wasm-bindgen surface (src/web.rs): load GGUF + tokenizer bytes from
 # JS, generate greedily. Same tokenizers feature pattern as
 # crates/llm-wasm/Cargo.toml's `web` feature (onig/esaxx_fast are not
@@ -51,8 +59,8 @@ getrandom = { workspace = true, optional = true }
 minijinja-contrib = { version = "2.24.0", features = ["pycompat"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-pollster = "0.3"
-clap = { workspace = true }
+pollster = { version = "0.3", optional = true }
+clap = { workspace = true, optional = true }
 # native-only: tokenizers/fancy-regex only, onig/esaxx_fast are not
 # wasm32-safe - see the wasm32 target block below for the browser build.
 tokenizers = { workspace = true, features = ["fancy-regex"] }
@@ -63,7 +71,9 @@ tokenizers = { workspace = true, features = ["unstable_wasm", "fancy-regex"] }
 [[bin]]
 name = "lean-cli"
 path = "src/bin/lean_cli.rs"
+required-features = ["native-bin"]
 
 [[bin]]
 name = "lean-bench-usecases"
 path = "src/bin/lean_bench_usecases.rs"
+required-features = ["native-bin"]
