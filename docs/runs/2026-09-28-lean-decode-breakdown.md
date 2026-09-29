@@ -930,3 +930,111 @@ cases). `wasm-pack build --target web` succeeds; `www/index.html?local=1`
 reports `allMatch: true` against the freshly built and served
 `pkg/lean_bg.wasm`. No code changes were made this session - only
 `ENGINE_BUILD` bumps (crates/lean/www/*.js) and this doc section.
+
+## Session 7: lean-kernels merge, Mac + browser side (2026-09-29)
+
+`lean-kernels` (Q6_K decode matvec, fused add+rmsnorm, decode-shaped F32
+matvec - `docs/runs/2026-09-29-lean-kernels.md`) was gated and timed only on
+the Linux/RTX 3080/Vulkan box. This session covers the Mac (Metal via wgpu)
+and the browser (headless Chromium/WebGPU), on the merge commit (branch
+`lean-perf`, base `lean-kernels` merged in). Same method as Session 6:
+quiet-machine gate before every timed run (1-minute load average < 3, no
+`rustc`/`cargo`/training process above 40% CPU, confirmed via `uptime`/
+process listing each time), both a build lock and a GPU lock held for the
+duration of every native gate/timing run.
+
+**Native gates** (release build, `--ignored --test-threads=1`, GPU-locked):
+all 8 pass - `fixture_parity`, `fixture_parity_qwen25_3b`,
+`fixture_parity_qwen3`, `fixture_parity_qwen3_1_7b`,
+`fixture_parity_llama_360m`, `fixture_parity_llama_1_7b`, `kv_snapshot`
+(both cases), `logit_mask` (all 3 cases). `top1_match=true` throughout.
+
+**Wasm build**: `wasm-pack build crates/lean --target web --out-dir pkg
+--no-default-features --features web` succeeded. `ENGINE_BUILD` bumped in
+every `crates/lean/www/*.js` loading URL this session (wgpu-build pages to
+`2026-09-29-07`, CPU-rung pages to `cpu-06`/`cpu-qwen3-06` for hygiene,
+unaffected by this merge). Served `pkg/lean_bg.wasm` bytes hashed (sha256
+`752bc7db9f522bc292f829625572534879b1ace8110262519d27f2c4748b111b`) and
+confirmed to match the freshly built file before every browser run in this
+session (checked twice, before the index check and again before the decode-
+timing sweep).
+
+**`www/index.html?local=1`**, headless Chromium (`--enable-unsafe-webgpu
+--enable-features=Vulkan,WebGPU --use-angle=metal`, Playwright's bundled
+browser only): `allMatch: true`, all 6 fixture-checked cases token-match,
+KV snapshot/restore byte- and token-match (speedup 124.1x), logit mask
+forces the exact target string, zero page errors.
+
+### Native decode ms/tok, Mac (Metal via wgpu), median of 5
+
+| model | case | before (Session 6, rmsnorm-fix only) | after (this session) | min-max (after) |
+|---|---|---:|---:|---|
+| Qwen2.5-0.5B-Instruct | short | 15.18 | 13.96 | 12.45-16.61 |
+| Qwen2.5-0.5B-Instruct | long_tools_single | 24.79 | 23.07 | 21.48-26.24 |
+| Qwen2.5-3B-Instruct (official GGUF) | short | 101.74 | 60.16 | 56.90-63.61 |
+| Qwen2.5-3B-Instruct (official GGUF) | long | 93.76 | 58.64 | 57.47-63.07 |
+| Qwen3-1.7B (Q8_0) | short | 40.81 | 38.54 | 33.69-40.24 |
+| Qwen3-1.7B (Q8_0) | long_tools_single | 66.11 | 62.32 | 61.33-67.61 |
+| SmolLM2-360M-Instruct (Q4_0) | short | 16.52 | 13.39 | 13.30-17.52 |
+| SmolLM2-360M-Instruct (Q4_0) | long | 16.77 | 14.52 | 14.43-14.92 |
+
+`top1_match=true` on every case/run in every sweep (20 runs); `tok_match=false`
+at `--tokens 16` is expected, same convention as every prior session. The
+Qwen2.5-3B improvement (101.74 -> 60.16ms/tok short, 1.69x) tracks the
+Q6_K decode matvec directly - this is the only model in the fixture set
+with a Q6_K tensor (`output.weight`), matching the 3080's own 1.24-1.28x
+finding in `docs/runs/2026-09-29-lean-kernels.md` at a larger absolute
+margin (different GPU, both real).
+
+### Browser decode timing (`decode_timing.html`), 3 fresh loads per case
+
+| model | case | before cold (3 loads) | after cold (3 loads) | before warm median | after warm median |
+|---|---|---|---|---|---|
+| Qwen2.5-0.5B-Instruct | short | 14.6, 14.6, 14.4 | 13.8, 13.5, 13.6 | 11.1, 11.2, 11.2 | 11.0, 11.0, 11.0 |
+| Qwen2.5-0.5B-Instruct | long (long_tools_single) | 22.9, 22.6, 22.8 | 22.1, 22.6, 22.2 | 18.5, 18.6, 18.5 | 18.4, 18.4, 18.4 |
+| SmolLM2-360M-Instruct (cross-tokenizer fixture) | short | 15.0, 15.1, 15.3 | 13.7, 13.4, 13.2 | 11.6, 11.5, 11.6 | 10.2, 10.3, 10.3 |
+| SmolLM2-360M-Instruct (cross-tokenizer fixture) | long | 27.4, 27.6, 34.8 | 25.9, 25.6, 25.6 | 23.2, 23.2, 23.3 | 22.8, 22.0, 22.0 |
+| Qwen3-1.7B (Q8_0) | short | 38.9, 47.6, 40.1 | 36.6, 35.3, 36.0 | 28.0, 28.1, 28.0 | 28.6, 28.9, 27.8 |
+| Qwen3-1.7B (Q8_0) | long | 92.2, 76.4, 80.0 | 53.8, 67.1, 91.4 | 88.6, 70.6, 68.9 | 45.8, 57.7, 88.4 |
+
+Engine build confirmed as `2026-09-29-07` in every one of the 18 page
+loads' own console log line. Qwen3-1.7B's `long` cell stays the noisiest
+cell measured on this Mac both before and after (Session 6 already flagged
+it as noisy) - the third of three after-runs (91.4/88.4) sits close to the
+before numbers while the first two (53.8/45.8, 67.1/57.7) are clearly
+faster, consistent with the add+rmsnorm fusion and (for the two smaller
+models) the same fusion's effect rather than the Q6_K kernel (neither
+Qwen2.5-0.5B nor Qwen3-1.7B has a Q6_K tensor).
+
+### Qwen2.5-3B, memory-guarded (`scripts/run_mem_profile.py --limit-gb 8`)
+
+One browser at a time, `case=short`, promptLen 36. First attempt this
+session hit the guard: peak Chromium process-tree RSS crossed 8.19GB before
+`window.__leanResult` was set, and `run_mem_profile.py` killed its own
+browser per its designed behavior - no result captured from that attempt.
+A second, otherwise identical run stayed under the guard:
+
+| metric | before (Session 6) | after (this session, 2nd attempt) |
+|---|---:|---:|
+| load ms | 1312 | 1206 |
+| prefill ms | 2427.5 | 2483.5 |
+| decode cold ms | 123.6 | 63.6 |
+| decode warm median ms (16 steps) | 120.1 | 53.6 |
+| peak Chromium process-tree RSS | 7.524GB | 7.453GB |
+
+Decode roughly halves (123.6 -> 63.6ms cold, 120.1 -> 53.6ms warm median),
+consistent with the Q6_K decode kernel - Qwen2.5-3B's `output.weight` is
+Q6_K, same tensor the native table's 1.69x improvement traces to. The first
+attempt's 8.19GB spike versus the second attempt's 7.453GB peak, both on an
+otherwise-idle Mac, reads as page-load/GC-timing variance around the same
+~7.5-8GB footprint rather than a reproducible regression - flagged, not
+resolved, since only one guarded run per attempt was taken.
+
+### Gate/build summary
+
+All 8 required native gates pass on the Mac this session. `wasm-pack build
+--target web` succeeds; `www/index.html?local=1` reports `allMatch: true`
+against the freshly built and served `pkg/lean_bg.wasm` (hash-verified).
+No source changes were made this session beyond the `ENGINE_BUILD` bumps
+(`crates/lean/www/*.js`) and this doc section - the kernel changes
+themselves were already merged into this branch before this session began.
