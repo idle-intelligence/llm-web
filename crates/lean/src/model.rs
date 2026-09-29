@@ -995,18 +995,24 @@ fn linear(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &
     match w {
         MatMulWeight::F32 { w } => {
             let dims = pool.uniform(&format!("{skey}.dims"), LinearDims { m: rows, k: in_dim, n: out_dim, act: 0 });
-            let bg = pool.bind_group(
-                key,
-                &engine.linear,
-                &[
-                    BindGroupEntry { binding: 0, resource: x.as_entire_binding() },
-                    BindGroupEntry { binding: 1, resource: w.as_entire_binding() },
-                    BindGroupEntry { binding: 2, resource: b.as_entire_binding() },
-                    BindGroupEntry { binding: 3, resource: out.as_entire_binding() },
-                    BindGroupEntry { binding: 4, resource: dims.as_entire_binding() },
-                ],
-            );
-            engine.dispatch(pass, &engine.linear, &bg, wgs, key);
+            let entries = [
+                BindGroupEntry { binding: 0, resource: x.as_entire_binding() },
+                BindGroupEntry { binding: 1, resource: w.as_entire_binding() },
+                BindGroupEntry { binding: 2, resource: b.as_entire_binding() },
+                BindGroupEntry { binding: 3, resource: out.as_entire_binding() },
+                BindGroupEntry { binding: 4, resource: dims.as_entire_binding() },
+            ];
+            if fast && rows == 1 {
+                // Decode: coalesced matvec (see linear_f32_decode.wgsl's
+                // header) - some GGUFs keep a handful of tensors at F32
+                // residency even in an otherwise-quantized file, which
+                // previously hit the naive per-output-element kernel below.
+                let bg = pool.bind_group(&format!("{key}.decode"), &engine.linear_f32_decode, &entries);
+                engine.dispatch(pass, &engine.linear_f32_decode, &bg, (out_dim.div_ceil(4), 1, 1), key);
+            } else {
+                let bg = pool.bind_group(key, &engine.linear, &entries);
+                engine.dispatch(pass, &engine.linear, &bg, wgs, key);
+            }
         }
         MatMulWeight::Q8_0 { chunks, blocks_per_row, out_dim: n_total } => {
             // Q8_0-resident weights appear on every tensor for Qwen3's

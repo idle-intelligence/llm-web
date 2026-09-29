@@ -81,6 +81,12 @@ pub struct Engine {
     pub rmsnorm: wgpu::ComputePipeline,
     pub rope: wgpu::ComputePipeline,
     pub linear: wgpu::ComputePipeline,
+    /// Coalesced F32 matvec (decode, M=1): same 128-thread,
+    /// rows-per-workgroup structure as `linear_q4_decode`/`linear_q8_decode`,
+    /// adapted to a plain (undequantized) f32 weight row - see
+    /// `shaders/linear_f32_decode.wgsl`'s header for why a F32-resident
+    /// tensor shows up at all in an otherwise-quantized GGUF.
+    pub linear_f32_decode: wgpu::ComputePipeline,
     pub linear_q4: wgpu::ComputePipeline,
     pub linear_q8: wgpu::ComputePipeline,
     /// Coalesced Q8_0 matvec (decode, M=1): same structure as
@@ -265,6 +271,7 @@ impl Engine {
             rmsnorm: make_pipeline(&device, "rmsnorm", include_str!("shaders/rmsnorm.wgsl")),
             rope: make_pipeline(&device, "rope", include_str!("shaders/rope_neox.wgsl")),
             linear: make_pipeline(&device, "linear", include_str!("shaders/linear.wgsl")),
+            linear_f32_decode: make_pipeline(&device, "linear_f32_decode", include_str!("shaders/linear_f32_decode.wgsl")),
             linear_q4: make_pipeline(&device, "linear_q4", include_str!("shaders/linear_q4.wgsl")),
             linear_q8: make_pipeline(&device, "linear_q8", include_str!("shaders/linear_q8.wgsl")),
             linear_q8_decode: make_pipeline(&device, "linear_q8_decode", include_str!("shaders/linear_q8_decode.wgsl")),
