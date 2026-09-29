@@ -20,9 +20,10 @@
 use anyhow::{Context, Result};
 use std::io::{Read, Seek};
 
-use crate::config::{config_from_gguf, Qwen2Config};
+use crate::config::{config_from_gguf, Architecture, Qwen2Config};
 use crate::cpu_kernels::{dot_q4_0, dot_q6_k, dot_q8_0};
 use crate::gguf::{dequantize_for, GgmlDtype, GgufReader};
+use crate::model::unpermute_rope_rows;
 
 /// A CPU-resident matmul weight (`shape = [out_dim, in_dim]`), holding the
 /// GGUF's on-disk bytes for Q4_0/Q8_0 unchanged (row-major, block-contiguous,
@@ -267,18 +268,41 @@ fn gguf_f32_vec<R: Read + Seek>(reader: &mut GgufReader<R>, name: &str) -> Resul
     Ok(dequantize_for(info.dtype(), &bytes, n))
 }
 
-fn gguf_weight<R: Read + Seek>(reader: &mut GgufReader<R>, name: &str) -> Result<CpuWeight> {
-    let info = reader.tensor_info(name).with_context(|| format!("missing tensor {name}"))?.clone();
-    let shape = info.shape();
-    let out_dim = shape[0];
-    let in_dim = shape[1];
-    let bytes = reader.tensor_data(name)?;
-    Ok(match info.dtype() {
+fn weight_from_bytes(bytes: Vec<u8>, dtype: GgmlDtype, out_dim: usize, in_dim: usize) -> CpuWeight {
+    match dtype {
         GgmlDtype::Q4_0 => CpuWeight::Q4_0 { bytes, out_dim, in_dim, blocks_per_row: in_dim / 32 },
         GgmlDtype::Q8_0 => CpuWeight::Q8_0 { bytes, out_dim, in_dim, blocks_per_row: in_dim / 32 },
         GgmlDtype::Q6_K => CpuWeight::Q6_K { bytes, out_dim, in_dim, blocks_per_row: in_dim / 256 },
         other => CpuWeight::F32 { data: dequantize_for(other, &bytes, out_dim * in_dim), out_dim, in_dim },
-    })
+    }
+}
+
+fn gguf_weight<R: Read + Seek>(reader: &mut GgufReader<R>, name: &str) -> Result<CpuWeight> {
+    let info = reader.tensor_info(name).with_context(|| format!("missing tensor {name}"))?.clone();
+    let shape = info.shape();
+    let (out_dim, in_dim) = (shape[0], shape[1]);
+    let bytes = reader.tensor_data(name)?;
+    Ok(weight_from_bytes(bytes, info.dtype(), out_dim, in_dim))
+}
+
+/// Like [`gguf_weight`], but un-permutes RoPE row order first when
+/// `config.architecture == Architecture::Llama` - the CPU mirror of
+/// `model.rs::gguf_matmul_qk`. Without this, a Llama-family GGUF's
+/// `attn_q.weight`/`attn_k.weight` rows are in llama.cpp's permuted order
+/// (interleaved-pairs-derived), which this crate's split-half `rope_inplace`
+/// does not expect - the GPU path already un-permutes these two tensors
+/// (`model.rs::gguf_matmul_qk`); the CPU rung must apply the exact same
+/// reordering or the two rungs diverge on any Llama-architecture model
+/// (observed on SmolLM2-360M-Instruct, not on Qwen2/Qwen3, which never take
+/// this branch). `n_heads` is the tensor's own head count: `config.num_heads`
+/// for `attn_q.weight`, `config.num_kv_heads` for `attn_k.weight`.
+fn gguf_weight_qk<R: Read + Seek>(reader: &mut GgufReader<R>, name: &str, config: &Qwen2Config, n_heads: usize) -> Result<CpuWeight> {
+    let info = reader.tensor_info(name).with_context(|| format!("missing tensor {name}"))?.clone();
+    let shape = info.shape();
+    let (out_dim, in_dim) = (shape[0], shape[1]);
+    let bytes = reader.tensor_data(name)?;
+    let bytes = if config.architecture == Architecture::Llama { unpermute_rope_rows(&bytes, n_heads, config.head_dim, out_dim) } else { bytes };
+    Ok(weight_from_bytes(bytes, info.dtype(), out_dim, in_dim))
 }
 
 impl CpuModel {
@@ -338,9 +362,9 @@ impl CpuModel {
             };
             layers.push(CpuLayer {
                 attn_norm: gguf_f32_vec(&mut reader, &format!("{p}.attn_norm.weight"))?,
-                q_w: gguf_weight(&mut reader, &format!("{p}.attn_q.weight"))?,
+                q_w: gguf_weight_qk(&mut reader, &format!("{p}.attn_q.weight"), &config, config.num_heads)?,
                 q_b,
-                k_w: gguf_weight(&mut reader, &format!("{p}.attn_k.weight"))?,
+                k_w: gguf_weight_qk(&mut reader, &format!("{p}.attn_k.weight"), &config, config.num_kv_heads)?,
                 k_b,
                 v_w: gguf_weight(&mut reader, &format!("{p}.attn_v.weight"))?,
                 v_b,

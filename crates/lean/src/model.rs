@@ -624,7 +624,13 @@ fn gguf_matmul_concat2<R: std::io::Read + std::io::Seek>(engine: &Engine, reader
 /// to `attn_q.weight` (`n_heads = config.num_heads`) and `attn_k.weight`
 /// (`n_heads = config.num_kv_heads`) for `Architecture::Llama`; a no-op for
 /// Qwen2/Qwen3, which are never passed through this function.
-fn unpermute_rope_rows(bytes: &[u8], n_heads: usize, head_dim: usize, out_dim: usize) -> Vec<u8> {
+///
+/// `pub(crate)` so `cpu.rs`'s CPU rung can apply the exact same row
+/// reordering to `attn_q.weight`/`attn_k.weight` before building its
+/// `CpuWeight` - the GPU and CPU paths must agree on RoPE row order for a
+/// Llama-architecture GGUF, or the two rungs diverge (see
+/// `cpu.rs::gguf_weight_qk`).
+pub(crate) fn unpermute_rope_rows(bytes: &[u8], n_heads: usize, head_dim: usize, out_dim: usize) -> Vec<u8> {
     assert_eq!(bytes.len() % out_dim, 0, "unpermute_rope_rows: bytes.len() not a multiple of out_dim");
     assert_eq!(n_heads * head_dim, out_dim, "unpermute_rope_rows: n_heads * head_dim != out_dim");
     let bytes_per_row = bytes.len() / out_dim;
