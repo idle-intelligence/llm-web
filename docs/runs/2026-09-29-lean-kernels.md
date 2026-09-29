@@ -448,3 +448,161 @@ Down from the task's starting point of 5.17x/14.78x (3.11x/3.53x gap to
 llama.cpp) via changes 4 and 6 above (change 5 and 7 reverted, no effect).
 Combined across all of this branch's sessions, the gap has closed from the
 original ~10-12x to ~2.9-3.3x.
+
+## 8. Session 3
+
+Same branch (`lean-kernels`), continuing from commit `000f33b` (this doc's
+own section 1-7 state). Same box (RTX 3080/Vulkan), same gates, same
+ABAB/median-of-5 (8 reps for any model/case with noticeable spread)
+methodology. Target: decode attention at long context, per the task's own
+"redundant-KV-read" and "head_dim-conditioned SPLIT_CHUNK" leads from
+session 2's Observations and Change 7.
+
+### Change 8 (attempted, reverted): GQA head-group fusion in decode attention
+
+The premise from session 2: in both `attn_decode.wgsl` (single-workgroup
+path) and `attn_decode_split.wgsl` (split-K path), each of the `n_rep`
+query heads sharing a `kv_head` (`n_rep`=7 on Qwen2.5-0.5B, up to 8 on this
+project's other GQA models) ran in its own workgroup and independently
+re-read the same `kv_head`'s K/V range from global memory - `n_rep`-fold
+redundant K/V traffic. Rewrote both shaders so one workgroup processes a
+`kv_head`'s whole query-head group at once: Q for all `n_rep` heads loaded
+into shared memory once, each thread's K row read from global memory
+exactly once per tile and fanned out to all `n_rep` heads' dot products via
+a small per-rep register array, each V element read once per (thread,
+tile-key) and fanned out to all `n_rep` accumulators. Per-head online-softmax
+state (`m`/`l`/`acc`, each `array<f32, MAX_N_REP=8>`) and the tree-reduction
+shape were otherwise unchanged, just looped once per head per tile instead
+of once per (head, workgroup). Workgroup memory: `q_shared`/`tile_scores`
+(`array<f32, 1024>` each, `MAX_N_REP=8 * HEAD_DIM_STRIDE=128`) plus
+`reduce_buf` (`array<f32, 256>`) = 9216B, under the 16KB default limit.
+Dispatch changed from `(n_heads, 1, 1)` / `(n_heads, num_splits, 1)` to
+`(n_kv_heads, 1, 1)` / `(n_kv_heads, num_splits, 1)`. `attn_decode_reduce.wgsl`
+(pass 2, already per-query-head) needed no change.
+
+**Gates**: all 8 pass, `top1_match=true` on every case (including
+`long_tools_single`/`long_tools_multiturn`, which exercise the split-K
+path).
+
+**Timing** (ABAB, median of 5, all 4 models, every fixture case including
+long-context ones where available):
+
+| model | case | before (unfused) | after (fused) | delta |
+|---|---|---:|---:|---|
+| Qwen2.5-0.5B | short | ~4.7 ms/tok | ~6.4 ms/tok | -36% |
+| Qwen2.5-0.5B | long (kv_len=86) | ~5.4 ms/tok | ~8.8 ms/tok | -63% |
+| Qwen2.5-0.5B | long_tools_single (kv_len=2225) | ~6.7 ms/tok | ~9.4 ms/tok | -40% |
+| Qwen2.5-3B | short/long | ~13.0-14.2 ms/tok | ~16.0-18.3 ms/tok | -25% to -30% |
+| Qwen3-1.7B | short/long/long_tools_single | ~8.6-11.6 ms/tok | ~9.3-12.8 ms/tok | -8% to -15% |
+| SmolLM2-360M | short/long | ~5.2-7.2 ms/tok | ~6.2-9.0 ms/tok | -15% to -25% |
+
+**Reverted** - every case on every model regressed; no case cleared the
+>3% gain bar. Root cause: collapsing `n_heads` (or `n_heads * num_splits`
+on the split path) workgroups down to `n_kv_heads` (or `n_kv_heads *
+num_splits`) cuts workgroup count by exactly `n_rep` (up to 8x) while
+making each surviving workgroup do `n_rep`x more serial work (the per-rep
+softmax reduction loop). This project's decode attention already dispatches
+few workgroups (14-16 query heads, or 2-8 KV heads) against a 68-SM GPU -
+it is occupancy-bound, not K/V-bandwidth-bound, at these problem sizes.
+Cutting workgroup count by up to 8x costs far more in occupancy than the
+saved K/V reads are worth, even at `kv_len=2225` where bandwidth would be
+expected to matter more. Confirmed uniform across every model, case, and
+both attention paths - a clean revert per the task's stop-rule. Not
+committed; `attn_decode.wgsl`, `attn_decode_split.wgsl`, and `model.rs`'s
+two `attn_decode` dispatch calls restored to be byte-identical to commit
+`000f33b`.
+
+### Change 9 (kept): head_dim-conditioned `SPLIT_CHUNK`
+
+The cheaper fallback from session 2's Change 7: a single global
+`SPLIT_CHUNK=128` is not a best fit for every `head_dim` this project
+compiles. Session 2 found `SPLIT_CHUNK=64` (applied uniformly) was a real
+win on `head_dim=64` models but regressed `head_dim=128` (Qwen3-1.7B, at
+the newly-crossed `kv_len=65` threshold: `attn_decode_split_128`'s wider
+`workgroup_size(128)` kernel doesn't amortize launch/reduce overhead at the
+resulting 33-key chunks). Conditioning the constant on `head_dim` - still a
+static model-architecture fact known at dispatch time, never a timing
+measurement - should capture the `head_dim=64` win without moving the
+`head_dim=128` threshold at all.
+
+`crates/lean/src/model.rs`: replaced the `SPLIT_CHUNK` constant with
+`fn split_chunk(head_dim: u32) -> u32 { if head_dim <= 64 { 64 } else { 128 } }`,
+threaded through `decode_split_plan(kv_len, head_dim)` (added the `head_dim`
+parameter) and its one call site in `attn_decode`. For `head_dim=128`
+models this is bit-for-bit identical to the old global constant (`128`
+either way), so no behavior change is possible there by construction - the
+"no loss elsewhere" risk from session 2's uniform attempt is closed by
+design, not just by measurement.
+
+**Gates**: all 8 pass, `top1_match=true` on every case.
+
+**Parity at long context**: a synthetic 5630-token prompt (repeated
+sentence, well past the task's 4096-token target and past `MAX_SPLITS`'s
+own saturation point for both old and new `SPLIT_CHUNK` values) run on
+Qwen2.5-0.5B against both the pre-session baseline and this change:
+identical greedy continuation text (`"The quick brown fox jumps over the
+lazy"`) and decode time within noise (9.32 vs 9.29 ms/tok) - expected,
+since at this length `num_splits` saturates at `MAX_SPLITS=32` for both old
+and new `SPLIT_CHUNK` (`kv_len / 64` and `kv_len / 128` both far exceed 32),
+so the two configurations converge to identical dispatch parameters well
+before 5630 tokens.
+
+**Timing** (ABAB, median of 8 for Qwen2.5-0.5B/Qwen3-1.7B/SmolLM2-360M, 5
+for Qwen2.5-3B - all 8 rounds ran in the same session, direction checked
+per-round, not just on the median):
+
+| model (head_dim) | case (kv_len) | before (global 128) | after (conditioned) | delta |
+|---|---|---:|---:|---|
+| Qwen2.5-0.5B (64) | long (86) | 5.845 | 5.400 | **+7.6%** |
+| Qwen2.5-0.5B (64) | long_tools_multiturn (2354) | 6.785 | 6.535 | **+3.7%** |
+| Qwen2.5-0.5B (64) | long_tools_single (2225) | 6.795 | 6.505 | **+4.3%** |
+| Qwen2.5-0.5B (64) | non_english (54) | 5.370 | 5.245 | +2.3% |
+| Qwen2.5-0.5B (64) | short (36) | 4.720 | 4.665 | +1.2% |
+| SmolLM2-360M (64) | long (86) | 6.790 | 5.730 | **+15.6%** |
+| SmolLM2-360M (64) | non_english (63) | 6.205 | 5.700 | **+8.1%** |
+| SmolLM2-360M (64) | short (37) | 5.395 | 5.340 | +1.0% |
+| Qwen2.5-3B (128) | long (86) | 14.220 | 14.100 | +0.8% |
+| Qwen2.5-3B (128) | non_english (54) | 13.830 | 13.780 | +0.4% |
+| Qwen2.5-3B (128) | short (36) | 13.600 | 13.720 | -0.9% |
+| Qwen3-1.7B (128) | long (65) | 9.715 | 9.750 | -0.4% |
+| Qwen3-1.7B (128) | long_tools_single (2225) | 11.530 | 11.580 | -0.4% |
+| Qwen3-1.7B (128) | non_english (33) | 9.355 | 9.390 | -0.4% |
+| Qwen3-1.7B (128) | short (15) | 8.985 | 8.955 | +0.3% |
+
+**Kept** - every `head_dim=64` long-context case clears the >3% bar
+(3.7-15.6%), with the biggest wins on the cases with the most split-K
+overhead to amortize (SmolLM2-360M `long`, Qwen2.5-0.5B's `long_tools_*`).
+Every `head_dim=128` case is flat within this box's own measured noise
+floor (session 2 logged 5.62-19.15% round-to-round spread on Qwen3-1.7B
+`short` alone) - the largest regression anywhere is Qwen2.5-3B `short` at
+-0.9%, well inside that noise band, and per-round direction (not just the
+median) favored `after` in 6-7 of 8 rounds on the winning cases. A
+kernel-level profile of SmolLM2-360M's `long` case confirms the mechanism:
+`dec_layer.attn` (single-workgroup, ~26-38us/call at kv_len=86-89 with the
+old threshold) is replaced by `dec_layer.attn.split` +
+`dec_layer.attn.reduce` at the same kv_len once `SPLIT_CHUNK` drops to 64 -
+exactly the intended earlier crossover to the split-K path for `head_dim=64`
+models. Committed as `lean: head_dim-conditioned SPLIT_CHUNK for decode
+attention split-K`.
+
+### Remaining gap to llama.cpp, end of session 3
+
+`short`-case decode is unaffected by Change 9 (both old and new
+`SPLIT_CHUNK` route `short`'s small `kv_len` through the un-split kernel
+identically), so the gap on the task's headline `short` numbers is
+unchanged from session 2's end:
+
+| model | lean decode (short) | llama.cpp decode | gap |
+|---|---:|---:|---:|
+| Qwen2.5-0.5B | ~4.67-4.83 ms/tok | 1.66 ms/tok | ~2.8-2.9x |
+| Qwen2.5-3B | ~13.7-13.8 ms/tok | 4.19 ms/tok | ~3.3x |
+
+Change 9's gain is entirely on long-context cases outside this headline
+pair (Qwen2.5-0.5B `long`/`long_tools_*`, SmolLM2-360M `long`/`non_english`),
+where it closes 3.7-15.6% of the remaining gap on `head_dim=64` models
+specifically. The GQA head-group fusion (Change 8) that would have targeted
+the `short`-case gap directly was reverted as an occupancy regression (see
+above) - closing the `short`-case gap further needs an approach that adds
+parallelism rather than removing it (e.g. batching multiple independent
+dispatches, or a genuinely different attention decomposition), not
+attempted this session.
