@@ -356,6 +356,24 @@ struct LayerWeights {
     /// Qwen2 layers.
     q_norm: Option<wgpu::Buffer>,
     k_norm: Option<wgpu::Buffer>,
+    /// `attn_q`/`attn_k`/`attn_v` weights concatenated at load time into one
+    /// `[q_dim+2*kv_dim, hidden_size]` weight (`gguf_matmul_qkv_fused`) -
+    /// `qkv_proj`'s decode-shaped (`rows == 1`, no LoRA) fast path runs one
+    /// `linear()` dispatch against this instead of three, and reads q/k/v
+    /// back out of the one result buffer via offset bindings (`BufView`) -
+    /// no copy. `q_w`/`k_w`/`v_w` above are kept alongside this (not
+    /// replaced) for the prefill/chunked-forward paths, which stay on the
+    /// three-separate-matmul path unconditionally (`rows > 1`; see
+    /// `qkv_proj`'s doc comment on why a fused *strided* per-row layout isn't
+    /// safe to read back with a plain offset+size binding). `None` when
+    /// `gguf_matmul_qkv_fused` found a dtype mismatch across the three
+    /// tensors - `qkv_proj` falls back to the three-matmul path in that case
+    /// too, at every `rows`.
+    qkv_w: Option<MatMulWeight>,
+    /// Bias matching `qkv_w`'s row order (`q_b` then `k_b` then `v_b`
+    /// concatenated) - a real per-tensor bias on Qwen2 (`cfg.has_qkv_bias`),
+    /// all-zero otherwise. `Some` exactly when `qkv_w` is.
+    qkv_b: Option<wgpu::Buffer>,
 }
 
 pub struct GpuModel {
@@ -548,11 +566,19 @@ pub fn build_mask_bitset(vocab: usize, allowed: &[u32]) -> Vec<u32> {
     bits
 }
 
-fn gguf_f32<R: std::io::Read + std::io::Seek>(engine: &Engine, reader: &mut GgufReader<R>, name: &str) -> Result<wgpu::Buffer> {
+/// Dequantized host-side data for an f32-ish GGUF tensor (norm gamma, bias),
+/// without uploading it - used where a caller needs to concatenate several
+/// small tensors (see `qkv_b` below) before making one GPU buffer out of the
+/// result, so the individual tensors are never uploaded twice.
+fn gguf_f32_raw<R: std::io::Read + std::io::Seek>(reader: &mut GgufReader<R>, name: &str) -> Result<Vec<f32>> {
     let info = reader.tensor_info(name).with_context(|| format!("missing tensor {name}"))?.clone();
     let n: usize = info.shape().iter().product();
     let bytes = reader.tensor_data(name)?;
-    let data = crate::gguf::dequantize_for(info.dtype(), &bytes, n);
+    Ok(crate::gguf::dequantize_for(info.dtype(), &bytes, n))
+}
+
+fn gguf_f32<R: std::io::Read + std::io::Seek>(engine: &Engine, reader: &mut GgufReader<R>, name: &str) -> Result<wgpu::Buffer> {
+    let data = gguf_f32_raw(reader, name)?;
     Ok(engine.buf_f32(&data, name))
 }
 
@@ -616,6 +642,44 @@ fn unpermute_rope_rows(bytes: &[u8], n_heads: usize, head_dim: usize, out_dim: u
     out
 }
 
+/// Step 2 of this session's brief (QKV fusion): concatenates
+/// `attn_q.weight`, `attn_k.weight` and `attn_v.weight`'s raw on-disk bytes
+/// end to end (q's rows, then k's, then v's), same reasoning as
+/// `gguf_matmul_concat2` generalized to three tensors. `attn_q`/`attn_k` are
+/// un-permuted first when `config.architecture == Architecture::Llama`
+/// (`unpermute_rope_rows`, each with its own head count - exactly what
+/// `gguf_matmul_qk` does per tensor) so the concatenated bytes are already in
+/// RoPE-ready row order before `load_matmul_weight_gguf` repacks them; `v` is
+/// never permuted (`gguf_matmul_qk` is never called for it either). Returns
+/// `None` when the three tensors don't share a dtype - every GGUF this crate
+/// has loaded so far quantizes all attn weights uniformly, so this is a
+/// defensive fallback, not an observed case: callers (`qkv_proj`) fall back
+/// to three separate matmuls when it fires.
+fn gguf_matmul_qkv_fused<R: std::io::Read + std::io::Seek>(engine: &Engine, reader: &mut GgufReader<R>, config: &Qwen2Config, p: &str) -> Result<Option<MatMulWeight>> {
+    let (name_q, name_k, name_v) = (format!("{p}.attn_q.weight"), format!("{p}.attn_k.weight"), format!("{p}.attn_v.weight"));
+    let info_q = reader.tensor_info(&name_q).with_context(|| format!("missing tensor {name_q}"))?.clone();
+    let info_k = reader.tensor_info(&name_k).with_context(|| format!("missing tensor {name_k}"))?.clone();
+    let info_v = reader.tensor_info(&name_v).with_context(|| format!("missing tensor {name_v}"))?.clone();
+    if info_q.dtype() != info_k.dtype() || info_k.dtype() != info_v.dtype() {
+        return Ok(None);
+    }
+    let (shape_q, shape_k, shape_v) = (info_q.shape(), info_k.shape(), info_v.shape());
+    if shape_q[1] != shape_k[1] || shape_k[1] != shape_v[1] {
+        return Ok(None);
+    }
+    let is_llama = config.architecture == Architecture::Llama;
+    let bytes_q = reader.tensor_data(&name_q)?;
+    let bytes_q = if is_llama { unpermute_rope_rows(&bytes_q, config.num_heads, config.head_dim, shape_q[0]) } else { bytes_q };
+    let bytes_k = reader.tensor_data(&name_k)?;
+    let bytes_k = if is_llama { unpermute_rope_rows(&bytes_k, config.num_kv_heads, config.head_dim, shape_k[0]) } else { bytes_k };
+    let bytes_v = reader.tensor_data(&name_v)?;
+    let mut bytes = bytes_q;
+    bytes.extend_from_slice(&bytes_k);
+    bytes.extend_from_slice(&bytes_v);
+    let shape = vec![shape_q[0] + shape_k[0] + shape_v[0], shape_q[1]];
+    Ok(Some(load_matmul_weight_gguf(engine, &format!("{p}.attn_qkv_fused.weight"), &shape, info_q.dtype(), &bytes)))
+}
+
 /// Like [`gguf_matmul`], but un-permutes RoPE row order first when
 /// `config.architecture == Architecture::Llama` (see
 /// [`unpermute_rope_rows`]). `n_heads` is the tensor's own head count:
@@ -670,13 +734,21 @@ impl GpuModel {
         let mut layers = Vec::with_capacity(config.num_layers);
         for i in 0..config.num_layers {
             let p = format!("blk.{i}");
-            let (q_b, k_b, v_b) = if config.has_qkv_bias {
-                (gguf_f32(engine, &mut reader, &format!("{p}.attn_q.bias"))?, gguf_f32(engine, &mut reader, &format!("{p}.attn_k.bias"))?, gguf_f32(engine, &mut reader, &format!("{p}.attn_v.bias"))?)
+            let q_dim = (config.num_heads * config.head_dim) as usize;
+            let kv_dim = (config.num_kv_heads * config.head_dim) as usize;
+            let (q_b, k_b, v_b, qkv_b_data) = if config.has_qkv_bias {
+                let q_data = gguf_f32_raw(&mut reader, &format!("{p}.attn_q.bias"))?;
+                let k_data = gguf_f32_raw(&mut reader, &format!("{p}.attn_k.bias"))?;
+                let v_data = gguf_f32_raw(&mut reader, &format!("{p}.attn_v.bias"))?;
+                let mut fused = q_data.clone();
+                fused.extend_from_slice(&k_data);
+                fused.extend_from_slice(&v_data);
+                (engine.buf_f32(&q_data, "attn_q.bias"), engine.buf_f32(&k_data, "attn_k.bias"), engine.buf_f32(&v_data, "attn_v.bias"), fused)
             } else {
-                let q_dim = (config.num_heads * config.head_dim) as usize;
-                let kv_dim = (config.num_kv_heads * config.head_dim) as usize;
-                (engine.buf_f32(&vec![0f32; q_dim], "q_b_zero"), engine.buf_f32(&vec![0f32; kv_dim], "k_b_zero"), engine.buf_f32(&vec![0f32; kv_dim], "v_b_zero"))
+                (engine.buf_f32(&vec![0f32; q_dim], "q_b_zero"), engine.buf_f32(&vec![0f32; kv_dim], "k_b_zero"), engine.buf_f32(&vec![0f32; kv_dim], "v_b_zero"), vec![0f32; q_dim + 2 * kv_dim])
             };
+            let qkv_w = gguf_matmul_qkv_fused(engine, &mut reader, &config, &p)?;
+            let qkv_b = qkv_w.is_some().then(|| engine.buf_f32(&qkv_b_data, "qkv_b_fused"));
             let (q_norm, k_norm) = if config.qk_norm {
                 (Some(gguf_f32(engine, &mut reader, &format!("{p}.attn_q_norm.weight"))?), Some(gguf_f32(engine, &mut reader, &format!("{p}.attn_k_norm.weight"))?))
             } else {
@@ -699,6 +771,8 @@ impl GpuModel {
                 down_b: engine.buf_f32(&vec![0f32; config.hidden_size], "down_b_zero"),
                 q_norm,
                 k_norm,
+                qkv_w,
+                qkv_b,
             });
         }
 
@@ -1137,8 +1211,70 @@ fn linear_lora(
     out
 }
 
+/// A view into a `wgpu::Buffer`: either the whole buffer (`From<&wgpu::Buffer>`,
+/// `binding()` is then exactly the `as_entire_binding()` every call site used
+/// before this type existed) or an offset+length sub-range (`BufView::slice`).
+/// Lets `rmsnorm`/`rope`/`attn_decode` read q/k/v straight out of
+/// `qkv_proj`'s fused matmul output (see `QkvSlot`, `LayerWeights::qkv_w`)
+/// through an offset binding instead of three separate buffers - no extra
+/// dispatch, no copy. A storage-buffer binding's declared `size` bounds the
+/// shader's `arrayLength()`/index range to that sub-range (standard
+/// WebGPU/wgpu behavior), so this is safe for read-write kernels like `rope`
+/// that mutate their input in place: the mutation only ever touches the
+/// bound sub-range.
+#[derive(Clone, Copy)]
+struct BufView<'a> {
+    buffer: &'a wgpu::Buffer,
+    elem_offset: u32,
+    elem_len: Option<u32>,
+}
+
+impl<'a> From<&'a wgpu::Buffer> for BufView<'a> {
+    fn from(buffer: &'a wgpu::Buffer) -> Self {
+        BufView { buffer, elem_offset: 0, elem_len: None }
+    }
+}
+
+impl<'a> BufView<'a> {
+    fn slice(buffer: &'a wgpu::Buffer, elem_offset: u32, elem_len: u32) -> Self {
+        BufView { buffer, elem_offset, elem_len: Some(elem_len) }
+    }
+    fn binding(&self) -> wgpu::BindingResource<'a> {
+        if self.elem_offset == 0 && self.elem_len.is_none() {
+            return self.buffer.as_entire_binding();
+        }
+        wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+            buffer: self.buffer,
+            offset: (self.elem_offset as u64) * 4,
+            size: self.elem_len.map(|n| wgpu::BufferSize::new((n as u64) * 4).expect("BufView::slice: elem_len must be nonzero")),
+        })
+    }
+}
+
+/// `qkv_proj`'s per-tensor result: either its own whole buffer (the ordinary
+/// three-separate-matmul path, `Whole`, byte-identical to before this type
+/// existed) or a view into the one buffer `qkv_proj`'s fused decode path
+/// produced (`View` - see `LayerWeights::qkv_w`'s doc comment). `&QkvSlot`
+/// converts to a `BufView` so every downstream call site
+/// (`rmsnorm`/`rope`/`scatter_kv_gpu`/`attn_decode`) is unchanged syntax
+/// whichever variant it's holding.
+enum QkvSlot {
+    Whole(wgpu::Buffer),
+    View { buf: wgpu::Buffer, elem_offset: u32, elem_len: u32 },
+}
+
+impl<'a> From<&'a QkvSlot> for BufView<'a> {
+    fn from(slot: &'a QkvSlot) -> Self {
+        match slot {
+            QkvSlot::Whole(b) => BufView::from(b),
+            QkvSlot::View { buf, elem_offset, elem_len } => BufView::slice(buf, *elem_offset, *elem_len),
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-fn rmsnorm(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &str, x: &wgpu::Buffer, scale: &wgpu::Buffer, rows: u32, dim: u32, eps: f32) -> wgpu::Buffer {
+fn rmsnorm<'a>(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &str, x: impl Into<BufView<'a>>, scale: &wgpu::Buffer, rows: u32, dim: u32, eps: f32) -> wgpu::Buffer {
+    let x = x.into();
     let skey = scratch_key(key);
     let out = pool.data(&format!("{skey}.out"), (rows * dim) as usize);
     let dims = pool.uniform(&format!("{skey}.dims"), RmsDims { rows, dim, eps, _p0: 0 });
@@ -1146,7 +1282,7 @@ fn rmsnorm(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: 
         key,
         &engine.rmsnorm,
         &[
-            BindGroupEntry { binding: 0, resource: x.as_entire_binding() },
+            BindGroupEntry { binding: 0, resource: x.binding() },
             BindGroupEntry { binding: 1, resource: scale.as_entire_binding() },
             BindGroupEntry { binding: 2, resource: out.as_entire_binding() },
             BindGroupEntry { binding: 3, resource: dims.as_entire_binding() },
@@ -1157,14 +1293,15 @@ fn rmsnorm(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: 
 }
 
 #[allow(clippy::too_many_arguments)]
-fn rope(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &str, buf: &wgpu::Buffer, cos: &wgpu::Buffer, sin: &wgpu::Buffer, rows: u32, heads: u32, head_dim: u32, pos_base: u32) {
+fn rope<'a>(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &str, buf: impl Into<BufView<'a>>, cos: &wgpu::Buffer, sin: &wgpu::Buffer, rows: u32, heads: u32, head_dim: u32, pos_base: u32) {
+    let buf = buf.into();
     let skey = scratch_key(key);
     let dims = pool.uniform(&format!("{skey}.dims"), RopeDims { rows, heads, head_dim, pos_base });
     let bg = pool.bind_group(
         key,
         &engine.rope,
         &[
-            BindGroupEntry { binding: 0, resource: buf.as_entire_binding() },
+            BindGroupEntry { binding: 0, resource: buf.binding() },
             BindGroupEntry { binding: 1, resource: cos.as_entire_binding() },
             BindGroupEntry { binding: 2, resource: sin.as_entire_binding() },
             BindGroupEntry { binding: 3, resource: dims.as_entire_binding() },
@@ -1178,14 +1315,15 @@ fn rope(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &st
 /// caller-supplied buffer (`ForwardSpec::positions`) instead of a
 /// contiguous `pos_base + row` run: see `shaders/rope_positions.wgsl`.
 #[allow(clippy::too_many_arguments)]
-fn rope_positions(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &str, buf: &wgpu::Buffer, cos: &wgpu::Buffer, sin: &wgpu::Buffer, positions: &wgpu::Buffer, rows: u32, heads: u32, head_dim: u32) {
+fn rope_positions<'a>(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &str, buf: impl Into<BufView<'a>>, cos: &wgpu::Buffer, sin: &wgpu::Buffer, positions: &wgpu::Buffer, rows: u32, heads: u32, head_dim: u32) {
+    let buf = buf.into();
     let skey = scratch_key(key);
     let dims = pool.uniform(&format!("{skey}.dims"), RopePosDims { rows, heads, head_dim, _p0: 0 });
     let bg = pool.bind_group(
         key,
         &engine.rope_positions,
         &[
-            BindGroupEntry { binding: 0, resource: buf.as_entire_binding() },
+            BindGroupEntry { binding: 0, resource: buf.binding() },
             BindGroupEntry { binding: 1, resource: cos.as_entire_binding() },
             BindGroupEntry { binding: 2, resource: sin.as_entire_binding() },
             BindGroupEntry { binding: 3, resource: positions.as_entire_binding() },
@@ -1232,6 +1370,19 @@ fn silu_mul_fused(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>
     out
 }
 
+/// Step 2 of this session's brief (QKV fusion). `rows == 1` (decode) with no
+/// LoRA adapter active and a fused weight available (`layer.qkv_w`) runs
+/// **one** `linear()` dispatch against the concatenated q/k/v weight instead
+/// of three, and returns `q`/`k`/`v` as `BufView`s into that single output
+/// buffer (`QkvSlot::View`, offsets `0` / `q_dim` / `q_dim+kv_dim`) - no copy,
+/// downstream (`rope`/`scatter_kv_gpu`/`attn_decode`) read the fused buffer
+/// directly through those offsets. Every other case (`rows > 1` - prefill and
+/// the chunked/masked forward path, which need q/k/v as separately
+/// addressable `[rows, dim]` buffers and can't safely read a fused *strided*
+/// per-row layout back with a plain offset+size binding; LoRA active; or
+/// `layer.qkv_w` is `None`, i.e. `gguf_matmul_qkv_fused` found a dtype
+/// mismatch) falls back to the original three-matmul path, `QkvSlot::Whole`,
+/// byte-identical to this function before fusion existed.
 #[allow(clippy::too_many_arguments)]
 fn qkv_proj(
     engine: &Engine,
@@ -1244,25 +1395,48 @@ fn qkv_proj(
     layer: &LayerWeights,
     fast: bool,
     lora: Option<&crate::lora::LoraLayer>,
-) -> (wgpu::Buffer, wgpu::Buffer, wgpu::Buffer) {
+) -> (QkvSlot, QkvSlot, QkvSlot) {
     let hidden = cfg.hidden_size as u32;
     let q_dim = (cfg.num_heads * cfg.head_dim) as u32;
     let kv_dim = (cfg.num_kv_heads * cfg.head_dim) as u32;
-    let q = linear_lora(engine, pool, pass, &format!("{key}.q"), x, rows, hidden, &layer.q_w, &layer.q_b, q_dim, fast, lora.map(|l| &l.q));
-    let k = linear_lora(engine, pool, pass, &format!("{key}.k"), x, rows, hidden, &layer.k_w, &layer.k_b, kv_dim, fast, lora.map(|l| &l.k));
-    let v = linear_lora(engine, pool, pass, &format!("{key}.v"), x, rows, hidden, &layer.v_w, &layer.v_b, kv_dim, fast, lora.map(|l| &l.v));
+
+    let (q, k, v) = if rows == 1 && lora.is_none() {
+        if let (Some(qkv_w), Some(qkv_b)) = (&layer.qkv_w, &layer.qkv_b) {
+            let qkv_out = linear(engine, pool, pass, &format!("{key}.qkv_fused"), x, rows, hidden, qkv_w, qkv_b, q_dim + 2 * kv_dim, fast);
+            let q = QkvSlot::View { buf: qkv_out.clone(), elem_offset: 0, elem_len: q_dim };
+            let k = QkvSlot::View { buf: qkv_out.clone(), elem_offset: q_dim, elem_len: kv_dim };
+            let v = QkvSlot::View { buf: qkv_out, elem_offset: q_dim + kv_dim, elem_len: kv_dim };
+            (q, k, v)
+        } else {
+            (
+                QkvSlot::Whole(linear_lora(engine, pool, pass, &format!("{key}.q"), x, rows, hidden, &layer.q_w, &layer.q_b, q_dim, fast, None)),
+                QkvSlot::Whole(linear_lora(engine, pool, pass, &format!("{key}.k"), x, rows, hidden, &layer.k_w, &layer.k_b, kv_dim, fast, None)),
+                QkvSlot::Whole(linear_lora(engine, pool, pass, &format!("{key}.v"), x, rows, hidden, &layer.v_w, &layer.v_b, kv_dim, fast, None)),
+            )
+        }
+    } else {
+        (
+            QkvSlot::Whole(linear_lora(engine, pool, pass, &format!("{key}.q"), x, rows, hidden, &layer.q_w, &layer.q_b, q_dim, fast, lora.map(|l| &l.q))),
+            QkvSlot::Whole(linear_lora(engine, pool, pass, &format!("{key}.k"), x, rows, hidden, &layer.k_w, &layer.k_b, kv_dim, fast, lora.map(|l| &l.k))),
+            QkvSlot::Whole(linear_lora(engine, pool, pass, &format!("{key}.v"), x, rows, hidden, &layer.v_w, &layer.v_b, kv_dim, fast, lora.map(|l| &l.v))),
+        )
+    };
+
     // Qwen3 only (`layer.q_norm`/`k_norm` set): per-head RMSNorm on q/k
     // before RoPE. `q`/`k` are `[rows, heads*head_dim]` row-major, so
     // reinterpreting the same flat buffer as `[rows*heads, head_dim]` for
     // `rmsnorm()` normalizes each head's slice independently in place - no
     // dedicated per-head kernel needed (see the qwen3 survey's open
-    // question, resolved this way).
+    // question, resolved this way). `rmsnorm()`'s output is always a fresh
+    // whole buffer (`pool.data`), so a fused `View` slot correctly
+    // "materializes" into `QkvSlot::Whole` here regardless of which branch
+    // above produced it.
     let q = match &layer.q_norm {
-        Some(scale) => rmsnorm(engine, pool, pass, &format!("{key}.qnorm"), &q, scale, rows * cfg.num_heads as u32, cfg.head_dim as u32, cfg.rms_norm_eps),
+        Some(scale) => QkvSlot::Whole(rmsnorm(engine, pool, pass, &format!("{key}.qnorm"), &q, scale, rows * cfg.num_heads as u32, cfg.head_dim as u32, cfg.rms_norm_eps)),
         None => q,
     };
     let k = match &layer.k_norm {
-        Some(scale) => rmsnorm(engine, pool, pass, &format!("{key}.knorm"), &k, scale, rows * cfg.num_kv_heads as u32, cfg.head_dim as u32, cfg.rms_norm_eps),
+        Some(scale) => QkvSlot::Whole(rmsnorm(engine, pool, pass, &format!("{key}.knorm"), &k, scale, rows * cfg.num_kv_heads as u32, cfg.head_dim as u32, cfg.rms_norm_eps)),
         None => k,
     };
     (q, k, v)
@@ -1330,22 +1504,25 @@ fn embed_gather(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, 
 /// per (row, kv_head) recorded into the same encoder as the dispatch that
 /// produced `src` - no CPU readback, so this can run before the attention
 /// dispatch that needs to see it (decode's self-attention).
-fn scatter_kv_gpu(encoder: &mut wgpu::CommandEncoder, cache_buf: &wgpu::Buffer, src: &wgpu::Buffer, rows: u32, cfg: &Qwen2Config, kv_base: u32, max_ctx: u32) {
+fn scatter_kv_gpu<'a>(encoder: &mut wgpu::CommandEncoder, cache_buf: &wgpu::Buffer, src: impl Into<BufView<'a>>, rows: u32, cfg: &Qwen2Config, kv_base: u32, max_ctx: u32) {
+    let src = src.into();
+    let src_base = (src.elem_offset as u64) * 4;
     let kv_heads = cfg.num_kv_heads as u32;
     let head_dim = cfg.head_dim as u32;
     let row_bytes = (head_dim * 4) as u64;
     for row in 0..rows {
         for h in 0..kv_heads {
-            let src_off = (((row * kv_heads + h) * head_dim) as u64) * 4;
+            let src_off = src_base + (((row * kv_heads + h) * head_dim) as u64) * 4;
             let dst_pos = kv_base + row;
             let dst_off = (((h * max_ctx + dst_pos) * head_dim) as u64) * 4;
-            encoder.copy_buffer_to_buffer(src, src_off, cache_buf, dst_off, row_bytes);
+            encoder.copy_buffer_to_buffer(src.buffer, src_off, cache_buf, dst_off, row_bytes);
         }
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-fn attn_prefill(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &str, q: &wgpu::Buffer, k: &wgpu::Buffer, v: &wgpu::Buffer, seq: u32, cfg: &Qwen2Config) -> wgpu::Buffer {
+fn attn_prefill<'a>(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &str, q: impl Into<BufView<'a>>, k: impl Into<BufView<'a>>, v: impl Into<BufView<'a>>, seq: u32, cfg: &Qwen2Config) -> wgpu::Buffer {
+    let (q, k, v) = (q.into(), k.into(), v.into());
     // Concatenated-heads width (`num_heads * head_dim`): equal to
     // `cfg.hidden_size` for Qwen2 (head_dim is derived that way) but *not*
     // for Qwen3, where head_dim=128 is explicit and 16*128=2048 != 1024 -
@@ -1362,9 +1539,9 @@ fn attn_prefill(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, 
         key,
         &engine.attn_prefill,
         &[
-            BindGroupEntry { binding: 0, resource: q.as_entire_binding() },
-            BindGroupEntry { binding: 1, resource: k.as_entire_binding() },
-            BindGroupEntry { binding: 2, resource: v.as_entire_binding() },
+            BindGroupEntry { binding: 0, resource: q.binding() },
+            BindGroupEntry { binding: 1, resource: k.binding() },
+            BindGroupEntry { binding: 2, resource: v.binding() },
             BindGroupEntry { binding: 3, resource: out.as_entire_binding() },
             BindGroupEntry { binding: 4, resource: dims.as_entire_binding() },
         ],
@@ -1407,7 +1584,8 @@ fn decode_split_plan(kv_len: u32) -> (u32, u32) {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn attn_decode(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &str, q: &wgpu::Buffer, k_cache: &wgpu::Buffer, v_cache: &wgpu::Buffer, kv_len: u32, max_ctx: u32, cfg: &Qwen2Config) -> wgpu::Buffer {
+fn attn_decode<'a>(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &str, q: impl Into<BufView<'a>>, k_cache: &wgpu::Buffer, v_cache: &wgpu::Buffer, kv_len: u32, max_ctx: u32, cfg: &Qwen2Config) -> wgpu::Buffer {
+    let q = q.into();
     let hidden = (cfg.num_heads * cfg.head_dim) as u32;
     let skey = scratch_key(key);
     let out = pool.data(&format!("{skey}.out"), hidden as usize);
@@ -1436,7 +1614,7 @@ fn attn_decode(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, k
             key,
             pipeline,
             &[
-                BindGroupEntry { binding: 0, resource: q.as_entire_binding() },
+                BindGroupEntry { binding: 0, resource: q.binding() },
                 BindGroupEntry { binding: 1, resource: k_cache.as_entire_binding() },
                 BindGroupEntry { binding: 2, resource: v_cache.as_entire_binding() },
                 BindGroupEntry { binding: 3, resource: out.as_entire_binding() },
@@ -1468,7 +1646,7 @@ fn attn_decode(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, k
         &format!("{key}.split"),
         split_pipeline,
         &[
-            BindGroupEntry { binding: 0, resource: q.as_entire_binding() },
+            BindGroupEntry { binding: 0, resource: q.binding() },
             BindGroupEntry { binding: 1, resource: k_cache.as_entire_binding() },
             BindGroupEntry { binding: 2, resource: v_cache.as_entire_binding() },
             BindGroupEntry { binding: 3, resource: partial_m.as_entire_binding() },
@@ -1500,7 +1678,8 @@ fn attn_decode(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, k
 /// `k_cache`/`v_cache`, gated by an explicit bitset instead of an implicit
 /// causal rule: see `shaders/attn_chunk_masked.wgsl`.
 #[allow(clippy::too_many_arguments)]
-fn attn_chunk_masked(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &str, q: &wgpu::Buffer, k_cache: &wgpu::Buffer, v_cache: &wgpu::Buffer, mask: &wgpu::Buffer, t: u32, kv_total: u32, max_ctx: u32, cfg: &Qwen2Config) -> wgpu::Buffer {
+fn attn_chunk_masked<'a>(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &str, q: impl Into<BufView<'a>>, k_cache: &wgpu::Buffer, v_cache: &wgpu::Buffer, mask: &wgpu::Buffer, t: u32, kv_total: u32, max_ctx: u32, cfg: &Qwen2Config) -> wgpu::Buffer {
+    let q = q.into();
     let hidden = (cfg.num_heads * cfg.head_dim) as u32;
     let skey = scratch_key(key);
     let out = pool.data(&format!("{skey}.out"), (t * hidden) as usize);
@@ -1513,7 +1692,7 @@ fn attn_chunk_masked(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<
         key,
         &engine.attn_chunk_masked,
         &[
-            BindGroupEntry { binding: 0, resource: q.as_entire_binding() },
+            BindGroupEntry { binding: 0, resource: q.binding() },
             BindGroupEntry { binding: 1, resource: k_cache.as_entire_binding() },
             BindGroupEntry { binding: 2, resource: v_cache.as_entire_binding() },
             BindGroupEntry { binding: 3, resource: mask.as_entire_binding() },
