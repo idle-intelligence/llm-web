@@ -55,6 +55,15 @@ pub struct Pool {
     queue: wgpu::Queue,
     generation: Cell<u64>,
     buffers: RefCell<HashMap<String, wgpu::Buffer>>,
+    /// Last bytes `uniform()` wrote for a given key, so a call site whose
+    /// value is unchanged from the previous call (every `linear()` dims
+    /// uniform at decode: same `m`/`k`/`n`/`blocks_per_row`/`n_offset` every
+    /// step, since decode's shape never changes step to step - only
+    /// position-dependent uniforms like RoPE's or attention's `kv_len` do)
+    /// can skip the `queue.write_buffer` call entirely. Pure CPU-side
+    /// per-step overhead reduction, no numerical change: the GPU-side bytes
+    /// are identical either way.
+    uniform_cache: RefCell<HashMap<String, Vec<u8>>>,
     bind_groups: RefCell<HashMap<String, (wgpu::BindGroup, u64)>>,
     alloc_count: Cell<u64>,
 }
@@ -68,6 +77,7 @@ impl Pool {
     /// shape" allocation cost this module's doc comment already describes.
     pub fn reset(&self) {
         self.buffers.borrow_mut().clear();
+        self.uniform_cache.borrow_mut().clear();
         self.bind_groups.borrow_mut().clear();
         self.generation.set(self.generation.get() + 1);
     }
@@ -80,6 +90,7 @@ impl Pool {
             queue,
             generation: Cell::new(0),
             buffers: RefCell::new(HashMap::new()),
+            uniform_cache: RefCell::new(HashMap::new()),
             bind_groups: RefCell::new(HashMap::new()),
             alloc_count: Cell::new(0),
         }
@@ -175,20 +186,27 @@ impl Pool {
     /// `value` into it every call (uniform buffers never need to grow --
     /// `T` is fixed per call site).
     pub fn uniform<T: bytemuck::Pod>(&self, key: &str, value: T) -> wgpu::Buffer {
+        let bytes = bytemuck::bytes_of(&value);
         let mut bufs = self.buffers.borrow_mut();
         if let Some(b) = bufs.get(key) {
             let b = b.clone();
             drop(bufs);
-            self.queue.write_buffer(&b, 0, bytemuck::bytes_of(&value));
+            let mut cache = self.uniform_cache.borrow_mut();
+            let unchanged = matches!(cache.get(key), Some(prev) if prev.as_slice() == bytes);
+            if !unchanged {
+                self.queue.write_buffer(&b, 0, bytes);
+                cache.insert(key.to_string(), bytes.to_vec());
+            }
             return b;
         }
         let b = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some(key),
-            contents: bytemuck::bytes_of(&value),
+            contents: bytes,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
         bufs.insert(key.to_string(), b.clone());
         drop(bufs);
+        self.uniform_cache.borrow_mut().insert(key.to_string(), bytes.to_vec());
         self.bump_generation();
         b
     }
