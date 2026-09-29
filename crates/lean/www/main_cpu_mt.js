@@ -1,12 +1,12 @@
 // Headless parity/perf harness for the lean engine's CPU rung, exercising
-// the capability-picked threads-vs-single-thread ladder rung (TC's ladder:
+// the capability-picked threads-vs-single-thread ladder rung (the project's ladder:
 // WebGPU, then CPU threads, then single CPU thread - this page never
 // touches WebGPU). Same fixture file and match-checking convention as
 // ../www/main_cpu.js's single-thread harness (crates/lean/reference/fixture.json).
 //
 // Rung selection is capability-detection only, never a runtime benchmark or
 // per-device tuning (see this crate's CPU-fallback plan's correction,
-// TC 2026-09-28): threads rung requires `self.crossOriginIsolated`,
+// 2026-09-28): threads rung requires `self.crossOriginIsolated`,
 // `typeof SharedArrayBuffer !== "undefined"`, and
 // `navigator.hardwareConcurrency > 1` - all three are fixed capability
 // reads, not measurements. If any is false, this page falls back to the

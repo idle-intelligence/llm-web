@@ -1,6 +1,6 @@
 # lean engine, CPU threads rung
 
-Adds the "CPU threads" rung of TC's capability ladder (WebGPU, then CPU
+Adds the "CPU threads" rung of the project's capability ladder (WebGPU, then CPU
 threads, then single CPU thread) below the existing single-thread CPU
 fallback (`docs/runs/2026-09-28-lean-cpu.md`). Crate `crates/lean`, changed
 files `src/cpu.rs` (`linear()` split into `linear_serial`/`linear_threads`),
@@ -37,7 +37,7 @@ spike for the CPU build: measured, not adopted"), `scripts/serve_coi.py`
   step and prefill call — no per-call thread spawn.
 - Native and browser share the exact same `cpu.rs`/`cpu_kernels.rs` source;
   only the Cargo feature set and the wasm build's linker flags differ.
-  Reused directly from TC's own prior work rather than reinvented:
+  Reused directly from the project's own prior work rather than reinvented:
   `scripts/build_lean_mt.sh` is idle-intelligence/t0-web's
   `tools/build-mt.sh` recipe (nightly `build-std`, `wasm-bindgen-rayon`,
   the same atomics/shared-memory/`--import-memory`/`__wasm_init_tls`
@@ -134,7 +134,7 @@ Observations, excluded from the headline numbers per house rule):
 
 ## Observations
 
-- Threading gives a real, substantial win here, unlike TC's own t0-web
+- Threading gives a real, substantial win here, unlike the project's own t0-web
   threads spike (PR #8, 0.93x-0.96x, a wash-to-regression) or `engine-plan.md`'s
   citation of the same result — the difference is structural, not a
   contradiction: t0's threads spike parallelised across a *batch* of small
@@ -202,7 +202,7 @@ Observations, excluded from the headline numbers per house rule):
   correctly *when real server-side COOP/COEP headers are present*, but
   does **not** prove anything about the client-side `coi-serviceworker.js`
   shim workaround that a header-less static host like GitHub Pages would
-  need instead. TC's own prior experience is the relevant warning here:
+  need instead. the project's own prior experience is the relevant warning here:
   on `trucs.ai/stt-llm-tts`, that exact shim's COEP header broke Web
   Worker initialization outright and was removed (`trucs.ai` commit
   `3432383`, "Remove coi-serviceworker: COEP was blocking worker
@@ -218,7 +218,7 @@ Observations, excluded from the headline numbers per house rule):
   `initThreadPool` itself throws) — but on GitHub Pages specifically, do
   not add a coi-serviceworker shim to force `crossOriginIsolated` true
   without first testing it against this engine's own worker/model-fetch
-  path the way TC's plan's step 5 calls for, given the stt-llm-tts
+  path the way the project's plan's step 5 calls for, given the stt-llm-tts
   precedent. Until that test happens, GitHub Pages traffic will
   legitimately fall through to the single-thread rung (correct, safe
   behavior per the capability check — not a bug), and only a host that can

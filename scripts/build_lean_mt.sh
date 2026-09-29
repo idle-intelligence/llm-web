@@ -7,7 +7,7 @@
 # the single-thread pkg build's +simd128-only rustflags).
 #
 # Same recipe as t0-web's tools/build-mt.sh (idle-intelligence/t0-web PR #8,
-# "Threads spike for the CPU build: measured, not adopted") - TC's own prior
+# "Threads spike for the CPU build: measured, not adopted") - the project's own prior
 # work, reused here, not reinvented: t0 built a burn-ndarray/rayon threaded
 # wasm module the same way (nightly build-std + wasm-bindgen-rayon +
 # explicit atomics/shared-memory linker flags), because wasm-pack cannot
