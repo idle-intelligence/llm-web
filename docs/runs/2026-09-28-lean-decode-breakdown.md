@@ -519,3 +519,154 @@ session - Task A's fix and its gates took the full session; starting a
 kernel fusion without room to verify qk-norm/QKV-bias correctness against
 all four models' fixtures would have been a worse outcome than not starting
 it.
+
+## Session 4: argmax pass-fold and QKV fusion, measured (2026-09-29)
+
+Two commits on this session's branch: `7264366` (fold decode's argmax
+dispatch into `decode_layers`' own compute pass, no dispatch-count change,
+one fewer pass/step) and `4737327` (fuse decode's q/k/v projection into one
+matmul, `qkv_proj`'s `rows == 1`/no-LoRA path only; prefill and the
+chunked/masked forward path keep the original three-matmul path
+unconditionally - see that commit's message for why). Both commits' gates
+(`fixture_parity`, `fixture_parity_qwen3`, `fixture_parity_qwen3_1_7b`,
+`fixture_parity_llama_360m`, `fixture_parity_llama_1_7b`,
+`fixture_parity_qwen25_3b` against the official
+`qwen2.5-3b-instruct-q4_0.gguf`, `kv_snapshot`, `logit_mask`) pass, native
+GPU-locked release build, `--ignored --test-threads=1`. `lora_parity`'s
+`packed_block_diagonal_matches_per_cell_forward` (rows > 1, exercises the
+untouched chunked-forward path) also passes on both commits;
+`lora_and_sliced_head_match_reference` fails identically on both the
+pre-fusion (`7264366`) and post-fusion (`4737327`) code with the same
+`.bin` file (`lora dead logit mismatch: got 24.040848 want 24.75631` on
+both) - a wrong/mismatched LoRA weights file picked for this check (not
+this repo's own fixture asset), not a fusion regression; not one of this
+task's required gates. `cargo clippy -p lean -- -D warnings` and
+`cargo clippy -p lean --lib --no-default-features --features web --target
+wasm32-unknown-unknown -- -D warnings` both clean on both commits. Browser
+gate (`www/index.html?local=1`, Playwright's bundled headless Chromium,
+`--enable-unsafe-webgpu --enable-features=Vulkan,WebGPU --use-angle=metal`,
+served bytes hashed and confirmed against the freshly built
+`pkg/lean_bg.wasm` before each check): `allMatch: true` on both commits
+(`engineBuild` `2026-09-29-04` for the argmax commit, `2026-09-29-05` for
+the QKV-fusion commit).
+
+Native timing: `lean-cli --gguf <path> --tokenizer-dir <path> --fixture
+<fixture> --tokens 16 --kernel fast`, GPU-locked, M2 laptop, one model
+loaded per process. "Before"/"after" below are the argmax-fold commit
+(`7264366`) vs the QKV-fusion commit (`4737327`) - i.e. this table isolates
+QKV fusion's own effect, since the argmax fold changes pass count, not
+dispatch count or (measurably) timing. Dispatch counts are exact
+(`decode_dispatches_per_step`, printed by `lean-cli` itself, zero
+variance across repeated runs at a fixed commit/model/case). `long`
+below is each model's own `long_tools_single` fixture case where its GGUF
+has one (Qwen2.5-0.5B, Qwen3-1.7B); Qwen2.5-3B's `long_tools_single` row
+uses the 0.5B-tokenizer `fixture.json`'s case against the 3B weights
+(timing-only cross-tokenizer run, same convention as this doc's Session 1
+footnote - `tok_match`/`top1_match` on that row are not evidence of a bug).
+
+### Decode dispatches/step, before vs after QKV fusion
+
+| model | layers (derived from the dispatch delta / 2) | short: before | short: after | delta | long_tools_single: before | long_tools_single: after | delta |
+|---|---|---|---|---|---|---|---|
+| Qwen2.5-0.5B-Instruct | 24 | 340 | 292 | -48 (-14.1%) | 364 | 316 | -48 (-13.2%) |
+| Qwen2.5-3B-Instruct (official GGUF) | 36 | 508 | 436 | -72 (-14.2%) | not measured before (see note) | 472 | n/a |
+| Qwen3-1.7B (Q8_0) | 28 | 452 | 396 | -56 (-12.4%) | 480 | 424 | -56 (-11.7%) |
+| SmolLM2-360M-Instruct (Q4_0) | 32 | 452 | 388 | -64 (-14.2%) | not measured (no own long_tools_single fixture case; not re-run cross-tokenizer this session) | - | - |
+
+Note: this session's first attempt at Qwen2.5-3B's cross-tokenizer
+`long_tools_single` row (via `fixture.json`) stopped after 3 of 5 cases on
+both the before and after runs (only `short`/`long`/`non_english` printed,
+matching each other) - not investigated further since it's a timing-only
+cross-tokenizer convenience case, not one of this task's required models'
+own fixtures; the `long_tools_single` dispatch count *after* fusion (472)
+was captured from a rerun of that same command, `after`-only.
+
+### Native decode ms/tok, before vs after QKV fusion
+
+`short`/`long_tools_single` are the fixture case names; `n` is the number
+of runs a median was taken over on this commit/model/case (3 unless
+noted). A GPU-contention check (`pgrep` for Chrome-for-Testing/headless-
+shell) was run before every timing command; none were found running.
+
+| model | case | before ms/tok (n, values) | after ms/tok (n, values) | change |
+|---|---|---|---|---|
+| Qwen2.5-0.5B-Instruct | short | 32.85 (n=3: 26.40, 32.85, 34.59) | 32.30 (n=3: 25.12, 32.30, 32.54) | -1.7% |
+| Qwen2.5-0.5B-Instruct | long_tools_single | 50.14 (n=3: 50.14, 49.12, 59.86) | 49.06 (n=3: 49.06, 48.86, 49.16) | -2.2% |
+| Qwen2.5-3B-Instruct (official GGUF) | short | 172.60 (n=3: 179.81, 117.89, 172.60) | 228.93 (n=3: 250.21, 228.93, 226.37) | +32.6% |
+| Qwen3-1.7B (Q8_0) | short | 84.45 (n=1) | 91.90 (n=1) | +8.8% |
+| Qwen3-1.7B (Q8_0) | long_tools_single | 132.58 (n=1) | 171.45 (n=1) | +29.3% |
+| SmolLM2-360M-Instruct (Q4_0) | short | 42.42 (n=1) | 50.79 (n=1) | +19.7% |
+
+### Observations
+
+- **Dispatch count dropped by exactly 2/layer on every model** (confirmed
+  by `lean-cli`'s own `decode_dispatches_per_step` counter, not estimated):
+  `q_w`/`k_w`/`v_w`'s three separate `linear()` dispatches collapsed into
+  `qkv_w`'s one, everywhere the fused path's guard (`rows == 1`, no LoRA,
+  `layer.qkv_w.is_some()`) held - which is every decode step on every
+  model tested (all four GGUFs quantize their attn weights uniformly, so
+  `gguf_matmul_qkv_fused`'s dtype-match check always passed).
+- **Wall-clock decode time did not improve to match the dispatch-count
+  drop, and regressed on 3 of 4 models.** Qwen2.5-0.5B (the model the
+  argmax-fold and pass-batching fixes were validated on in earlier
+  sessions) is roughly a wash (-1.7%/-2.2%, inside this session's own
+  measured run-to-run spread - see the `n=3` value lists above, e.g. the
+  3B "before" row's 117.89-179.81 spread on the *same* commit/model/case).
+  Qwen2.5-3B, Qwen3-1.7B and SmolLM2-360M all got slower after fusion,
+  Qwen2.5-3B by the largest margin (+32.6% at `short`, +29.3% at
+  `long_tools_single` on Qwen3-1.7B). This is the opposite of what the
+  dispatch-count reduction predicts and was re-measured before being
+  reported here: Qwen2.5-3B's `short` case was independently confirmed on
+  3 runs before fusion (179.81, 117.89, 172.60ms/tok, via a temporary
+  revert of `model.rs` to the pre-fusion commit and a rebuild - not a
+  fixture/config difference) and 3 runs after (250.21, 228.93, 226.37ms/tok),
+  non-overlapping ranges.
+- **No root cause identified this session for the regression.** Candidate
+  hypotheses, none tested: the fused decode matvec kernel
+  (`linear_q4_decode`/`linear_q8_decode`/`linear_q8_decode_dp4`, chosen by
+  `rows == 1` in `linear()`) may not scale linearly with `out_dim` the way
+  three separate dispatches implicitly did (GQA's asymmetric split - one
+  wide `q_dim` chunk plus two narrow `kv_dim` chunks concatenated into one
+  `out_dim = q_dim + 2*kv_dim` - could interact with the kernel's
+  per-workgroup row assignment in a way three separately-sized dispatches
+  didn't); or bind-group/pool-key overhead for the new `.qkv_fused` key
+  outweighs the saved dispatch overhead at these model sizes now that the
+  pass-batching fix (this doc's Session 1) already removed most of the
+  per-dispatch `MTLComputeCommandEncoder` cost that made fusion attractive
+  in the first place. Per this task's own "parity before perf" framing:
+  this is reported as a **measured regression**, not a fix, and the
+  commit is not reverted pending that decision - `qkv_proj`'s fused path
+  is functionally correct (every required gate passes) but is not shown
+  to be faster on any model tested except within noise on the smallest.
+- **Browser decode timing (`decode_timing.html`) was not run this
+  session** for either commit, on any model - the native regression above
+  took priority to confirm honestly (three separate native rebuild/measure
+  cycles) within this session's time budget. `main_decode_timing.js` was
+  extended with `qwen3_1_7b`/`smollm2_360m` model keys and a local
+  `model_smollm2_360m/` dir was added (gitignored) in the argmax-fold
+  commit, so the harness is ready for a follow-up session to run the full
+  cold/warm x 3-page-load x per-model matrix this task originally asked
+  for.
+
+### Next dispatch-count candidate (not implemented, per this session's scope)
+
+Post-fusion, one decode layer's dispatch list (short context, no
+split-K) is: `rmsnorm`(attn_norm) -> `qkv` -> `rope`(q) -> `rope`(k) ->
+`attn_decode` -> `linear`(wo) -> `add_inplace` -> `rmsnorm`(ffn_norm) ->
+`linear`(gate_up) -> `silu_mul_fused` -> `linear`(down) ->
+`add_inplace` = 12 dispatches/layer (matches: 12*24 + 4 fixed
+(embed/out_norm/lm_head/argmax) = 292, the measured Qwen2.5-0.5B count).
+The two `rmsnorm`+`add_inplace` pairs (`attn_norm` reads `x`, `add_inplace`
+writes `x`; `ffn_norm` reads `x`, `add_inplace` writes `x`) are 4 of those
+12 dispatches/layer and are the next-biggest same-shaped group: fusing
+each residual-add into the *following* rmsnorm's read (an "add-then-normalize"
+kernel reading two inputs and writing one normalized output, replacing
+`add_inplace`+`rmsnorm`) would save 2 dispatches/layer - the same order of
+magnitude as this session's QKV fusion (48-72 total depending on layer
+count). Given this session's QKV fusion measured a wall-clock regression
+despite an identical-magnitude dispatch-count win, this candidate should
+not be implemented without first profiling *why* fusion isn't paying off
+on this codebase's current dispatch-batching baseline (e.g. an isolated
+kernel-time comparison of the fused vs. three-separate-dispatch QKV path,
+per this project's own t0-fast lesson that framework/dispatch overhead
+should be measured in isolation before more fusion work, not assumed).
