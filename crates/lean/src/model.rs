@@ -995,18 +995,24 @@ fn linear(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &
     match w {
         MatMulWeight::F32 { w } => {
             let dims = pool.uniform(&format!("{skey}.dims"), LinearDims { m: rows, k: in_dim, n: out_dim, act: 0 });
-            let bg = pool.bind_group(
-                key,
-                &engine.linear,
-                &[
-                    BindGroupEntry { binding: 0, resource: x.as_entire_binding() },
-                    BindGroupEntry { binding: 1, resource: w.as_entire_binding() },
-                    BindGroupEntry { binding: 2, resource: b.as_entire_binding() },
-                    BindGroupEntry { binding: 3, resource: out.as_entire_binding() },
-                    BindGroupEntry { binding: 4, resource: dims.as_entire_binding() },
-                ],
-            );
-            engine.dispatch(pass, &engine.linear, &bg, wgs, key);
+            let entries = [
+                BindGroupEntry { binding: 0, resource: x.as_entire_binding() },
+                BindGroupEntry { binding: 1, resource: w.as_entire_binding() },
+                BindGroupEntry { binding: 2, resource: b.as_entire_binding() },
+                BindGroupEntry { binding: 3, resource: out.as_entire_binding() },
+                BindGroupEntry { binding: 4, resource: dims.as_entire_binding() },
+            ];
+            if fast && rows == 1 {
+                // Decode: coalesced matvec (see linear_f32_decode.wgsl's
+                // header) - some GGUFs keep a handful of tensors at F32
+                // residency even in an otherwise-quantized file, which
+                // previously hit the naive per-output-element kernel below.
+                let bg = pool.bind_group(&format!("{key}.decode"), &engine.linear_f32_decode, &entries);
+                engine.dispatch(pass, &engine.linear_f32_decode, &bg, (out_dim.div_ceil(4), 1, 1), key);
+            } else {
+                let bg = pool.bind_group(key, &engine.linear, &entries);
+                engine.dispatch(pass, &engine.linear, &bg, wgs, key);
+            }
         }
         MatMulWeight::Q8_0 { chunks, blocks_per_row, out_dim: n_total } => {
             // Q8_0-resident weights appear on every tensor for Qwen3's
@@ -1066,28 +1072,33 @@ fn linear(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &
             }
         }
         MatMulWeight::Q6_K { chunks, blocks_per_row, out_dim: n_total } => {
-            // Naive kernel only (see linear_q6k.wgsl's doc comment) - Q6_K
-            // is only ever token_embd/output.weight in this crate's models,
-            // one matmul per forward, not worth a fast-path yet.
+            // Q6_K is only ever token_embd/output.weight in this crate's
+            // models, one matmul per forward - but decode (rows == 1) still
+            // gets the coalesced matvec below (see linear_q6k_decode.wgsl's
+            // header): the naive kernel below stayed at 7.6% of peak
+            // bandwidth on the official Qwen2.5-3B GGUF's Q6_K lm head
+            // (docs/runs/2026-09-29-lean-vs-llamacpp-profile.md).
             for chunk in chunks {
                 let ckey = format!("{key}.{}", chunk.row_start);
                 let sckey = scratch_key(&ckey);
                 let dims = pool.uniform(&format!("{sckey}.dims"), LinearQDims { m: rows, k: in_dim, n: chunk.rows, act: 0, blocks_per_row: *blocks_per_row, n_offset: chunk.row_start, n_total: *n_total, _p2: 0 });
-                let bg = pool.bind_group(
-                    &ckey,
-                    &engine.linear_q6k,
-                    &[
-                        BindGroupEntry { binding: 0, resource: x.as_entire_binding() },
-                        BindGroupEntry { binding: 1, resource: chunk.ql.as_entire_binding() },
-                        BindGroupEntry { binding: 2, resource: chunk.qh.as_entire_binding() },
-                        BindGroupEntry { binding: 3, resource: chunk.scales.as_entire_binding() },
-                        BindGroupEntry { binding: 4, resource: chunk.d.as_entire_binding() },
-                        BindGroupEntry { binding: 5, resource: b.as_entire_binding() },
-                        BindGroupEntry { binding: 6, resource: out.as_entire_binding() },
-                        BindGroupEntry { binding: 7, resource: dims.as_entire_binding() },
-                    ],
-                );
-                engine.dispatch(pass, &engine.linear_q6k, &bg, (chunk.rows.div_ceil(16), rows.div_ceil(16), 1), &ckey);
+                let entries = [
+                    BindGroupEntry { binding: 0, resource: x.as_entire_binding() },
+                    BindGroupEntry { binding: 1, resource: chunk.ql.as_entire_binding() },
+                    BindGroupEntry { binding: 2, resource: chunk.qh.as_entire_binding() },
+                    BindGroupEntry { binding: 3, resource: chunk.scales.as_entire_binding() },
+                    BindGroupEntry { binding: 4, resource: chunk.d.as_entire_binding() },
+                    BindGroupEntry { binding: 5, resource: b.as_entire_binding() },
+                    BindGroupEntry { binding: 6, resource: out.as_entire_binding() },
+                    BindGroupEntry { binding: 7, resource: dims.as_entire_binding() },
+                ];
+                if fast && rows == 1 {
+                    let bg = pool.bind_group(&format!("{ckey}.decode"), &engine.linear_q6k_decode, &entries);
+                    engine.dispatch(pass, &engine.linear_q6k_decode, &bg, (chunk.rows.div_ceil(4), 1, 1), &ckey);
+                } else {
+                    let bg = pool.bind_group(&ckey, &engine.linear_q6k, &entries);
+                    engine.dispatch(pass, &engine.linear_q6k, &bg, (chunk.rows.div_ceil(16), rows.div_ceil(16), 1), &ckey);
+                }
             }
         }
         MatMulWeight::Q4_0 { chunks, blocks_per_row, out_dim: n_total } => {
@@ -1333,6 +1344,34 @@ fn rope_positions<'a>(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass
     );
     let half = head_dim / 2;
     engine.dispatch(pass, &engine.rope_positions, &bg, ((rows * heads * half).div_ceil(64), 1, 1), key);
+}
+
+/// Fused `add_inplace` (residual `a += delta`) + `rmsnorm` read of the
+/// updated `a` - see `shaders/add_rmsnorm.wgsl`'s header. `a` is mutated in
+/// place exactly as `add_inplace` would leave it (so later reads of `a`,
+/// e.g. the next `add_rmsnorm`/`add_inplace` call, see the same value); the
+/// normalized result is returned as a fresh buffer, exactly as `rmsnorm`
+/// returns one. Decode-only (see call sites in `forward_decode_step*`) -
+/// prefill's add+norm pairs stay unfused, already amortized across rows.
+#[allow(clippy::too_many_arguments)]
+fn add_rmsnorm(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &str, a: &wgpu::Buffer, delta: &wgpu::Buffer, scale: &wgpu::Buffer, rows: u32, dim: u32, eps: f32) -> wgpu::Buffer {
+    let skey = scratch_key(key);
+    let out = pool.data(&format!("{skey}.out"), (rows * dim) as usize);
+    let dims = pool.uniform(&format!("{skey}.dims"), RmsDims { rows, dim, eps, _p0: 0 });
+    let bg = pool.bind_group(
+        key,
+        &engine.add_rmsnorm,
+        &[
+            BindGroupEntry { binding: 0, resource: a.as_entire_binding() },
+            BindGroupEntry { binding: 1, resource: delta.as_entire_binding() },
+            BindGroupEntry { binding: 2, resource: scale.as_entire_binding() },
+            BindGroupEntry { binding: 3, resource: out.as_entire_binding() },
+            BindGroupEntry { binding: 4, resource: dims.as_entire_binding() },
+        ],
+    );
+    // One workgroup per row (see shaders/add_rmsnorm.wgsl's header comment).
+    engine.dispatch(pass, &engine.add_rmsnorm, &bg, (rows, 1, 1), key);
+    out
 }
 
 fn add_inplace(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &str, a: &wgpu::Buffer, b: &wgpu::Buffer, len: u32) {
@@ -1907,9 +1946,17 @@ fn decode_layers(engine: &Engine, model: &GpuModel, encoder: &mut wgpu::CommandE
     let mut pass = engine.begin_pass(encoder, "decode");
     let x = embed_gather(engine, pool, &mut pass, model, &[token_id]);
 
+    // `normed` carries the *next* dispatch's already-computed rmsnorm input:
+    // seeded here from a plain rmsnorm on the fresh embedding (layer 0's
+    // attn_norm), then thereafter produced as a side effect of the previous
+    // iteration's `add_rmsnorm(add2, next layer's attn_norm)` fusion below -
+    // see that call's comment. This removes one dispatch per layer relative
+    // to a separate `add_inplace`+`rmsnorm(attn_norm)` pair.
+    let mut normed = rmsnorm(engine, pool, &mut pass, "dec_layer0.norm", &x, &model.layers[0].attn_norm, 1, hidden, cfg.rms_norm_eps);
+
+    let num_layers = model.layers.len();
     for (i, layer) in model.layers.iter().enumerate() {
         let key = format!("dec_layer{i}");
-        let normed = rmsnorm(engine, pool, &mut pass, &format!("{key}.norm"), &x, &layer.attn_norm, 1, hidden, cfg.rms_norm_eps);
         let lora_layer = model.lora.as_ref().map(|l| &l.layers[i]);
         let (q, k, v) = qkv_proj(engine, pool, &mut pass, &format!("{key}.qkv"), &normed, 1, cfg, layer, model.fast_kernels, lora_layer);
         rope(engine, pool, &mut pass, &format!("{key}.ropeq"), &q, cos, sin, 1, cfg.num_heads as u32, cfg.head_dim as u32, pos);
@@ -1924,11 +1971,17 @@ fn decode_layers(engine: &Engine, model: &GpuModel, encoder: &mut wgpu::CommandE
 
         let attn_dim = (cfg.num_heads * cfg.head_dim) as u32;
         let o = linear_lora(engine, pool, &mut pass, &format!("{key}.wo"), &attn_out, 1, attn_dim, &layer.o_w, &layer.o_b, hidden, model.fast_kernels, lora_layer.map(|l| &l.o));
-        add_inplace(engine, pool, &mut pass, &format!("{key}.add1"), &x, &o, hidden);
-
-        let ffn_normed = rmsnorm(engine, pool, &mut pass, &format!("{key}.ffnnorm"), &x, &layer.ffn_norm, 1, hidden, cfg.rms_norm_eps);
+        // Fused add1 (x += o) + ffnnorm(x) - one dispatch instead of two
+        // (docs/runs/2026-09-29-lean-kernels.md).
+        let ffn_normed = add_rmsnorm(engine, pool, &mut pass, &format!("{key}.add1_ffnnorm"), &x, &o, &layer.ffn_norm, 1, hidden, cfg.rms_norm_eps);
         let mlp_out = mlp(engine, pool, &mut pass, &format!("{key}.mlp"), &ffn_normed, 1, cfg, layer, model.fast_kernels);
-        add_inplace(engine, pool, &mut pass, &format!("{key}.add2"), &x, &mlp_out, hidden);
+        // Fused add2 (x += mlp_out) + the *next* dispatch's rmsnorm: the
+        // following layer's attn_norm, or (last layer) the final out_norm -
+        // either way `x`'s next reader is always exactly one rmsnorm, so
+        // this fusion always applies. `normed` here becomes next iteration's
+        // `qkv_proj` input (or `normed_final` below, at the last layer).
+        let next_scale = if i + 1 < num_layers { &model.layers[i + 1].attn_norm } else { &model.out_norm };
+        normed = add_rmsnorm(engine, pool, &mut pass, &format!("{key}.add2_nextnorm"), &x, &mlp_out, next_scale, 1, hidden, cfg.rms_norm_eps);
 
         // No per-layer flush here (unlike `forward_prefill`'s per-layer
         // flush, which exists to bound the *seq_len*-scaled dispatch count
@@ -1944,7 +1997,7 @@ fn decode_layers(engine: &Engine, model: &GpuModel, encoder: &mut wgpu::CommandE
         // dispatch volume - removed.
     }
 
-    let normed_final = rmsnorm(engine, pool, &mut pass, "dec_out_norm", &x, &model.out_norm, 1, hidden, cfg.rms_norm_eps);
+    let normed_final = normed;
     let logits = linear(engine, pool, &mut pass, "dec_lm_head", &normed_final, 1, hidden, &model.lm_head, &model.zero_bias_vocab, cfg.vocab_size as u32, model.fast_kernels);
     if let Some(mask) = mask {
         mask_logits_gpu(engine, pool, &mut pass, "dec_mask", &logits, mask, cfg.vocab_size as u32, 0);

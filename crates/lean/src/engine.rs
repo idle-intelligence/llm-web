@@ -81,6 +81,12 @@ pub struct Engine {
     pub rmsnorm: wgpu::ComputePipeline,
     pub rope: wgpu::ComputePipeline,
     pub linear: wgpu::ComputePipeline,
+    /// Coalesced F32 matvec (decode, M=1): same 128-thread,
+    /// rows-per-workgroup structure as `linear_q4_decode`/`linear_q8_decode`,
+    /// adapted to a plain (undequantized) f32 weight row - see
+    /// `shaders/linear_f32_decode.wgsl`'s header for why a F32-resident
+    /// tensor shows up at all in an otherwise-quantized GGUF.
+    pub linear_f32_decode: wgpu::ComputePipeline,
     pub linear_q4: wgpu::ComputePipeline,
     pub linear_q8: wgpu::ComputePipeline,
     /// Coalesced Q8_0 matvec (decode, M=1): same structure as
@@ -89,10 +95,13 @@ pub struct Engine {
     /// Q8_0-resident - not just the lm head (Qwen3's official GGUFs ship
     /// every tensor as Q8_0, no Q4_0 quant at all - see qwen3 survey).
     pub linear_q8_decode: wgpu::ComputePipeline,
-    /// Naive Q6_K matmul/matvec (`shaders/linear_q6k.wgsl`) - see that
-    /// file's doc comment on why no tiled/decode-specialized variant exists
-    /// yet.
+    /// Naive Q6_K matmul/matvec (`shaders/linear_q6k.wgsl`) - used for
+    /// prefill (M>1); decode (M=1) uses `linear_q6k_decode` below.
     pub linear_q6k: wgpu::ComputePipeline,
+    /// Coalesced Q6_K matvec (decode, M=1): same 128-thread,
+    /// rows-per-workgroup structure as `linear_q4_decode`/`linear_q8_decode`,
+    /// see `shaders/linear_q6k_decode.wgsl`'s header for the per-block split.
+    pub linear_q6k_decode: wgpu::ComputePipeline,
     /// Tiled Q4_0 matmul (prefill, M>1): ported from llm-wasm's
     /// shader_q4_tiled.wgsl. Only faster than `linear_q4` once weight reuse
     /// across rows outweighs the tile/barrier overhead: see the shader's
@@ -146,6 +155,12 @@ pub struct Engine {
     /// Same shader as `attn_decode_reduce`, `HEAD_DIM` overridden to 128.
     pub attn_decode_reduce_128: wgpu::ComputePipeline,
     pub add_inplace: wgpu::ComputePipeline,
+    /// `shaders/add_rmsnorm.wgsl`: fuses a residual `add_inplace` with the
+    /// rmsnorm that always immediately follows it in the decoder layer's
+    /// decode path (see that shader's header). Used only by decode's
+    /// `add1`/`add2` sites in `model.rs` (prefill's own add+norm pairs are
+    /// unchanged, already amortized across many rows per dispatch).
+    pub add_rmsnorm: wgpu::ComputePipeline,
     /// `shaders/silu_mul_fused.wgsl`: SwiGLU over one `[rows, 2*hidden]`
     /// fused gate/up matmul output (see `model.rs::gguf_matmul_concat2`'s
     /// doc comment) - replaces a two-buffer `silu_mul` now that gate/up
@@ -256,10 +271,12 @@ impl Engine {
             rmsnorm: make_pipeline(&device, "rmsnorm", include_str!("shaders/rmsnorm.wgsl")),
             rope: make_pipeline(&device, "rope", include_str!("shaders/rope_neox.wgsl")),
             linear: make_pipeline(&device, "linear", include_str!("shaders/linear.wgsl")),
+            linear_f32_decode: make_pipeline(&device, "linear_f32_decode", include_str!("shaders/linear_f32_decode.wgsl")),
             linear_q4: make_pipeline(&device, "linear_q4", include_str!("shaders/linear_q4.wgsl")),
             linear_q8: make_pipeline(&device, "linear_q8", include_str!("shaders/linear_q8.wgsl")),
             linear_q8_decode: make_pipeline(&device, "linear_q8_decode", include_str!("shaders/linear_q8_decode.wgsl")),
             linear_q6k: make_pipeline(&device, "linear_q6k", include_str!("shaders/linear_q6k.wgsl")),
+            linear_q6k_decode: make_pipeline(&device, "linear_q6k_decode", include_str!("shaders/linear_q6k_decode.wgsl")),
             linear_q4_tiled: make_pipeline(&device, "linear_q4_tiled", include_str!("shaders/linear_q4_tiled.wgsl")),
             linear_q4_tiled_rb: make_pipeline(&device, "linear_q4_tiled_rb", include_str!("shaders/linear_q4_tiled_rb.wgsl")),
             linear_q8_tiled_rb: make_pipeline(&device, "linear_q8_tiled_rb", include_str!("shaders/linear_q8_tiled_rb.wgsl")),
@@ -275,6 +292,7 @@ impl Engine {
             attn_decode_reduce: make_pipeline_with_constants(&device, "attn_decode_reduce", include_str!("shaders/attn_decode_reduce.wgsl"), &[("HEAD_DIM", 64.0)]),
             attn_decode_reduce_128: make_pipeline_with_constants(&device, "attn_decode_reduce_128", include_str!("shaders/attn_decode_reduce.wgsl"), &[("HEAD_DIM", 128.0)]),
             add_inplace: make_pipeline(&device, "add_inplace", include_str!("shaders/add_inplace.wgsl")),
+            add_rmsnorm: make_pipeline(&device, "add_rmsnorm", include_str!("shaders/add_rmsnorm.wgsl")),
             silu_mul_fused: make_pipeline(&device, "silu_mul_fused", include_str!("shaders/silu_mul_fused.wgsl")),
             argmax: make_pipeline(&device, "argmax", include_str!("shaders/argmax.wgsl")),
             mask_logits: make_pipeline(&device, "mask_logits", include_str!("shaders/mask_logits.wgsl")),
