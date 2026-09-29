@@ -606,3 +606,165 @@ above) - closing the `short`-case gap further needs an approach that adds
 parallelism rather than removing it (e.g. batching multiple independent
 dispatches, or a genuinely different attention decomposition), not
 attempted this session.
+
+## 9. Session 4
+
+Same branch (`lean-kernels`), continuing from commit `a225b37` (this doc's
+own section 1-8 state). Same box (RTX 3080/Vulkan), same 8 gates
+(`fixture_parity`, `fixture_parity_qwen25_3b`, `fixture_parity_qwen3`,
+`fixture_parity_qwen3_1_7b`, `fixture_parity_llama_360m`,
+`fixture_parity_llama_1_7b`, `kv_snapshot`, `logit_mask`), same
+box-locked/ABAB/median-of-5-or-8 methodology. Target: re-profile the
+`short`-case gap to llama.cpp (Qwen2.5-0.5B ~4.7ms/tok vs 1.66ms/tok,
+Qwen2.5-3B ~13.7ms/tok vs 4.19ms/tok) with a CPU-side phase breakdown, per
+this session's own brief, then act on the largest lever found.
+
+### CPU-phase breakdown (`short` case, `--tokens 16`, steady-state average)
+
+Method: a temporary diagnostic (`LEAN_DEBUG_CPU_TIME=1`, `std::time::Instant`
+wall-clock around three phases of `forward_decode_step_argmax` - encoder
+build/record through `decode_layers`, the `queue.submit` call itself, and
+`read_u32`'s await, which is the blocking `device.poll(PollType::Wait)` +
+map + 4-byte copy) - added locally, run, and reverted before any commit (not
+part of this session's kept diff). Averaged over steps 5-16 of the `short`
+case (first 4 steps excluded as pipeline/cache warm-up, visible as
+elevated encode times in the raw trace).
+
+| model | encode (CPU record) | submit (CPU) | wait+readback (blocks on GPU) | total/step | encode share | wait share |
+|---|---:|---:|---:|---:|---:|---:|
+| Qwen2.5-0.5B | 748.7 us | 37.7 us | 3785.6 us | 4571.9 us | 16.4% | 82.8% |
+| Qwen2.5-3B | 2120.5 us | 100.0 us | 11269.4 us | 13490.7 us | 15.7% | 83.5% |
+
+Cross-check against the same commit's `LEAN_PROFILE_KERNELS=1` run (separate
+invocation, full per-kernel table, `short` case, 16 steps, sum of every
+listed kernel's `total_us/16`): Qwen2.5-0.5B's summed per-kernel GPU time is
+3801.7 us/step, Qwen2.5-3B's is 10932.0 us/step - both within 3% of the
+unprofiled `wait+readback` figure above (3785.6 us / 11269.4 us). This
+confirms `wait+readback` is essentially the real GPU device time for the
+whole step (the CPU has nothing else to do between `submit` and the blocking
+`poll`, so the wait duration tracks actual kernel execution, not idle
+scheduling slack) - it is not slack available to reclaim by better
+CPU/GPU overlap, since there is only one command buffer and one dependency
+chain per step (each layer depends on the previous one's output).
+
+**Where the ~3.8-4.6ms (0.5B) / ~11.3-13.5ms (3B) per step goes**: ~83% is
+real GPU kernel execution (`wait+readback`, cross-checked above); ~16% is
+CPU-side command-buffer recording (`encode` - building ~220-370 dispatches'
+worth of bind groups and `dispatch_workgroups` calls, ~3-6 us/dispatch);
+`submit` itself is under 1%. There is no readback-stall or idle-gap
+component distinct from `wait` at this dispatch count (single
+submit/single 4-byte readback per step, per `forward_decode_step_argmax`'s
+existing design) - the earlier sessions' "low %-of-peak" kernel numbers
+(section 2's Observations) are a real property of the GPU-side kernel
+bodies at these small dispatch sizes, not a separate CPU-overhead
+component hiding in the same measurement.
+
+### Change 10 (attempted, reverted): fuse decode's `ropeq`+`ropek` into one dispatch
+
+The one actionable lever inside the ~16% `encode` share: `decode_layers`
+always calls `rope(q)` immediately followed by `rope(k)`, same cos/sin
+table and position, on every layer - two separate dispatches (and two
+separate bind-group/uniform-buffer builds) for work that only differs in
+which buffer and head count it touches. Per this session's brief's own
+suggested direction ("RoPE into the QKV epilogue") and llm-wasm's own
+fused q+k RoPE kernel (cited in `rope_neox.wgsl`'s header comment, which
+this crate had previously split into two dispatches) - fused the two back
+into one, at the dispatch level rather than folding into the QKV matvec's
+per-thread epilogue (rejected as higher-risk: the matvec's
+`ROWS_PER_WG=4` row grouping doesn't align with RoPE's `(j, j+head_dim/2)`
+pairing across workgroups without reorganizing which output rows a
+workgroup owns - a larger kernel rewrite than this session's remaining
+budget justified after Change 10's own result, below).
+
+New kernel `shaders/rope_qk_fused.wgsl`: same split-half ("NeoX-style")
+per-element math as `rope_neox.wgsl`, one dispatch spanning
+`rows*(heads_q+heads_k)*half` invocations, q and k as two independent
+buffer bindings (not one shared buffer + offset) so it works whether q/k
+are views into one fused qkv matmul output (Qwen2.5, no q_norm/k_norm) or
+two separate buffers (Qwen3's per-head q_norm/k_norm path, which
+materializes q/k before RoPE runs). Wired into `decode_layers` only
+(`model.rs`); prefill's and `forward_chunk_spec`'s separate `rope()`/
+`rope_positions()` calls are unchanged, matching this branch's established
+rule (Change 3, Change 9) that prefill's per-dispatch cost is already
+amortized across many rows.
+
+**Gates**: all 8 pass, `top1_match=true` on every case, every model.
+Confirmed dispatch-count reduction, exactly one fewer dispatch/layer:
+
+| model | decode_dispatches_per_step before | after | layers |
+|---|---:|---:|---:|
+| Qwen2.5-0.5B | 244 (`short`) | 220 | 24 |
+| Qwen2.5-3B | 364 | 328 | 36 |
+| Qwen3-1.7B | 340 | 312 | 28 |
+| SmolLM2-360M | 324 (`short`) | 292 | 32 |
+
+**Timing, round 1** (ABAB, median of 8, `--tokens 8`, box load average
+0.22-1.18 throughout, no other GPU job running):
+
+| model | case | before | after | delta |
+|---|---|---:|---:|---|
+| Qwen2.5-0.5B | short | 5.245 | 5.030 | +4.1% |
+| Qwen3-1.7B | short | 9.775 | 9.005 | +7.9% |
+| SmolLM2-360M | short | 5.760 | 5.925 | -2.9% |
+| Qwen2.5-3B | short | 14.015 | 13.855 | +1.1% |
+| Qwen2.5-0.5B/3B/Qwen3-1.7B | long, non_english, long_tools_* | (13 more cases) | | +0.5% to +3.7%, all same-direction gains |
+
+Per-round direction on the three headline/borderline cases (not just the
+median): Qwen2.5-0.5B `short` faster in 7/8 rounds; Qwen3-1.7B `short`
+faster in 5/8 rounds with swings from -35.6% to +26.1% round to round
+(this model/case's own documented high variance, section 6's Observations);
+SmolLM2-360M `short` faster in only 2/7 valid rounds (net regression).
+
+**Timing, round 2 - re-measured on the same three models/short at
+`--tokens 16`** (more decode steps averaged per process invocation, per
+this doc's own "re-measure before concluding" rule given round 1's mixed
+signal), ABAB, median of 8, box load average 0.32-0.77 throughout:
+
+| model | before | after | delta | rounds after-faster |
+|---|---:|---:|---:|---:|
+| Qwen2.5-0.5B | 4.760 | 4.685 | +1.6% | 4/8 |
+| Qwen3-1.7B | 8.660 | 8.630 | +0.3% | 5/8 |
+| SmolLM2-360M | 5.460 | 5.330 | +2.4% | 6/8 |
+
+**Reverted** - round 1's Qwen2.5-0.5B `short` result (+4.1%, 7/8 rounds)
+did not reproduce at `--tokens 16` on the same model/case/box (+1.6%, a
+coin-flip 4/8 rounds); no model/case cleared the >3% bar with a direction
+that held across both measurement rounds. Read as: the CPU-phase
+breakdown above correctly identified `encode` as ~16% of step time and one
+fewer dispatch/layer as a real, verified reduction in that count, but the
+actual per-dispatch CPU cost this fusion removes (bind-group build +
+uniform-buffer write + one `dispatch_workgroups` call for a kernel this
+small) is on the order of 100-300 us/step - inside this box's own
+documented noise floor for the `short` case (session 2's Observations:
+5.6-19.2% round-to-round spread on Qwen3-1.7B `short` alone), not above
+it. Not committed; `engine.rs`, `model.rs`, and the new
+`rope_qk_fused.wgsl` file were reverted to be byte-identical to commit
+`a225b37`.
+
+### Remaining gap to llama.cpp, end of session 4
+
+Unchanged from end of session 3 (no change from this session was kept):
+
+| model | lean decode (short) | llama.cpp decode | gap |
+|---|---:|---:|---:|
+| Qwen2.5-0.5B | ~4.7-4.8 ms/tok | 1.66 ms/tok | ~2.8-2.9x |
+| Qwen2.5-3B | ~13.7-14.0 ms/tok | 4.19 ms/tok | ~3.3x |
+
+The CPU-phase breakdown narrows what's left: ~83% of every decode step is
+real GPU kernel execution time (cross-checked two independent ways,
+above), not CPU dispatch overhead or readback stall - so the remaining gap
+to llama.cpp is a GPU kernel-body/occupancy question, not a dispatch-count
+one. Session 3's Change 8 (GQA head-group fusion, the most direct
+"add parallelism" attempt at the `short`-case gap) already found this
+project's decode attention occupancy-bound rather than bandwidth-bound at
+these problem sizes (14-16 query heads / 2-8 KV heads against a 68-SM GPU)
+and regressed when workgroup count was reduced; this session's Change 10
+found the complementary dispatch-count lever (fewer, larger dispatches)
+too small in absolute terms to clear the noise floor at this model size.
+Both of this branch's two most-promising remaining directions from
+session 3's own notes have now been tried and reverted at `short` context;
+closing the `short`-case gap further likely needs a genuinely different
+decomposition of decode's per-layer work (e.g. processing more than one
+speculative/batched token per dispatch, which changes the arithmetic
+intensity per dispatch rather than the dispatch count) rather than a
+further variation on this branch's existing per-op kernel set.
