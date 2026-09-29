@@ -1,9 +1,9 @@
 # lean in the browser on the RTX 3080/Vulkan box (Chrome/Dawn vs native wgpu-core)
 
-Machine: TC's Linux GPU box (Manjaro, RTX 3080 10GB, driver 610.57.04,
+Machine: a Linux desktop (Manjaro, RTX 3080 10GB, driver 610.57.04,
 Vulkan 1.4). Chromium 152.0.7977.75 (system package, already installed - no
 sudo used, no packages installed at the OS level). Work done entirely under
-a fresh directory (`llm-web-browser/`) inside the box's agent-guest sandbox;
+a fresh directory (`llm-web-browser/`) inside a sandbox directory on the box;
 no other worker's checkout was touched. Source: the `lean-kernels` branch
 tip (commit `57fa22d`, includes all sessions in
 `docs/runs/2026-09-29-lean-kernels.md` - Q6_K decode matvec, add+rmsnorm
@@ -80,7 +80,7 @@ out of this task's scope). Limits: `maxStorageBufferBindingSize =
 **Reproducible command** (adapter probe only, no model):
 ```
 XAUTHORITY=/run/user/<uid>/.mutter-Xwaylandauth.<token> DISPLAY=:0 \
-  flock <agent-guest>/lean/box.lock -c '<venv>/bin/python3 gpu_probe.py \
+  flock <workdir>/lean/box.lock -c '<venv>/bin/python3 gpu_probe.py \
   --executable-path /usr/bin/chromium --headless-mode headed'
 ```
 (`gpu_probe.py`: Playwright launch with `headless=False` and args
@@ -114,7 +114,7 @@ no NaN/garbled output; greedy continuations read as coherent English/French
 text in every case.
 
 ```
-flock <agent-guest>/lean/box.lock -c \
+flock <workdir>/lean/box.lock -c \
   'XAUTHORITY=<...> DISPLAY=:0 <venv>/bin/python3 run_lean_page.py \
    "http://localhost:8899/www/index.html?local=1" --limit-gb 20 --timeout 180'
 ```
@@ -156,12 +156,10 @@ long-context cases).
 
 **Browser is within 1.0-1.2x of native on this NVIDIA box on every model
 tested, and faster than native on three of four models' long-context
-case** - a much smaller browser-vs-native gap than the Mac's Dawn/Metal
-numbers in `docs/runs/2026-09-28-lean-decode-breakdown.md` (which saw
-browser 2-5x slower than native at long context, attributed there mostly to
-memory pressure at the 16GB ceiling, not kernel/dispatch overhead). This
-box has 62GB RAM and never approached a memory ceiling on any model, so
-that confound is absent here; the browser/native ratio above is read as a
+case** - on the Mac the browser was also at or ahead of native in the same period
+(Sessions 6-8 of `docs/runs/2026-09-28-lean-decode-breakdown.md`: Qwen2.5-0.5B
+10.8 ms/tok in the browser against 11.6 native). This box has 62GB RAM and
+never approached a memory ceiling on any model, so that confound is absent here; the browser/native ratio above is read as a
 closer measurement of Dawn's own per-dispatch overhead vs wgpu-core's on
 Vulkan specifically (both back ends target the same driver/GPU here, unlike
 the Mac's Dawn-Metal vs wgpu-core-Metal comparison).
@@ -172,13 +170,13 @@ findings, not investigated further here.
 
 **Reproducible command** (per model/case/run):
 ```
-flock <agent-guest>/lean/box.lock -c \
+flock <workdir>/lean/box.lock -c \
   'XAUTHORITY=<...> DISPLAY=:0 <venv>/bin/python3 run_lean_page.py \
    "http://localhost:8899/www/decode_timing.html?model=<05b|3b|qwen3_1_7b|smollm2_360m>&case=<short|long>&steps=16" \
    --limit-gb <see section 4> --timeout 300'
 ```
 models served from `crates/lean/www/model*/` directories, each a set of
-symlinks into `<agent-guest>/lean/models/{gguf,hf}/...` (no files copied,
+symlinks into `<workdir>/lean/models/{gguf,hf}/...` (no files copied,
 no HF re-download - all four models were already cached on the box from
 earlier native work).
 
@@ -250,15 +248,15 @@ passes (this test used a standalone trivial kernel, not `Engine::dispatch`).
 
 **Reproducible command:**
 ```
-flock <agent-guest>/lean/box.lock -c \
+flock <workdir>/lean/box.lock -c \
   'XAUTHORITY=<...> DISPLAY=:0 <venv>/bin/python3 run_ts_test.py'
 ```
 (`run_ts_test.py` navigates to a static test page,
 `www/ts_query_test.html`, and reads `window.__tsResult`.)
 
-## Files touched (box side, not committed - lives under agent-guest)
+## Files touched (box side, not committed - lives in the sandbox directory)
 
-`<agent-guest>/llm-web-browser/` (fresh dir): `repo/` (git bundle clone of
+`<workdir>/llm-web-browser/` (fresh dir): `repo/` (git bundle clone of
 `lean-kernels`, wasm built in place), `venv/` (Python + Playwright, bundled
 Chromium also installed via `playwright install chromium` though the system
 `/usr/bin/chromium` was used for every real run above), `gpu_probe.py`,
