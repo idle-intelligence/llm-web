@@ -27,7 +27,7 @@
 // Dispatch: ceil(N / ROWS_PER_WG) workgroups in X, B in Y. Requires M==1
 // (caller in gguf.rs only dispatches this kernel for decode's M=1 step).
 //
-// Tint uniformity fix (docs/ENGINE.md "Known issues / fixed"): this kernel
+// Tint uniformity fix (docs/llm-wasm/ENGINE.md "Known issues / fixed"): this kernel
 // used to `return` early when `b >= B`, before the workgroupBarrier() calls
 // in the tile loop below. `b` (== wg_id.y) is uniform per workgroup, but
 // `B` is loaded from a storage buffer and Tint conservatively taints every

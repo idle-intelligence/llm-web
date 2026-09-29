@@ -1,14 +1,14 @@
 # Model reference: xLAM-2-3b-fc-r (+ 8B candidates for later)
 
-Sources: local checkout `~/Code/idle-intelligence/models/hf/xLAM-2-3b-fc-r/`
+> This document is about `crates/llm-wasm` (the Burn+wgpu engine), not `crates/lean`.
+
+Sources: a local checkout of `Salesforce/xLAM-2-3b-fc-r`'s HF repo
 (config.json, generation_config.json, tokenizer.json, tokenizer_config.json,
-special_tokens_map.json, README.md, xlam_tool_call_parser.py) and
-`~/Code/idle-intelligence/models/gguf/xlam-2-3b-fc-r/` (README.md,
-`xLAM-2-3B-fc-r-Q4_0.gguf`, header parsed locally with the `gguf` pip
-package). HF Hub API (`/api/models/<repo>?blobs=true`, `/raw/main/config.json`)
-queried live for quant listings and 8B configs. `docs.rs/minijinja` queried
-live for feature-flag semantics. `~/Code/idle-intelligence/trucs.ai/.claude/worktrees/sonos-mcp/sonos/{NOTES,PLAN}.md`
-read for project context.
+special_tokens_map.json, README.md, xlam_tool_call_parser.py) and its GGUF repo
+(README.md, `xLAM-2-3B-fc-r-Q4_0.gguf`, header parsed locally with the `gguf`
+pip package). HF Hub API (`/api/models/<repo>?blobs=true`,
+`/raw/main/config.json`) queried live for quant listings and 8B configs.
+`docs.rs/minijinja` queried live for feature-flag semantics.
 
 ## 1. xLAM-2-3b-fc-r — base model, license, config
 

@@ -7,7 +7,7 @@
 //! - The **real** `token_embd.weight` tensor from the xLAM-2-3b-fc-r GGUF
 //!   (Q4_0, [151936, 2048], tied lm_head shape) at M in {1, 64}: the GPU
 //!   kernel computes the full 151936-wide output (exercising the real
-//!   dispatch-grid/buffer-size path from docs/ENGINE.md §2), but the CPU
+//!   dispatch-grid/buffer-size path from docs/llm-wasm/ENGINE.md §2), but the CPU
 //!   reference only dequantizes+dots a handful of sampled output rows
 //!   (avoiding a full 1.2GB CPU dequant of the 151936x2048 table — this
 //!   crate's whole embedding-lookup design deliberately avoids that, see
@@ -317,7 +317,7 @@ fn test_q4_matvec_coalesced_shapes() {
 
 /// Real `token_embd.weight` (Q4_0, [151936, 2048], tied lm_head shape) from
 /// the xLAM-2-3b-fc-r GGUF. Exercises the full 151936-wide dispatch and the
-/// ~174MB single-buffer upload (docs/ENGINE.md §2's untested-limit concern).
+/// ~174MB single-buffer upload (docs/llm-wasm/ENGINE.md §2's untested-limit concern).
 #[test]
 fn test_q4_matmul_real_gguf_token_embd() {
     let model_dir = std::env::var("LLM_MODEL_DIR").unwrap_or_else(|_| {
@@ -343,7 +343,7 @@ fn test_q4_matmul_real_gguf_token_embd() {
 
     // Reading + uploading the full 174MB Q4_0 buffer and successfully
     // launching the kernel at N=151936 below *is* the check for
-    // docs/ENGINE.md §2's untested maxStorageBufferBindingSize concern —
+    // docs/llm-wasm/ENGINE.md §2's untested maxStorageBufferBindingSize concern —
     // a limit shortfall would panic on `create_from_slice` or the launch.
     let bytes = loader.tensor_bytes("token_embd.weight").expect("read token_embd bytes");
     drop(loader);

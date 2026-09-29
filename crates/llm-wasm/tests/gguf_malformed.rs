@@ -1,7 +1,7 @@
 //! Malformed/adversarial GGUF header tests (no GPU) — every case here must
 //! return `Err` from `GgufReader::open`, never panic or abort (OOM from an
 //! unchecked `with_capacity`, index-out-of-bounds from an unchecked
-//! offset/length, etc.). See docs/ENGINE.md's "Review fixes 2026-09-10"
+//! offset/length, etc.). See docs/llm-wasm/ENGINE.md's "Review fixes 2026-09-10"
 //! list, finding 1/6/8.
 
 use std::io::Cursor;

@@ -110,11 +110,11 @@ async function fetchSonosResult(name) {
 
 // Wrap a canned/fallback JS value as the shape a real MCP `tools/call`
 // result actually has: `{"content":[{"type":"text","text":"<pretty JSON>"}]}`,
-// mirroring `agent.rs::FixtureCaller`'s `as_mcp_result` (docs/ENGINE.md
+// mirroring `agent.rs::FixtureCaller`'s `as_mcp_result` (docs/llm-wasm/ENGINE.md
 // "Agent loop" / "The id rule"). A bare parsed value here — what this page
 // returned before this fix — is exactly the shape mismatch that let the id
 // rule silently starve every id-taking tool in a real browser session
-// while native fixture-driven evals passed (see docs/ENGINE.md's
+// while native fixture-driven evals passed (see docs/llm-wasm/ENGINE.md's
 // grammar.rs "content/text" fix).
 function asMcpResult(value) {
   return { content: [{ type: 'text', text: JSON.stringify(value, null, 2) }] };

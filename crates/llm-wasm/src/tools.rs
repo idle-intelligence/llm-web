@@ -1,5 +1,5 @@
 //! MCP tool-call schema (de)serialization and the xLAM tool-call output
-//! parser. Owned by phase 1a. See `docs/MODELS.md` §3 ("Tool-call OUTPUT
+//! parser. Owned by phase 1a. See `docs/llm-wasm/MODELS.md` §3 ("Tool-call OUTPUT
 //! format the model emits"): xLAM-2 emits a bare JSON array
 //! `[{"name": ..., "arguments": {...}}, ...]` at the start of the turn,
 //! with no `<tool_call>` wrapper tags — detection is "does the (stripped)

@@ -9,7 +9,7 @@
 //! constraint"), and `minimum`/`maximum` set to the i64 extremes (a
 //! schema author's "effectively unbounded" spelling, not a real bound).
 //! None of that changes what counts as a valid call, so stripping it is
-//! lossless in meaning — see `docs/ENGINE.md` §"Tool-schema token diet"
+//! lossless in meaning — see `docs/llm-wasm/ENGINE.md` §"Tool-schema token diet"
 //! for the measured savings and where this hooks into the two loops that
 //! own `Tool::from_mcp` (`agent.rs`, `web.rs` — not touched here).
 //!

@@ -8,7 +8,7 @@ under `fixtures/sonos` and `eval/` and are not a dependency of the core
 engine or the headless harness.
 
 Skeleton for xLAM-2-3b-fc-r (Qwen2 architecture) in Burn+wgpu, mirroring stt-web's
-stt-wasm engine (see docs/ENGINE.md, docs/MODELS.md). `Cargo.toml` (workspace root
+stt-wasm engine (see docs/llm-wasm/ENGINE.md, docs/llm-wasm/MODELS.md). `Cargo.toml` (workspace root
 and crate) and `src/lib.rs` are frozen for the two phases below — don't touch them;
 everything else is fair game.
 

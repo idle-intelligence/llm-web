@@ -65,7 +65,7 @@ const DEFAULT_MAX_STEPS: usize = 6;
 /// Per-step cap on malformed-output retries (empty tool-call array,
 /// unparsable `[...]` JSON, or a call naming a tool outside the current
 /// `tools` set) — mirrors `agent.rs::DEFAULT_MAX_RETRIES`. See
-/// `docs/ENGINE.md` "Agent loop" for the retry policy `run_step` mirrors.
+/// `docs/llm-wasm/ENGINE.md` "Agent loop" for the retry policy `run_step` mirrors.
 const MAX_RETRIES: usize = 2;
 
 /// A generic, non-committal nudge appended as a `user` message when a model
@@ -86,7 +86,7 @@ const ENGINE_DIET_LEVEL: DietLevel = DietLevel::Level1;
 /// A forced-run length below this is decoded one token at a time via
 /// masked argmax instead of the batched jump-forward path — mirrors
 /// `model.rs::JUMP_MIN_TOKENS` (kept as a separate constant here since
-/// that one isn't `pub`; see docs/ENGINE.md "Session 12 speed addendum").
+/// that one isn't `pub`; see docs/llm-wasm/ENGINE.md "Session 12 speed addendum").
 const JUMP_MIN_TOKENS: usize = 8;
 
 /// Device initialized by `initWgpuDevice()` — used by every `LlmEngine`.
@@ -106,7 +106,7 @@ pub fn start() {
 /// awaited) once before constructing any `LlmEngine`. Requests the
 /// adapter's full limits, same as stt-web's `initWgpuDevice` — this model's
 /// 175MB single-buffer tied lm_head needs `maxStorageBufferBindingSize`
-/// above the WebGPU spec default (see docs/ENGINE.md's Browser section).
+/// above the WebGPU spec default (see docs/llm-wasm/ENGINE.md's Browser section).
 #[wasm_bindgen(js_name = initWgpuDevice)]
 pub async fn init_wgpu_device() -> Result<(), JsError> {
     use burn::backend::wgpu::{init_device, RuntimeOptions, WgpuSetup};
@@ -186,7 +186,7 @@ pub struct LlmEngine {
 
     /// sha256 of the loaded GGUF's bytes, as computed by the caller and
     /// passed to `load()` — see `prefix_key`/`import_kv_image`/
-    /// `export_kv_image` and `docs/ENGINE.md` "Prefix KV images" for why
+    /// `export_kv_image` and `docs/llm-wasm/ENGINE.md` "Prefix KV images" for why
     /// this is computed in JS (`crypto.subtle.digest`) rather than in wasm.
     model_fingerprint: Option<String>,
 
@@ -203,13 +203,13 @@ pub struct LlmEngine {
     consecutive_tool_errors: usize,
 
     /// Whether to constrain generation to `grammar.rs`'s tool-call schema
-    /// (see `docs/ENGINE.md` "Schema-constrained decoding"). On by
+    /// (see `docs/llm-wasm/ENGINE.md` "Schema-constrained decoding"). On by
     /// default — set via `opts.constrained`.
     constrained: bool,
     /// Whether the first generation of a turn (no tool called yet this
     /// turn), with at least one callable tool, must be a tool call —
     /// mirrors `agent.rs::Agent::require_tool_call_first_step` (see
-    /// `docs/ENGINE.md` "Agent loop"). On by default — set via
+    /// `docs/llm-wasm/ENGINE.md` "Agent loop"). On by default — set via
     /// `opts.requireToolCallFirstStep`.
     require_tool_call_first_step: bool,
     /// Whether `start()`/the KV-image entry points run raw MCP tool lists
@@ -217,7 +217,7 @@ pub struct LlmEngine {
     /// default — set via `opts.diet`.
     diet: bool,
     /// Id-shaped strings harvested from every tool result seen so far this
-    /// conversation (see `docs/ENGINE.md` "The id rule"). Reset in
+    /// conversation (see `docs/llm-wasm/ENGINE.md` "The id rule"). Reset in
     /// `start`/`reset`.
     id_values: IdValues,
     /// Built lazily on first constrained step and cached.
@@ -414,7 +414,7 @@ impl LlmEngine {
     /// or `"{}"` is fine). Returns a JSON string: `{"outcome":"needTools",
     /// "calls":[{"call_id","name","arguments"}...],"step":{...}}`,
     /// `{"outcome":"final","text":...,"step":{...}}`, or
-    /// `{"outcome":"error","message":...}` — see docs/ENGINE.md's Browser
+    /// `{"outcome":"error","message":...}` — see docs/llm-wasm/ENGINE.md's Browser
     /// section for the full shape and `web/agent/worker.js` for how it's
     /// consumed. No `on_token` streaming callback: `model.rs`'s `generate`
     /// has no per-token hook at HEAD, so a step's text arrives in one piece
@@ -505,7 +505,7 @@ impl LlmEngine {
     /// (`load_tools_generic`), so this is the only way to get the two
     /// sides to agree when the page's live `tools_json` differs from
     /// whatever fixture a human might otherwise reach for — see
-    /// `docs/ENGINE.md` "Prefix KV images" for the mismatch this fixes.
+    /// `docs/llm-wasm/ENGINE.md` "Prefix KV images" for the mismatch this fixes.
     /// Errors under the same conditions as `prefixKey`.
     #[wasm_bindgen(js_name = prefixInputs)]
     pub fn prefix_inputs(&self, tools_json: String, system: String) -> Result<String, JsError> {
@@ -533,7 +533,7 @@ impl LlmEngine {
     }
 
     /// Prefix-KV-image cache key for `tools_json`/`system` under the
-    /// currently loaded model (`docs/ENGINE.md` "Prefix KV images"):
+    /// currently loaded model (`docs/llm-wasm/ENGINE.md` "Prefix KV images"):
     /// `sha256(model_fingerprint || rendered_prefix_text)`, computed the same way
     /// `bin/llm-agent.rs`'s `kv-export` subcommand computes it when writing
     /// an image, so a worker can `fetch(<modelBase>/kv/<key>.kvimg)` before
@@ -641,7 +641,7 @@ impl LlmEngine {
     /// time. Errors (rather than exporting garbage) if `resident_tokens`
     /// doesn't currently cover the rendered prefix — call this only after
     /// a `start()`/step whose prefill included the full system+tools
-    /// preamble. `dtype` is always `q8_0` (the format `docs/ENGINE.md`
+    /// preamble. `dtype` is always `q8_0` (the format `docs/llm-wasm/ENGINE.md`
     /// recommends for a one-time browser download — see kvimg.rs module
     /// docs).
     #[wasm_bindgen(js_name = exportKvImage)]
@@ -737,12 +737,12 @@ struct OptsIn {
     max_steps: Option<usize>,
     #[serde(rename = "systemPrompt")]
     system_prompt: Option<String>,
-    /// Schema-constrained decoding (`docs/ENGINE.md` "Schema-constrained
+    /// Schema-constrained decoding (`docs/llm-wasm/ENGINE.md` "Schema-constrained
     /// decoding"). Defaults to on (`LlmEngine::new`'s `constrained: true`)
     /// when omitted.
     constrained: Option<bool>,
     /// Whether the first generation of a turn must be a tool call
-    /// (`docs/ENGINE.md` "Agent loop"). Defaults to on when omitted.
+    /// (`docs/llm-wasm/ENGINE.md` "Agent loop"). Defaults to on when omitted.
     #[serde(rename = "requireToolCallFirstStep")]
     require_tool_call_first_step: Option<bool>,
     /// Tool-schema token diet applied before `Tool::from_mcp` (`docs/
@@ -781,7 +781,7 @@ fn apply_opts(engine: &mut LlmEngine, opts_json: &str) -> Result<(), JsError> {
 /// on, run it through `schemadiet::diet_tools` — returns the *raw JSON*
 /// (post-diet, if applied), not `Tool`s, so a caller (`prefix_inputs`) can
 /// dump exactly the bytes that were rendered into the prompt, byte for
-/// byte — see `docs/ENGINE.md` "Prefix KV images": `kv-export --tools
+/// byte — see `docs/llm-wasm/ENGINE.md` "Prefix KV images": `kv-export --tools
 /// <dump>` doesn't diet at all (`load_tools_generic` in
 /// `bin/llm-agent.rs`), so handing it already-dieted tools is the only way
 /// its rendered prefix (and therefore its `prefix_key`) matches this
@@ -883,7 +883,7 @@ impl LlmEngine {
     /// `Agent::step_inner`.
     ///
     /// Wraps [`LlmEngine::generate_attempt`] with `agent.rs::step_inner`'s
-    /// malformed-output retry policy (see `docs/ENGINE.md` "Agent loop" —
+    /// malformed-output retry policy (see `docs/llm-wasm/ENGINE.md` "Agent loop" —
     /// "what web.rs must mirror" (1)): an empty tool-call array, unparsable
     /// `[...]` JSON, or a call naming a tool outside `self.tools` does not
     /// become an assistant turn — instead attempt 1 forces
@@ -919,7 +919,7 @@ impl LlmEngine {
                 Ok(ParsedOutput::Text(_)) => false,
             };
 
-            // Generic repeated-call loop guard (`docs/ENGINE.md` "Agent
+            // Generic repeated-call loop guard (`docs/llm-wasm/ENGINE.md` "Agent
             // loop"; mirrors `agent.rs::step_inner`) — a well-formed, valid
             // call identical (same name+args) to one already made earlier
             // this run — not only the immediately preceding step — is
@@ -1106,7 +1106,7 @@ impl LlmEngine {
 
     /// One render -> encode -> (restore prefix ->) prefill -> constrained
     /// decode -> parse round — the async, WebGPU-backed shape of
-    /// `agent.rs::Agent::generate_attempt` (see `docs/ENGINE.md`
+    /// `agent.rs::Agent::generate_attempt` (see `docs/llm-wasm/ENGINE.md`
     /// "Schema-constrained decoding", "web.rs's job"): builds a
     /// `Grammar::for_tools` from `self.tools` + the running `self.id_values`
     /// when constrained decoding is on (`self.constrained` or
@@ -1176,7 +1176,7 @@ impl LlmEngine {
         } else {
             use_constrained.then(|| Grammar::for_tools(&grammar_tools, &self.id_values))
         };
-        // Fail-open (`docs/ENGINE.md` "Agent loop" — "fail-open"; mirrors
+        // Fail-open (`docs/llm-wasm/ENGINE.md` "Agent loop" — "fail-open"; mirrors
         // `agent.rs::generate_attempt`): if every still-callable tool is a
         // read tool already called this turn, the id rule left nothing
         // new — rebuild without it instead of boxing the model into
@@ -1192,7 +1192,7 @@ impl LlmEngine {
         if id_rule_relaxed {
             grammar_for_step = Some(Grammar::for_tools_unrestricted_ids(&grammar_tools));
         }
-        // `require_tool_call_first_step` (`docs/ENGINE.md` "Agent loop";
+        // `require_tool_call_first_step` (`docs/llm-wasm/ENGINE.md` "Agent loop";
         // mirrors `agent.rs::generate_attempt`): the first generation of a
         // turn, with at least one tool still callable after the id-rule
         // (and its fail-open relaxation above), must be a tool call —

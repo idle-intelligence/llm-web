@@ -43,7 +43,7 @@ js-sys = "0.3"
 web-sys = { version = "0.3", features = [
     "console", "Response", "Request", "RequestInit", "RequestMode",
     # OPFS (File System Access API), for web.rs's robust before-decode
-    # kv-image write-back (docs/ENGINE.md "Prefix KV images").
+    # kv-image write-back (docs/llm-wasm/ENGINE.md "Prefix KV images").
     "WorkerGlobalScope", "WorkerNavigator", "StorageManager",
     "FileSystemDirectoryHandle", "FileSystemFileHandle", "FileSystemGetFileOptions",
     "FileSystemWritableFileStream", "WritableStream",

@@ -1,5 +1,7 @@
 # ENGINE.md — what stt-wasm transfers to a Qwen2 decoder
 
+> This document is about `crates/llm-wasm` (the Burn+wgpu engine), not `crates/lean`.
+
 Audit of the sibling `stt-web` repo's `crates/stt-wasm` (read-only, not modified) as
 a starting point for a Qwen2.5-3B-style decoder (xLAM-2-3b-fc-r: GQA + q/k/v bias, RoPE, RMSNorm,
 SwiGLU, tied embeddings, 151k vocab) driving MCP tool calls in-browser.
@@ -320,8 +322,7 @@ ported, before any prefill/tiling optimization work.
 
 ## 9. Facts settled after the audit
 
-- **The GGUF actually in use** is `~/Code/idle-intelligence/models/gguf/xlam-2-3b-fc-r/
-  xLAM-2-3b-fc-r-q4_0.gguf` (lowercase filename; a **Mungert** requant, not the Salesforce-
+- **The GGUF actually in use** is a **Mungert** requant of `xLAM-2-3b-fc-r-q4_0.gguf` (lowercase filename, not the Salesforce-
   official file `MODELS.md` §2 audited). Confirmed on disk: 1,742,628,672 bytes ≈ **1.74 GB**,
   **pure F32 + Q4_0** throughout including `token_embd.weight` (the Salesforce Q4_0 file instead
   keeps `token_embd.weight` at Q6_K and is 1.82 GB — a different, unused file). No `output.weight`
@@ -432,7 +433,7 @@ against real WebGPU `maxStorageBufferBindingSize` on M2/Chrome.
   `PowerPreference::HighPerformance`, then a device with the **adapter's full limits** (not spec
   defaults) — required because the tied lm_head is a single ~175MB Q4_0 buffer
   (`maxStorageBufferBindingSize` needs to clear that; unverified on real hardware, same open risk
-  docs/ENGINE.md §12 already flagged for the native path). Must be awaited exactly once before
+  docs/llm-wasm/ENGINE.md §12 already flagged for the native path). Must be awaited exactly once before
   constructing any `LlmEngine`.
 - `new LlmEngine()` — cheap constructor; grabs the device `initWgpuDevice` stashed in a
   `static OnceLock<WgpuDevice>`.
@@ -458,7 +459,7 @@ against real WebGPU `maxStorageBufferBindingSize` on M2/Chrome.
   this simple):
   `{"outcome":"needTools","calls":[{"call_id","name","arguments"}...],"step":{"promptTokens","text","prefillMs","decodeMs","tokens","modelSteps","forcedTokens","retries","toolErrors","toolsForced"}}`,
   `{"outcome":"final","text":...,"step":{...}}`, or `{"outcome":"error","message":...}`.
-  **Mirrors `agent.rs::Agent`'s behaviour** (`docs/ENGINE.md` "Agent loop" / "Schema-constrained
+  **Mirrors `agent.rs::Agent`'s behaviour** (`docs/llm-wasm/ENGINE.md` "Agent loop" / "Schema-constrained
   decoding" — this was `web.rs`'s TODO, now done): `LlmEngine::run_step` builds a fresh
   `Grammar::for_tools` every step from the current `tools` + an `IdValues` accumulated across the
   whole conversation from every tool result (`provideToolResults`), wraps it in a
@@ -631,7 +632,7 @@ actually degrades are genuine content changes (a different tool call, a differen
 
 ### The three local dev servers
 
-1. `scripts/serve_models.py --dir ~/Code/idle-intelligence/models` (port 8001) — GGUF + tokenizer
+1. `scripts/serve_models.py --dir <local models directory>` (port 8001) — GGUF + tokenizer
    files, Range-request + CORS aware (pre-existing, not owned by this work). Exposes
    `/gguf/xlam-2-3b-fc-r/xLAM-2-3b-fc-r-q4_0.gguf` and
    `/hf/xLAM-2-3b-fc-r/{tokenizer.json,tokenizer_config.json}`.
@@ -716,319 +717,85 @@ blocking `engine.start`/`provideToolResults` calls so `index.html` can drive a p
 
 ## Known issues / fixed
 
-### 2026-09-11: Fused decode-time attention kernel for the production F32 KV cache (Session 14)
+Debugging notes, condensed from the engine's build history. Bug, root cause, and fix only; dated
+session narrative removed.
 
-`shader_attn_decode_f32.wgsl` fuses decode's (t==1) QK^T -> softmax -> PV into one dispatch per
-layer (one workgroup per query head, GQA-aware, f32 accumulation throughout), reading K/V directly
-out of `kv.rs`'s `KvDtype::F32` cache tensors via a new `KvCache::f32_layer` raw-handle accessor —
-no dequant step (this cache is already f32), replacing ~8 Burn dispatches (QK^T matmul, scale
-multiply, causal-mask compare+fill, softmax's several ops, PV matmul via `pv_matmul`'s
-contraction-chunking workaround, plus `repeat_kv`'s `cat`) with 1. It's the F32-cache counterpart
-of Session 13's `shader_attn_decode_q8.wgsl`, sharing that kernel's three-phase structure (raw
-scores + running max, then exp/sum, then PV) and `workgroupUniformLoad` uniformity discipline, but
-without any block/word unpacking. Measured (`docs/BENCHMARKS.md` Session 14): a ~10% decode
-ms/token win at kv_len~2225, but a regression at kv_len~8140 — 16 workgroups total isn't enough to
-keep the GPU saturated once each thread's unstrided per-key V-accumulation loop (phase C) dominates
-at long context. `model.rs`'s `Q4Attention::forward` therefore gates the fused path behind
-`FUSED_DECODE_ATTN_MAX_KV_LEN = 4096`, falling back to the existing chunked Burn-matmul path beyond
-that; a tiled/two-pass variant with more workgroups per head is the likely fix for long context but
-wasn't attempted this session.
+- **Fused decode-time attention (F32 KV cache).** `shader_attn_decode_f32.wgsl` fuses decode's
+  QK^T -> softmax -> PV into one dispatch per layer, reading K/V directly out of the F32 KV cache.
+  It wins ~10% decode ms/token at short context but regresses at long context (too few workgroups
+  to saturate the GPU once the per-key V-accumulation loop dominates), so `model.rs` gates it
+  behind `FUSED_DECODE_ATTN_MAX_KV_LEN = 4096` and falls back to the chunked matmul path beyond
+  that.
+- **Burn/cubecl wgpu matmul mis-computes for large-K/small-N shapes.** A chunked prefill's P@V
+  matmul (contraction dim K in the low thousands, output width N = head_dim) diverged from a CPU
+  reference by tens of units, isolated to `probs.matmul(v_chunk)` on exactly that shape and
+  reproduced with a plain matmul on random tensors of the same shape (no attention math
+  involved) — a Burn 0.20/cubecl wgpu kernel-selection bug, not an attention or GGUF-loading bug.
+  Fix: `model.rs::pv_matmul` chunks the P@V matmul's contraction dimension into 256-element blocks
+  and sums partial products, avoiding the bad kernel selection rather than patching cubecl itself.
+  Any future matmul call site with a similarly large-K/small-N shape should chunk its contraction
+  dimension the same way.
+- **Tint WGSL uniformity rejects `workgroupBarrier`/`subgroupAdd` after a storage-buffer-gated
+  early return.** Native wgpu/Naga doesn't run this analysis, so it only surfaced in Chrome:
+  `createShaderModule` failed on kernels that branched on a storage-buffer-loaded bound (`row >=
+  rows`, `b >= B`) and used that branch to skip a later barrier or subgroup op, because Tint
+  conservatively treats any storage-buffer load as non-uniform. Fix, same pattern in every
+  affected shader (`shader_rmsnorm.wgsl`, `shader_q4_matvec.wgsl`, `shader_q4_matvec_subgroup.wgsl`):
+  never branch around a barrier or subgroup op. Compute a `valid` flag once, guard only the
+  loads/accumulation/store with `if (valid)`, and leave every barrier/subgroup call unconditional
+  at the top level of `main`. Rule for future kernels: guard work, not barriers.
+- **`eval --tools 12` tool preamble silently reordered (not a KV-cache bug).** A 12-tool eval
+  subset invented a group id instead of calling the listing tool first, while the same prompt via
+  the native run path called it correctly. Looked like a split-prefill/KV-offset bug at first
+  (ruled out by `full_forward.rs::split_prefill_matches_single_prefill`, which matches a
+  fresh single-shot prefill at multiple split points to <1e-4). Actual cause: `eval::select_tools`
+  filtered the full tool list down to the 12-tool subset's names but sorted the result
+  alphabetically instead of preserving the curated order that puts the listing tool first, so the
+  model saw a different tool preamble token sequence than the reference. Fixed by iterating the
+  12-tool file in its own order and looking up each tool's schema in the full list.
+- **Headless repro harness.** `web/agent/worker.js` wraps `GPUDevice` methods in error scopes
+  (`gpu-debug.js`) so Chrome's cascade errors surface their root validation message instead of
+  downstream noise; `index.html` exposes every log line on `window.__llmLog` for automation. A
+  ready-to-run Playwright harness lives at `scripts/headless/repro.mjs` (see
+  `scripts/headless/README.md`); WebGPU works in headless Chromium as long as the page has
+  navigated to a real http(s) origin first.
+- **Untrusted-input hardening.** `gguf.rs::GgufReader::open` caps `metadata_kv_count`/
+  `tensor_count`/`ndims` before any unbounded allocation, and checks every tensor's byte range
+  against the actual file length before it can be sliced. Tensor-size and element-count
+  arithmetic uses `checked_mul` instead of raw multiplication/`.product()`, converts to `usize`
+  via `usize::try_from` instead of `as usize` truncation, and out-of-range embedding ids return
+  `Result` instead of panicking, propagated through the whole embed/forward/generate path. Runtime
+  `expect`/`unwrap` on untrusted data (GGUF bytes, tokenizer JSON, model output) was swept from
+  the crate outside test code and GPU kernel-launch invariants. `tests/gguf_malformed.rs` covers
+  truncated headers, absurd counts, out-of-range `ndims`, and tensor offsets past EOF against a
+  hand-rolled GGUF byte writer.
+- **Sampling NaN-safety.** `sample::top_k`'s sort comparator maps NaN logits to `-inf` for the
+  comparison only and uses `total_cmp` otherwise, so it never panics and NaN never wins top-k;
+  `greedy`'s strict `>` was already NaN-safe.
+- **Subgroup matvec kernel gating.** `shader_q4_matvec_subgroup.wgsl` hardcodes
+  `SUBGROUP_SIZE=32`; `web.rs`'s `initWgpuDevice` only enables it when the adapter both reports the
+  `SUBGROUP` feature and reports `min_subgroup_size == max_subgroup_size == 32`. wgpu 26's
+  `BROWSER_WEBGPU` backend always reports `0`/`0` for these limits today, so the subgroup kernel
+  is effectively disabled on WebGPU until wgpu or the WebGPU spec surfaces a real subgroup size.
+- **Autotune and prefill shapes.** Burn's per-shape autotune has no persistent cache across a
+  browser session, and every prefill length is a distinct shape, so every new agent-loop
+  utterance paid a fresh tuning pass. Fix: pad the scratch-dequant+matmul path's input rows up to
+  a fixed set of buckets before calling `matmul` and slice the output back, so autotune only ever
+  sees a small, reused set of shapes. Because the *first* prefill of a new bucket still pays a
+  full native-cached-but-browser-uncached autotune benchmark, and every CMMA/MMA candidate
+  strategy fails kernel selection outright on this Metal-via-wgpu backend, the scratch-matmul path
+  now calls the underlying kernel launch directly with a manually chosen `Strategy` per M-size
+  bucket (`gguf.rs::strategy_for_bucket`) instead of going through Burn's `Tensor::matmul`/
+  `autotune` for the shapes that caused multi-minute stalls; `burn/autotune` stays enabled for the
+  smaller attention-path matmuls, where an earlier attempt to disable it crate-wide produced
+  numerically wrong attention output. Three regimes hold across the M values production prompts
+  actually hit: small M favors the naive per-element-dequant kernel, mid M favors a
+  double-buffered kernel with a larger tile size, large M favors the smaller tile size. See
+  `docs/BENCHMARKS.md` for the measured before/after numbers.
 
-### 2026-09-10: Burn/cubecl wgpu matmul mis-computes for large-K/small-N shapes (fixed: chunked-attention 11.14 logit divergence)
-
-Symptom (Session 6, docs/BENCHMARKS.md): `full_forward.rs::split_prefill_matches_single_prefill`'s
-split=1000 case (prefix 1000 rows, then 1225 rows at offset 1000) showed max-abs
-logit diff 11.14 vs a single whole-prompt prefill. Session 6 traced this to
-`model.rs::attention_scores_and_values`'s `t > ATTN_QUERY_CHUNK` branch and
-exonerated `gguf.rs`/WGSL (both matmul kernels agree with a CPU reference to
-~1e-5 on every real weight shape, at every M value from the failing split) but
-left it unfixed as a KNOWN BUG, hypothesizing non-contiguous strides from
-`Tensor::narrow` on a permuted tensor feeding `Burn::matmul`.
-
-Root cause (Session 7): **not** contiguity — forcing every chunked tensor
-through a sync CPU round-trip before `matmul` produced a bit-identical
-divergence. Bisecting QK^T -> mask -> softmax -> P@V independently against a
-CPU f64 reference (`model.rs::debug_tests::chunked_attention_matches_unchunked_synthetic`,
-fully synthetic, no GGUF model) isolated the bug to the P@V matmul
-(`probs.matmul(v)`) specifically: QK^T and softmax matched the CPU reference to
-~1e-6/~1e-8, but `probs.matmul(v_chunk)` on shape `[1,H,256,1256]` x
-`[1,H,1256,16]` did not. Confirmed as a Burn 0.20/cubecl wgpu matmul kernel bug
-unrelated to attention entirely: a plain `matmul` on fresh random tensors of
-that same shape (no softmax, no masking) diverged from a CPU reference by 33.79
-max-abs. Trigger appears to be a large contraction dimension (K = kv_len, low
-thousands during prefill) paired with a small output width (N = head_dim).
-
-Fix: `model.rs::pv_matmul` chunks the P@V matmul's contraction (K) dimension
-into 256-element blocks and sums partial products instead of one large-K/
-small-N `matmul` call, used in both branches of `attention_scores_and_values`.
-Verified: all `split_prefill_matches_single_prefill` splits (including two new
-ones matching the real MCP tool-result-suffix shapes, 133-token and 531-token
-suffixes on `03_tools_multiturn`) now hold the tight 3e-4 bound (measured
-7e-5-1.3e-4); `test_forward_02/03` remain greedy-exact; prefill tok/s unchanged
-(75.52 tok/s on `02_tools_single`, above Session 5's 73.3 baseline). Did not
-patch cubecl itself (out of scope) — this workaround avoids the bad kernel
-selection rather than fixing it upstream, so any *other* future call site with
-a similarly large-K/small-N matmul shape should chunk its contraction dimension
-the same way rather than assuming Burn's `matmul` handles it correctly.
-
-### 2026-09-10: Tint WGSL uniformity rejects `workgroupBarrier`/`subgroupAdd` after a storage-buffer-gated early return
-
-Symptom, real Chrome (Dawn/Tint), first compute dispatch of a run:
-`createShaderModule failed: Error while parsing WGSL: :61:9 error:
-'workgroupBarrier' must only be called from uniform control flow` /
-`control flow depends on possibly non-uniform value` / `reading from
-read_write storage buffer 'info' may result in a non-uniform value`.
-Native wgpu/Naga does not run this analysis, so the bug was invisible to
-`cargo test --features wgpu` and only surfaced in the browser.
-
-Root cause: three fused kernels each had an early `return` guarding
-per-workgroup bounds (`row >= rows` in `shader_rmsnorm.wgsl`, `b >= B` in
-`shader_q4_matvec.wgsl` and `shader_q4_matvec_subgroup.wgsl`) that executed
-*before* the kernel's `workgroupBarrier()`/`subgroupAdd()` calls. The guard
-condition (`row`/`b` == a builtin id) is uniform per workgroup, but the
-bound it's compared against (`rows`/`B`) is loaded from a `storage` buffer
-(`info`), and Tint's WGSL uniformity analysis conservatively taints *every*
-storage-buffer load as non-uniform — it cannot prove the load reads the
-same address for every invocation, so any branch on that value that can
-skip a later barrier is rejected, even when (as here) the skip is
-workgroup-uniform in practice.
-
-Fix, same pattern in all three shaders: never branch around a barrier or
-subgroup op. Compute a `valid`/`b_valid` flag once, guard only the
-loads/accumulation/store with `if (valid)`, and leave every
-`workgroupBarrier()`/`subgroupAdd()` call at the top level of `main` (or of
-an unconditional loop) so it is always reached by the whole workgroup
-regardless of the storage-buffer-derived bound. Invalid lanes contribute 0
-to shared-memory reductions, which doesn't change results for valid lanes.
-Changed: `crates/llm-wasm/src/wgsl/shader_rmsnorm.wgsl`,
-`shader_q4_matvec.wgsl`, `shader_q4_matvec_subgroup.wgsl`. No dispatch-shape
-or binding changes, so `gguf.rs` was untouched.
-
-Audited and left as-is: `shader_naive.wgsl` has an early return but no
-barriers/subgroup ops at all, so the rule doesn't apply (this is why it was
-already known to pass Chrome). `shader_q4_tiled.wgsl` (native-only,
-`#[cfg(not(target_arch = "wasm32"))]` in `gguf.rs`, never compiled for
-Tint) already followed the correct pattern — its per-element bounds checks
-(`n_global < N`, `m_global < M`) gate `if/else` value selection, not a
-`return`/`break` that skips a barrier, and its K-loop barriers are
-unconditional at loop-body top level.
-
-Rule for future kernels: **guard work, not barriers.** A `workgroupBarrier`
-or `subgroupAdd` call must never sit inside an `if`/`for`/`while` whose
-condition was computed from a storage-buffer load, and no `return`/`break`/
-`continue` derived from such a load may skip a barrier call for only some
-invocations. Push the bounds check down into the loads/stores instead.
-
-**Addendum, same day:** the guard-work-not-barriers rule alone is not
-sufficient when the *loop itself* is bounded by a storage-buffer value and
-contains a barrier — `shader_q4_matvec.wgsl`'s tile loop
-(`loop { if (tile_start >= K) { break; } ... workgroupBarrier(); }`) still
-tripped Tint in the headless Chromium harness even after the return-before-
-barrier fix, because the loop's exit condition depends on `K` (read from
-`info`), which Tint taints non-uniform regardless of guard placement. Fix:
-stage every control value that drives a barrier-gating loop/branch through
-`var<workgroup>` + `workgroupUniformLoad` — thread 0 writes `info`'s fields
-into a `var<workgroup> array<...>`, then every thread reads it back via
-`let x = workgroupUniformLoad(&wg_array);` (one call for the whole array,
-not one per scalar — it already contains its own barrier pair). Tint's
-uniformity analysis special-cases `workgroupUniformLoad`'s result as
-uniform. Applied to `shader_rmsnorm.wgsl`, `shader_q4_matvec.wgsl`,
-`shader_q4_matvec_subgroup.wgsl`. Verified end-to-end in the headless
-Chromium harness (`web/agent/`, real Dawn/Tint): full prefill+decode with
-a tool call and a follow-up turn completed with no shader errors. Updated
-rule: **any control value that gates a loop or branch containing a barrier
-or subgroup op must be loaded via `workgroupUniformLoad`, not read directly
-from a storage buffer** — the guard-work-not-barriers pattern is still
-correct for per-thread bounds checks (`row < N`, `b < B`) that only guard
-work, never a barrier.
-
-### 2026-09-10: `eval --tools 12` tool preamble silently reordered (not a KV-cache bug)
-
-Symptom: `llm-agent eval --tools 12` on `m01`/`s09` ("Pause the kitchen." / "Resume
-playback.") invented a group id directly instead of calling the listing tool
-first, while `llm-agent run` on the identical HF-rendered prompt (and HF bf16
-itself) called the listing tool first. Initial hypothesis was a split-prefill
-bug: the eval harness prefills the constant system+tools prefix once,
-`KvCache::snapshot`/`restore`s it, and prefills only the per-turn suffix at a
-nonzero `offset` — suspects were RoPE position, the causal mask at `offset >
-0`, or `KvCache::append`/`restore` writing/reading the wrong range.
-
-That hypothesis was wrong. `crates/llm-wasm/tests/full_forward.rs`'s
-`split_prefill_matches_single_prefill` test (added for this investigation)
-prefills a 2225-token prompt whole, then again split at token 2218/1000/2224
-with `restore()` in between, and again with `restore()` followed by a
-*different* suffix (simulating a second turn) — all three variants match a
-fresh single-shot prefill to <1e-4 max-abs-diff in logits and bit-for-bit in
-an 8-token greedy continuation. The KV cache / RoPE-offset / causal-mask
-machinery in `model.rs`/`kv.rs` is correct at nonzero offset.
-
-The real bug: `s09` is the *first* case run in that eval (no cache reuse
-involved at all — a single fresh 2225-token prefill, same code path as
-`llm-agent run`) and still produced the wrong tool call, which ruled out
-prefix-caching entirely and pointed at prompt construction instead.
-`eval::select_tools` (`crates/llm-wasm/src/eval.rs`) built the 12-tool subset
-by filtering the full 34-tool list (`tools.json`, alphabetically ordered) down
-to the names present in `tools-12.json`, **discarding `tools-12.json`'s own
-curated order** (which lists `get_households_and_groups_and_players` — the
-listing tool — first) and replacing it with alphabetical order. The model
-sees a completely different tool preamble token sequence than the
-HF/`llm-agent run` reference (which used `tools-12.json`'s order verbatim),
-so it picks a different first action — nothing to do with KV cache offsets.
-
-Fix: `select_tools` now iterates `tools-12.json` in its own order and looks
-up each tool's schema in the full 34-tool list, instead of filtering the
-34-tool list's order. `llm-agent eval --tools 12 --only s09,m01 --label
-split-fix` after the fix: both call `get_households_and_groups_and_players({})`
-first (`correct=true`).
-
-### Headless repro
-
-`web/agent/worker.js` imports `./gpu-debug.js` before dynamically importing
-`pkg/llm_wasm.js`, wrapping `GPUDevice` methods in error scopes so Chrome's
-cascade errors (`[Invalid BindGroupLayout] ... is invalid due to a previous
-error`) surface their root validation message instead of only the downstream
-noise. `index.html` exposes every log line on `window.__llmLog` for
-automation. To reproduce headless with Playwright's bundled Chromium (never
-the user's real browser): start `python3 web/agent/serve.py` (port 8002,
-COOP/COEP) alongside the model server on :8001, then drive the page with
-`chromium.launch({ headless: true, args: ['--enable-unsafe-webgpu',
-'--enable-features=WebGPU', '--use-angle=metal', '--ignore-gpu-blocklist'] })`
-— WebGPU works fine in headless mode on this hardware (Apple M2, metal-3
-adapter) as long as the page has navigated to a real http(s) origin first;
-`navigator.gpu` is `undefined` on `about:blank`. Click `#load-btn`, wait for
-`window.__llmLog` to contain `ready`, fill `#utterance`, click `#run-btn`,
-and watch for `[gpu-debug]` lines.
-
-A ready-to-run version of this harness lives at `scripts/headless/repro.mjs`
-(see `scripts/headless/README.md`).
-
-## Review fixes 2026-09-10
-
-1. `gguf.rs::GgufReader::open` — `metadata_kv_count`/`tensor_count`/`ndims`
-   from the untrusted header no longer drive unbounded `with_capacity`
-   (capped at `MAX_CAPACITY_HINT = 1<<16`); `ndims <= 4` is `ensure!`d; every
-   tensor's `offset` and `[abs_offset, abs_offset+byte_size)` range is
-   checked against the actual file length before any caller can slice it.
-2. `GgmlDtype::byte_size`/`GgufTensorInfo::{num_elements,byte_size}` return
-   `Result` (`checked_mul` chain, "tensor size overflow"/"element count
-   overflow"); `tensor_data` converts the result to `usize` via
-   `usize::try_from` with context instead of `as usize` truncation.
-   `EmbeddingStore::embed_id`/`embed_id_add_cpu` now return `Result` and
-   `ensure!` `id < vocab_size`; propagated through `LlmModel::embed_tokens`
-   -> `forward_hidden` -> `forward_logits`/`generate`, and every native
-   (`llm-agent.rs`) and WASM (`web.rs`) caller.
-3. `model::logits_to_vec` returns `Result` instead of
-   `.expect("f32 logits")`; `web.rs`'s async GPU-readback `.expect(...)` maps
-   to `JsError` instead. Swept the crate for other runtime-reachable
-   `expect`/`unwrap` on untrusted-data paths (GGUF bytes, tokenizer JSON,
-   model output) — none left outside `#[cfg(test)]` code and internal GPU
-   kernel-launch invariants (not driven by untrusted input).
-4. `load_q4_linear`/`load_q4_linear_with_bias` `ensure!(shape.len() == 2, ...)`
-   with the tensor name in the message, before indexing `shape[0]`/`shape[1]`.
-5. `sample::top_k`'s sort comparator is now NaN-safe: NaN logits are mapped
-   to `-inf` for the comparison only (never win top-k), non-NaN values use
-   `total_cmp` (total order, never panics). `greedy`'s strict `>` was
-   already NaN-safe and deterministic (first true max wins); added tests.
-6. `GgmlDtype::byte_size`/`GgufTensorInfo::num_elements` use a `checked_mul`
-   chain instead of raw `*`/`.product()` (see finding 2 above — same fix).
-7. `LlmEngine::new()` (`#[wasm_bindgen(constructor)]`, can't return `Result`)
-   still falls back to `WgpuDevice::default()` when `initWgpuDevice()`
-   wasn't awaited first, but now logs a `console.warn` explaining the
-   fallback almost certainly means later GPU calls fail; documented on the
-   method.
-8. Added `tests/gguf_malformed.rs` (8 cases, no GPU): truncated header (two
-   variants), absurd `tensor_count`/`metadata_kv_count`, `ndims = 9`, tensor
-   offset+size past EOF, offset alone past EOF, and a well-formed-file
-   sanity check — all via a small hand-rolled GGUF byte writer. Added
-   `sample.rs` unit tests for NaN in `greedy`/`top_k`.
-9. Subgroup matvec kernel gating (`shader_q4_matvec_subgroup.wgsl` hardcodes
-   `SUBGROUP_SIZE=32`): `web.rs`'s `initWgpuDevice` now only calls
-   `gguf::set_subgroup_support(true)` when `wgpu::Features::SUBGROUP` is
-   present **and** `adapter.limits().min_subgroup_size ==
-   max_subgroup_size == 32`. As of wgpu 26's `BROWSER_WEBGPU` backend these
-   limits always come back `0`/`0` (`Limits::default()` — the backend
-   doesn't query a real value from the browser), so the subgroup kernel is
-   effectively disabled on WebGPU today, with a comment explaining why and
-   what would need to change (wgpu, or the WebGPU spec, actually surfacing
-   subgroup size) for it to activate.
-10. `shader_q4_tiled.wgsl`'s header comment corrected: it previously
-    described the shipped kernel as TM=TN=128/MICRO=8, but the constants in
-    the file (and what's actually compiled) are TM=TN=64/MICRO=4
-    (`docs/BENCHMARKS.md` K2's `v3`, vectorized dequant); the 128/MICRO=8
-    variant (`v2`) was measured and found slower, then reverted. No code
-    change, comment only.
-
-### Deferred
-
-- **Agent/web duplication** (review finding 7): `web.rs`'s async step loop
-  duplicates `agent.rs`'s `Agent::step_inner` orchestration because Burn's
-  wgpu tensor readback has no sync-over-async escape hatch on wasm32 (see
-  `web.rs`'s module doc comment) — not addressed here.
-- **Per-step re-render cost** (review finding 6): each agent step
-  re-renders the full chat-template prompt from scratch rather than
-  incrementally extending it — not addressed here.
-
-### 2026-09-10: Autotune and prefill shapes
-
-`Tensor::matmul`'s `burn/autotune` (enabled since Session 5) tunes a kernel
-strategy per distinct `(M,N,K)` shape and has no persistent cache across a
-browser session — every new prefill length M paid a fresh tuning pass, and
-since every agent-loop utterance and tool result has a different M, this meant
-constant re-tuning rather than a one-time warm-up. Fixed in `gguf.rs`'s
-`q4_matmul_dispatch`: the scratch-dequant+matmul path now pads the input's M
-up to a fixed bucket (`pad_m_bucket` — multiples of 32 below 128, multiples of
-128 at/above) before calling `Tensor::matmul`, and slices the output back to
-the real M, so autotune only ever sees a small, reused set of shapes
-(128, 256, ..., 2304, ...) regardless of how ragged the actual prefill lengths
-are; `SCRATCH_MATMUL_CHUNK_M` dropped from 2225 to 2048 (itself 128-aligned)
-so a chunked prefill's remainder chunk stays bucket-aligned too. See
-docs/BENCHMARKS.md Session 10 for the in-process bucket-reuse measurement and
-the padding-is-numerically-inert test in `tests/q4_matmul.rs`.
-
-**Session 11 update**: bucketing only reduced the *number* of distinct
-tuning passes — each one was still a real autotune benchmark, cheap natively
-(cubecl caches results on disk at `target/autotune/0.9.0/<device-key>/
-burn_cubecl-kernel-matmul-tune-base.json.log`, `CacheConfig::Target`,
-see `cubecl-runtime-0.9.0/src/config/cache.rs`) but with no browser
-equivalent, so the *first* prefill of a new bucket still paid the full
-benchmark-every-candidate cost in Chrome (6.5 min for a 2304-row session).
-Inspecting that native cache (`CUBECL_DEBUG_LOG=stdout` env var also
-logs autotune picks) shows every CMMA/MMA candidate strategy failing kernel
-selection outright on this Metal-via-wgpu backend ("No tile size is
-available for the problem"), so the winner at every shape sampled is a
-`DoubleUnit` (double-buffered, non-tensor-core) kernel, varying only by
-`cubek_matmul::routines::TileSizeSelection` (`MinTileSize` wins at the
-dominant M=2048-row scratch-matmul chunk; `MaxTileSize` only wins for
-smaller-M remainder chunks). `gguf.rs`'s scratch-matmul path
-(`pinned_matmul`) now calls `cubek_matmul::launch::launch_ref` directly with
-that `Strategy` pinned as a constant, bypassing Burn's `Tensor::matmul`/
-`autotune` entirely for the shapes that actually caused the multi-minute
-spike. `burn/autotune` stays enabled for the smaller attention-path matmuls
-in `model.rs` (cheap to tune, and empirically *not* safe to run through
-cubek's un-benchmarked `Strategy::Auto` fallback — an earlier attempt to
-disable `autotune` crate-wide produced numerically wrong attention output).
-See docs/BENCHMARKS.md Session 11 for cold/warm numbers.
-
-**Session 15 update**: Session 11's single process-wide pin was chosen only
-at the dominant M=2048 chunk shape, and left real throughput on the table at
-every other M an agent loop's tool-result prefills actually hit — the
-browser gate's ~460-token tool results were measured at ~24 tok/s (~145
-GFLOP/s, ~10% of f32 peak on this GPU). `llm-agent prefill-sweep` swept M x
-every non-CMMA/MMA `cubek_matmul::Strategy` (CMMA/MMA already dead per
-Session 11; `SimpleVecMat`/`DoubleVecMat` newly found dead too — they
-require column-major Rhs, but `q4_dequant_scratch`'s output is row-major) at
-two production shapes and found three clean regimes: M<=128 the naive
-per-element-dequant kernel wins outright (no scratch-dequant/pipeline
-overhead to amortize), 129<=M<1024 `DoubleUnit/MaxTileSize` wins by
-1.2-1.4x over `MinTileSize`, M>=1024 `MinTileSize` wins (Session 11's
-regime, unchanged). `gguf.rs::strategy_for_bucket(m)` now replaces the
-single pinned constant with this three-way table (`SCRATCH_MATMUL_MIN_M`
-raised 32->129 so M<=128 skips the scratch route entirely, same path as
-M==1's matvec); `pinned_matmul`/`scratch_matmul_chunked` call it per chunk,
-so a chunked prefill's 2048-row chunks and bucket-aligned remainder each get
-their own bucket's winner automatically. See docs/BENCHMARKS.md Session 15
-for the full sweep table and before/after numbers (M=460: 26.9->39.8 tok/s
-warm, +1.4x, zero regression at M=2225).
+Deferred, not addressed: `web.rs`'s async step loop duplicates `agent.rs`'s orchestration logic
+(Burn's wgpu tensor readback has no sync-over-async escape hatch on wasm32); each agent step
+re-renders the full chat-template prompt from scratch rather than incrementally extending it.
 
 ## 14. Schema-constrained decoding (`src/grammar.rs`)
 
@@ -1532,10 +1299,8 @@ human — or the model — reads per tool.
 ## Prefix KV images
 
 Build-time-produced files that let any engine instance load a prefix's KV cache in one shot
-instead of running prefill token-by-token, per the idea in
-`trucs.ai/.claude/worktrees/sonos-mcp/docs/kv-cache-images.md` (read-only reference). Steps 1-2 of
-that plan: the file format supports both `f32` and `q8_0` tensor encodings (§"KV quantisation" in
-that doc); reading `q8_0` directly in the attention kernels (rather than dequantizing at import)
+instead of running prefill token-by-token. The file format supports both `f32` and `q8_0` tensor
+encodings; reading `q8_0` directly in the attention kernels (rather than dequantizing at import)
 is still a later step.
 
 ### Format v1
@@ -1673,7 +1438,7 @@ primitive to target directly (only `create_from_slice`/`empty`).
   `--gguf`, `--model-dir`, `--tools <MCP tools/list JSON>` (any file with that shape, not just the
   two fixed fixtures — `eval.rs`'s tools loader is duplicated locally as `load_tools_generic`
   rather than editing that module), `--system`, `--dtype f32|q8_0` (default `q8_0`), `--out-dir`
-  (default `~/Code/idle-intelligence/models/kv/`), `--tool-order listing-first|as-is`. Renders the
+  (default a local `models/kv/` directory), `--tool-order listing-first|as-is`. Renders the
   prefix as the common leading tokens between two content-free probe utterances (`"kv-export-
   probe-alpha"` / `"totally-different-probe-beta"` — chosen with **no shared leading text**, since
   an earlier version shared `"kv-export-probe-"` and the token-level common prefix overran into
@@ -1711,7 +1476,7 @@ primitive to target directly (only `create_from_slice`/`empty`).
   GGUF shard URL by substituting its `/gguf/` path segment (`deriveKvBaseUrl`) — matches
   `scripts/serve_models.py` serving the whole `models/` tree, `kv/` a sibling of `gguf/`/`hf/`.
   `'status'` messages with `phase: 'kv-image'` and a human `note` report the outcome;
-  `docs/ENGINE.md`'s worker protocol comment (top of `worker.js`) documents the message shapes.
+  `docs/llm-wasm/ENGINE.md`'s worker protocol comment (top of `worker.js`) documents the message shapes.
 
 Debug-only, not part of the KV-image feature itself: `LlmEngine.setPrefillKernel("naive"|"pinned")`
 (`web.rs`) / `gguf::set_force_naive_kernel` toggle production `ForceKernel::Auto` routing (which

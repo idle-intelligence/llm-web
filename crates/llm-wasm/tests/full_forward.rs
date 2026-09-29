@@ -228,7 +228,7 @@ fn test_forward_01_no_tools() {
     // position (see per-position dump above). The task brief's target is
     // <=1 mismatch and cosine>0.99; investigated and NOT hit exactly —
     // documenting rather than tuning this bound to the brief's number (see
-    // docs/ENGINE.md and the checkpoint report for the investigation: the
+    // docs/llm-wasm/ENGINE.md and the checkpoint report for the investigation: the
     // causal mask and rotate-half RoPE formula were independently verified
     // correct via `model::debug_tests` unit tests; 6/8 mismatches are
     // near-ties (margin < 0.5 logit, one as close as 0.011) consistent with

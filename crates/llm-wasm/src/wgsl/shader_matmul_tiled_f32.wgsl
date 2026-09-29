@@ -2,7 +2,7 @@
 //
 // Why a hand-written GEMM when `cubek_matmul` is already wired up: on this
 // M2/Metal-via-wgpu adapter every CMMA/MMA candidate fails kernel selection
-// (docs/ENGINE.md, Session 11), so cubek falls back to a non-tensor-core
+// (docs/llm-wasm/ENGINE.md, Session 11), so cubek falls back to a non-tensor-core
 // `DoubleUnit` kernel. Measured end to end on llm-life's Qwen2.5-0.5B
 // prefill that is ~430 GFLOP/s against the M2's ~3.6 TFLOP/s f32 peak —
 // about 12% — and it is the single largest term in a variant-B forward once
@@ -82,7 +82,7 @@ fn main(
     }
     // Routing the loop bounds through a uniform load is what keeps the
     // barriers below legal under Tint's uniformity analysis — a raw storage
-    // read is non-uniform (docs/ENGINE.md, 2026-09-10).
+    // read is non-uniform (docs/llm-wasm/ENGINE.md, 2026-09-10).
     let li = workgroupUniformLoad(&wg_info);
     let m = li[0];
     let n = li[1];

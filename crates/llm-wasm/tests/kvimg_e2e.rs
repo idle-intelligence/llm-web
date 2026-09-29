@@ -1,4 +1,4 @@
-//! Native end-to-end test for prefix KV images (`docs/ENGINE.md` "Prefix
+//! Native end-to-end test for prefix KV images (`docs/llm-wasm/ENGINE.md` "Prefix
 //! KV images"): exports the 13-tool system+tools prefix (`dtype: "q8_0"`),
 //! imports it into a fresh `KvCache`, and checks that greedy generation
 //! over the suffix of a real eval fixture's prompt matches a fresh

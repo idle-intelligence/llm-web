@@ -312,7 +312,7 @@ fn prefix_is_stable_across_utterances_for_same_tools() {
     assert!(common < a.len() && common < b.len());
 }
 
-// --- Retry / tool-error / schema-diet policy (see `docs/ENGINE.md` "Agent loop") ---
+// --- Retry / tool-error / schema-diet policy (see `docs/llm-wasm/ENGINE.md` "Agent loop") ---
 
 /// (a) An empty tool-call array `[]` followed by a valid call: 1 retry
 /// recorded on step 1, 2 steps total, and the tool actually gets called
@@ -479,7 +479,7 @@ fn unknown_tool_name_retries_instead_of_calling() {
 /// native fixture-driven evals while failing against the real server: ids
 /// never got harvested from a value that was already parsed). This is the
 /// documented `CallToolResult` shape (see `agent::FixtureCaller`'s doc
-/// comment / `docs/ENGINE.md`); no live-run capture of the exact bytes was
+/// comment / `docs/llm-wasm/ENGINE.md`); no live-run capture of the exact bytes was
 /// available to diff against, so this asserts the documented shape.
 #[test]
 fn fixture_caller_result_is_mcp_content_shaped() {
@@ -539,7 +539,7 @@ fn diet_on_strips_annotations_from_rendered_prompt() {
     assert!(!prompt.contains("annotations"), "diet should have stripped annotations:\n{prompt}");
 }
 
-/// Generic repeated-call loop guard (`docs/ENGINE.md` "Agent loop"): the
+/// Generic repeated-call loop guard (`docs/llm-wasm/ENGINE.md` "Agent loop"): the
 /// model calling the exact same tool with the exact same arguments as one
 /// it already successfully called earlier this run is never re-executed —
 /// instead the step retries with a nudge telling the model it already has
@@ -693,7 +693,7 @@ fn fully_cached_repeat_guard_step_does_not_error() {
     }
 }
 
-/// Repeat-after-error (docs/ENGINE.md "Agent loop" / "Typed ids" —
+/// Repeat-after-error (docs/llm-wasm/ENGINE.md "Agent loop" / "Typed ids" —
 /// the `bloupblip` fix): a call identical (same tool *and* same
 /// arguments) to one already made this run is never re-executed a second
 /// time, whether that earlier call's result was an error or not — the
@@ -803,7 +803,7 @@ fn repeat_after_an_error_with_different_args_is_allowed() {
     }
 }
 
-/// Fail-open (`docs/ENGINE.md` "Agent loop" — "fail-open"): when the only
+/// Fail-open (`docs/llm-wasm/ENGINE.md` "Agent loop" — "fail-open"): when the only
 /// tools still callable under the id-restricted grammar are read tools
 /// already called this turn (the id rule left nothing new — e.g. a
 /// listing tool's result carried no id-shaped values, and the only
@@ -873,7 +873,7 @@ fn fail_open_relaxes_id_rule_when_only_option_is_a_repeat() {
     }
 }
 
-/// `require_tool_call_first_step` (on by default, `docs/ENGINE.md` "Agent
+/// `require_tool_call_first_step` (on by default, `docs/llm-wasm/ENGINE.md` "Agent
 /// loop" — the `bloupblip` refusal): the first generation of a turn, with
 /// at least one callable tool, is built under `Grammar::tools_only`
 /// regardless of what the model would have said, recorded as
@@ -913,7 +913,7 @@ fn first_step_of_turn_forces_tool_call_grammar() {
 
 /// A later step of the same turn — after a tool has already been called —
 /// is not forced into `tools_only`: the turn can still end with a prose
-/// answer (`docs/ENGINE.md` "Agent loop").
+/// answer (`docs/llm-wasm/ENGINE.md` "Agent loop").
 #[test]
 fn later_step_of_turn_can_still_answer_in_text() {
     let Some((template, tokenizer)) = load_agent_parts() else {

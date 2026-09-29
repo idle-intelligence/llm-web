@@ -151,7 +151,7 @@ below); (e) the sync-readback cost of `into_data()` alone on a 151936-f32 tensor
 | 2048 | 2048 (q/o) | 0.144 | 16.4 |
 
 All four shapes land at **16-27 GB/s** against the M2's ~100GB/s unified-memory peak
-(16-27% of peak) — well above the ~11 GB/s stt-wasm extrapolation in `docs/ENGINE.md`
+(16-27% of peak) — well above the ~11 GB/s stt-wasm extrapolation in `docs/llm-wasm/ENGINE.md`
 §10, but still far short of bandwidth-bound. Confirms the shader review's diagnosis
 (misaligned/uncoalesced nibble reads from the 18-bytes/block interleaved layout) as
 the mechanism, not a different bottleneck.
@@ -186,7 +186,7 @@ not the ~5-8x the ≤40ms/token target would need.
 
 **Prefill breakdown (`02_tools_single`, 2225 tokens, before K5):** matmul-calls
 78.18s, attention+everything-else 6.18s, of 84.36s total — **prefill is >90% matmul
-time**, confirming `docs/ENGINE.md` §10's compute-bound diagnosis and that the naive
+time**, confirming `docs/llm-wasm/ENGINE.md` §10's compute-bound diagnosis and that the naive
 kernel's per-element redundant dequant (K2's finding) is the lever, not attention
 chunking (already ruled out by K3) or cache-copy overhead.
 
@@ -1208,7 +1208,7 @@ Headless (Playwright's bundled Chromium, GPU otherwise idle):
 
 `grammar.rs`'s `Constraint`/`GrammarConstraint` wired into
 `model.rs::generate_with_constraint` and `Agent`/`NativeGenerator` — see
-`docs/ENGINE.md` "Schema-constrained decoding" for the design (byte-level
+`docs/llm-wasm/ENGINE.md` "Schema-constrained decoding" for the design (byte-level
 `forced_bytes`, not token-level mask-count, and why).
 
 ### `tests/constrained.rs` — fixtures 02/03, steps vs tokens

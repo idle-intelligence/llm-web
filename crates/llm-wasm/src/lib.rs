@@ -2,7 +2,7 @@
 //!
 //! Decoder-only transformer (GQA + q/k/v bias, RoPE, RMSNorm, SwiGLU, tied
 //! embeddings, 151936-token vocab) driving MCP tool calls in-browser, mirroring
-//! the stt-wasm engine's Burn+wgpu architecture (see docs/ENGINE.md).
+//! the stt-wasm engine's Burn+wgpu architecture (see docs/llm-wasm/ENGINE.md).
 
 #[cfg(feature = "wgpu")]
 pub mod gguf;
@@ -37,7 +37,7 @@ pub mod web;
 
 /// Model configuration for xLAM-2-3b-fc-r (Qwen2 architecture).
 ///
-/// See `docs/MODELS.md` for the values verified against the GGUF header and
+/// See `docs/llm-wasm/MODELS.md` for the values verified against the GGUF header and
 /// `config.json`.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct LlmConfig {
@@ -68,7 +68,7 @@ pub struct LlmConfig {
 impl Default for LlmConfig {
     fn default() -> Self {
         // Verified values from xLAM-2-3b-fc-r's config.json / GGUF header,
-        // see docs/MODELS.md §1-2.
+        // see docs/llm-wasm/MODELS.md §1-2.
         Self {
             num_layers: 36,
             hidden_size: 2048,

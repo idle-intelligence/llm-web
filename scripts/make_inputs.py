@@ -15,7 +15,7 @@ Copied verbatim field-for-field (no edits to descriptions/schemas) -- this
 matches the shape already used in 02_tools_single.json/03_tools_multiturn.json
 before this script existed, and is the shape export_reference.py's
 tokenizer.apply_chat_template(..., tools=tools) call expects as input (see
-docs/MODELS.md: the chat template itself just tojson-dumps whatever object
+docs/llm-wasm/MODELS.md: the chat template itself just tojson-dumps whatever object
 sits in each tools[] entry -- it doesn't unwrap the type/function wrapper --
 so this wrapped shape ends up serialized as-is inside the rendered prompt's
 system block, same as it did with the placeholders).

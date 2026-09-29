@@ -1,5 +1,5 @@
 //! Chat template rendering (minijinja) for xLAM-2-3b-fc-r's embedded Jinja2
-//! `chat_template`. Owned by phase 1a. See `docs/MODELS.md` §3 for the
+//! `chat_template`. Owned by phase 1a. See `docs/llm-wasm/MODELS.md` §3 for the
 //! template source and the wire shapes it expects.
 //!
 //! ## Closing the `tojson` fidelity gap vs. Python/transformers
@@ -218,7 +218,7 @@ pub struct ChatTemplate {
 impl ChatTemplate {
     /// Build from the raw Jinja2 template string plus the special tokens it
     /// may reference (this particular xLAM-2 template doesn't use
-    /// `bos_token`/`eos_token` as Jinja globals — see `docs/MODELS.md` §3 —
+    /// `bos_token`/`eos_token` as Jinja globals — see `docs/llm-wasm/MODELS.md` §3 —
     /// but other chat templates do, so we still thread them through).
     pub fn new(
         template_source: impl Into<String>,

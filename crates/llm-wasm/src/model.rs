@@ -3,7 +3,7 @@
 //! HF's `Qwen2Model`/`Qwen2Attention` semantics (transformers
 //! `modeling_qwen2.py`), matched numerically against `fixtures/reference`
 //! (see tests/full_forward.rs), not from stt-web's structurally-similar but
-//! differently-shaped `SttModel` (docs/ENGINE.md §3-4 catalogued the deltas:
+//! differently-shaped `SttModel` (docs/llm-wasm/ENGINE.md §3-4 catalogued the deltas:
 //! separate q/k/v/bias instead of one `in_proj`, 3-matrix SwiGLU instead of
 //! 2-matrix gating, rotate-half RoPE instead of interleaved-pair, no sliding
 //! window, tied lm_head instead of an independent `text_linear`).
@@ -28,7 +28,7 @@ use crate::LlmConfig;
 /// Rotary Position Embeddings with precomputed cos/sin tables, HF
 /// `rotate_half` convention: `head_dim` splits into two contiguous halves
 /// `[x0..x_{d/2})` / `[x_{d/2}..x_d)`, rotated against each other — **not**
-/// stt-wasm's interleaved-pair convention (docs/ENGINE.md §3). `cos`/`sin`
+/// stt-wasm's interleaved-pair convention (docs/llm-wasm/ENGINE.md §3). `cos`/`sin`
 /// are `[max_seq_len, head_dim]` (the per-half-dim frequency table
 /// concatenated with itself, matching HF's `emb = cat([freqs, freqs],
 /// dim=-1)`) so they can be sliced and broadcast-multiplied directly against
@@ -348,7 +348,7 @@ impl RmsNormLayer {
 
 /// Grouped-query attention: `n_heads` query heads, `n_kv_heads` key/value
 /// heads (`n_heads / n_kv_heads` query heads share each KV head). Qwen2's
-/// q/k/v projections carry bias; `attn_output` doesn't (docs/MODELS.md §2).
+/// q/k/v projections carry bias; `attn_output` doesn't (docs/llm-wasm/MODELS.md §2).
 pub struct Q4Attention {
     q_proj: Q4Linear,
     k_proj: Q4Linear,
@@ -936,7 +936,7 @@ impl Q4TransformerBlock {
 // ---------------------------------------------------------------------------
 
 /// The complete Qwen2 decoder. `lm_head` is tied to `embed`'s Q4 buffer (same
-/// GPU handle, shared via `Q4Tensor::clone` at load time — docs/MODELS.md §2:
+/// GPU handle, shared via `Q4Tensor::clone` at load time — docs/llm-wasm/MODELS.md §2:
 /// no independent `output.weight` tensor exists in this GGUF).
 /// A forced run shorter than this many tokens is decoded one token at a
 /// time via ordinary masked argmax instead of the batched jump-forward
@@ -1084,7 +1084,7 @@ impl LlmModel {
     /// `llm-life` (CONCEPT.md §1) reads p(alive) from two logits (`0`/`1`) at
     /// every one of thousands of positions; the full head would materialize
     /// `T x 151936` floats to read two columns. The rows come from the same
-    /// Q4 buffer `lm_head` is tied to (docs/MODELS.md §2: no independent
+    /// Q4 buffer `lm_head` is tied to (docs/llm-wasm/MODELS.md §2: no independent
     /// `output.weight` exists), so this is the same projection, sliced.
     /// Build it once per generation and reuse it across positions.
     pub fn head_slice(&self, token_ids: &[u32]) -> Result<Tensor<Wgpu, 2>> {
@@ -1152,7 +1152,7 @@ impl LlmModel {
     /// tokens are appended without individual argmax/forward-pass-per-token
     /// decode steps — instead, one `forward_hidden` prefill call of `M =
     /// run.len()` runs them all through in a single model step, appending
-    /// to `cache` the same way prefill does (`docs/ENGINE.md` "Schema-
+    /// to `cache` the same way prefill does (`docs/llm-wasm/ENGINE.md` "Schema-
     /// constrained decoding", jump-forward semantics). Otherwise, one
     /// normal masked-argmax decode step runs (`sample::greedy_masked` when
     /// the constraint has a mask, plain `sample::greedy` when
@@ -1246,7 +1246,7 @@ impl LlmModel {
 }
 
 /// Model-step / forced-token breakdown for `generate_with_constraint`
-/// (`docs/ENGINE.md` "Schema-constrained decoding"). `model_steps` counts
+/// (`docs/llm-wasm/ENGINE.md` "Schema-constrained decoding"). `model_steps` counts
 /// forward passes (one jump-forward run of `k` forced tokens is 1 step, not
 /// `k`); `forced_tokens` + the sampled-token count equal `total_tokens`.
 #[derive(Debug, Clone, Copy, Default)]

@@ -37,7 +37,7 @@ changing any property name, `required` list, `enum`, or `type`. Measured
 against the real tokenizer + chat template
 (`crates/llm-wasm/tests/schemadiet.rs`): the 13-tool Sonos preamble goes
 from 2499 to 2382 tokens and the 34-tool one from 8129 to 7738 tokens.
-Not wired into this eval's agent loop yet — see `docs/ENGINE.md`
+Not wired into this eval's agent loop yet — see `docs/llm-wasm/ENGINE.md`
 §"Tool-schema token diet" for the hook-in point and level-2 (opt-in,
 description-deduping) numbers.
 

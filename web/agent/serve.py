@@ -9,8 +9,8 @@ plus permissive CORS so this page's own fetches (of, say, the wasm-pack
 `pkg/` files) aren't blocked either.
 
 This is the third of three local dev servers documented in
-docs/ENGINE.md's Browser section:
-  1. scripts/serve_models.py --dir ~/Code/idle-intelligence/models  (port 8001, GGUF + tokenizer)
+docs/llm-wasm/ENGINE.md's Browser section:
+  1. scripts/serve_models.py --dir <local models directory>  (port 8001, GGUF + tokenizer)
   2. (reserved — MCP tool server, out of scope here)
   3. web/agent/serve.py                                             (port 8002, this page)
 

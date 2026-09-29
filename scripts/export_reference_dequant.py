@@ -16,7 +16,7 @@ time. See scripts/README.md for the exact command and expected duration.
 
 venv mon ami: run with scripts/.venv/bin/python (see scripts/README.md).
 
-Tensor naming (llama.cpp GGUF <-> HF state_dict), per docs/MODELS.md section 2:
+Tensor naming (llama.cpp GGUF <-> HF state_dict), per docs/llm-wasm/MODELS.md section 2:
 
     token_embd.weight              <-> model.embed_tokens.weight   (tied to lm_head.weight)
     blk.N.attn_q.{weight,bias}     <-> model.layers.N.self_attn.q_proj.{weight,bias}

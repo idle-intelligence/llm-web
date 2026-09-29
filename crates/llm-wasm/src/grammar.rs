@@ -2,7 +2,7 @@
 //!
 //! A pure state machine (no GPU, no model) that decides, at every decoding
 //! step, which vocab tokens are legal continuations of the output so far —
-//! see `docs/ENGINE.md` §"Schema-constrained decoding" for the design and
+//! see `docs/llm-wasm/ENGINE.md` §"Schema-constrained decoding" for the design and
 //! how this is meant to hook into `sample.rs` (not wired up yet — another
 //! worker owns the generate loop).
 //!
@@ -45,7 +45,7 @@ pub struct Prop {
     pub name: String,
     pub required: bool,
     /// Name ends with `_id`/`_ids`, or description contains "ID" — see
-    /// `docs/ENGINE.md` for why this is generic rather than Sonos-specific.
+    /// `docs/llm-wasm/ENGINE.md` for why this is generic rather than Sonos-specific.
     pub is_id: bool,
     pub kind: PropKind,
 }
@@ -138,7 +138,7 @@ pub fn tools_from_json(list: &[Value]) -> Vec<Tool> {
 //
 // Values are bucketed by a "type token" derived from the key they were
 // harvested under (`normalize_type_token`) so that, e.g., a `groupId` and
-// a `playerId` never land in the same pool — see docs/ENGINE.md "Typed
+// a `playerId` never land in the same pool — see docs/llm-wasm/ENGINE.md "Typed
 // ids" for the regression (a player id satisfying a `group_id` property)
 // this guards against. Values harvested from a key that isn't itself
 // id-shaped (`is_id_key`) fall into the untyped `""` bucket, exactly like
@@ -226,7 +226,7 @@ impl IdValues {
             Value::String(s) => {
                 // MCP tool results commonly carry their payload as
                 // `{"content":[{"type":"text","text":"<pretty-printed JSON
-                // string>"}]}` (see `docs/ENGINE.md`'s "The id rule" and
+                // string>"}]}` (see `docs/llm-wasm/ENGINE.md`'s "The id rule" and
                 // the real-MCP-shape regression this guards against) —
                 // mirrors `tools.rs::compact_embedded_json`'s detection of
                 // the same shape. Try parsing every string value as JSON
@@ -289,7 +289,7 @@ fn is_id_key(k: &str) -> bool {
 /// kind — `groupId`/`group_id` and `player_ids`/`playerIds` normalise to
 /// `"group"`/`"player"` respectively, so a `group_id` property is
 /// restricted to values harvested from `groupId`-shaped keys, never
-/// `playerId`-shaped ones (docs/ENGINE.md "Typed ids" — the `bloupblip`
+/// `playerId`-shaped ones (docs/llm-wasm/ENGINE.md "Typed ids" — the `bloupblip`
 /// regression this fixes: a player id satisfying `get_now_playing`'s
 /// `group_id`).
 ///
@@ -375,7 +375,7 @@ pub struct Grammar {
     /// When set, `Pos::Start` never enters the tool-call-array branch (a
     /// leading `[` is rejected outright) — every generation is forced into
     /// `Pos::FreeText` instead. Built by [`Grammar::text_only`] for the
-    /// agent loops' forced-final-answer fallback (`docs/ENGINE.md` "Agent
+    /// agent loops' forced-final-answer fallback (`docs/llm-wasm/ENGINE.md` "Agent
     /// loop"): once retries are exhausted on a repeated or empty tool call,
     /// the model must produce a text answer, not another array.
     text_only: bool,
@@ -383,7 +383,7 @@ pub struct Grammar {
     /// non-`[` byte is rejected outright) — every generation is forced into
     /// the tool-call-array branch instead. Mirror image of `text_only`; set
     /// by [`Grammar::tools_only`] for both agent loops'
-    /// `require_tool_call_first_step` (`docs/ENGINE.md` "Agent loop"): the
+    /// `require_tool_call_first_step` (`docs/llm-wasm/ENGINE.md` "Agent loop"): the
     /// first generation of a turn must at least attempt a tool call rather
     /// than refuse in prose (the observed `bloupblip` failure this guards
     /// against never looked anything up).
@@ -418,7 +418,7 @@ impl Grammar {
     /// as an ordinary free string instead of being restricted to (or
     /// dropped for lack of) `id_values`. Fail-open escape hatch for when
     /// the id-restricted grammar would leave the model nothing new to
-    /// call (`docs/ENGINE.md` "Agent loop" — "fail-open"): both agent
+    /// call (`docs/llm-wasm/ENGINE.md` "Agent loop" — "fail-open"): both agent
     /// loops rebuild with this instead of `for_tools` for one step when
     /// every still-callable tool is a read tool already called this turn.
     pub fn for_tools_unrestricted_ids(tools: &[Tool]) -> Self {
@@ -428,7 +428,7 @@ impl Grammar {
     /// A grammar with no callable tools at all — `Pos::Start` rejects a
     /// leading `[` outright, so the only legal output is free text. Used by
     /// both agent loops' forced-final-answer fallback once retries are
-    /// exhausted on a repeated or empty tool call (`docs/ENGINE.md` "Agent
+    /// exhausted on a repeated or empty tool call (`docs/llm-wasm/ENGINE.md` "Agent
     /// loop"): the model must answer, not emit another tool-call array.
     pub fn text_only() -> Self {
         Self {
@@ -465,7 +465,7 @@ impl Grammar {
                     // Candidates are typed by the PROPERTY NAME's own type
                     // token (`normalize_type_token`), not a flat pool of
                     // every id ever seen — see `IdValues::candidates_for`
-                    // and docs/ENGINE.md "Typed ids".
+                    // and docs/llm-wasm/ENGINE.md "Typed ids".
                     let candidates = id_values.candidates_for(&normalize_type_token(&p.name));
                     if candidates.is_empty() {
                         // Property cannot be emitted at all. If it was
@@ -522,7 +522,7 @@ impl Grammar {
     /// Every tool name that survived id-availability filtering — the set
     /// the model can actually start typing (`Grammar::can_call`'s data,
     /// exposed as a slice for the fail-open "is the model stuck" check —
-    /// see `docs/ENGINE.md` "Agent loop").
+    /// see `docs/llm-wasm/ENGINE.md` "Agent loop").
     pub fn callable_tool_names(&self) -> &[String] {
         &self.tool_names
     }
@@ -1118,7 +1118,7 @@ impl Grammar {
     /// `GrammarConstraint::forced_bytes`'s "exactly one legal next byte"
     /// test — it would see `,` as a live second option and refuse to force
     /// through `}` even when `}` is the only byte that can ever complete
-    /// the grammar (`docs/ENGINE.md` "Schema-constrained decoding" /
+    /// the grammar (`docs/llm-wasm/ENGINE.md` "Schema-constrained decoding" /
     /// jump-forward).
     fn has_unseen_prop(&self, tool: usize, seen: u32) -> bool {
         self.tools[tool].props.len() > seen.count_ones() as usize
@@ -1161,7 +1161,7 @@ impl TokenVocab {
 }
 
 /// A bitset over vocab ids — the token mask a sampler would AND into its
-/// logits before argmax/top-k (see `docs/ENGINE.md`; not wired into
+/// logits before argmax/top-k (see `docs/llm-wasm/ENGINE.md`; not wired into
 /// `sample.rs` by this change).
 #[derive(Clone)]
 pub struct TokenMask {
@@ -1318,7 +1318,7 @@ impl<'g> GrammarState<'g> {
 
 // ---------------------------------------------------------------------
 // Constraint — the trait `model.rs::generate` and `agent.rs::Agent` drive
-// the decode loop through (see docs/ENGINE.md "Schema-constrained
+// the decode loop through (see docs/llm-wasm/ENGINE.md "Schema-constrained
 // decoding" for the jump-forward wiring). `GrammarConstraint` is the only
 // implementation today; the trait exists so `generate`'s signature doesn't
 // hard-code `GrammarState`/`TokenVocab`.

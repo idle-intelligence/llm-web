@@ -1,6 +1,6 @@
 // Copied from stt-web crates/stt-wasm/src/wgsl/shader_naive.wgsl at commit
 // 16940c99218303747c13bbe905f538628415ce64. No changes. Q4_0 naive dequant+matmul
-// kernel; see docs/ENGINE.md §2 for size-limit analysis against xLAM-2-3b-fc-r's
+// kernel; see docs/llm-wasm/ENGINE.md §2 for size-limit analysis against xLAM-2-3b-fc-r's
 // larger tensors (151936-wide lm_head, 11008-wide MLP).
 
 // Q4_0 Dequantization + Matrix Multiplication Compute Shader (naive variant)

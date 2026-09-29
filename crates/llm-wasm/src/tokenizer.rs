@@ -11,7 +11,7 @@ use anyhow::{anyhow, Result};
 use tokenizers::Tokenizer as HfTokenizer;
 
 /// The two turn-ending tokens xLAM-2 stops generation on — see
-/// `docs/MODELS.md` §1 (`generation_config.json`'s `eos_token_id: [151645,
+/// `docs/llm-wasm/MODELS.md` §1 (`generation_config.json`'s `eos_token_id: [151645,
 /// 151643]`).
 const EOS_TOKEN_STRS: [&str; 2] = ["<|im_end|>", "<|endoftext|>"];
 
@@ -47,7 +47,7 @@ impl Tokenizer {
     }
 
     /// Ids of `<|im_end|>` and `<|endoftext|>`, i.e. the ids generation
-    /// should stop on — see `docs/MODELS.md` §1.
+    /// should stop on — see `docs/llm-wasm/MODELS.md` §1.
     pub fn eos_ids(&self) -> &[u32] {
         &self.eos_ids
     }

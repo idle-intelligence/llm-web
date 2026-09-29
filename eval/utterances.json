@@ -888,7 +888,7 @@
     ],
     "accept": "subset",
     "tools12_ok": true,
-    "notes": "Same pattern as m11 but with a real speaker name ('BLOUPBLIP') that has no match in the fixture household; the expected call uses the fixture's kitchen group id (RINCON_KITCHEN01:1) as a stand-in target the way m11/m13 do, since the harness has no fixture room actually named 'bloupblip'. Regression case for the observed browser failure (docs/ENGINE.md \"Agent loop\" / require_tool_call_first_step): with no id known yet, play_artist is correctly excluded from the grammar by the id rule, but before require_tool_call_first_step the free-text branch let the model answer with a prose refusal on step 0 instead of calling get_households_and_groups_and_players first."
+    "notes": "Same pattern as m11 but with a real speaker name ('BLOUPBLIP') that has no match in the fixture household; the expected call uses the fixture's kitchen group id (RINCON_KITCHEN01:1) as a stand-in target the way m11/m13 do, since the harness has no fixture room actually named 'bloupblip'. Regression case for the observed browser failure (docs/llm-wasm/ENGINE.md \"Agent loop\" / require_tool_call_first_step): with no id known yet, play_artist is correctly excluded from the grammar by the id rule, but before require_tool_call_first_step the free-text branch let the model answer with a prose refusal on step 0 instead of calling get_households_and_groups_and_players first."
   },
   {
     "id": "m28",
@@ -908,7 +908,7 @@
     ],
     "accept": "subset",
     "tools12_ok": true,
-    "notes": "Regression case for the observed browser failure (owner's real browser, 13 tools, build 9294f0c, \"what's playing on bloupblip?\"): 'Kitchen Surround' is a *player* name (playerId RINCON_KITCHEN02) belonging to the Kitchen *group* (groupId RINCON_KITCHEN01:1) in the fixture household. get_now_playing takes a group_id, not a player_id, so the model must resolve the player's group and call it with RINCON_KITCHEN01:1 — before the typed-ids fix (docs/ENGINE.md \"Typed ids\"), the flat id pool let a harvested player id satisfy a group_id-typed property just as readily as a real group id, and the relay rejected the resulting call as an invalid/stale group_id."
+    "notes": "Regression case for the observed browser failure (owner's real browser, 13 tools, build 9294f0c, \"what's playing on bloupblip?\"): 'Kitchen Surround' is a *player* name (playerId RINCON_KITCHEN02) belonging to the Kitchen *group* (groupId RINCON_KITCHEN01:1) in the fixture household. get_now_playing takes a group_id, not a player_id, so the model must resolve the player's group and call it with RINCON_KITCHEN01:1 — before the typed-ids fix (docs/llm-wasm/ENGINE.md \"Typed ids\"), the flat id pool let a harvested player id satisfy a group_id-typed property just as readily as a real group id, and the relay rejected the resulting call as an invalid/stale group_id."
   },
   {
     "id": "s18",

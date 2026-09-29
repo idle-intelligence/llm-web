@@ -49,7 +49,7 @@
 // `workgroupUniformLoad`, including the two per-query values read out of
 // `meta`. Tint treats a raw storage load as non-uniform and then rejects
 // the `workgroupBarrier`s that follow a loop gated on it (see
-// docs/ENGINE.md, 2026-09-10 Tint uniformity note); routing them through a
+// docs/llm-wasm/ENGINE.md, 2026-09-10 Tint uniformity note); routing them through a
 // workgroup variable is what makes the barriers legal.
 
 @group(0) @binding(0) var<storage, read_write> q: array<f32>;
@@ -137,7 +137,7 @@ fn main(
     // Phase A: raw scores for this thread's strided keys, running max.
     // -1e30: a sentinel far below any attention score. Do NOT use
     // -3.4028235e38 — Tint rejects it as not representable in f32 while
-    // native Naga accepts it (docs/ENGINE.md).
+    // native Naga accepts it (docs/llm-wasm/ENGINE.md).
     var local_max: f32 = -1e30;
     j = tid;
     loop {

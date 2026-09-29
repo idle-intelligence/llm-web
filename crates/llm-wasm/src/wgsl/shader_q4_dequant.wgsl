@@ -14,7 +14,7 @@
 // first cut — see docs/BENCHMARKS.md Session 4 P1 for the measured effect.
 //
 // No barriers, no loops bounded by a storage-buffer value — the Tint
-// uniformity rule (docs/ENGINE.md "Known issues / fixed") doesn't apply to
+// uniformity rule (docs/llm-wasm/ENGINE.md "Known issues / fixed") doesn't apply to
 // this kernel; the only branch is a per-thread bounds-check `return`, which
 // is safe because there's no barrier/subgroup op anywhere in this shader.
 

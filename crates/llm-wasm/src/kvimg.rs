@@ -1,6 +1,6 @@
 //! Prefix KV images: a build-time-produced file that stores a `KvCache`
 //! prefix (K/V for the constant system+tools preamble, see
-//! `docs/ENGINE.md`'s "Prefix cache" section and `kv.rs`'s module docs) so
+//! `docs/llm-wasm/ENGINE.md`'s "Prefix cache" section and `kv.rs`'s module docs) so
 //! any engine instance can load it in one shot instead of running prefill
 //! token-by-token.
 //!
@@ -45,10 +45,9 @@
 //!
 //! Attention still accumulates in f32 regardless of KV storage dtype;
 //! quantizing K/V does not touch the accumulator. See
-//! `docs/ENGINE.md`'s "Prefix KV images" section and
-//! `trucs.ai/.claude/worktrees/sonos-mcp/docs/kv-cache-images.md`'s "KV
-//! quantisation" section for the rationale (no `shader-f16` dependency,
-//! llama.cpp-reported q8_0 KV perplexity delta of 0.002-0.05).
+//! `docs/llm-wasm/ENGINE.md`'s "Prefix KV images" section for the rationale
+//! (no `shader-f16` dependency, llama.cpp-reported q8_0 KV perplexity delta
+//! of 0.002-0.05).
 //!
 //! ## Hashing
 //!

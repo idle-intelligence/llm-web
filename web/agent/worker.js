@@ -10,7 +10,7 @@
  *   {type:'load', model:{id, shards:[url...], tokenizerUrl, templateUrl}}   // templateUrl: tokenizer_config.json
  *   {type:'run', id, utterance, tools:[MCP tool objects], opts:{maxSteps:6, maxNewTokens:256, temperature:0, toolTimeoutMs:30000, systemPrompt?, prefillKernel?:'naive'|'pinned', constrained?:true, diet?:true}}
  *   {type:'toolResult', id, callId, result}      // or {type:'toolResult', id, callId, error} — an `error` is fed back
- *                                                 // to the model as a tool-error result (docs/ENGINE.md "Agent loop"),
+ *                                                 // to the model as a tool-error result (docs/llm-wasm/ENGINE.md "Agent loop"),
  *                                                 // not treated as a worker-fatal failure.
  *   {type:'reset'}                                // drop conversation, keep model
  *   {type:'dumpPrefix', id, tools:[MCP tool objects], opts:{systemPrompt?}}  // debug/tooling, see handleDumpPrefix
@@ -18,14 +18,14 @@
  *   {type:'progress', loaded, total, shard}
  *   {type:'ready', info:{model, prefixTokens?}}
  *   {type:'step', id, step:{index, promptTokens, promptTokenIds, text, calls:[{name,args}]|null, prefillMs, decodeMs, tokens, modelSteps, forcedTokens, retries, toolErrors}}
- *   {type:'token', id, text}                      // streaming — NOT emitted by this engine, see docs/ENGINE.md
+ *   {type:'token', id, text}                      // streaming — NOT emitted by this engine, see docs/llm-wasm/ENGINE.md
  *   {type:'callTool', id, callId, name, args}
  *   {type:'status', id?, phase:'prefill'|'decode'|'idle'|'kv-image', note?}
  *   {type:'prefixInputs', id, data:{tools, system, diet, prefixText, prefixTokens, modelFingerprint, prefixKey}}
  *   {type:'done', id, transcript:{steps, finalText, totalMs}}
  *   {type:'error', id?, message}
  *
- * Prefix KV images (docs/ENGINE.md "Prefix KV images"): before each run's
+ * Prefix KV images (docs/llm-wasm/ENGINE.md "Prefix KV images"): before each run's
  * first prefill, the worker checks OPFS then `<modelBase>/kv/<key>.kvimg`
  * for a prebuilt image of the system+tools prefix and imports it instead of
  * running prefill token-by-token (a 'status' message with phase:'kv-image'
@@ -52,7 +52,7 @@ let wasmReady = false;
 let initWgpuDevice = null;
 let LlmEngine = null;
 // `<modelBase>/kv/` derived from the first GGUF shard URL (see
-// `deriveKvBaseUrl`) — where prefix KV images (docs/ENGINE.md "Prefix KV
+// `deriveKvBaseUrl`) — where prefix KV images (docs/llm-wasm/ENGINE.md "Prefix KV
 // images") are fetched from on a cache miss. Null if the shard URL doesn't
 // contain a `/gguf/` segment to substitute.
 let kvBaseUrl = null;
@@ -243,7 +243,7 @@ async function handleLoad(model) {
     fetchJsonText(model.templateUrl, 'tokenizer_config.json'),
   ]);
 
-  // Model-identity fingerprint for prefix-KV-image matching (docs/ENGINE.md
+  // Model-identity fingerprint for prefix-KV-image matching (docs/llm-wasm/ENGINE.md
   // "Prefix KV images") is computed inside `engine.load()` itself, from the
   // GGUF header bytes only (magic through the tensor-info table — a few
   // KB) + file size — NOT a hash of the whole 1.7GB+ model. No
@@ -349,7 +349,7 @@ async function handleRun(msg) {
 }
 
 // ---------------------------------------------------------------------------
-// Prefix KV images (docs/ENGINE.md "Prefix KV images"): before the first
+// Prefix KV images (docs/llm-wasm/ENGINE.md "Prefix KV images"): before the first
 // prefill of a given tool set, check OPFS then `<modelBase>/kv/` for a
 // prebuilt image and import it instead of running prefill token-by-token;
 // on a miss, export the freshly-prefilled prefix after the fact and save it
@@ -487,7 +487,7 @@ function handleToolResult(msg) {
   if (!pending) return;
   pendingToolCalls.delete(msg.callId);
   // A page-reported tool error is fed back to the model as a normal
-  // `{"error": ...}` result (docs/ENGINE.md "Agent loop" — `engine`'s
+  // `{"error": ...}` result (docs/llm-wasm/ENGINE.md "Agent loop" — `engine`'s
   // `provideToolResults` handles the retry/consecutive-error-cap policy),
   // not a worker-fatal rejection — only `callToolFromWorker`'s own timeout
   // below still aborts the run, since that's a worker-side failure the

@@ -101,7 +101,7 @@ to `--out`, writes the JSON report to `--json` if given, and exits non-zero
 on failure/timeout/gpu-debug-failure/`--expect` mismatch, zero on pass.
 
 Bench numbers report the *decode* phase's tok/s from the transcript step's
-`tokens`/`decodeMs`. Per docs/ENGINE.md's Browser section: the total
+`tokens`/`decodeMs`. Per docs/llm-wasm/ENGINE.md's Browser section: the total
 wall-clock time (`totalMs`) is trustworthy, but the prefill/decode ms
 *split* currently measures submission, not GPU completion, until the
 engine syncs after prefill — treat tok/s from this split as directional,

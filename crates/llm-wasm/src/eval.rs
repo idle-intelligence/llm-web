@@ -198,7 +198,7 @@ fn valid_group_ids(households: Option<&Value>) -> std::collections::HashSet<Stri
 /// the listing tool first — not `tools.json`'s alphabetical order. Getting
 /// this wrong silently reorders the tool preamble the model sees, which
 /// changes its greedy output independently of any KV-cache/prefill
-/// behavior — see docs/ENGINE.md "Known issues / fixed").
+/// behavior — see docs/llm-wasm/ENGINE.md "Known issues / fixed").
 pub fn select_tools(all: &[Tool], subset: ToolSet, fixtures_dir: impl AsRef<Path>) -> Result<Vec<Tool>> {
     match subset {
         ToolSet::All => Ok(all.to_vec()),
@@ -223,7 +223,7 @@ pub fn select_tools(all: &[Tool], subset: ToolSet, fixtures_dir: impl AsRef<Path
 }
 
 /// Which order the tool preamble is rendered in — independent of
-/// [`ToolSet`] (see docs/ENGINE.md "Known issues / fixed": tool order
+/// [`ToolSet`] (see docs/llm-wasm/ENGINE.md "Known issues / fixed": tool order
 /// changes the model's first call). `ListingFirst` puts
 /// `get_households_and_groups_and_players` first; `Alphabetical` uses
 /// `tools.json`'s own (alphabetical) order.

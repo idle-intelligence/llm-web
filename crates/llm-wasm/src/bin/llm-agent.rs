@@ -69,7 +69,7 @@ enum Commands {
         /// first — `tools-12.json`'s order for `--tools 12`,
         /// `fixtures/sonos/tools-listing-first.json`'s order for `--tools
         /// all`). Folded into the label/filename and the parameters block
-        /// (see docs/ENGINE.md "Known issues / fixed").
+        /// (see docs/llm-wasm/ENGINE.md "Known issues / fixed").
         #[arg(long = "tool-order", default_value = "listing-first")]
         tool_order: String,
         #[arg(long, default_value = "eval/utterances.json")]
@@ -100,7 +100,7 @@ enum Commands {
         /// in the parameters block.
         #[arg(long, default_value = "default")]
         label: String,
-        /// Schema-constrained decoding (docs/ENGINE.md "Schema-constrained
+        /// Schema-constrained decoding (docs/llm-wasm/ENGINE.md "Schema-constrained
         /// decoding"): jump-forward through grammar-forced spans instead
         /// of sampling them one token at a time.
         #[arg(long)]
@@ -155,7 +155,7 @@ enum Commands {
         #[arg(long, default_value_t = 3)]
         reps: usize,
     },
-    /// Build-time export of a prefix KV image (docs/ENGINE.md "Prefix KV
+    /// Build-time export of a prefix KV image (docs/llm-wasm/ENGINE.md "Prefix KV
     /// images"): renders the system+tools prefix exactly as the agent loop
     /// does, prefills it natively, and writes `<out-dir>/<prefix_key>.kvimg`
     /// (+ a human-readable `.json` sidecar) so any engine instance can
@@ -177,7 +177,7 @@ enum Commands {
         #[arg(long = "out-dir")]
         out_dir: Option<PathBuf>,
         /// `listing-first` (move `get_households_and_groups_and_players`
-        /// to the front if present, per docs/ENGINE.md "Known issues /
+        /// to the front if present, per docs/llm-wasm/ENGINE.md "Known issues /
         /// fixed") or `as-is` (`--tools` file's own order, unchanged).
         #[arg(long = "tool-order", default_value = "listing-first")]
         tool_order: String,
@@ -860,7 +860,7 @@ impl Generator for NativeGenerator {
     /// Same prefix-reuse prefill as `generate_with_cached_prefix`, but the
     /// decode tail is `model.rs`'s jump-forward loop
     /// (`LlmModel::decode_with_constraint`) instead of plain greedy —
-    /// see `docs/ENGINE.md` "Schema-constrained decoding".
+    /// see `docs/llm-wasm/ENGINE.md` "Schema-constrained decoding".
     fn generate_constrained(
         &mut self,
         prompt_ids: &[u32],
@@ -1134,7 +1134,7 @@ fn run_eval(
         other => anyhow::bail!("--tool-order must be `alphabetical` or `listing-first`, got `{other}`"),
     };
     // Folded into the label so it lands in both the filename and the
-    // report's `label=...` parameters-block line (see docs/ENGINE.md
+    // report's `label=...` parameters-block line (see docs/llm-wasm/ENGINE.md
     // "Known issues / fixed").
     let label = format!("{label}-{tool_order}");
     let label = label.as_str();

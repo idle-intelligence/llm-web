@@ -120,8 +120,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--dir",
-        default=os.path.expanduser("~/Code/idle-intelligence/models/gguf"),
-        help="Directory to serve (default: ~/Code/idle-intelligence/models/gguf)",
+        default=os.path.expanduser("~/models/gguf"),
+        help="Directory to serve (default: ~/models/gguf)",
     )
     parser.add_argument("--port", type=int, default=8001)
     parser.add_argument("--bind", default="127.0.0.1")

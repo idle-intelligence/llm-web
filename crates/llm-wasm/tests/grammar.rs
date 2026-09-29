@@ -173,7 +173,7 @@ fn free_text_accepted() {
 }
 
 // `Grammar::text_only` (agent loops' forced-final-answer fallback,
-// `docs/ENGINE.md` "Agent loop"): a leading `[` is rejected outright — the
+// `docs/llm-wasm/ENGINE.md` "Agent loop"): a leading `[` is rejected outright — the
 // tool-call-array branch doesn't exist under this grammar — while prose is
 // accepted exactly like `Grammar::for_tools`'s free-text branch.
 #[test]
@@ -197,7 +197,7 @@ fn text_only_accepts_prose() {
 }
 
 // `Grammar::tools_only` (both agent loops' `require_tool_call_first_step`,
-// `docs/ENGINE.md` "Agent loop"): the free-text branch is rejected at
+// `docs/llm-wasm/ENGINE.md` "Agent loop"): the free-text branch is rejected at
 // `Pos::Start` — a leading non-`[` byte is invalid — while the tool-call
 // array branch behaves exactly like `Grammar::for_tools`'s.
 #[test]
@@ -325,7 +325,7 @@ fn multi_candidate_id_reachable_token_by_token_for_every_alternative() {
     }
 }
 
-/// Typed ids (`docs/ENGINE.md` "Typed ids" — the `bloupblip` regression,
+/// Typed ids (`docs/llm-wasm/ENGINE.md` "Typed ids" — the `bloupblip` regression,
 /// owner's browser session 2026-09-11): a player id must never satisfy a
 /// `group_id`-typed property, and vice versa, even though both are
 /// `RINCON_`-shaped strings the old flat `IdValues` set couldn't tell

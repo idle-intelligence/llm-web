@@ -33,7 +33,7 @@ export class LlmEngine {
      * time. Errors (rather than exporting garbage) if `resident_tokens`
      * doesn't currently cover the rendered prefix — call this only after
      * a `start()`/step whose prefill included the full system+tools
-     * preamble. `dtype` is always `q8_0` (the format `docs/ENGINE.md`
+     * preamble. `dtype` is always `q8_0` (the format `docs/llm-wasm/ENGINE.md`
      * recommends for a one-time browser download — see kvimg.rs module
      * docs).
      * @param {string} tools_json
@@ -153,7 +153,7 @@ export class LlmEngine {
      * (`load_tools_generic`), so this is the only way to get the two
      * sides to agree when the page's live `tools_json` differs from
      * whatever fixture a human might otherwise reach for — see
-     * `docs/ENGINE.md` "Prefix KV images" for the mismatch this fixes.
+     * `docs/llm-wasm/ENGINE.md` "Prefix KV images" for the mismatch this fixes.
      * Errors under the same conditions as `prefixKey`.
      * @param {string} tools_json
      * @param {string} system
@@ -183,7 +183,7 @@ export class LlmEngine {
     }
     /**
      * Prefix-KV-image cache key for `tools_json`/`system` under the
-     * currently loaded model (`docs/ENGINE.md` "Prefix KV images"):
+     * currently loaded model (`docs/llm-wasm/ENGINE.md` "Prefix KV images"):
      * `sha256(model_fingerprint || rendered_prefix_text)`, computed the same way
      * `bin/llm-agent.rs`'s `kv-export` subcommand computes it when writing
      * an image, so a worker can `fetch(<modelBase>/kv/<key>.kvimg)` before
@@ -267,7 +267,7 @@ export class LlmEngine {
      * or `"{}"` is fine). Returns a JSON string: `{"outcome":"needTools",
      * "calls":[{"call_id","name","arguments"}...],"step":{...}}`,
      * `{"outcome":"final","text":...,"step":{...}}`, or
-     * `{"outcome":"error","message":...}` — see docs/ENGINE.md's Browser
+     * `{"outcome":"error","message":...}` — see docs/llm-wasm/ENGINE.md's Browser
      * section for the full shape and `web/agent/worker.js` for how it's
      * consumed. No `on_token` streaming callback: `model.rs`'s `generate`
      * has no per-token hook at HEAD, so a step's text arrives in one piece
@@ -295,7 +295,7 @@ if (Symbol.dispose) LlmEngine.prototype[Symbol.dispose] = LlmEngine.prototype.fr
  * awaited) once before constructing any `LlmEngine`. Requests the
  * adapter's full limits, same as stt-web's `initWgpuDevice` — this model's
  * 175MB single-buffer tied lm_head needs `maxStorageBufferBindingSize`
- * above the WebGPU spec default (see docs/ENGINE.md's Browser section).
+ * above the WebGPU spec default (see docs/llm-wasm/ENGINE.md's Browser section).
  * @returns {Promise<void>}
  */
 export function initWgpuDevice() {

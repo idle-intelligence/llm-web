@@ -1,6 +1,6 @@
 //! GPU tests for schema-constrained decoding: `grammar.rs`'s `Constraint`/
 //! `GrammarConstraint` driven through `model.rs::LlmModel::generate_with_constraint`
-//! (see `docs/ENGINE.md` "Schema-constrained decoding").
+//! (see `docs/llm-wasm/ENGINE.md` "Schema-constrained decoding").
 //!
 //! Env vars, skip behavior, and helper shapes mirror `tests/full_forward.rs`
 //! (same model/reference directories, same "print + return instead of
@@ -186,7 +186,7 @@ fn constrained_03_tools_multiturn_matches_reference_and_is_forced() {
 
 /// Unit test (no GPU/model — just the tokenizer): a genuinely fresh
 /// `GrammarConstraint` has nothing forced yet — position 0 is the
-/// free-text-vs-array-call decision point (`docs/ENGINE.md`: "decided by
+/// free-text-vs-array-call decision point (`docs/llm-wasm/ENGINE.md`: "decided by
 /// the first non-whitespace byte: anything other than `[` switches the
 /// whole output to unconstrained text"), so *every* non-`[` byte is also a
 /// legal continuation there and `forced_run()` correctly returns `None`.

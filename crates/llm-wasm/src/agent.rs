@@ -102,7 +102,7 @@ pub trait Generator {
 
     /// Like [`Generator::generate_with_cached_prefix`], but drives an
     /// optional schema [`Constraint`] (`grammar.rs`) through the decode
-    /// loop — see `docs/ENGINE.md` "Schema-constrained decoding" for the
+    /// loop — see `docs/llm-wasm/ENGINE.md` "Schema-constrained decoding" for the
     /// jump-forward semantics a concrete implementation backed by a real
     /// model (`model.rs::LlmModel::generate_with_constraint`) should give
     /// this. The default implementation ignores `constraint` entirely and
@@ -187,12 +187,12 @@ pub struct Step {
     /// Set when this step's grammar was rebuilt via
     /// `Grammar::for_tools_unrestricted_ids` instead of `Grammar::for_tools`
     /// because every still-callable tool was a read tool already called
-    /// this turn (fail-open — see `docs/ENGINE.md` "Agent loop"). `false`
+    /// this turn (fail-open — see `docs/llm-wasm/ENGINE.md` "Agent loop"). `false`
     /// for an unconstrained step.
     pub id_rule_relaxed: bool,
     /// Set when reaching this step required detecting and nudging past at
     /// least one repeated identical tool call this turn (see `step_inner`'s
-    /// generic repeated-call loop guard, `docs/ENGINE.md` "Agent loop") —
+    /// generic repeated-call loop guard, `docs/llm-wasm/ENGINE.md` "Agent loop") —
     /// regardless of whether the step that follows the nudge is a normal
     /// model answer or a `forced_text_answer`. `false` when no repeat was
     /// detected reaching this step.
@@ -207,7 +207,7 @@ pub struct Step {
     /// Set when this step was generated under `Grammar::tools_only` because
     /// it was the first generation of the turn, no tool had been called yet,
     /// and at least one tool was callable (`Agent::require_tool_call_first_step`
-    /// — see `docs/ENGINE.md` "Agent loop" / the `bloupblip` refusal this
+    /// — see `docs/llm-wasm/ENGINE.md` "Agent loop" / the `bloupblip` refusal this
     /// guards against). `false` for every other step, including one forced
     /// the other way by `force_final_answer`.
     pub tools_forced: bool,
@@ -359,7 +359,7 @@ const DEFAULT_MAX_STEPS: usize = 8;
 /// Default per-step cap on malformed-output retries (empty tool-call
 /// array, unparsable JSON starting with `[`, or a call naming a tool not
 /// in the current `tools` set) — override with [`Agent::set_max_retries`].
-/// See `docs/ENGINE.md` "Agent loop" for the retry policy.
+/// See `docs/llm-wasm/ENGINE.md` "Agent loop" for the retry policy.
 const DEFAULT_MAX_RETRIES: usize = 2;
 
 /// Number of consecutive tool-error results (see `tool_error_message`)
@@ -414,7 +414,7 @@ pub struct Agent<G: Generator, C: ToolCaller> {
     /// Whether the first generation of a turn (no tool called yet this
     /// turn), with at least one callable tool, must be a tool call —
     /// `Grammar::tools_only` rather than the normal grammar's free-text
-    /// branch (see `docs/ENGINE.md` "Agent loop"). On by default: the
+    /// branch (see `docs/llm-wasm/ENGINE.md` "Agent loop"). On by default: the
     /// observed failure this guards against (`bloupblip`, see that doc) was
     /// a first-step prose refusal that never looked anything up, even
     /// though one tool — a listing call — was callable. Only has any effect
@@ -426,7 +426,7 @@ pub struct Agent<G: Generator, C: ToolCaller> {
     /// Id-shaped strings harvested from every tool result seen so far this
     /// conversation (`IdValues::collect_from_result`, called from
     /// `provide_tool_results`) — the only values a `*_id`/`*_ids` schema
-    /// property may take (`docs/ENGINE.md` "The id rule"). Reset in
+    /// property may take (`docs/llm-wasm/ENGINE.md` "The id rule"). Reset in
     /// `start`/`reset`.
     id_values: IdValues,
     /// Built lazily on first constrained step and cached — `TokenVocab`
@@ -441,7 +441,7 @@ pub struct Agent<G: Generator, C: ToolCaller> {
     /// call errored: the error text is already fed back, so the model
     /// must change the arguments or call a different tool) and by the
     /// fail-open "is the model stuck" check in `generate_attempt` (see
-    /// `docs/ENGINE.md` "Agent loop" — "fail-open"). Reset in
+    /// `docs/llm-wasm/ENGINE.md` "Agent loop" — "fail-open"). Reset in
     /// `start`/`reset`.
     calls_made_this_turn: Vec<ToolCall>,
 }
@@ -488,7 +488,7 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
     }
 
     /// Turn schema-constrained decoding on/off (`grammar.rs`,
-    /// `docs/ENGINE.md` "Schema-constrained decoding"). Off by default. A
+    /// `docs/llm-wasm/ENGINE.md` "Schema-constrained decoding"). Off by default. A
     /// `Generator` that doesn't override `generate_constrained` runs
     /// unconstrained regardless of this flag (its default impl ignores the
     /// constraint) — see that method's docs.
@@ -557,7 +557,7 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
     /// (`{"name", "description", "inputSchema"}`) instead of already-built
     /// `Tool`s — runs them through `schemadiet::diet_tools` (when
     /// [`Agent::set_diet`] is on, the default) before `Tool::from_mcp`,
-    /// per `docs/ENGINE.md`'s "Tool-schema token diet" hook-in point.
+    /// per `docs/llm-wasm/ENGINE.md`'s "Tool-schema token diet" hook-in point.
     pub fn start_from_mcp(&mut self, utterance: &str, raw_tools: &[Value]) -> StepOutcome {
         let tools = tools_from_mcp(raw_tools, self.diet);
         self.start(utterance, &tools)
@@ -608,7 +608,7 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
         }
         self.step_index += 1;
 
-        // Malformed-output retry loop (`docs/ENGINE.md` "Agent loop"): an
+        // Malformed-output retry loop (`docs/llm-wasm/ENGINE.md` "Agent loop"): an
         // empty tool-call array, unparsable `[...]` JSON, or a call naming
         // a tool outside `self.tools` does *not* get appended to history
         // as an assistant turn (that would just teach the model its own
@@ -640,7 +640,7 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
                 Ok(ParsedOutput::Text(_)) => false,
             };
 
-            // Generic repeated-call loop guard (`docs/ENGINE.md` "Agent
+            // Generic repeated-call loop guard (`docs/llm-wasm/ENGINE.md` "Agent
             // loop"): a well-formed, valid call identical (same name+args)
             // to one already made earlier this run — not only the
             // immediately preceding step — is never re-executed, whether
@@ -652,7 +652,7 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
             // steps once the model had nothing new to ask about, and as
             // the same invalid `group_id` re-tried against
             // `get_now_playing` after the relay had already said it was
-            // invalid (`bloupblip`, see docs/ENGINE.md "Typed ids"). A
+            // invalid (`bloupblip`, see docs/llm-wasm/ENGINE.md "Typed ids"). A
             // *different* call to the same tool (different arguments)
             // remains allowed.
             let is_repeat = !invalid
@@ -861,7 +861,7 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
 
         // Build this step's schema constraint (if `constrained`, or this
         // attempt forces it on) from the current tool set + every id
-        // harvested from tool results so far — see `docs/ENGINE.md`
+        // harvested from tool results so far — see `docs/llm-wasm/ENGINE.md`
         // "Schema-constrained decoding". `force_text_only` bypasses all of
         // this: the constraint is `Grammar::text_only` outright, and the
         // id rule / fail-open logic (which only makes sense for a tool-call
@@ -880,7 +880,7 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
         } else {
             use_constrained.then(|| Grammar::for_tools(&grammar_tools, &self.id_values))
         };
-        // Fail-open (`docs/ENGINE.md` "Agent loop" — "fail-open"): if the
+        // Fail-open (`docs/llm-wasm/ENGINE.md` "Agent loop" — "fail-open"): if the
         // id rule left the model nothing new to call — every still-
         // callable tool is a read tool it's already called this turn —
         // rebuild without the id restriction instead of leaving it boxed
@@ -897,7 +897,7 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
         if id_rule_relaxed {
             grammar_for_step = Some(Grammar::for_tools_unrestricted_ids(&grammar_tools));
         }
-        // `require_tool_call_first_step` (`docs/ENGINE.md` "Agent loop"):
+        // `require_tool_call_first_step` (`docs/llm-wasm/ENGINE.md` "Agent loop"):
         // the first generation of a turn, with at least one tool still
         // callable after the id-rule (and its fail-open relaxation above),
         // must be a tool call — rebuild under `Grammar::tools_only` so the
@@ -1019,7 +1019,7 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
 
 /// Build `Tool`s from raw MCP `tools/list` entries, optionally running
 /// them through `schemadiet::diet_tools` first — see `Agent::start_from_mcp`
-/// and `docs/ENGINE.md`'s "Tool-schema token diet" hook-in point. Entries
+/// and `docs/llm-wasm/ENGINE.md`'s "Tool-schema token diet" hook-in point. Entries
 /// missing `name`/`description`/`inputSchema` are skipped rather than
 /// panicking (same "don't trust the wire" posture as `FixtureCaller`).
 /// Naming-convention heuristic for a read (non-mutating) tool — no MCP
@@ -1028,7 +1028,7 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
 /// undieted), so this mirrors the one Sonos-adjacent-but-not-Sonos-specific
 /// convention already used elsewhere in this codebase (`tool_order`'s
 /// "listing-first"): a `get_`/`list_` prefix. Used only by the fail-open
-/// check in `generate_attempt` — see `docs/ENGINE.md` "Agent loop".
+/// check in `generate_attempt` — see `docs/llm-wasm/ENGINE.md` "Agent loop".
 fn is_read_tool(name: &str) -> bool {
     name.starts_with("get_") || name.starts_with("list_")
 }

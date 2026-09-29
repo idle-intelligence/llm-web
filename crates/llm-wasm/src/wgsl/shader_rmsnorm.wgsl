@@ -13,7 +13,7 @@
 // info: [rows, hidden, eps] packed as f32 (rows/hidden are exact integers
 // well within f32's 24-bit mantissa, cast back with u32()).
 //
-// Tint uniformity fix (docs/ENGINE.md "Known issues / fixed"): this kernel
+// Tint uniformity fix (docs/llm-wasm/ENGINE.md "Known issues / fixed"): this kernel
 // used to `return` early when `row >= rows`, before the workgroupBarrier()
 // calls below. `row` is uniform per workgroup (== wg_id.x), but `rows` is
 // loaded from a storage buffer, and Tint's WGSL uniformity analysis taints
