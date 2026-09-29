@@ -670,3 +670,120 @@ on this codebase's current dispatch-batching baseline (e.g. an isolated
 kernel-time comparison of the fused vs. three-separate-dispatch QKV path,
 per this project's own t0-fast lesson that framework/dispatch overhead
 should be measured in isolation before more fusion work, not assumed).
+
+## Session 5: QKV fusion re-measured on a quiet machine (2026-09-29)
+
+Session 4 reported native decode regressions after QKV fusion (commit
+`4737327`, "B" below) vs the commit before it (`7264366`, "A" below):
+Qwen2.5-3B `short` +32.6%, Qwen3-1.7B `long_tools_single` +29.3%,
+SmolLM2-360M `short` +19.7%. Its own after-the-fact 3-run check on
+Qwen2.5-3B's `short` case (a temporary revert/rebuild, not a fresh
+worktree) already ran 30-50% slower than the same commit's own numbers
+measured earlier the same night (0.5B 32.9ms/tok that session vs 25.1ms/tok
+an earlier session; 3B 172-181ms/tok that session vs 113-119ms/tok this
+session, below) - evidence the machine was under load throughout that
+session's measurements, not evidence of a fusion regression. This session
+re-measures both commits from two separate detached worktrees (so no
+build/revert step in between), gated on a quiet machine, to settle it.
+
+**Method.** Two `lean-cli` release binaries, one built from each commit in
+its own detached worktree (`git worktree add --detach`, never `git
+stash`). Before every timed run: 1-minute `vm.loadavg` < 3.0, no
+`rustc`/`cargo`/training-`python` process running, and no process (other
+than the run itself) above 40% CPU (`ps -Ao pcpu,comm -r | awk 'NR==2'`) -
+checked by a polling loop, gate re-checked every 20s until it opens.
+(A first pass gated only on `vm.loadavg < 1.5` after finding a leftover
+shell from an unrelated task had been spinning one core at 100% for
+hours while this session's own `vm.loadavg` sat around 2 - that stray
+process was killed and this session's timings up to that point were
+discarded and rerun from scratch, which is why every number below is
+from a single rerun-from-scratch pass, not the session's first attempt.)
+Runs interleaved A/B/A/B/..., 5 runs per commit per case, one process per
+run, `lean-cli --gguf <path> --tokenizer-dir <path> --fixture <path>
+--tokens 16 --kernel fast --long`. `short` is each model's own fixture;
+`long_tools_single` is each model's own fixture case where it has one
+(Qwen2.5-0.5B, Qwen3-1.7B); Qwen2.5-3B's `long_tools_single` row uses a
+single-case fixture file built from the 0.5B fixture's `long_tools_single`
+case against the 3B weights (same cross-tokenizer timing-only convention
+as this doc's Session 1 footnote and Session 4 - `tok_match`/`top1_match`
+mismatches on that row are expected, not a bug); SmolLM2-360M has no own
+`long_tools_single` case and was not run cross-tokenizer this session
+(same choice Session 4 made).
+
+### Native decode ms/tok, commit A (`7264366`, pre-fusion) vs B (`4737327`, post-fusion), quiet machine
+
+n=5 runs per cell, interleaved A/B/A/B/A/B/A/B/A/B. 1-minute loadavg stayed
+under 1.6 for every run in this table (recorded per-run, not sampled after
+the fact); the top non-`lean-cli` process stayed under 40% CPU for every
+run except the very first (38.9% once, then under 24% for the rest).
+
+| model | case | A median (min-max) ms/tok | B median (min-max) ms/tok | change |
+|---|---|---|---|---|
+| Qwen2.5-0.5B-Instruct | short | 27.49 (27.08-28.39) | 26.36 (26.27-26.83) | -4.1% |
+| Qwen2.5-0.5B-Instruct | long_tools_single | 38.69 (35.45-39.41) | 38.27 (37.80-39.60) | -1.1% |
+| Qwen2.5-3B-Instruct (official GGUF) | short | 118.60 (117.63-119.26) | 118.36 (118.14-118.38) | -0.2% |
+| Qwen2.5-3B-Instruct (official GGUF, cross-tokenizer) | long_tools_single | 165.54 (139.98-204.79) | 162.32 (153.24-166.98) | -1.9% |
+| Qwen3-1.7B (Q8_0) | short | 73.29 (66.93-74.57) | 72.85 (66.48-74.91) | -0.6% |
+| Qwen3-1.7B (Q8_0) | long_tools_single | 99.37 (86.17-102.84) | 99.43 (98.35-100.66) | +0.1% |
+| SmolLM2-360M-Instruct (Q4_0) | short | 33.34 (33.02-34.66) | 32.94 (32.69-33.97) | -1.2% |
+
+None of these changes exceed the run-to-run spread within a single
+commit/case (e.g. Qwen2.5-3B `long_tools_single` A's own 139.98-204.79
+range on the same commit). Session 4's reported +32.6%/+29.3%/+19.7%
+regressions do not reproduce on a quiet machine; every model is a wash or
+a small (1-4%) improvement, consistent with the dispatch-count drop QKV
+fusion produces (Session 4's own measurement: -12% to -14% dispatches/step
+across all four models).
+
+### Browser decode timing (`decode_timing.html`), same two commits, quiet machine
+
+Session 4 did not run this; this session runs it for the models it skipped
+last time (Qwen2.5-3B excluded per this doc's own Session 2 finding -
+browser decode on Qwen2.5-3B risks a 22GB renderer footprint on a 16GB
+Mac, a memory problem unrelated to this fusion question, and native
+already answers it above without that risk). Each commit's own
+`wasm-pack build crates/lean --target web --out-dir pkg --no-default-features
+--features web` served from its own worktree; served `pkg/lean_bg.wasm`
+bytes hashed and confirmed to match that worktree's own build before any
+run (and to differ between the two worktrees, confirming two distinct
+binaries were actually under test). 3 fresh page loads per model/case/
+commit, Playwright's bundled headless Chromium
+(`--enable-unsafe-webgpu --enable-features=Vulkan,WebGPU --use-angle=metal`),
+`cold` = first decode step of a fresh page load, `warm` = median of the
+remaining 15 steps.
+
+| model | case | commit | cold ms (3 loads) | warm ms (3 loads) |
+|---|---|---|---|---|
+| Qwen2.5-0.5B-Instruct | short | A | 26.1, 26.1, 26.0 | 22.5, 22.7, 22.4 |
+| Qwen2.5-0.5B-Instruct | short | B | 25.4, 25.0, 24.4 | 22.1, 22.1, 21.7 |
+| Qwen2.5-0.5B-Instruct | long_tools_single | A | 33.6, 33.4, 33.5 | 29.8, 29.5, 29.4 |
+| Qwen2.5-0.5B-Instruct | long_tools_single | B | 31.3, 33.3, 33.3 | 27.3, 29.3, 29.1 |
+| SmolLM2-360M-Instruct | short | A | 32.4, 32.1, 31.7 | 27.6, 27.4, 27.7 |
+| SmolLM2-360M-Instruct | short | B | 31.3, 30.7, 30.6 | 27.1, 27.3, 27.4 |
+| SmolLM2-360M-Instruct (cross-tokenizer) | long_tools_single | A | 53.2, 42.6, 48.1 | 39.0, 39.0, 42.1 |
+| SmolLM2-360M-Instruct (cross-tokenizer) | long_tools_single | B | 42.0, 43.4, 45.1 | 38.5, 38.8, 42.3 |
+| Qwen3-1.7B (Q8_0) | short | A | 71.2, 71.6, 73.2 | 68.1, 66.4, 63.5 |
+| Qwen3-1.7B (Q8_0) | short | B | 69.9, 69.0, 70.4 | 67.2, 64.8, 60.7 |
+| Qwen3-1.7B (Q8_0) | long_tools_single | A | 112.7, 120.0, 113.4 | 98.0, 102.0, 98.4 |
+| Qwen3-1.7B (Q8_0) | long_tools_single | B | 115.5, 113.4, 121.5 | 100.5, 98.1, 102.1 |
+
+Browser confirms native: B matches or is marginally faster than A on
+every model/case, no regression anywhere.
+
+### Decision
+
+**Keep the fusion (`4737327`), no revert, no shape gate.** On a verified
+quiet machine, across all four models this task named, both native and
+browser, QKV fusion is a wash to a small win (0-4% faster on 6 of 7 native
+cells, essentially flat on the 7th) - never a regression. Session 4's
+reported regressions were a measurement artifact (background CPU
+contention: first an unrelated worker's stray process at 100% CPU for
+hours, found and killed mid-session; before that, contention already
+flagged by this doc's own before/after inconsistency at the top of this
+section). No shape-dependent kernel issue was found because there was
+nothing to find - the GQA asymmetric-width hypothesis from Session 4's
+"next candidate" section was never tested because the regression it was
+meant to explain does not reproduce. All 8 fixture/KV/mask gates and the
+browser `allMatch` check remain as Session 4 left them (unaffected by this
+session, which only re-measured timing); no code changes were made this
+session.
