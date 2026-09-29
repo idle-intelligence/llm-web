@@ -117,9 +117,23 @@ pub fn config_from_gguf<R: Read + Seek>(reader: &GgufReader<R>) -> Result<Qwen2C
     let rope_theta = reader.meta_f32(&format!("{p}.rope.freq_base")).with_context(|| format!("missing {p}.rope.freq_base"))?;
     let max_seq_len = reader.meta_u32(&format!("{p}.context_length")).with_context(|| format!("missing {p}.context_length"))? as usize;
 
-    let bos_token_id = reader.meta_u32("tokenizer.ggml.bos_token_id").unwrap_or(151643);
-    let eos_token_id = reader.meta_u32("tokenizer.ggml.eos_token_id").unwrap_or(151645);
-    let pad_token_id = reader.meta_u32("tokenizer.ggml.padding_token_id").unwrap_or(151643);
+    // Qwen2/Qwen3's own special-token ids (151643/151645) are only a safe
+    // default for those two architectures; a Llama-family GGUF (e.g.
+    // SmolLM2) missing these keys gets a clear parse error instead of
+    // silently inheriting Qwen's ids, which would be wrong for that vocab.
+    let (default_bos, default_eos) = match architecture {
+        Architecture::Qwen2 | Architecture::Qwen3 => (Some(151643), Some(151645)),
+        Architecture::Llama => (None, None),
+    };
+    let bos_token_id = reader
+        .meta_u32("tokenizer.ggml.bos_token_id")
+        .or(default_bos)
+        .with_context(|| format!("missing tokenizer.ggml.bos_token_id (no safe default for architecture '{arch_str}')"))?;
+    let eos_token_id = reader
+        .meta_u32("tokenizer.ggml.eos_token_id")
+        .or(default_eos)
+        .with_context(|| format!("missing tokenizer.ggml.eos_token_id (no safe default for architecture '{arch_str}')"))?;
+    let pad_token_id = reader.meta_u32("tokenizer.ggml.padding_token_id").or(default_bos).unwrap_or(bos_token_id);
     let mut eos_token_ids = vec![eos_token_id];
     if pad_token_id != eos_token_id {
         eos_token_ids.push(pad_token_id);
