@@ -37,11 +37,36 @@ fn reverse_gguf_dims(gguf_dims: &[u64]) -> Vec<usize> {
     gguf_dims.iter().rev().map(|&d| d as usize).collect()
 }
 
-fn read_gguf_string<R: Read>(reader: &mut R) -> Result<String> {
-    let len = reader.read_u64::<LittleEndian>()? as usize;
-    let mut buf = vec![0u8; len];
+/// Bytes left between the reader's current position and the end of the
+/// stream, without disturbing the current position. Used to sanity-check a
+/// length-prefixed field (string or array count) read straight off a
+/// possibly corrupt or untrusted file before it drives an allocation or a
+/// loop bound.
+fn remaining_bytes<R: Read + Seek>(reader: &mut R) -> Result<u64> {
+    let pos = reader.stream_position()?;
+    let end = reader.seek(SeekFrom::End(0))?;
+    reader.seek(SeekFrom::Start(pos))?;
+    Ok(end.saturating_sub(pos))
+}
+
+fn read_gguf_string<R: Read + Seek>(reader: &mut R) -> Result<String> {
+    let len = reader.read_u64::<LittleEndian>()?;
+    let remaining = remaining_bytes(reader)?;
+    ensure!(len <= remaining, "GGUF string length {len} exceeds remaining file size ({remaining} bytes)");
+    let mut buf = vec![0u8; usize::try_from(len).context("GGUF string length overflows usize")?];
     reader.read_exact(&mut buf)?;
     String::from_utf8(buf).context("invalid UTF-8 in GGUF string")
+}
+
+/// Read a GGUF array value's `(elem_type, count)` header, bounding `count`
+/// against the remaining file size (each skipped/read element needs at
+/// least one byte) before any caller loops `count` times or allocates.
+fn read_array_header<R: Read + Seek>(reader: &mut R) -> Result<(u32, u64)> {
+    let elem_type = reader.read_u32::<LittleEndian>()?;
+    let count = reader.read_u64::<LittleEndian>()?;
+    let remaining = remaining_bytes(reader)?;
+    ensure!(count <= remaining, "GGUF array length {count} exceeds remaining file size ({remaining} bytes)");
+    Ok((elem_type, count))
 }
 
 #[derive(Debug, Clone)]
@@ -61,7 +86,7 @@ pub enum GgufValue {
     Array { elem_type: u32, len: u64 },
 }
 
-fn read_gguf_scalar<R: Read>(reader: &mut R, value_type: u32) -> Result<GgufValue> {
+fn read_gguf_scalar<R: Read + Seek>(reader: &mut R, value_type: u32) -> Result<GgufValue> {
     Ok(match value_type {
         0 => GgufValue::U8(reader.read_u8()?),
         1 => GgufValue::I8(reader.read_i8()?),
@@ -94,8 +119,7 @@ fn skip_gguf_value<R: Read + Seek>(reader: &mut R, value_type: u32) -> Result<()
             let _ = read_gguf_string(reader)?;
         }
         9 => {
-            let elem_type = reader.read_u32::<LittleEndian>()?;
-            let count = reader.read_u64::<LittleEndian>()?;
+            let (elem_type, count) = read_array_header(reader)?;
             for _ in 0..count {
                 skip_gguf_value(reader, elem_type)?;
             }
@@ -110,8 +134,7 @@ fn skip_gguf_value<R: Read + Seek>(reader: &mut R, value_type: u32) -> Result<()
 
 fn read_gguf_value<R: Read + Seek>(reader: &mut R, value_type: u32) -> Result<GgufValue> {
     if value_type == 9 {
-        let elem_type = reader.read_u32::<LittleEndian>()?;
-        let count = reader.read_u64::<LittleEndian>()?;
+        let (elem_type, count) = read_array_header(reader)?;
         for _ in 0..count {
             skip_gguf_value(reader, elem_type)?;
         }
