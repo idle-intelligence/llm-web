@@ -1038,3 +1038,126 @@ against the freshly built and served `pkg/lean_bg.wasm` (hash-verified).
 No source changes were made this session beyond the `ENGINE_BUILD` bumps
 (`crates/lean/www/*.js`) and this doc section - the kernel changes
 themselves were already merged into this branch before this session began.
+
+## Session 8: lean-kernels docs-only merge, Mac + browser recheck (2026-09-29)
+
+`lean-kernels` had one commit past Session 7's merge point
+(`38d3eee`, docs-only - `docs/runs/2026-09-29-lean-kernels.md`, CPU-phase
+breakdown and a reverted `rope_qk_fused` attempt). Merged into `lean-perf`
+with `git merge --no-edit lean-kernels`; no source files changed by the
+merge, only that one doc file added. This session re-ran the full native +
+wasm + browser gate set on the resulting commit, since no gate/timing pass
+had been taken on the branch since Session 7's merge point. Same
+quiet-machine method as Sessions 6-7 (1-minute load average checked via
+`uptime` before every timed run - stayed between 1.1 and 2.0 throughout,
+never above 3; no `rustc`/`cargo`/training process above 40% CPU via `ps
+aux`), both a build lock and a GPU lock held for the duration of every
+native gate and timed run (`locked cargo`/`locked gpu` wrapper scripts).
+
+**Native gates**: all 8 pass - `fixture_parity`, `fixture_parity_qwen25_3b`,
+`fixture_parity_qwen3`, `fixture_parity_qwen3_1_7b`,
+`fixture_parity_llama_360m`, `fixture_parity_llama_1_7b`, `kv_snapshot`
+(both cases), `logit_mask` (all 3 cases). `top1_match=true` throughout.
+Build note: `logit_mask`'s three test function names
+(`singleton_mask_forces_exact_string`, `all_allowed_mask_matches_unmasked`,
+`mask_upload_per_step_cost`) don't contain the substring `logit_mask`, so
+passing `logit_mask` as one of several libtest filter args alongside the
+other seven gate names matches 0 of its tests (cargo's multi-filter is an
+OR over each binary's own test names, not binary names) - ran as its own
+`cargo test -p lean --release --test logit_mask -- --ignored
+--test-threads=1` instead, 3 passed.
+
+**Wasm build**: `wasm-pack build crates/lean --target web --out-dir pkg --
+--no-default-features --features web` succeeded. `ENGINE_BUILD` bumped from
+`2026-09-29-07` to `2026-09-29-08` in every wgpu-build `crates/lean/www/*.js`
+loading URL this session (`main.js`, `main_decode_timing.js`,
+`main_mem_profile.js`, `main_mem_profile_3b.js`, `main_qwen25_3b.js`,
+`main_qwen3.js`, `main_qwen3_1_7b.js`); the CPU-rung files
+(`main_cpu.js`, `main_cpu_qwen3.js`) were left untouched, unaffected by this
+merge. Served `pkg/lean_bg.wasm` bytes hashed (sha256
+`056f550e5766f72a296fde7b17f8b26bda744ea7b22fc9147ef3ad2312acb066`) and
+confirmed to match the freshly built file before the `index.html` check.
+
+**`www/index.html?local=1`**, headless Chromium (`--enable-unsafe-webgpu
+--enable-features=Vulkan,WebGPU --use-angle=metal`, Playwright's bundled
+browser only): `allMatch: true`, all 6 rows report `match: true` or `match:
+null` (the `long_1500` timing-only case, which has no reference
+continuation by design), `engineBuild` confirmed as `2026-09-29-08` in the
+page's own result object.
+
+### Native decode ms/tok, Mac (Metal via wgpu), median of 5
+
+| model | case | before (Session 7) | after (this session) | min-max (after) |
+|---|---|---:|---:|---|
+| Qwen2.5-0.5B-Instruct | short | 13.96 | 11.61 | 11.43-14.71 |
+| Qwen2.5-0.5B-Instruct | long_tools_single | 23.07 | 20.63 | 20.57-20.66 |
+| Qwen2.5-3B-Instruct (official GGUF) | short | 60.16 | 55.50 | 54.55-57.77 |
+| Qwen2.5-3B-Instruct (official GGUF) | long | 58.64 | 54.73 | 54.38-56.56 |
+| Qwen3-1.7B (Q8_0) | short | 38.54 | 33.91 | 28.63-35.19 |
+| Qwen3-1.7B (Q8_0) | long_tools_single | 62.32 | 57.50 | 54.91-58.55 |
+| SmolLM2-360M-Instruct (Q4_0) | short | 13.39 | 11.77 | 11.62-11.83 |
+| SmolLM2-360M-Instruct (Q4_0) | long | 14.52 | 11.70 | 11.69-11.74 |
+
+`top1_match=true` on every case/run in every sweep (20 runs total, plus the
+5-run `logit_mask` gate separately). No source/kernel changes landed
+between Session 7 and this session (the merge was docs-only), so every
+row's improvement over the Session 7 numbers reads as machine-quietness
+variance between the two sessions' runs, not a code effect - both sessions
+passed the same load-average gate, but Session 7 doesn't record the exact
+load-average value at measurement time to compare directly.
+
+### Browser decode timing (`decode_timing.html`), 3 fresh loads per case, `steps=16`
+
+| model | case | cold ms/tok (3 loads) | warm median ms/tok (3 loads) |
+|---|---|---|---|
+| Qwen2.5-0.5B-Instruct | short | 13.3, 13.8, 13.6 | 10.7, 10.8, 10.9 |
+| Qwen2.5-0.5B-Instruct | long (long_tools_single) | 22.4, 22.6, 22.6 | 18.5, 18.8, 18.8 |
+| SmolLM2-360M-Instruct (cross-tokenizer fixture) | short | 13.1, 13.9, 14.1 | 9.9, 9.9, 9.9 |
+| SmolLM2-360M-Instruct (cross-tokenizer fixture) | long | 25.2, 26.3, 25.2 | 21.2, 22.0, 21.1 |
+| Qwen3-1.7B (Q8_0) | short | 33.3, 66.6, 37.8 | 27.6, 28.1, 27.6 |
+| Qwen3-1.7B (Q8_0) | long | 55.7, 73.7, 141.6 | 46.2, 70.5, 164.8 |
+
+Engine build confirmed as `2026-09-29-08` in every page load's own console
+log line. Qwen3-1.7B's `long` cell is again the noisiest cell measured on
+this Mac (flagged as such in Sessions 6 and 7 too): its third load's own
+first browser attempt hit this harness's memory guardrail (6GB
+Chromium-process-tree RSS, peak 7.18GB) mid-run and was killed before
+producing a result, so that cell's third value is a retry, not the original
+third attempt - the retry's own warm median (164.8ms/tok) is close to 3x
+its first two loads' medians (46.2, 70.5), consistent with page-load/GC
+variance around a footprint close to this harness's guard threshold rather
+than a reproducible regression (no code changed between loads).
+
+### Qwen2.5-3B, memory-guarded (`scripts/run_mem_profile.py --limit-gb 8`)
+
+`decode_timing.html?model=3b&case=short`, one browser at a time. Four
+consecutive attempts at `steps=16` (this session's native/browser
+convention elsewhere) hit the script's own 8GB guard before producing a
+result - peaks 8.08GB, 8.22GB, 8.05GB, 8.30GB, each killed mid-run by the
+script's own guard (never another process). A fifth attempt at `steps=8`
+stayed under the guard:
+
+| metric | value (`steps=8`, 5th attempt) |
+|---|---:|
+| load ms | 1401.4 |
+| prefill ms | 1598.6 |
+| decode cold ms | 56.6 |
+| decode warm median ms (7 steps) | 52.5 |
+| peak Chromium process-tree RSS | 7.031GB |
+
+This session's four `steps=16` peaks (8.05-8.30GB) sit above Session 7's
+own `steps=16`-equivalent second-attempt peak (7.453GB, a different,
+since-removed scratch harness) - flagged, not resolved, since the exact
+harness differs between the two sessions (this session's `decode_timing.html`
+vs. Session 7's scratch `lean-3b-harness` script) and no source code changed
+in between, so the two peak-RSS numbers aren't a clean before/after
+comparison of the same code path.
+
+### Gate/build summary
+
+All 8 required native gates pass on the Mac this session. `wasm-pack build
+--target web` succeeds; `www/index.html?local=1` reports `allMatch: true`
+against the freshly built and served `pkg/lean_bg.wasm` (hash-verified). No
+source changes were made this session beyond the `ENGINE_BUILD` bumps
+(`crates/lean/www/*.js`) and this doc section - the one upstream commit
+merged in this session (`38d3eee`) was itself docs-only.
