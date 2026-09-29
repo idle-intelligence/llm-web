@@ -1288,7 +1288,8 @@ fn rmsnorm<'a>(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, k
             BindGroupEntry { binding: 3, resource: dims.as_entire_binding() },
         ],
     );
-    engine.dispatch(pass, &engine.rmsnorm, &bg, (rows.div_ceil(64), 1, 1), key);
+    // One workgroup per row (see shaders/rmsnorm.wgsl's header comment).
+    engine.dispatch(pass, &engine.rmsnorm, &bg, (rows, 1, 1), key);
     out
 }
 
