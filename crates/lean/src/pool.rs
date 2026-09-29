@@ -192,6 +192,16 @@ impl Pool {
             let b = b.clone();
             drop(bufs);
             let mut cache = self.uniform_cache.borrow_mut();
+            if let Some(prev) = cache.get(key) {
+                debug_assert_eq!(
+                    prev.len(),
+                    bytes.len(),
+                    "pool key {key:?} was previously written with a different byte length ({} vs {}) - \
+                     one key must map to one T/shape for its whole lifetime, see this module's doc comment",
+                    prev.len(),
+                    bytes.len()
+                );
+            }
             let unchanged = matches!(cache.get(key), Some(prev) if prev.as_slice() == bytes);
             if !unchanged {
                 self.queue.write_buffer(&b, 0, bytes);
