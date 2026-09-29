@@ -950,43 +950,6 @@ fn scratch_key(key: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct QuantActDims {
-    k: u32,
-    blocks: u32,
-    _p0: u32,
-    _p1: u32,
-}
-
-/// Quantizes `x` (`in_dim` f32 activations, `in_dim` must be a multiple of
-/// 32) into a per-32-block int8 buffer + f32 scale buffer via
-/// `quantize_act_q8.wgsl` - the online activation-quantization step
-/// `linear_q4_decode_dp4`/`linear_q8_decode_dp4` need before every dp4
-/// dispatch (see those shaders' headers). Caller must have already checked
-/// `engine.has_dp4`. Buffers are cached per `key` in `pool` like every other
-/// per-call-site buffer.
-fn quantize_activation(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &str, x: &wgpu::Buffer, in_dim: u32) -> (wgpu::Buffer, wgpu::Buffer) {
-    let skey = scratch_key(key);
-    let blocks = in_dim / 32;
-    let act_q = pool.data(&format!("{skey}.act_q"), (blocks * 8) as usize);
-    let act_scale = pool.data(&format!("{skey}.act_scale"), blocks as usize);
-    let dims = pool.uniform(&format!("{skey}.qdims"), QuantActDims { k: in_dim, blocks, _p0: 0, _p1: 0 });
-    let pipeline = engine.quantize_act_q8.as_ref().expect("quantize_activation called without has_dp4");
-    let bg = pool.bind_group(
-        key,
-        pipeline,
-        &[
-            BindGroupEntry { binding: 0, resource: x.as_entire_binding() },
-            BindGroupEntry { binding: 1, resource: act_q.as_entire_binding() },
-            BindGroupEntry { binding: 2, resource: act_scale.as_entire_binding() },
-            BindGroupEntry { binding: 3, resource: dims.as_entire_binding() },
-        ],
-    );
-    engine.dispatch(pass, pipeline, &bg, (blocks, 1, 1), key);
-    (act_q, act_scale)
-}
-
 #[allow(clippy::too_many_arguments)]
 fn linear(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &str, x: &wgpu::Buffer, rows: u32, in_dim: u32, w: &MatMulWeight, b: &wgpu::Buffer, out_dim: u32, fast: bool) -> wgpu::Buffer {
     let skey = scratch_key(key);
@@ -1024,27 +987,10 @@ fn linear(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &
             // `quant.rs::chunk_rows`) - one dispatch per chunk, each
             // writing its own column range of `out` (see linear_q8.wgsl's
             // Dims doc comment).
-            let dp4 = fast && rows == 1 && engine.has_dp4 && engine.dp4_decode.get();
-            let act_q_scale = dp4.then(|| quantize_activation(engine, pool, pass, &format!("{skey}.q8dp4"), x, in_dim));
             for chunk in chunks {
                 let ckey = format!("{key}.{}", chunk.row_start);
                 let sckey = scratch_key(&ckey);
                 let dims = pool.uniform(&format!("{sckey}.dims"), LinearQDims { m: rows, k: in_dim, n: chunk.rows, act: 0, blocks_per_row: *blocks_per_row, n_offset: chunk.row_start, n_total: *n_total, _p2: 0 });
-                if let Some((act_q, act_scale)) = &act_q_scale {
-                    let entries = [
-                        BindGroupEntry { binding: 0, resource: act_q.as_entire_binding() },
-                        BindGroupEntry { binding: 1, resource: act_scale.as_entire_binding() },
-                        BindGroupEntry { binding: 2, resource: chunk.qs.as_entire_binding() },
-                        BindGroupEntry { binding: 3, resource: chunk.scales.as_entire_binding() },
-                        BindGroupEntry { binding: 4, resource: b.as_entire_binding() },
-                        BindGroupEntry { binding: 5, resource: out.as_entire_binding() },
-                        BindGroupEntry { binding: 6, resource: dims.as_entire_binding() },
-                    ];
-                    let pipeline = engine.linear_q8_decode_dp4.as_ref().expect("dp4 gated on has_dp4");
-                    let bg = pool.bind_group(&format!("{ckey}.decode_dp4"), pipeline, &entries);
-                    engine.dispatch(pass, pipeline, &bg, (chunk.rows.div_ceil(4), 1, 1), &ckey);
-                    continue;
-                }
                 let entries = [
                     BindGroupEntry { binding: 0, resource: x.as_entire_binding() },
                     BindGroupEntry { binding: 1, resource: chunk.qs.as_entire_binding() },
@@ -1102,27 +1048,10 @@ fn linear(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &
             }
         }
         MatMulWeight::Q4_0 { chunks, blocks_per_row, out_dim: n_total } => {
-            let dp4 = fast && rows == 1 && engine.has_dp4 && engine.dp4_decode.get();
-            let act_q_scale = dp4.then(|| quantize_activation(engine, pool, pass, &format!("{skey}.q4dp4"), x, in_dim));
             for chunk in chunks {
                 let ckey = format!("{key}.{}", chunk.row_start);
                 let sckey = scratch_key(&ckey);
                 let dims = pool.uniform(&format!("{sckey}.dims"), LinearQDims { m: rows, k: in_dim, n: chunk.rows, act: 0, blocks_per_row: *blocks_per_row, n_offset: chunk.row_start, n_total: *n_total, _p2: 0 });
-                if let Some((act_q, act_scale)) = &act_q_scale {
-                    let entries = [
-                        BindGroupEntry { binding: 0, resource: act_q.as_entire_binding() },
-                        BindGroupEntry { binding: 1, resource: act_scale.as_entire_binding() },
-                        BindGroupEntry { binding: 2, resource: chunk.qs.as_entire_binding() },
-                        BindGroupEntry { binding: 3, resource: chunk.scales.as_entire_binding() },
-                        BindGroupEntry { binding: 4, resource: b.as_entire_binding() },
-                        BindGroupEntry { binding: 5, resource: out.as_entire_binding() },
-                        BindGroupEntry { binding: 6, resource: dims.as_entire_binding() },
-                    ];
-                    let pipeline = engine.linear_q4_decode_dp4.as_ref().expect("dp4 gated on has_dp4");
-                    let bg = pool.bind_group(&format!("{ckey}.decode_dp4"), pipeline, &entries);
-                    engine.dispatch(pass, pipeline, &bg, (chunk.rows.div_ceil(4), 1, 1), &ckey);
-                    continue;
-                }
                 let entries = [
                     BindGroupEntry { binding: 0, resource: x.as_entire_binding() },
                     BindGroupEntry { binding: 1, resource: chunk.qs.as_entire_binding() },

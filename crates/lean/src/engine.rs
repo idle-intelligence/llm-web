@@ -15,8 +15,8 @@ use wgpu::util::DeviceExt;
 /// "never on in the browser" behavior) to request
 /// `Features::TIMESTAMP_QUERY | Features::TIMESTAMP_QUERY_INSIDE_PASSES` at
 /// device creation; silently stays off if the adapter doesn't report both
-/// (checked once here, never inferred from a device/vendor name - same rule
-/// as `has_dp4` above). See docs/runs/2026-09-29-lean-vs-llamacpp-profile.md
+/// (checked once here, never inferred from a device/vendor name). See
+/// docs/runs/2026-09-29-lean-vs-llamacpp-profile.md
 /// for the kernel-time table this path was built to produce. Zero cost when
 /// disabled: `dispatch()`'s profiling branch is one `bool` check, and
 /// `profile_labels` stays an empty `Vec`.
@@ -30,32 +30,6 @@ const PROFILE_QUERY_CAPACITY: u32 = 4096;
 pub struct Engine {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
-    /// This adapter's own report of WGSL's `packed_4x8_integer_dot_product`
-    /// language feature (`dot4I8Packed`/`dot4U8Packed`), queried once from
-    /// `wgpu::Instance::wgsl_language_features()` at construction - never
-    /// inferred from a device/vendor name. On the native `wgpu_core` backend
-    /// (Vulkan/Metal/DX12) this is unconditionally `true`: naga (26.0.0,
-    /// `src/front/wgsl/parse/directive/language_extension.rs`) implements
-    /// the extension on every backend it targets, polyfilling the integer
-    /// dot with bitfield-extract + multiply-add when the underlying GPU/API
-    /// lacks a native packed-dot instruction (SPIR-V:
-    /// `src/back/spv/block.rs`'s `Dot4I8Packed` arm falls back when
-    /// `DotProductInput4x8BitPacked` isn't available; MSL:
-    /// `src/back/msl/writer.rs`'s arm falls back below MSL 2.1) - so this
-    /// flag reflects "naga can lower it here", which is always the case
-    /// natively. On the WASM `webgpu` backend it instead reflects the real
-    /// browser's `navigator.gpu.wgslLanguageFeatures` set
-    /// (`wgpu-26.0.1/src/backend/webgpu.rs`), which is the actual per-browser
-    /// capability this project's portability rule requires querying rather
-    /// than assuming. Not itself a "should I use it" decision - `Model`'s
-    /// own opt-in flag (`dp4_decode`) gates that; see model.rs::linear.
-    pub has_dp4: bool,
-    /// Explicit opt-in for the dp4 decode kernels, independent of
-    /// `has_dp4`: this crate's rule is "capability-gated, opt-in until
-    /// proven token-exact" (docs/runs/2026-09-28-lean-perf-2.md session 6) -
-    /// `has_dp4 && dp4_decode` is model.rs::linear's actual gate. Set by
-    /// `lean-cli --dp4` or a test, default `false`.
-    pub dp4_decode: Cell<bool>,
     /// Total `dispatch()` calls since the last `reset_dispatch_count()` -
     /// same op-count metric on native and wasm (same Rust forward-pass
     /// code), used to separate "more work" from "slower per-op overhead"
@@ -116,23 +90,6 @@ pub struct Engine {
     /// shader_q4_matvec_coalesced.wgsl. The fast decode kernel; it uses no
     /// cooperative-group extension, so it runs on any WebGPU adapter.
     pub linear_q4_decode: wgpu::ComputePipeline,
-    /// Integer-dot-product (`dot4I8Packed`) counterpart of
-    /// `linear_q4_decode` - see `shaders/linear_q4_decode_dp4.wgsl`'s header.
-    /// `None` when `!has_dp4`: these three shaders use the WGSL `requires
-    /// packed_4x8_integer_dot_product;` directive, which some backends may
-    /// reject outright if the feature isn't reported - so they are only
-    /// compiled when `has_dp4` is `true`, never unconditionally at startup.
-    /// Only ever dispatched when `has_dp4 && dp4_decode.get()` (both true
-    /// implies these are `Some`).
-    pub linear_q4_decode_dp4: Option<wgpu::ComputePipeline>,
-    /// Integer-dot-product counterpart of `linear_q8_decode` - see
-    /// `shaders/linear_q8_decode_dp4.wgsl`'s header.
-    pub linear_q8_decode_dp4: Option<wgpu::ComputePipeline>,
-    /// Per-32-block int8 activation quantization
-    /// (`shaders/quantize_act_q8.wgsl`), the online quantization pass the
-    /// two dp4 decode kernels above need on their input activation before
-    /// every dispatch.
-    pub quantize_act_q8: Option<wgpu::ComputePipeline>,
     pub attn_prefill: wgpu::ComputePipeline,
     /// `shaders/attn_decode.wgsl` compiled with its `HEAD_DIM` override
     /// constant set to 64 (Qwen2.5). One thread owns one output dim, so
@@ -246,10 +203,6 @@ impl Engine {
             .await
             .map_err(|e| anyhow::anyhow!("no wgpu device: {e}"))?;
 
-        let has_dp4 = instance
-            .wgsl_language_features()
-            .contains(wgpu::WgslLanguageFeatures::Packed4x8IntegerDotProduct);
-
         let query_set = grant_profiling.then(|| {
             device.create_query_set(&wgpu::QuerySetDescriptor {
                 label: Some("lean_profile_timestamps"),
@@ -260,8 +213,6 @@ impl Engine {
         let timestamp_period = queue.get_timestamp_period();
 
         Ok(Engine {
-            has_dp4,
-            dp4_decode: Cell::new(false),
             query_set,
             timestamp_period,
             profile_labels: RefCell::new(Vec::new()),
@@ -281,9 +232,6 @@ impl Engine {
             linear_q4_tiled_rb: make_pipeline(&device, "linear_q4_tiled_rb", include_str!("shaders/linear_q4_tiled_rb.wgsl")),
             linear_q8_tiled_rb: make_pipeline(&device, "linear_q8_tiled_rb", include_str!("shaders/linear_q8_tiled_rb.wgsl")),
             linear_q4_decode: make_pipeline(&device, "linear_q4_decode", include_str!("shaders/linear_q4_decode.wgsl")),
-            linear_q4_decode_dp4: has_dp4.then(|| make_pipeline(&device, "linear_q4_decode_dp4", include_str!("shaders/linear_q4_decode_dp4.wgsl"))),
-            linear_q8_decode_dp4: has_dp4.then(|| make_pipeline(&device, "linear_q8_decode_dp4", include_str!("shaders/linear_q8_decode_dp4.wgsl"))),
-            quantize_act_q8: has_dp4.then(|| make_pipeline(&device, "quantize_act_q8", include_str!("shaders/quantize_act_q8.wgsl"))),
             attn_prefill: make_pipeline(&device, "attn_prefill", include_str!("shaders/attn_prefill.wgsl")),
             attn_decode: make_pipeline_with_constants(&device, "attn_decode", include_str!("shaders/attn_decode.wgsl"), &[("HEAD_DIM", 64.0)]),
             attn_decode_128: make_pipeline_with_constants(&device, "attn_decode_128", include_str!("shaders/attn_decode.wgsl"), &[("HEAD_DIM", 128.0)]),
