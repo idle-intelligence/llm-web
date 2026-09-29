@@ -1,12 +1,17 @@
 # llm-web
 
-A Rust/Burn WebGPU inference engine for Qwen2-architecture language models, running client-side in the browser: quantized GGUF weights, runtime LoRA adapters, schema-constrained decoding and a tool-calling agent loop. A wllama fallback serves the public chat demo.
+Two Rust WebGPU inference engines for language models, running client-side in the browser, plus a wllama fallback demo.
+
+- `crates/llm-wasm/` is the original engine: a Burn+wgpu implementation of the Qwen2 architecture, with quantized GGUF weights, runtime LoRA adapters, schema-constrained decoding and a tool-calling agent loop.
+- `crates/lean/` is a second, newer engine: a hand-written raw-wgpu + WGSL forward pass (no Burn, no CubeCL), native and wasm from one source, that picks a rung (WebGPU, or a single-threaded CPU fallback with NEON/simd128 kernels) by capability rather than by runtime measurement.
 
 [**Try the demo →**](https://idle-intelligence.github.io/llm-web/web/)
 
-> **Disclaimer:** the engine (`crates/llm-wasm/`) is an original Burn+wgpu implementation of the Qwen2 architecture, written from public model configs and GGUF metadata, not a port of wllama or llama.cpp. Models are fetched at run time from their authors' Hugging Face repos under their own licenses; no weights are redistributed here. This project is not affiliated with the Qwen team or Salesforce.
+> **Disclaimer:** both engines are original implementations written from public model configs and GGUF metadata, not ports of wllama or llama.cpp. Models are fetched at run time from their authors' Hugging Face repos under their own licenses; no weights are redistributed here. This project is not affiliated with the Qwen team or Salesforce.
 
-## Status
+## llm-wasm (Burn+wgpu engine)
+
+### Status
 
 - The Burn+wgpu engine runs the full Qwen2 forward pass (GQA attention, QKV bias, RoPE, RMSNorm, SwiGLU, tied embeddings) natively and compiles to `wasm32-unknown-unknown` with WebGPU, verified by a native CLI (`llm-agent`) and a browser demo page under `web/agent/`.
 - Runs Qwen2.5-0.5B-Instruct (Q4_0) with runtime LoRA adapters in the browser. This is the engine behind the LLM methods of [llm-life](https://github.com/idle-intelligence/llm-life), where fine-tuned adapters turn the model into a Game of Life update rule.
@@ -15,7 +20,7 @@ A Rust/Burn WebGPU inference engine for Qwen2-architecture language models, runn
 - Prefix KV cache images let a session restore GPU KV state to the longest matching prompt prefix instead of re-prefilling from scratch.
 - The public demo above runs the wllama fallback path (SmolLM2-360M-Instruct), which is deployed to GitHub Pages. The Burn+wgpu engine demo (`web/agent/`) is a local dev page: it loads the GGUF/tokenizer from a local model server and is not currently deployed publicly.
 
-## Models
+### Models
 
 | Model | Size | Params | Quant | License |
 |-------|------|--------|-------|---------|
@@ -23,7 +28,7 @@ A Rust/Burn WebGPU inference engine for Qwen2-architecture language models, runn
 | [xLAM-2-3b-fc-r](https://huggingface.co/Salesforce/xLAM-2-3b-fc-r) (Qwen2 architecture, tool calling) | ~1.8 GB (Q4_0 GGUF) | 3B | Q4_0 (Q6_K token embedding) | CC-BY-NC-4.0, research only |
 | [SmolLM2-360M-Instruct](https://huggingface.co/HuggingFaceTB/SmolLM2-360M-Instruct) | ~271 MB | 360M | Q4_K_M | Apache 2.0 |
 
-## Structure
+### Structure
 
 ```
 crates/llm-wasm/   # The engine: GGUF loader, Qwen2 model, WGSL kernels, tokenizer/template/agent, WASM bindings
@@ -35,7 +40,7 @@ pkg/wllama/        # Vendored @wllama/wllama ESM build + WASM binaries
 web/index.html     # Public demo page, wllama fallback: download model, chat, streaming output
 ```
 
-## Build
+### Build
 
 ```bash
 # Native (default features: wgpu + native)
@@ -49,7 +54,7 @@ cargo build --target wasm32-unknown-unknown --no-default-features --features web
 wasm-pack build crates/llm-wasm --target web --no-default-features --features web
 ```
 
-## Run locally
+### Run locally
 
 Public wllama demo:
 
@@ -70,6 +75,60 @@ Native CLI (run/eval/bench against a local GGUF file):
 ```bash
 cargo run --release --bin llm-agent -- run --gguf <path-to-gguf> --tokens <path-to-tokens.json> --tokenizer <path-to-tokenizer.json>
 ```
+
+## lean (raw wgpu engine)
+
+`crates/lean/` is a second engine in this repo: a forward pass written directly against `wgpu` and hand-written WGSL, with no Burn and no CubeCL. It compiles from one source to native and to `wasm32-unknown-unknown`, and it picks a rung by capability rather than by runtime measurement or per-device tuning: WebGPU when available, otherwise a single-threaded CPU forward pass (`cpu.rs`) with NEON (aarch64) or simd128 (wasm32) dot-product kernels, otherwise a plain scalar fallback.
+
+### Supported architectures and quant types
+
+Architectures (`src/config.rs`): Qwen2, Qwen3, and Llama (including SmolLM2, which uses the Llama architecture). GGUF tensor dtypes (`src/gguf.rs`): F32, F16, Q4_0, Q8_0, and Q6_K (Q4_1-encoded tensors are read and dequantized to F32). Which dtypes a given tensor uses depends on how the GGUF was quantized; llama.cpp's "Q4_0" quant profile commonly keeps `token_embd.weight`/`output.weight` at Q6_K or Q8_0.
+
+### Build
+
+```bash
+# Native
+cargo build -p lean
+cargo test -p lean
+
+# WASM (web feature; native CLI bins excluded)
+cargo build -p lean --target wasm32-unknown-unknown --no-default-features --features web
+
+# wasm-pack, for the www/ demo pages
+wasm-pack build crates/lean --target web --no-default-features --features web
+```
+
+### Run locally
+
+Native CLI (fixture-parity check or free-form prompt against a local GGUF + tokenizer):
+
+```bash
+LEAN_GGUF=<path-to-gguf> LEAN_TOKENIZER_DIR=<dir-with-tokenizer.json> cargo run -p lean --release --bin lean-cli
+# or: cargo run -p lean --release --bin lean-cli -- --prompt "..." --tokens 64
+```
+
+www demo pages (`crates/lean/www/index.html` and friends: `cpu.html`, `qwen3.html`, `qwen25_3b.html`, `decode_timing.html`, `mem_profile*.html`) load a `wasm-pack`-built `pkg/` plus a locally hosted GGUF and tokenizer with `?local=1`. Serve the crate directory over HTTP and open the page:
+
+```bash
+cd crates/lean && python3 -m http.server 8000
+# Open http://localhost:8000/www/index.html?local=1
+```
+
+### Tests
+
+`cargo test -p lean` always runs the synthetic (non-GPU) tests: `chat_template.rs`, `lora.rs`'s parser tests, `quant.rs`'s dequant-repack tests, and `q6k_reference_dequant.rs`. The GPU-backed parity tests are `#[ignore]`d because they need real model files not committed to this repo; run them explicitly with the matching env vars set, for example:
+
+```bash
+LEAN_GGUF=<path> LEAN_TOKENIZER_DIR=<dir> cargo test -p lean --test fixture_parity -- --ignored
+LEAN_GGUF=<path> LEAN_TOKENIZER_DIR=<dir> cargo test -p lean --test kv_snapshot -- --ignored
+LEAN_GGUF=<path> LEAN_TOKENIZER_DIR=<dir> cargo test -p lean --test logit_mask -- --ignored
+```
+
+Each of `fixture_parity_qwen3.rs`, `fixture_parity_qwen3_1_7b.rs`, `fixture_parity_qwen25_3b.rs`, `fixture_parity_llama_360m.rs`, and `fixture_parity_llama_1_7b.rs` reads its own model-specific env vars (e.g. `LEAN_GGUF_QWEN3`/`LEAN_TOKENIZER_DIR_QWEN3`); see each test file's `env::var` calls for the exact names.
+
+### Performance
+
+Benchmark and profiling runs (native and browser, prefill/decode timing, kernel-level breakdowns) are logged under `docs/runs/` (for example `docs/runs/2026-09-29-lean-vs-llamacpp-profile.md` for a comparison against llama.cpp on the same GGUF). Those docs are the source of truth for any performance number; this README doesn't restate them.
 
 ## Credits
 
