@@ -1600,25 +1600,39 @@ fn attn_prefill<'a>(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'
 /// becomes the decode step's latency floor even though the GPU has far more
 /// concurrent-workgroup capacity than `n_heads` uses, and splitting each
 /// head's KV range across `num_splits` workgroups lets that capacity
-/// actually shorten the loop. Chosen from `kv_len` alone (a workload-size
-/// fact), never from a timing measurement.
-const SPLIT_CHUNK: u32 = 128;
+/// actually shorten the loop.
+///
+/// `head_dim`-conditioned (session 3): a single global constant isn't a
+/// best fit for every `head_dim` this project compiles. Session 2 tried a
+/// uniform `SPLIT_CHUNK=64` and found a real win on `head_dim=64` models
+/// (Qwen2.5-0.5B, SmolLM2-360M: -4.7% to -9.3%) but a regression on
+/// `head_dim=128` (Qwen3-1.7B: +14.1% at the newly-crossed `kv_len=65`
+/// threshold - `attn_decode_split_128`'s wider `workgroup_size(128)` split
+/// kernel doesn't cover its launch/reduce overhead at the tiny 33-key
+/// chunks that threshold produces). Splitting the constant by `head_dim` -
+/// still a shape fact known at pipeline-selection time, never a timing
+/// measurement - captures the `head_dim=64` win without moving the
+/// `head_dim=128` threshold at all.
+fn split_chunk(head_dim: u32) -> u32 {
+    if head_dim <= 64 { 64 } else { 128 }
+}
 /// Upper bound on split count and the partial-result buffers' per-head
 /// stride; must match `MAX_SPLITS` in `attn_decode_split.wgsl` and
 /// `attn_decode_reduce.wgsl` exactly. Fixed so those buffers never need to
 /// regrow as `kv_len` grows one token per decode step.
 const MAX_SPLITS: u32 = 32;
 
-/// `kv_len <= SPLIT_CHUNK` returns `(1, kv_len)` (no split: `attn_decode`
-/// picks the single-workgroup kernel). Otherwise `num_splits =
-/// min(MAX_SPLITS, ceil(kv_len / SPLIT_CHUNK))` and `chunk =
+/// `kv_len <= split_chunk(head_dim)` returns `(1, kv_len)` (no split:
+/// `attn_decode` picks the single-workgroup kernel). Otherwise `num_splits =
+/// min(MAX_SPLITS, ceil(kv_len / split_chunk(head_dim)))` and `chunk =
 /// ceil(kv_len / num_splits)` (recomputed from the actual split count so the
 /// chunks partition `[0, kv_len)` exactly, with no split ever going idle).
-fn decode_split_plan(kv_len: u32) -> (u32, u32) {
-    if kv_len <= SPLIT_CHUNK {
+fn decode_split_plan(kv_len: u32, head_dim: u32) -> (u32, u32) {
+    let split_chunk = split_chunk(head_dim);
+    if kv_len <= split_chunk {
         return (1, kv_len.max(1));
     }
-    let num_splits = kv_len.div_ceil(SPLIT_CHUNK).min(MAX_SPLITS);
+    let num_splits = kv_len.div_ceil(split_chunk).min(MAX_SPLITS);
     let chunk = kv_len.div_ceil(num_splits).max(1);
     (num_splits, chunk)
 }
@@ -1633,7 +1647,7 @@ fn attn_decode<'a>(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_
     let n_heads = cfg.num_heads as u32;
     let head_dim = cfg.head_dim as u32;
 
-    let (num_splits, chunk) = decode_split_plan(kv_len);
+    let (num_splits, chunk) = decode_split_plan(kv_len, head_dim);
     if num_splits <= 1 {
         // Short context: the plain single-workgroup-per-head kernel, exactly
         // as before this change (no split/reduce overhead).
