@@ -810,7 +810,7 @@ bumped in every `crates/lean/www/*.js` loading URL this session (to
 CPU-rung pages, unaffected by this fix but bumped for hygiene since they
 share the same `pkg/`). `www/index.html?local=1` run in Playwright's
 bundled headless Chromium (`--enable-unsafe-webgpu
---enable-features=Vulkan,WebGPU --use-angle=metal`, never TC's own
+--enable-features=Vulkan,WebGPU --use-angle=metal`, never a personal
 browser): `allMatch: true` - all 5 fixture cases token-match, KV
 snapshot/restore byte- and token-match, logit mask forces the exact target
 string. `decode_timing.html` (per-step timing harness, unchanged from
