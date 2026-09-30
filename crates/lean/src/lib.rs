@@ -8,12 +8,14 @@ pub mod config;
 pub mod cpu;
 pub mod cpu_kernels;
 pub mod engine;
+pub mod generate;
 pub mod gguf;
 pub mod lora;
 pub mod model;
 pub mod pool;
 pub mod profile_report;
 pub mod quant;
+pub mod sampling;
 #[cfg(feature = "web")]
 pub mod web;
 

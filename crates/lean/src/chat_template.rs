@@ -27,8 +27,21 @@ struct ChatMessage<'a> {
 /// Renders `chat_template` for a single user message, `add_generation_prompt
 /// = true` - the same call shape `gen_fixture.py` makes via
 /// `tok.apply_chat_template([{"role": "user", "content": prompt}],
-/// add_generation_prompt=True)`.
+/// add_generation_prompt=True)`. A thin wrapper over [`render_conversation`]
+/// for the single-user-turn case.
 pub fn render_user_prompt(chat_template: &str, prompt: &str) -> Result<String> {
+    render_conversation(chat_template, &[("user", prompt)], true)
+}
+
+/// Renders `chat_template` over an arbitrary `(role, content)` turn history -
+/// the multi-turn generalization of [`render_user_prompt`], used by
+/// `web.rs`'s `chatGenerate` to re-render the full conversation (system
+/// message included implicitly by the template itself, same as
+/// `render_user_prompt`) each turn. Re-rendering the full conversation is
+/// cheap (pure CPU string work); what stays cheap on the GPU side is that
+/// the caller only forwards the *new* suffix of tokens this produces through
+/// the model - see `web.rs::LeanEngine::chat_generate`'s doc comment.
+pub fn render_conversation(chat_template: &str, messages: &[(&str, &str)], add_generation_prompt: bool) -> Result<String> {
     let mut env = Environment::new();
     // Qwen3's chat_template calls Python string methods (`.startswith`,
     // `.endswith`, `.split`, `.strip`, `.lstrip`, `.rstrip`) that plain
@@ -40,11 +53,11 @@ pub fn render_user_prompt(chat_template: &str, prompt: &str) -> Result<String> {
     env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
     env.add_template("chat", chat_template).context("parsing chat_template")?;
     let tmpl = env.get_template("chat").unwrap();
-    let messages = vec![ChatMessage { role: "user", content: prompt }];
+    let messages: Vec<ChatMessage> = messages.iter().map(|&(role, content)| ChatMessage { role, content }).collect();
     // `tools` is left out of the context entirely: minijinja's Undefined is
     // falsy in the template's `{%- if tools %}` check, matching Python
     // Jinja2's behavior for a variable that was never passed.
-    let rendered = tmpl.render(context! { messages => messages, add_generation_prompt => true }).context("rendering chat_template")?;
+    let rendered = tmpl.render(context! { messages => messages, add_generation_prompt => add_generation_prompt }).context("rendering chat_template")?;
     Ok(rendered)
 }
 

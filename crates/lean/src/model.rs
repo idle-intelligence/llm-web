@@ -553,6 +553,21 @@ fn write_kv_prefix(engine: &Engine, buf: &wgpu::Buffer, compact: &[f32], kv_head
     }
 }
 
+/// CPU argmax over a full logits vector, ties broken toward the lower index -
+/// matches `shaders/argmax.wgsl`'s tie-break (`forward_decode_step_argmax`'s
+/// GPU path) so a caller can freely mix the two without behavior drift
+/// (`generate.rs::decode_loop`'s greedy path uses this on `forward_prefill`'s
+/// CPU-readback logits, then switches to the GPU path for every decode step).
+pub fn argmax(logits: &[f32]) -> u32 {
+    let mut best = 0usize;
+    for (i, &v) in logits.iter().enumerate().skip(1) {
+        if v > logits[best] {
+            best = i;
+        }
+    }
+    best as u32
+}
+
 /// Packs `allowed` token ids into a bitset (32 ids per `u32`, bit `i % 32`
 /// of word `i / 32`) for `mask_logits.wgsl`. `vocab` sizes the bitset (any
 /// id `>= vocab` is meaningless to the kernel, which never reads past

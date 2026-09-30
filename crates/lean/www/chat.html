@@ -1,0 +1,33 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>lean engine - multi-turn chat streaming test</title>
+<style>
+  body { font-family: monospace; max-width: 720px; margin: 24px auto; padding: 0 16px; }
+  #log { white-space: pre-wrap; border: 1px solid #ccc; padding: 12px; min-height: 200px; margin-bottom: 12px; }
+  .turn-user { color: #345; font-weight: bold; }
+  .turn-assistant { color: #073; }
+  #controls { display: flex; gap: 8px; margin-bottom: 8px; }
+  #prompt { flex: 1; }
+  #params { font-size: 12px; color: #555; margin-bottom: 12px; }
+  #params input { width: 4em; }
+</style>
+</head>
+<body>
+<h3>lean engine - chat streaming test</h3>
+<div id="status">loading...</div>
+<div id="params">
+  temperature <input id="temperature" value="0"> top_k <input id="topK" value="0">
+  top_p <input id="topP" value="1"> rep_penalty <input id="repPenalty" value="1"> seed <input id="seed" value="0">
+</div>
+<div id="log"></div>
+<div id="controls">
+  <input id="prompt" placeholder="type a message..." disabled>
+  <button id="send" disabled>send</button>
+  <button id="stop" disabled>stop</button>
+  <button id="reset" disabled>reset</button>
+</div>
+<script type="module" src="./main_chat.js"></script>
+</body>
+</html>
