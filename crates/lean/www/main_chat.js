@@ -91,7 +91,7 @@ async function main() {
         window.__leanChatTokens += 1;
         replySpan.textContent += engine.decodeIds(Uint32Array.from([id]));
         logEl.scrollTop = logEl.scrollHeight;
-      }, abortFlag);
+      }, abortFlag.cloneFlag());
     } catch (e) {
       appendTurn("turn-assistant", "[error] " + (e && e.message ? e.message : e));
       console.error(e);

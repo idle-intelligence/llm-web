@@ -142,6 +142,21 @@ impl AbortFlag {
     pub fn is_aborted(&self) -> bool {
         self.0.get()
     }
+
+    /// A cheap `Rc` clone sharing the same underlying flag - **the value to
+    /// pass into `generateStream`/`chatGenerate`, not the original**.
+    /// wasm-bindgen destroys a by-value class argument's JS-side handle the
+    /// instant it crosses into wasm (`__destroy_into_raw()` in the generated
+    /// glue), so passing the caller's own `AbortFlag` directly would leave
+    /// that JS object unusable (a later `flag.abort()` call would hit a
+    /// freed pointer) even though the call is still in flight. Passing
+    /// `flag.cloneFlag()` instead keeps the caller's original object alive
+    /// and callable for the whole (possibly multi-second) generation, since
+    /// both point at the same `Rc<Cell<bool>>`.
+    #[wasm_bindgen(js_name = cloneFlag)]
+    pub fn clone_flag(&self) -> AbortFlag {
+        self.clone()
+    }
 }
 
 impl Default for AbortFlag {
