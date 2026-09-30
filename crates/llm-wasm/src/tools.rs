@@ -1,9 +1,14 @@
-//! MCP tool-call schema (de)serialization and the xLAM tool-call output
-//! parser. Owned by phase 1a. See `docs/llm-wasm/MODELS.md` §3 ("Tool-call OUTPUT
-//! format the model emits"): xLAM-2 emits a bare JSON array
+//! MCP tool-call schema (de)serialization and this engine's tool-call output
+//! parser. Owned by phase 1a. See `docs/archive/MODELS-2026-09-archived.md` §3 ("Tool-call OUTPUT
+//! format the model emits"): this parser expects a bare JSON array
 //! `[{"name": ..., "arguments": {...}}, ...]` at the start of the turn,
 //! with no `<tool_call>` wrapper tags — detection is "does the (stripped)
-//! output start with `[`".
+//! output start with `[`". This is the tool-call convention of the
+//! fine-tune `docs/archive/MODELS-2026-09-archived.md` researched, not
+//! Qwen2.5-3B-Instruct's own default chat template (which wraps calls in
+//! `<tool_call>...</tool_call>`) — schema-constrained decoding
+//! (`grammar.rs`) is what makes this repo's current model emit this format
+//! regardless of its own default.
 
 use crate::template::{to_json_compact_py, Message};
 use serde::{Deserialize, Serialize};

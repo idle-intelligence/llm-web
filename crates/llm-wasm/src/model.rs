@@ -348,7 +348,7 @@ impl RmsNormLayer {
 
 /// Grouped-query attention: `n_heads` query heads, `n_kv_heads` key/value
 /// heads (`n_heads / n_kv_heads` query heads share each KV head). Qwen2's
-/// q/k/v projections carry bias; `attn_output` doesn't (docs/llm-wasm/MODELS.md §2).
+/// q/k/v projections carry bias; `attn_output` doesn't (docs/archive/MODELS-2026-09-archived.md §2).
 pub struct Q4Attention {
     q_proj: Q4Linear,
     k_proj: Q4Linear,
@@ -936,7 +936,7 @@ impl Q4TransformerBlock {
 // ---------------------------------------------------------------------------
 
 /// The complete Qwen2 decoder. `lm_head` is tied to `embed`'s Q4 buffer (same
-/// GPU handle, shared via `Q4Tensor::clone` at load time — docs/llm-wasm/MODELS.md §2:
+/// GPU handle, shared via `Q4Tensor::clone` at load time — docs/archive/MODELS-2026-09-archived.md §2:
 /// no independent `output.weight` tensor exists in this GGUF).
 /// A forced run shorter than this many tokens is decoded one token at a
 /// time via ordinary masked argmax instead of the batched jump-forward
@@ -1084,7 +1084,7 @@ impl LlmModel {
     /// `llm-life` (CONCEPT.md §1) reads p(alive) from two logits (`0`/`1`) at
     /// every one of thousands of positions; the full head would materialize
     /// `T x 151936` floats to read two columns. The rows come from the same
-    /// Q4 buffer `lm_head` is tied to (docs/llm-wasm/MODELS.md §2: no independent
+    /// Q4 buffer `lm_head` is tied to (docs/archive/MODELS-2026-09-archived.md §2: no independent
     /// `output.weight` exists), so this is the same projection, sliced.
     /// Build it once per generation and reuse it across positions.
     pub fn head_slice(&self, token_ids: &[u32]) -> Result<Tensor<Wgpu, 2>> {

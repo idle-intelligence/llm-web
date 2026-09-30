@@ -226,7 +226,7 @@ fn q8_0_file_roundtrip_write_read() {
     let n_layers = 3;
     let n_kv_heads = 2;
     let n_tokens = 17;
-    let head_dim = 128; // 4 blocks of 32 per row, matches xLAM-2-3b-fc-r
+    let head_dim = 128; // 4 blocks of 32 per row, matches Qwen2.5-3B-Instruct
 
     let header = q8_0_header(n_layers, n_kv_heads, n_tokens, head_dim);
     let len = n_kv_heads * n_tokens * head_dim;

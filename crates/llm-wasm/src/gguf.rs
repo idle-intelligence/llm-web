@@ -1,8 +1,8 @@
-// Rewritten from the stt-web copy (see git history) for Qwen2/xLAM-2-3b-fc-r's
+// Rewritten from the stt-web copy (see git history) for Qwen2.5-3B-Instruct's
 // GGUF layout. GGUF metadata KV pairs are now parsed generically (not
 // skipped) so `qwen2.*` hyperparameters can be read from the file instead of
 // hand-copied; tensor names follow llama.cpp's `blk.N.attn_{q,k,v,output}`
-// convention (docs/llm-wasm/MODELS.md §2). See docs/llm-wasm/ENGINE.md §1 for the audit this
+// convention (docs/archive/MODELS-2026-09-archived.md §2). See docs/llm-wasm/ENGINE.md §1 for the audit this
 // replaces.
 
 //! Q4 GGUF weight loader and WGSL dequantization shaders.
@@ -342,7 +342,7 @@ pub enum GgmlDtype {
     /// `Qwen/Qwen2.5-0.5B-Instruct-GGUF`), and a header parse that bails on
     /// it makes the whole file unloadable even though this crate never reads
     /// that tensor — its lm_head is tied to `token_embd.weight`
-    /// (docs/llm-wasm/MODELS.md §2). Community *base*-model GGUFs
+    /// (docs/archive/MODELS-2026-09-archived.md §2). Community *base*-model GGUFs
     /// (`QuantFactory/Qwen2.5-0.5B-GGUF`) go further and keep
     /// `token_embd.weight` itself at Q8_0, which `EmbeddingStore` and
     /// `Q4ModelParts::finalize` handle. Every other tensor still fails via
@@ -671,11 +671,11 @@ impl<R: Read + Seek> GgufReader<R> {
 // Config extraction — qwen2.* metadata -> LlmConfig
 // ---------------------------------------------------------------------------
 
-/// Build an [`LlmConfig`] from a GGUF's `qwen2.*` metadata (docs/llm-wasm/MODELS.md §2).
+/// Build an [`LlmConfig`] from a GGUF's `qwen2.*` metadata (docs/archive/MODELS-2026-09-archived.md §2).
 ///
 /// Vocab size is read from `token_embd.weight`'s tensor shape rather than any
 /// metadata array length, since the tokenizer's own vocab (151665) is smaller
-/// than the padded embedding matrix (151936) — see docs/llm-wasm/MODELS.md §1.
+/// than the padded embedding matrix (151936) — see docs/archive/MODELS-2026-09-archived.md §1.
 pub fn config_from_gguf<R: Read + Seek>(reader: &GgufReader<R>) -> Result<LlmConfig> {
     let arch = reader.meta_string("general.architecture").unwrap_or("");
     ensure!(
@@ -714,7 +714,7 @@ pub fn config_from_gguf<R: Read + Seek>(reader: &GgufReader<R>) -> Result<LlmCon
         .meta_u32("tokenizer.ggml.padding_token_id")
         .unwrap_or(151643);
     // generation_config.json's eos list is [151645, 151643] (im_end, then
-    // endoftext/pad as fallback) — see docs/llm-wasm/MODELS.md §1. Dedup in case the
+    // endoftext/pad as fallback) — see docs/archive/MODELS-2026-09-archived.md §1. Dedup in case the
     // GGUF's own eos/pad happen to coincide.
     let mut eos_token_ids = vec![eos_token_id];
     if pad_token_id != eos_token_id {
@@ -928,7 +928,7 @@ impl Q4Tensor {
 ///
 /// Stores weights as `[out_features, in_features]` in Q4_0 format and an
 /// optional f32 bias (Qwen2's q/k/v projections carry bias; attn_output and
-/// all ffn_* projections don't — docs/llm-wasm/MODELS.md §2). Forward: `x @ weights^T
+/// all ffn_* projections don't — docs/archive/MODELS-2026-09-archived.md §2). Forward: `x @ weights^T
 /// + bias` via fused dequant+matmul.
 pub struct Q4Linear {
     weights: Q4Tensor,
@@ -2056,7 +2056,7 @@ impl Q4ModelParts {
     /// model's 151936×2048 shape) and reuses that same buffer as both the
     /// embedding table (via CPU-side `EmbeddingStore`, for input lookups)
     /// and the lm_head weight (via `Q4Linear`, tied — no separate
-    /// `output.weight` tensor exists in this GGUF, docs/llm-wasm/MODELS.md §2).
+    /// `output.weight` tensor exists in this GGUF, docs/archive/MODELS-2026-09-archived.md §2).
     /// A Q8_0 `token_embd.weight` (what community base-model GGUFs ship, e.g.
     /// `QuantFactory/Qwen2.5-0.5B-GGUF`) is kept exact on the CPU side and
     /// **re-quantized to Q4_0 for the GPU tied head only** — no kernel in
@@ -2204,7 +2204,7 @@ impl<R: Read + Seek> Q4ModelLoader<R> {
     }
 
     /// Load a single transformer layer from GGUF (llama.cpp `blk.N.*` naming,
-    /// docs/llm-wasm/MODELS.md §2).
+    /// docs/archive/MODELS-2026-09-archived.md §2).
     fn load_transformer_layer(
         &mut self,
         layer_idx: usize,

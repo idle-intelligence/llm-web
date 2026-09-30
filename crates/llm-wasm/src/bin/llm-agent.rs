@@ -22,7 +22,7 @@ use llm_wasm::template::{ChatTemplate, Message, Tool};
 use llm_wasm::tokenizer::Tokenizer;
 
 #[derive(Parser)]
-#[command(name = "llm-agent", about = "xLAM-2-3b-fc-r native CLI")]
+#[command(name = "llm-agent", about = "Qwen2.5-3B-Instruct native CLI")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -438,7 +438,7 @@ fn prefill_sweep(lengths: &str, reps: usize) -> anyhow::Result<()> {
         .split(',')
         .map(|s| s.trim().parse::<usize>().expect("lengths must be comma-separated integers"))
         .collect();
-    // xLAM-2-3b-fc-r's two dominant shapes, then Qwen2.5-0.5B's three
+    // Qwen2.5-3B-Instruct's two dominant shapes, then Qwen2.5-0.5B's three
     // (llm-life runs that model, and its K is 896 — a regime the Session 15
     // sweep never sampled).
     let shapes: &[(usize, usize, &str)] = &[
@@ -909,8 +909,8 @@ impl Generator for NativeGenerator {
 }
 
 const DEFAULT_GGUF_SUFFIX: &str =
-    "Code/idle-intelligence/models/gguf/xlam-2-3b-fc-r/xLAM-2-3b-fc-r-q4_0.gguf";
-const DEFAULT_MODEL_DIR_SUFFIX: &str = "Code/idle-intelligence/models/hf/xLAM-2-3b-fc-r";
+    "Code/idle-intelligence/models/gguf/qwen2.5-3b-instruct/qwen2.5-3b-instruct-q4_0.gguf";
+const DEFAULT_MODEL_DIR_SUFFIX: &str = "Code/idle-intelligence/models/hf/Qwen2.5-3B-Instruct";
 
 fn home_relative(suffix: &str) -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_default();

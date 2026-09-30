@@ -1,4 +1,4 @@
-//! wasm-bindgen browser surface for the xLAM-2-3b-fc-r agent.
+//! wasm-bindgen browser surface for the Qwen2.5-3B-Instruct agent.
 //!
 //! Mirrors stt-web's `stt-wasm/src/web/bindings.rs`: a module-level
 //! `initWgpuDevice()` that must be awaited once before constructing

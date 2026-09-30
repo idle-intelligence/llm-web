@@ -3,7 +3,7 @@ name = "llm-wasm"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Qwen2-family LLM (xLAM-2-3b-fc-r) in Burn+wgpu — runs natively and in browser via WASM+WebGPU"
+description = "Qwen2-family LLM (Qwen2.5-3B-Instruct) in Burn+wgpu — runs natively and in browser via WASM+WebGPU"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
@@ -71,7 +71,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 byteorder = { workspace = true }
 
-# Chat templating (Jinja2-compatible; xLAM-2's embedded chat_template uses `tojson`)
+# Chat templating (Jinja2-compatible; Qwen2.5-3B-Instruct's embedded chat_template uses `tojson`)
 minijinja = { workspace = true }
 
 # Tokenizer — onig/esaxx_fast (C/C++) are not wasm32-safe, so default features

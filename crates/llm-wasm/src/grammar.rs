@@ -1,4 +1,4 @@
-//! Schema-constrained decoding for xLAM-2 tool calls.
+//! Schema-constrained decoding for this engine's tool calls.
 //!
 //! A pure state machine (no GPU, no model) that decides, at every decoding
 //! step, which vocab tokens are legal continuations of the output so far —
@@ -6,9 +6,10 @@
 //! how this is meant to hook into `sample.rs` (not wired up yet — another
 //! worker owns the generate loop).
 //!
-//! xLAM-2 emits either a bare JSON array of tool calls
+//! Constrains output to either a bare JSON array of tool calls
 //! (`[{"name": ..., "arguments": {...}}, ...]`, see `tools.rs`) or plain
-//! text. `Grammar::for_tools` builds the constraint for one turn (given the
+//! text, regardless of the model's own default chat-template output
+//! format. `Grammar::for_tools` builds the constraint for one turn (given the
 //! tool schemas and the `IdValues` known so far); `GrammarState` walks a
 //! generation through it token by token.
 //!

@@ -2,7 +2,7 @@
 //! last position's `[vocab]` row — see `model.rs::lm_head` callers). Greedy
 //! is what `tests/full_forward.rs` and `generate()` use for reference-match
 //! testing (deterministic); temperature/top-p/top-k/repetition-penalty match
-//! xLAM-2-3b-fc-r's `generation_config.json` defaults (docs/llm-wasm/MODELS.md §1:
+//! Qwen2.5-3B-Instruct's `generation_config.json` defaults (docs/archive/MODELS-2026-09-archived.md §1:
 //! `temperature: 0.7, top_p: 0.8, top_k: 20, repetition_penalty: 1.05`) for
 //! actual agent use, not exercised by the reference-comparison tests.
 
@@ -74,7 +74,7 @@ pub struct SamplingConfig {
 
 impl Default for SamplingConfig {
     fn default() -> Self {
-        // xLAM-2-3b-fc-r generation_config.json defaults, docs/llm-wasm/MODELS.md §1.
+        // Qwen2.5-3B-Instruct generation_config.json defaults, docs/archive/MODELS-2026-09-archived.md §1.
         Self {
             temperature: 0.7,
             top_p: 0.8,

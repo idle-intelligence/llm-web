@@ -1,5 +1,5 @@
-//! Chat template rendering (minijinja) for xLAM-2-3b-fc-r's embedded Jinja2
-//! `chat_template`. Owned by phase 1a. See `docs/llm-wasm/MODELS.md` §3 for the
+//! Chat template rendering (minijinja) for Qwen2.5-3B-Instruct's embedded Jinja2
+//! `chat_template`. Owned by phase 1a. See `docs/archive/MODELS-2026-09-archived.md` §3 for the
 //! template source and the wire shapes it expects.
 //!
 //! ## Closing the `tojson` fidelity gap vs. Python/transformers
@@ -77,7 +77,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::io;
 
-/// A single chat message, matching the fields the xLAM-2 chat template
+/// A single chat message, matching the fields the Qwen2.5-3B-Instruct chat template
 /// inspects (`role`, `content`, `tool_calls`, `name`, `tool_call_id`).
 ///
 /// Field order here has no bearing on template output — the template only
@@ -208,7 +208,7 @@ impl Tool {
     }
 }
 
-/// A compiled xLAM-2 chat template, ready to render prompts.
+/// A compiled Qwen2.5-3B-Instruct chat template, ready to render prompts.
 pub struct ChatTemplate {
     env: Environment<'static>,
     bos_token: Option<String>,
@@ -217,8 +217,8 @@ pub struct ChatTemplate {
 
 impl ChatTemplate {
     /// Build from the raw Jinja2 template string plus the special tokens it
-    /// may reference (this particular xLAM-2 template doesn't use
-    /// `bos_token`/`eos_token` as Jinja globals — see `docs/llm-wasm/MODELS.md` §3 —
+    /// may reference (this particular Qwen2.5-3B-Instruct template doesn't use
+    /// `bos_token`/`eos_token` as Jinja globals — see `docs/archive/MODELS-2026-09-archived.md` §3 —
     /// but other chat templates do, so we still thread them through).
     pub fn new(
         template_source: impl Into<String>,

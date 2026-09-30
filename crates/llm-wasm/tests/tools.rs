@@ -9,7 +9,7 @@ fn fixture_root() -> PathBuf {
 }
 
 /// The recorded greedy first-32-token strings from every logits fixture
-/// (`greedy_first_32_tokens_text`) are real xLAM-2 outputs — parse each and
+/// (`greedy_first_32_tokens_text`) are real recorded model outputs — parse each and
 /// check it comes back as the expected tool call(s).
 #[test]
 fn parses_recorded_greedy_outputs() {

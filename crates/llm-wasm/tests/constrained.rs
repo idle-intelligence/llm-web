@@ -25,12 +25,12 @@ use serde_json::Value;
 
 fn model_dir() -> String {
     std::env::var("LLM_MODEL_DIR")
-        .unwrap_or_else(|_| "./models/gguf/xlam-2-3b-fc-r".to_string())
+        .unwrap_or_else(|_| "./models/gguf/qwen2.5-3b-instruct".to_string())
 }
 
 fn tokenizer_model_dir() -> String {
     std::env::var("LLM_TOKENIZER_DIR")
-        .unwrap_or_else(|_| "./models/hf/xLAM-2-3b-fc-r".to_string())
+        .unwrap_or_else(|_| "./models/hf/Qwen2.5-3B-Instruct".to_string())
 }
 
 fn fixtures_dir() -> String {
@@ -38,7 +38,7 @@ fn fixtures_dir() -> String {
 }
 
 fn load_model(device: &WgpuDevice) -> Option<LlmModel> {
-    let path = format!("{}/xLAM-2-3b-fc-r-q4_0.gguf", model_dir());
+    let path = format!("{}/qwen2.5-3b-instruct-q4_0.gguf", model_dir());
     if !Path::new(&path).exists() {
         eprintln!("skipping: {path} not found");
         return None;

@@ -1,4 +1,4 @@
-//! xLAM-2-3b-fc-r (Qwen2 architecture) — browser-native tool-calling LLM.
+//! Qwen2.5-3B-Instruct (Qwen2 architecture) — browser-native tool-calling LLM.
 //!
 //! Decoder-only transformer (GQA + q/k/v bias, RoPE, RMSNorm, SwiGLU, tied
 //! embeddings, 151936-token vocab) driving MCP tool calls in-browser, mirroring
@@ -35,9 +35,9 @@ pub mod eval;
 #[cfg(feature = "web")]
 pub mod web;
 
-/// Model configuration for xLAM-2-3b-fc-r (Qwen2 architecture).
+/// Model configuration for Qwen2.5-3B-Instruct (Qwen2 architecture).
 ///
-/// See `docs/llm-wasm/MODELS.md` for the values verified against the GGUF header and
+/// See `docs/archive/MODELS-2026-09-archived.md` for the values verified against the GGUF header and
 /// `config.json`.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct LlmConfig {
@@ -67,8 +67,8 @@ pub struct LlmConfig {
 
 impl Default for LlmConfig {
     fn default() -> Self {
-        // Verified values from xLAM-2-3b-fc-r's config.json / GGUF header,
-        // see docs/llm-wasm/MODELS.md §1-2.
+        // Verified values from Qwen2.5-3B-Instruct's config.json / GGUF header,
+        // see docs/archive/MODELS-2026-09-archived.md §1-2.
         Self {
             num_layers: 36,
             hidden_size: 2048,

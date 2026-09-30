@@ -1,7 +1,7 @@
 //! Renders Qwen2.5-Instruct's own Jinja2 `chat_template` (read straight out
 //! of `tokenizer_config.json`, never hand-copied) via minijinja, for a
 //! single-user-turn prompt with no tools - the scope this slice needs.
-//! Unlike llm-wasm's `template.rs` (347 lines: xLAM-2's tool-calling
+//! Unlike llm-wasm's `template.rs` (347 lines: Qwen2.5-3B-Instruct's tool-calling
 //! message model, custom `py_tojson` filter for byte-exact `tojson`
 //! fidelity against Python's `json.dumps`), Qwen2.5's own template never
 //! calls `tojson` on the no-tools path this crate exercises, so none of

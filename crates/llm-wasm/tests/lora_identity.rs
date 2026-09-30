@@ -7,9 +7,9 @@
 //! Env vars (default is relative to the repo root, same convention as
 //! `tests/full_forward.rs`):
 //! - `LLM_MODEL_DIR` -> GGUF directory, default
-//!   `./models/gguf/xlam-2-3b-fc-r`
+//!   `./models/gguf/qwen2.5-3b-instruct`
 //! - `LLM_MODEL_FILE` -> GGUF filename within that directory, default
-//!   `xLAM-2-3b-fc-r-q4_0.gguf`
+//!   `qwen2.5-3b-instruct-q4_0.gguf`
 //!
 //! Skips (prints + returns) instead of failing when the GGUF isn't present.
 #![cfg(feature = "wgpu")]
@@ -25,8 +25,8 @@ use llm_wasm::model::logits_to_vec;
 
 fn model_path() -> String {
     let dir = std::env::var("LLM_MODEL_DIR")
-        .unwrap_or_else(|_| "./models/gguf/xlam-2-3b-fc-r".to_string());
-    let file = std::env::var("LLM_MODEL_FILE").unwrap_or_else(|_| "xLAM-2-3b-fc-r-q4_0.gguf".to_string());
+        .unwrap_or_else(|_| "./models/gguf/qwen2.5-3b-instruct".to_string());
+    let file = std::env::var("LLM_MODEL_FILE").unwrap_or_else(|_| "qwen2.5-3b-instruct-q4_0.gguf".to_string());
     format!("{dir}/{file}")
 }
 

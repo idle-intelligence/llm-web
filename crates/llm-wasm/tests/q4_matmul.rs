@@ -4,7 +4,7 @@
 //! - Synthetic random Q4_0 weights at the model's actual `[N, K]` shapes
 //!   apart from the 151936-wide lm_head (q/o: 2048x2048, gate/up: 11008x2048,
 //!   down: 2048x11008), M in {1, 64}, full CPU-dequant-then-matmul reference.
-//! - The **real** `token_embd.weight` tensor from the xLAM-2-3b-fc-r GGUF
+//! - The **real** `token_embd.weight` tensor from the Qwen2.5-3B-Instruct GGUF
 //!   (Q4_0, [151936, 2048], tied lm_head shape) at M in {1, 64}: the GPU
 //!   kernel computes the full 151936-wide output (exercising the real
 //!   dispatch-grid/buffer-size path from docs/llm-wasm/ENGINE.md §2), but the CPU
@@ -316,14 +316,14 @@ fn test_q4_matvec_coalesced_shapes() {
 }
 
 /// Real `token_embd.weight` (Q4_0, [151936, 2048], tied lm_head shape) from
-/// the xLAM-2-3b-fc-r GGUF. Exercises the full 151936-wide dispatch and the
+/// the Qwen2.5-3B-Instruct GGUF. Exercises the full 151936-wide dispatch and the
 /// ~174MB single-buffer upload (docs/llm-wasm/ENGINE.md §2's untested-limit concern).
 #[test]
 fn test_q4_matmul_real_gguf_token_embd() {
     let model_dir = std::env::var("LLM_MODEL_DIR").unwrap_or_else(|_| {
-        "./models/gguf/xlam-2-3b-fc-r".to_string()
+        "./models/gguf/qwen2.5-3b-instruct".to_string()
     });
-    let path = format!("{model_dir}/xLAM-2-3b-fc-r-q4_0.gguf");
+    let path = format!("{model_dir}/qwen2.5-3b-instruct-q4_0.gguf");
     if !std::path::Path::new(&path).exists() {
         eprintln!("skipping: {path} not found");
         return;
@@ -402,7 +402,7 @@ fn test_q4_matmul_real_gguf_token_embd() {
 
 fn model_dir() -> String {
     std::env::var("LLM_MODEL_DIR")
-        .unwrap_or_else(|_| "./models/gguf/xlam-2-3b-fc-r".to_string())
+        .unwrap_or_else(|_| "./models/gguf/qwen2.5-3b-instruct".to_string())
 }
 
 /// Full CPU dequant of a raw Q4_0 `[n, k]` tensor's on-disk bytes into a
@@ -482,7 +482,7 @@ fn max_abs_rel(cpu: &[f32], gpu: &[f32]) -> (f32, f32) {
 /// real tool-result size (531).
 #[test]
 fn test_scratch_vs_naive_vs_cpu_per_m_real_gguf() {
-    let path = format!("{}/xLAM-2-3b-fc-r-q4_0.gguf", model_dir());
+    let path = format!("{}/qwen2.5-3b-instruct-q4_0.gguf", model_dir());
     if !std::path::Path::new(&path).exists() {
         eprintln!("skipping: {path} not found");
         return;
@@ -565,7 +565,7 @@ fn test_scratch_vs_naive_vs_cpu_per_m_real_gguf() {
 /// (`cpu[n*K+k]`).
 #[test]
 fn test_dequant_scratch_matches_cpu_real_gguf() {
-    let path = format!("{}/xLAM-2-3b-fc-r-q4_0.gguf", model_dir());
+    let path = format!("{}/qwen2.5-3b-instruct-q4_0.gguf", model_dir());
     if !std::path::Path::new(&path).exists() {
         eprintln!("skipping: {path} not found");
         return;
