@@ -1,5 +1,5 @@
 /**
- * Web Worker hosting the real llm-wasm engine (xLAM-2-3b-fc-r, Burn+wgpu,
+ * Web Worker hosting the real llm-wasm engine (Qwen2.5-3B-Instruct, Burn+wgpu,
  * WebGPU). Speaks the same protocol as the trucs.ai stub
  * (`sonos/llm-worker.js`) verbatim, so it's a drop-in replacement there —
  * only this file's internals differ; message shapes are unchanged.

@@ -8,6 +8,7 @@ export const llmengine_exportKvImage: (a: number, b: number, c: number, d: numbe
 export const llmengine_importKvImage: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => [number, number, number];
 export const llmengine_info: (a: number) => [number, number];
 export const llmengine_load: (a: number, b: number, c: number, d: number, e: number, f: any) => any;
+export const llmengine_loadAdapter: (a: number, b: number, c: number) => [number, number];
 export const llmengine_new: () => number;
 export const llmengine_prefixInputs: (a: number, b: number, c: number, d: number, e: number) => [number, number, number, number];
 export const llmengine_prefixKey: (a: number, b: number, c: number, d: number, e: number) => [number, number, number, number];

@@ -95,6 +95,22 @@ export class LlmEngine {
         }
     }
     /**
+     * Load a runtime LoRA adapter (`crate::lora`'s LLMLIFE2 format) onto
+     * the already-`load()`-ed model, applying its q/k/v/o deltas on every
+     * subsequent forward. Call after `load()`; replaces any previously
+     * loaded adapter (does not stack). No Q4 kernel or GGUF weight is
+     * touched — the base model is unaffected if this is never called.
+     * @param {Uint8Array} bytes
+     */
+    loadAdapter(bytes) {
+        const ptr0 = passArray8ToWasm0(bytes, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.llmengine_loadAdapter(this.__wbg_ptr, ptr0, len0);
+        if (ret[1]) {
+            throw takeFromExternrefTable0(ret[0]);
+        }
+    }
+    /**
      * Parse the GGUF (from previously `appendModelShard`-ed bytes), upload
      * weights to GPU, and build the tokenizer + chat template.
      *
@@ -1024,12 +1040,12 @@ function __wbg_get_imports() {
             return ret;
         }, arguments); },
         __wbindgen_generic_0000000000000001: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 3970, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 3989, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h453dd913ed002526);
             return ret;
         },
         __wbindgen_generic_0000000000000002: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 4107, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 4127, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h2d808c2d349e4bb9);
             return ret;
         },

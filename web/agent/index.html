@@ -19,17 +19,17 @@
 </style>
 </head>
 <body>
-<h1>llm-wasm agent demo (xLAM-2-3b-fc-r, Burn+wgpu, WebGPU)</h1>
+<h1>llm-wasm agent demo (Qwen2.5-3B-Instruct, Burn+wgpu, WebGPU)</h1>
 <p id="status">Not loaded.</p>
 
 <fieldset>
   <legend>1. Load model</legend>
   <label>GGUF shard URL(s), comma-separated (single file is fine)</label>
-  <input id="gguf-url" type="text" value="http://127.0.0.1:8001/gguf/xlam-2-3b-fc-r/xLAM-2-3b-fc-r-q4_0.gguf" />
+  <input id="gguf-url" type="text" value="http://127.0.0.1:8001/gguf/qwen2.5-3b-instruct/Qwen2.5-3B-Instruct-q4_0.gguf" />
   <label>tokenizer.json URL</label>
-  <input id="tokenizer-url" type="text" value="http://127.0.0.1:8001/hf/xLAM-2-3b-fc-r/tokenizer.json" />
+  <input id="tokenizer-url" type="text" value="http://127.0.0.1:8001/hf/Qwen2.5-3B-Instruct/tokenizer.json" />
   <label>tokenizer_config.json URL</label>
-  <input id="template-url" type="text" value="http://127.0.0.1:8001/hf/xLAM-2-3b-fc-r/tokenizer_config.json" />
+  <input id="template-url" type="text" value="http://127.0.0.1:8001/hf/Qwen2.5-3B-Instruct/tokenizer_config.json" />
   <p><button id="load-btn">Load model</button></p>
   <progress id="load-progress" value="0" max="1"></progress>
   <div id="load-detail" style="font-size:0.8rem;color:#777;"></div>
@@ -204,7 +204,7 @@ document.getElementById('load-btn').addEventListener('click', async () => {
   document.getElementById('status').textContent = 'Loading model (this fetches ~1.7GB, then uploads to GPU)...';
   document.getElementById('load-btn').disabled = true;
   try {
-    const info = await client.load({ id: 'xlam-2-3b-fc-r', shards, tokenizerUrl, templateUrl });
+    const info = await client.load({ id: 'qwen2.5-3b-instruct', shards, tokenizerUrl, templateUrl });
     document.getElementById('status').textContent = `Ready: ${JSON.stringify(info)}`;
     logLine(`ready: ${JSON.stringify(info)}`);
     document.getElementById('run-btn').disabled = false;

@@ -45,6 +45,14 @@ export class LlmEngine {
      */
     info(): string;
     /**
+     * Load a runtime LoRA adapter (`crate::lora`'s LLMLIFE2 format) onto
+     * the already-`load()`-ed model, applying its q/k/v/o deltas on every
+     * subsequent forward. Call after `load()`; replaces any previously
+     * loaded adapter (does not stack). No Q4 kernel or GGUF weight is
+     * touched — the base model is unaffected if this is never called.
+     */
+    loadAdapter(bytes: Uint8Array): void;
+    /**
      * Parse the GGUF (from previously `appendModelShard`-ed bytes), upload
      * weights to GPU, and build the tokenizer + chat template.
      *
@@ -168,6 +176,7 @@ export interface InitOutput {
     readonly llmengine_importKvImage: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => [number, number, number];
     readonly llmengine_info: (a: number) => [number, number];
     readonly llmengine_load: (a: number, b: number, c: number, d: number, e: number, f: any) => any;
+    readonly llmengine_loadAdapter: (a: number, b: number, c: number) => [number, number];
     readonly llmengine_new: () => number;
     readonly llmengine_prefixInputs: (a: number, b: number, c: number, d: number, e: number) => [number, number, number, number];
     readonly llmengine_prefixKey: (a: number, b: number, c: number, d: number, e: number) => [number, number, number, number];
