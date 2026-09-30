@@ -1162,3 +1162,70 @@ against the freshly built and served `pkg/lean_bg.wasm` (hash-verified). No
 source changes were made this session beyond the `ENGINE_BUILD` bumps
 (`crates/lean/www/*.js`) and this doc section - the one upstream commit
 merged in this session (`38d3eee`) was itself docs-only.
+
+## Session 9: post-merge check - ENGINE_BUILD bumps, native gates, partial browser check
+
+### ENGINE_BUILD bump
+
+The 10 `crates/lean/www/*.js` `ENGINE_BUILD` tags were bumped by exactly one
+step each from the last committed value (e.g. `2026-09-29-08` ->
+`2026-09-29-09`, `2026-09-29-cpu-06` -> `2026-09-29-cpu-07`), matching the
+rule that every wasm-loading URL gets a new tag in the same commit as a
+wasm/model rebuild. Committed in `9b04874`.
+
+### Served-bytes proof
+
+`wasm-pack build crates/lean --target web --no-default-features --features
+web`, then served `crates/lean/` over `python3 -m http.server 8123` and
+fetched `pkg/lean_bg.wasm` over HTTP:
+
+| file | sha256 |
+|---|---|
+| local build (`crates/lean/pkg/lean_bg.wasm`) | `889b372e5844bd098bc96ccca8da144a745c9cb692293490e07b1e860881370d` |
+| served (`http://localhost:8123/pkg/lean_bg.wasm`) | `889b372e5844bd098bc96ccca8da144a745c9cb692293490e07b1e860881370d` |
+
+Identical.
+
+### Native ignored tests (`cargo test -p lean --release --test <name> -- --ignored`, run individually per test binary, each under the repo's `cargo`/`gpu` locks)
+
+| test | result | time |
+|---|---|---:|
+| fixture_parity | ok | 188.35s |
+| fixture_parity_qwen25_3b | ok | 57.59s |
+| fixture_parity_qwen3 | ok | 125.91s |
+| fixture_parity_qwen3_1_7b | ok | 288.34s |
+| fixture_parity_llama_360m | ok | 20.08s |
+| fixture_parity_llama_1_7b | ok | 52.22s |
+| kv_snapshot (2 tests) | ok | 154.64s |
+| logit_mask (3 tests) | ok | 8.34s |
+| fixture_parity_llama_360m_cpu | ok | 25.89s |
+
+0 failures across all 9 test binaries (14 individual `#[test]` fns total).
+
+### Browser check (SwiftShader, headless Chromium)
+
+`www/index.html?local=1` run in Playwright's bundled headless Chromium with
+`--enable-unsafe-webgpu --enable-features=Vulkan --use-angle=swiftshader
+--use-gl=swiftshader --ignore-gpu-blocklist` (software WebGPU - correctness
+check only, no timing). First attempt (900s wait) timed out before
+`window.__leanResult` was set; 3 of the fixture's 5 cases had completed by
+then:
+
+| case | tokens_match | prefill_ms | decode_ms_per_tok |
+|---|---|---:|---:|
+| short | true | 27355.2 | 3594.8 |
+| long | true | 35153.9 | 3137.0 |
+| non_english | true | 20924.9 | 3164.6 |
+
+Partial only - the run never reached the final `allMatch` verdict (2 of 5
+cases, `kv_cache`/whichever the fixture orders last, not yet executed). A
+second attempt with a longer timeout was stopped by the lead before
+completion: it had been running 75+ minutes of active SwiftShader CPU time
+and was holding the shared browser-automation lock two other workers
+needed.
+
+**Browser allMatch on a real GPU: pending** - run `www/index.html?local=1`
+in Chrome on the M2, or headed on the 3080/Vulkan box, to get the
+authoritative allMatch verdict; SwiftShader software rendering is too slow
+for this fixture to finish in a practical amount of time on shared
+infrastructure.
