@@ -1,8 +1,8 @@
 """
-Generate a "dequant-matched" reference: load Salesforce/xLAM-2-3b-fc-r on
+Generate a "dequant-matched" reference: load Qwen/Qwen2.5-3B-Instruct on
 CPU in float32, then overwrite every weight with the Q4_0 (and Q6_K for the
 embedding table)-dequantised values pulled straight out of the local
-xLAM-2-3b-fc-r-q4_0.gguf. Forward-pass logits from this model isolate
+Qwen2.5-3B-Instruct-q4_0.gguf. Forward-pass logits from this model isolate
 quantisation noise from bugs in the Rust port: the Rust port also runs
 Q4_0 weights (dequantised at load, f32 compute), so this reference should
 match it far more closely than the plain bf16 reference does.
@@ -16,7 +16,7 @@ time. See scripts/README.md for the exact command and expected duration.
 
 venv mon ami: run with scripts/.venv/bin/python (see scripts/README.md).
 
-Tensor naming (llama.cpp GGUF <-> HF state_dict), per docs/llm-wasm/MODELS.md section 2:
+Tensor naming (llama.cpp GGUF <-> HF state_dict), per docs/archive/MODELS-2026-09-archived.md section 2:
 
     token_embd.weight              <-> model.embed_tokens.weight   (tied to lm_head.weight)
     blk.N.attn_q.{weight,bias}     <-> model.layers.N.self_attn.q_proj.{weight,bias}
@@ -46,9 +46,9 @@ No transpose needed relative to gguf's `ne` field (which is reported
 reversed, ggml-internal order).
 
 Outputs:
-- models/reference/xlam-2-3b-fc-r/<name>.dequant.logits.npy   float32 [seq_len, vocab_size]
+- models/reference/qwen2.5-3b-instruct/<name>.dequant.logits.npy   float32 [seq_len, vocab_size]
 - fixtures/reference/logits/<name>.dequant.json               argmax/top5/greedy, same shape as the bf16 *.json
-- models/reference/xlam-2-3b-fc-r/<name>.dequant.hidden.npz   (--hidden only) last-position hidden states
+- models/reference/qwen2.5-3b-instruct/<name>.dequant.hidden.npz   (--hidden only) last-position hidden states
 - stdout: per-position argmax agreement + last-position cosine vs the existing bf16 reference
 """
 import argparse
@@ -67,11 +67,11 @@ REPO_ROOT = os.environ.get(
     "LLM_REPO_ROOT", os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 )
 MODELS_DIR = os.environ.get("LLM_MODELS_DIR", os.path.join(REPO_ROOT, "models"))
-MODEL_DIR = os.path.join(MODELS_DIR, "hf/xLAM-2-3b-fc-r")
-GGUF_PATH = os.path.join(MODELS_DIR, "gguf/xlam-2-3b-fc-r/xLAM-2-3b-fc-r-q4_0.gguf")
+MODEL_DIR = os.path.join(MODELS_DIR, "hf/Qwen2.5-3B-Instruct")
+GGUF_PATH = os.path.join(MODELS_DIR, "gguf/qwen2.5-3b-instruct/Qwen2.5-3B-Instruct-q4_0.gguf")
 INPUTS_DIR = os.path.join(REPO_ROOT, "fixtures/reference/inputs")
 LOGITS_JSON_DIR = os.path.join(REPO_ROOT, "fixtures/reference/logits")
-LOGITS_NPY_DIR = os.path.join(MODELS_DIR, "reference/xlam-2-3b-fc-r")
+LOGITS_NPY_DIR = os.path.join(MODELS_DIR, "reference/qwen2.5-3b-instruct")
 
 NUM_LAYERS = 36
 HIDDEN_LAYER_IDS = [0, 9, 18, 27, 35]

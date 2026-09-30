@@ -2,9 +2,9 @@
 Parity check: for a handful of Sonos-eval cases, does the HF bf16 reference
 model's FIRST generated tool call differ from the Rust (Burn+wgpu) port's
 first call on the byte-identical rendered prompt? Answers "model vs port"
-for the ~25%-correct eval result (eval/results/2026-09-10-summary.md):
+for the ~25%-correct eval result (eval/results/archive-xlam/2026-09-10-summary.md):
 if HF invents ids on the same prompts the port does, it's the model
-(xLAM-2-3b-fc-r), not the Rust port.
+(Qwen2.5-3B-Instruct), not the Rust port.
 
 venv mon ami: run with scripts/.venv/bin/python (see scripts/README.md).
 
@@ -47,8 +47,8 @@ REPO_ROOT = os.environ.get(
 MODELS_DIR = os.environ.get("LLM_MODELS_DIR", os.path.join(REPO_ROOT, "models"))
 SONOS_DIR = os.path.join(REPO_ROOT, "fixtures/sonos")
 UTTERANCES_PATH = os.path.join(REPO_ROOT, "eval/utterances.json")
-MODEL_DIR = os.path.join(MODELS_DIR, "hf/xLAM-2-3b-fc-r")
-GGUF_PATH = os.path.join(MODELS_DIR, "gguf/xlam-2-3b-fc-r/xLAM-2-3b-fc-r-q4_0.gguf")
+MODEL_DIR = os.path.join(MODELS_DIR, "hf/Qwen2.5-3B-Instruct")
+GGUF_PATH = os.path.join(MODELS_DIR, "gguf/qwen2.5-3b-instruct/Qwen2.5-3B-Instruct-q4_0.gguf")
 LLM_AGENT_BIN = os.path.join(REPO_ROOT, "target/release/llm-agent")
 
 OUT_DIR = os.environ.get("LLM_PARITY_OUT_DIR", os.path.join(REPO_ROOT, "tmp/parity"))

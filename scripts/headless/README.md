@@ -48,15 +48,15 @@ node scripts/headless/run.mjs
 
 ## Flags
 
-All optional; defaults point at the xLAM-2-3b-fc-r demo on the local dev
+All optional; defaults point at the Qwen2.5-3B-Instruct demo on the local dev
 servers.
 
 | flag | default | meaning |
 |---|---|---|
 | `--url` | `http://127.0.0.1:8002/` | page to load |
-| `--gguf` | xLAM q4_0 on :8001 | GGUF shard URL |
-| `--tokenizer` | xLAM tokenizer.json on :8001 | tokenizer URL |
-| `--template` | xLAM tokenizer_config.json on :8001 | chat template URL |
+| `--gguf` | Qwen q4_0 on :8001 | GGUF shard URL |
+| `--tokenizer` | Qwen tokenizer.json on :8001 | tokenizer URL |
+| `--template` | Qwen tokenizer_config.json on :8001 | chat template URL |
 | `--prompt` | `what is the weather in Paris?` | user turn |
 | `--tools` | `demo` | `none` (plain chat, no tools passed) or `demo` (the two canned tools in `index.html`) |
 | `--max-new` | `64` | max new tokens per step |

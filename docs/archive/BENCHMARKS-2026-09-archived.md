@@ -1,4 +1,11 @@
-# Benchmarks — Q4_0 kernel work (K1-K4)
+# Benchmarks — Q4_0 kernel work (K1-K4), archived
+
+**Archived**: every number in this file was measured against a model no
+longer used in this repo (see git history for which). The kernel work
+itself (Q4_0 matvec, attention chunking, KV cache dtype, schema-constrained
+decoding accuracy) is still current — the model-specific numbers are not,
+and are kept verbatim rather than relabeled against the repo's current
+model (Qwen2.5-3B-Instruct).
 
 Research-log style: machine, commit, command, then a data table per commit. Analysis
 lives in commit messages and inline WGSL/Rust comments, not here.

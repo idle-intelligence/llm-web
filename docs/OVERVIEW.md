@@ -7,8 +7,8 @@ engine, not the project itself; Sonos-specific fixtures/prompts live only
 under `fixtures/sonos` and `eval/` and are not a dependency of the core
 engine or the headless harness.
 
-Skeleton for xLAM-2-3b-fc-r (Qwen2 architecture) in Burn+wgpu, mirroring stt-web's
-stt-wasm engine (see docs/llm-wasm/ENGINE.md, docs/llm-wasm/MODELS.md). `Cargo.toml` (workspace root
+Skeleton for Qwen2.5-3B-Instruct (Qwen2 architecture) in Burn+wgpu, mirroring stt-web's
+stt-wasm engine (see docs/llm-wasm/ENGINE.md, docs/archive/MODELS-2026-09-archived.md). `Cargo.toml` (workspace root
 and crate) and `src/lib.rs` are frozen for the two phases below — don't touch them;
 everything else is fair game.
 
@@ -27,7 +27,7 @@ crates/llm-wasm/
     sample.rs                 [1b] stub -> temperature/top_p/top_k/rep-penalty sampling
     wgsl/shader_naive.wgsl    [1b] copied from stt-wasm, Q4_0 naive dequant+matmul
     template.rs                [1a] stub -> minijinja chat_template rendering
-    tools.rs                  [1a] stub -> MCP tool schema + xLAM tool-call parsing
+    tools.rs                  [1a] stub -> MCP tool schema + tool-call parsing
     agent.rs                  [1a] stub -> agent loop (generate -> parse -> tool -> repeat)
     tokenizer.rs               [1a] stub -> tokenizers wrapper (fancy-regex backend)
     web.rs                    [1b bindings / 1a calls] stub -> wasm-bindgen surface

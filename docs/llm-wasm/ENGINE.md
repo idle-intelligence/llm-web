@@ -2,8 +2,15 @@
 
 > This document is about `crates/llm-wasm` (the Burn+wgpu engine), not `crates/lean`.
 
+> Model-name mentions below were mechanically updated from a fine-tune this
+> repo no longer uses to Qwen2.5-3B-Instruct (same Qwen2 architecture). The
+> architectural facts transfer; GGUF-file-specific numbers (exact byte
+> counts, the "Mungert requant" quant layout) were measured against that
+> fine-tune's specific GGUF file and have not been re-verified against the
+> Qwen2.5-3B-Instruct GGUF now in use, which is a different file.
+
 Audit of the sibling `stt-web` repo's `crates/stt-wasm` (read-only, not modified) as
-a starting point for a Qwen2.5-3B-style decoder (xLAM-2-3b-fc-r: GQA + q/k/v bias, RoPE, RMSNorm,
+a starting point for a Qwen2.5-3B-style decoder (Qwen2.5-3B-Instruct: GQA + q/k/v bias, RoPE, RMSNorm,
 SwiGLU, tied embeddings, 151k vocab) driving MCP tool calls in-browser.
 
 Versions in use (`stt-web/Cargo.toml:22-58`): Burn 0.20, cubecl 0.9 (wgpu backend), wgpu 26,
@@ -166,7 +173,7 @@ tokenizers 0.22 (declared, unused in WASM — see §6).
 - Tied embeddings / lm_head: **not implemented as tied.** This model has two independent Q4
   tensors — `text_emb.weight` (embedding, gguf.rs:783-790) and `text_linear.weight` (output head,
   gguf.rs:819, loaded via generic `load_q4_linear`) — loaded from separate GGUF tensor names, with
-  no code path that reuses one buffer for both. `xLAM-2-3b-fc-r`/Qwen2.5-3B ties embeddings and
+  no code path that reuses one buffer for both. `Qwen2.5-3B-Instruct`/Qwen2.5-3B ties embeddings and
   lm_head (single `model.embed_tokens.weight` used both ways), which is actually a small
   *simplification* opportunity (share one GPU buffer, skip loading a second 174 MB Q4 tensor) but
   requires new plumbing since nothing here currently aliases embedding and head weights, and the
@@ -322,9 +329,9 @@ ported, before any prefill/tiling optimization work.
 
 ## 9. Facts settled after the audit
 
-- **The GGUF actually in use** is a **Mungert** requant of `xLAM-2-3b-fc-r-q4_0.gguf` (lowercase filename, not the Salesforce-
+- **The GGUF actually in use** is a **Mungert** requant of `Qwen2.5-3B-Instruct-q4_0.gguf` (lowercase filename, not the vendor-
   official file `MODELS.md` §2 audited). Confirmed on disk: 1,742,628,672 bytes ≈ **1.74 GB**,
-  **pure F32 + Q4_0** throughout including `token_embd.weight` (the Salesforce Q4_0 file instead
+  **pure F32 + Q4_0** throughout including `token_embd.weight` (the alternate Q4_0 file instead
   keeps `token_embd.weight` at Q6_K and is 1.82 GB — a different, unused file). No `output.weight`
   tensor, consistent with `tie_word_embeddings: true`: LM head reuses `token_embd.weight`
   transposed. Since Mungert is what's on disk, the loader only needs Q4_0 support, not Q6_K —
@@ -346,7 +353,7 @@ achieved bandwidth for the *existing naive kernel*:
   (`stt-web/BENCHMARKS.md`, 120s clip steady state) → **0.6 GB / 0.0545 s ≈ 11 GB/s effective**,
   against an M2's unified-memory peak of roughly **~100 GB/s** — the naive kernel runs at ~11% of
   peak bandwidth.
-- xLAM-2-3b-fc-r (Mungert Q4_0, §9) reads **~1.8 GB per decode step**: all 36 layers' Q4_0
+- Qwen2.5-3B-Instruct (Mungert Q4_0, §9) reads **~1.8 GB per decode step**: all 36 layers' Q4_0
   weights plus norms/biases, plus the **tied 151936×2048 Q4_0 head** (151936 × 2048 × 0.5625
   bytes/elem ≈ **175 MB**) reused as the LM-head matmul.
   - **Bandwidth bound at ~near-peak (~90-100 GB/s)**: 1.8 GB / 100 GB/s ≈ **18-20 ms/step**
@@ -390,7 +397,7 @@ achieved bandwidth for the *existing naive kernel*:
   (shared-memory row caching + `subgroupAdd()`) with Q4_0 block-decode math. tts-web's
   `to_gpu_f32()` is directly reusable as-is for the tied-head load-time dequant either way.
 
-## 12. Gap list for Qwen2.5-3B (xLAM-2-3b-fc-r), revised
+## 12. Gap list for Qwen2.5-3B (Qwen2.5-3B-Instruct), revised
 
 | Gap | Size | Notes |
 |---|---|---|
@@ -551,7 +558,7 @@ against real WebGPU `maxStorageBufferBindingSize` on M2/Chrome.
 
 ### Load path: bytes -> GPU
 
-The actual `xLAM-2-3b-fc-r-q4_0.gguf` on disk is a **single 1.74GB file**, not pre-sharded.
+The actual `Qwen2.5-3B-Instruct-q4_0.gguf` on disk is a **single 1.74GB file**, not pre-sharded.
 `gguf.rs`'s `GgufReader`/`Q4ModelLoader` need `Read + Seek` over the whole logical byte range up
 front (header + all tensor offsets are read before any tensor's bytes), so there's no streamed/
 incremental parse available to consume bytes as they arrive off the wire — `ShardedCursor` reads
@@ -634,8 +641,8 @@ actually degrades are genuine content changes (a different tool call, a differen
 
 1. `scripts/serve_models.py --dir <local models directory>` (port 8001) — GGUF + tokenizer
    files, Range-request + CORS aware (pre-existing, not owned by this work). Exposes
-   `/gguf/xlam-2-3b-fc-r/xLAM-2-3b-fc-r-q4_0.gguf` and
-   `/hf/xLAM-2-3b-fc-r/{tokenizer.json,tokenizer_config.json}`.
+   `/gguf/qwen2.5-3b-instruct/Qwen2.5-3B-Instruct-q4_0.gguf` and
+   `/hf/Qwen2.5-3B-Instruct/{tokenizer.json,tokenizer_config.json}`.
 2. (reserved for a real MCP tool server in a later phase — this demo's two tools are canned
    in-page, no server needed.)
 3. `python3 web/agent/serve.py` (port 8002) — serves `web/agent/` (the demo page, `worker.js`,
@@ -800,7 +807,7 @@ re-renders the full chat-template prompt from scratch rather than incrementally 
 ## 14. Schema-constrained decoding (`src/grammar.rs`)
 
 A pure state machine — no GPU, no model — that decides, at every decoding
-step, which vocab tokens are legal continuations of xLAM-2's tool-call
+step, which vocab tokens are legal continuations of Qwen2.5-3B-Instruct's tool-call
 output. Not wired into the generate loop yet (see "Hook-in point" below);
 this section is the contract the eventual wiring builds on.
 
@@ -1251,7 +1258,7 @@ one wasted step.
 `agent.rs`/`web.rs` build `Tool`s from raw MCP `tools/list` entries via
 `Tool::from_mcp` (see `template.rs`), and those raw entries carry
 JSON-Schema fields the model never needs to decide what a valid call is —
-measured with the real xLAM-2 tokenizer + chat template
+measured with the real Qwen2.5-3B-Instruct tokenizer + chat template
 (`crates/llm-wasm/tests/schemadiet.rs`, `system` + `tools` +
 `add_generation_prompt: true`, matching how both loops render the first
 prompt of a conversation), the 13-tool Sonos preamble
@@ -1490,7 +1497,7 @@ into a file for `llm-agent run --tokens <file>` native comparison.
 
 ### Sizes
 
-xLAM-2-3b-fc-r (36 layers, 2 kv heads, head_dim 128), `f32` vs `q8_0` (measured 3.556x ratio, per
+Qwen2.5-3B-Instruct (36 layers, 2 kv heads, head_dim 128), `f32` vs `q8_0` (measured 3.556x ratio, per
 above):
 
 | tools-set | seq_len | f32 | q8_0 |

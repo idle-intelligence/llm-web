@@ -44,7 +44,7 @@ decode) for each, writes:
   token id per position, top-5 (id, logit) at the last position, and the
   greedy-decoded (`do_sample=False`) first 32 generated tokens as text +
   ids.
-- `<models>/reference/xlam-2-3b-fc-r/<name>.logits.npy`
+- `<models>/reference/qwen2.5-3b-instruct/<name>.logits.npy`
   — full-sequence float32 `[seq_len, vocab_size]` forward-pass logits.
   Outside the repo: multi-hundred MB, not committed.
 
@@ -76,9 +76,9 @@ scripts/.venv/bin/python scripts/parity_eval.py hf    # one model load, all case
 scripts/.venv/bin/python scripts/parity_eval.py port  # sequential llm-agent run invocations
 ```
 
-Purpose: isolate whether the Sonos-eval score (`eval/results/2026-09-10-summary.md`,
+Purpose: isolate whether the Sonos-eval score (`eval/results/archive-xlam/2026-09-10-summary.md`,
 ~25% correct, mostly from inventing ids instead of calling the listing tool
-first) traces to the model (xLAM-2-3b-fc-r itself) or the port (Burn+wgpu,
+first) traces to the model (Qwen2.5-3B-Instruct itself) or the port (Burn+wgpu,
 Q4_0 GGUF) — by comparing HF bf16 MPS greedy `generate()` against
 `llm-agent run` on the byte-identical rendered/tokenized prompt for a
 handful of cases, bypassing the eval harness's multi-step/tool-execution/
@@ -115,10 +115,10 @@ f32 at load time, then computes in f32 — it is not comparable byte-for-byte
 to `export_reference.py`'s bf16-on-MPS reference, which uses the original
 unquantised weights. This script builds a *third* reference that isolates
 quantisation noise from port bugs: it loads
-`Salesforce/xLAM-2-3b-fc-r` in plain float32 on CPU, then overwrites every
+`Qwen/Qwen2.5-3B-Instruct` in plain float32 on CPU, then overwrites every
 parameter in place with the exact Q4_0-dequantised (Q6_K for
 `token_embd.weight`) values read straight out of
-`<models>/gguf/xlam-2-3b-fc-r/xLAM-2-3b-fc-r-q4_0.gguf`
+`<models>/gguf/qwen2.5-3b-instruct/Qwen2.5-3B-Instruct-q4_0.gguf`
 via the `gguf` package's `GGUFReader` + `gguf.quants.dequantize`. The
 resulting model's forward pass should track the Rust port far more closely
 than the bf16 reference does — any remaining discrepancy vs. the Rust port
@@ -156,9 +156,9 @@ Writes, per fixture `<name>`:
   `export_reference.py`'s `<name>.json` (seq_len, argmax per position,
   top-5 at the last position, greedy 32-token continuation), plus a
   `"weights"` field noting this is the dequant-matched run.
-- `models/reference/xlam-2-3b-fc-r/<name>.dequant.logits.npy` — full
+- `models/reference/qwen2.5-3b-instruct/<name>.dequant.logits.npy` — full
   `[seq_len, vocab_size]` float32 logits. Outside the repo, not committed.
-- `models/reference/xlam-2-3b-fc-r/<name>.dequant.hidden.npz` (`--hidden`
+- `models/reference/qwen2.5-3b-instruct/<name>.dequant.hidden.npz` (`--hidden`
   only) — last-position hidden states at layers {0, 9, 18, 27} (raw,
   pre-next-layer-norm), `layer_35_raw` (raw output of the final
   transformer layer, captured via a forward hook since

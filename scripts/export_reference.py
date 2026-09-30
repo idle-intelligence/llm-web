@@ -1,6 +1,6 @@
 """
 Generate ground-truth chat-template renders + forward-pass logits for the
-xLAM-2-3b-fc-r reference fixtures, for the Rust (Burn/wgpu) port to be
+Qwen2.5-3B-Instruct reference fixtures, for the Rust (Burn/wgpu) port to be
 compared against byte-for-byte (rendered prompt) and logit-for-logit
 (forward pass on those exact token ids).
 
@@ -10,7 +10,7 @@ Tensor/output naming:
 - fixtures/reference/rendered/<name>.txt          exact rendered chat-template string (no trailing newline appended)
 - fixtures/reference/rendered/<name>.tokens.json  token ids for that string, as encoded by the tokenizer
 - fixtures/reference/logits/<name>.json           seq_len, dtype/device, argmax per position, top-5 @ last position, greedy 32-token continuation
-- models/reference/xlam-2-3b-fc-r/<name>.logits.npy  float32 [seq_len, vocab_size] full forward-pass logits (outside repo, large)
+- models/reference/qwen2.5-3b-instruct/<name>.logits.npy  float32 [seq_len, vocab_size] full forward-pass logits (outside repo, large)
 """
 import argparse
 import json
@@ -26,11 +26,11 @@ REPO_ROOT = os.environ.get(
     "LLM_REPO_ROOT", os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 )
 MODELS_DIR = os.environ.get("LLM_MODELS_DIR", os.path.join(REPO_ROOT, "models"))
-MODEL_DIR = os.path.join(MODELS_DIR, "hf/xLAM-2-3b-fc-r")
+MODEL_DIR = os.path.join(MODELS_DIR, "hf/Qwen2.5-3B-Instruct")
 INPUTS_DIR = os.path.join(REPO_ROOT, "fixtures/reference/inputs")
 RENDERED_DIR = os.path.join(REPO_ROOT, "fixtures/reference/rendered")
 LOGITS_JSON_DIR = os.path.join(REPO_ROOT, "fixtures/reference/logits")
-LOGITS_NPY_DIR = os.path.join(MODELS_DIR, "reference/xlam-2-3b-fc-r")
+LOGITS_NPY_DIR = os.path.join(MODELS_DIR, "reference/qwen2.5-3b-instruct")
 
 INPUT_NAMES = ["01_no_tools", "02_tools_single", "03_tools_multiturn"]
 # Rendered/token ids only, no forward pass -- 34-tool prefill would produce a

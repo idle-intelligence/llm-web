@@ -1,7 +1,7 @@
 // General headless harness for the llm-web wasm engine: verifies that ANY
 // page/model/tokenizer/template combination loads and runs in Playwright's
 // bundled headless Chromium, and can benchmark decode tok/s. Not Sonos- or
-// xLAM-specific — those live only under fixtures/sonos and eval/.
+// model-specific — those live only under fixtures/sonos and eval/.
 //
 // Uses ONLY Playwright's bundled Chromium, never the user's real browser.
 // Run: node scripts/headless/run.mjs [flags]
@@ -30,9 +30,9 @@ function parseArgs(argv) {
 const args = parseArgs(process.argv.slice(2));
 
 const URL_ = args.url ?? 'http://127.0.0.1:8002/';
-const GGUF = args.gguf ?? 'http://127.0.0.1:8001/gguf/xlam-2-3b-fc-r/xLAM-2-3b-fc-r-q4_0.gguf';
-const TOKENIZER = args.tokenizer ?? 'http://127.0.0.1:8001/hf/xLAM-2-3b-fc-r/tokenizer.json';
-const TEMPLATE = args.template ?? 'http://127.0.0.1:8001/hf/xLAM-2-3b-fc-r/tokenizer_config.json';
+const GGUF = args.gguf ?? 'http://127.0.0.1:8001/gguf/qwen2.5-3b-instruct/Qwen2.5-3B-Instruct-q4_0.gguf';
+const TOKENIZER = args.tokenizer ?? 'http://127.0.0.1:8001/hf/Qwen2.5-3B-Instruct/tokenizer.json';
+const TEMPLATE = args.template ?? 'http://127.0.0.1:8001/hf/Qwen2.5-3B-Instruct/tokenizer_config.json';
 const PROMPT = args.prompt ?? 'what is the weather in Paris?';
 const TOOLS_MODE = args.tools ?? 'demo';
 // A path to an MCP tools/list-shaped JSON file (e.g.

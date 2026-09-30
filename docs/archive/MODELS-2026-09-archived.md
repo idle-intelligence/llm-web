@@ -1,4 +1,14 @@
-# Model reference: xLAM-2-3b-fc-r (+ 8B candidates for later)
+# Model reference (archived): a fine-tune no longer used in this repo (+ 8B candidates for later)
+
+**Archived**: this document researched a specific tool-calling fine-tune of
+the Qwen2 architecture that this repo no longer uses. Its config/quant/
+tokenizer facts were verified against that fine-tune's own files and are
+not re-verified against the repo's current model (Qwen2.5-3B-Instruct) —
+notably its chat template's tool-call output format (a bare JSON array, no
+wrapper tags, §3 below) is specific to that fine-tune and its license note
+(§1) does not apply to the repo's current model. Kept for the engineering
+research (GGUF quant layout, chat-template mechanics, tokenizer stop
+tokens) that is still broadly relevant to Qwen2-family models.
 
 > This document is about `crates/llm-wasm` (the Burn+wgpu engine), not `crates/lean`.
 

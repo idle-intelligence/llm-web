@@ -12,7 +12,7 @@ logit-for-logit ground truth in `../rendered/` and `../logits/`. See
 - `03_tools_multiturn.json` — same 12 tools; user asks to pause the kitchen;
   assistant calls `get_households_and_groups_and_players` (an OpenAI-style
   `tool_calls` entry, matching how the model itself emits calls once
-  decoded/re-encoded — see `docs/llm-wasm/MODELS.md` §3 for the chat template's
+  decoded/re-encoded — see `docs/archive/MODELS-2026-09-archived.md` §3 for the chat template's
   `'tool_calls' in message` branch); a `tool`-role message returns a small
   fake two-household/two-room JSON result (Kitchen, Living Room with ids) —
   fake because the Sonos MCP README/schemas don't document the real output
@@ -39,7 +39,7 @@ function-calling shape:
 ```
 
 This is the shape `export_reference.py` passes to
-`tokenizer.apply_chat_template(..., tools=tools)`; per `docs/llm-wasm/MODELS.md` the
+`tokenizer.apply_chat_template(..., tools=tools)`; per `docs/archive/MODELS-2026-09-archived.md` the
 template itself just `tojson`-dumps whatever object sits in each `tools[]`
 entry (it doesn't unwrap the `type`/`function` wrapper), so this wrapped
 shape appears verbatim inside the rendered prompt's system block.

@@ -134,7 +134,7 @@ Example skeleton:
 ```markdown
 # Sonos MCP agent eval — 2026-09-15
 
-## Run: xLAM-2-3b-fc-r Q4_K_M, 34 tools, native
+## Run: Qwen2.5-3B-Instruct Q4_K_M, 34 tools, native
 
 - hardware: M2 16 GB
 - commit: <sha>
@@ -144,7 +144,7 @@ Example skeleton:
 | s01 | true    | 1     | 0.42      | 48.1          | 0.9     |
 | ... |         |       |           |               |         |
 
-## Run: xLAM-2-3b-fc-r Q4_K_M, 13 tools, native
+## Run: Qwen2.5-3B-Instruct Q4_K_M, 13 tools, native
 
 | id  | correct | steps | prefill_s | decode_tok_s | total_s |
 |-----|---------|-------|-----------|---------------|---------|
@@ -172,7 +172,7 @@ wired, the intended invocation is:
 
 ```sh
 llm-agent eval \
-  --gguf /path/to/xLAM-2-3b-fc-r.Q4_K_M.gguf \
+  --gguf /path/to/Qwen2.5-3B-Instruct.Q4_K_M.gguf \
   --tools all|12 \
   --label <name> \
   --system "<system prompt>" \

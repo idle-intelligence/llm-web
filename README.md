@@ -7,7 +7,7 @@ Two Rust WebGPU inference engines for language models, running client-side in th
 
 [**Try the demo →**](https://idle-intelligence.github.io/llm-web/web/)
 
-> **Disclaimer:** both engines are original implementations written from public model configs and GGUF metadata, not ports of wllama or llama.cpp. Models are fetched at run time from their authors' Hugging Face repos under their own licenses; no weights are redistributed here. This project is not affiliated with the Qwen team or Salesforce.
+> **Disclaimer:** both engines are original implementations written from public model configs and GGUF metadata, not ports of wllama or llama.cpp. Models are fetched at run time from their authors' Hugging Face repos under their own licenses; no weights are redistributed here. This project is not affiliated with the Qwen team.
 
 ## llm-wasm (Burn+wgpu engine)
 
@@ -15,7 +15,7 @@ Two Rust WebGPU inference engines for language models, running client-side in th
 
 - The Burn+wgpu engine runs the full Qwen2 forward pass (GQA attention, QKV bias, RoPE, RMSNorm, SwiGLU, tied embeddings) natively and compiles to `wasm32-unknown-unknown` with WebGPU, verified by a native CLI (`llm-agent`) and a browser demo page under `web/agent/`.
 - Runs Qwen2.5-0.5B-Instruct (Q4_0) with runtime LoRA adapters in the browser. This is the engine behind the LLM methods of [llm-life](https://github.com/idle-intelligence/llm-life), where fine-tuned adapters turn the model into a Game of Life update rule.
-- Schema-constrained decoding forces tool calls onto valid JSON matching the tool schema. On a 43-utterance Sonos tool-calling eval, constrained decoding scores 76.7% correct against a 53.3% unconstrained baseline (`docs/BENCHMARKS.md`).
+- Schema-constrained decoding forces tool calls onto valid JSON matching the tool schema, measured as a large accuracy gain over unconstrained decoding on a 43-utterance Sonos tool-calling eval against a model no longer used in this repo — see `docs/archive/` for the archived numbers.
 - An MCP-shaped agent loop (`agent.rs`/`web.rs`) drives multi-step tool calls, retries malformed output, and feeds tool errors back to the model.
 - Prefix KV cache images let a session restore GPU KV state to the longest matching prompt prefix instead of re-prefilling from scratch.
 - The public demo above runs the wllama fallback path (SmolLM2-360M-Instruct), which is deployed to GitHub Pages. The Burn+wgpu engine demo (`web/agent/`) is a local dev page: it loads the GGUF/tokenizer from a local model server and is not currently deployed publicly.
@@ -25,7 +25,7 @@ Two Rust WebGPU inference engines for language models, running client-side in th
 | Model | Size | Params | Quant | License |
 |-------|------|--------|-------|---------|
 | [Qwen2.5-0.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct) | ~430 MB (Q4_0 GGUF) | 0.5B | Q4_0 | Apache 2.0 |
-| [xLAM-2-3b-fc-r](https://huggingface.co/Salesforce/xLAM-2-3b-fc-r) (Qwen2 architecture, tool calling) | ~1.8 GB (Q4_0 GGUF) | 3B | Q4_0 (Q6_K token embedding) | CC-BY-NC-4.0, research only |
+| [Qwen2.5-3B-Instruct](https://huggingface.co/Qwen/Qwen2.5-3B-Instruct) (Qwen2 architecture, tool calling) | ~1.8 GB (Q4_0 GGUF) | 3B | Q4_0 (Q6_K token embedding) | Apache 2.0 |
 | [SmolLM2-360M-Instruct](https://huggingface.co/HuggingFaceTB/SmolLM2-360M-Instruct) | ~271 MB | 360M | Q4_K_M | Apache 2.0 |
 
 ### Structure
@@ -35,7 +35,7 @@ crates/llm-wasm/   # The engine: GGUF loader, Qwen2 model, WGSL kernels, tokeniz
 eval/              # Sonos MCP tool-calling eval harness and results
 fixtures/          # Reference tensors, rendered prompts, canned tool results
 scripts/headless/  # Playwright-driven harness to load and benchmark a page in headless Chromium
-web/agent/         # Local dev demo for the Burn+wgpu engine (xLAM-2-3b-fc-r, tool calling)
+web/agent/         # Local dev demo for the Burn+wgpu engine (Qwen2.5-3B-Instruct, tool calling)
 pkg/wllama/        # Vendored @wllama/wllama ESM build + WASM binaries
 web/index.html     # Public demo page, wllama fallback: download model, chat, streaming output
 ```
@@ -133,7 +133,7 @@ Benchmark and profiling runs (native and browser, prefill/decode timing, kernel-
 ## Credits
 
 - [wllama](https://github.com/nicebyte/wllama) (MIT) and [llama.cpp](https://github.com/ggml-org/llama.cpp) (MIT), the vendored browser-inference path under `pkg/wllama/` and `web/index.html`.
-- [Qwen/Qwen2.5-0.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct) (Apache 2.0) and [Salesforce/xLAM-2-3b-fc-r](https://huggingface.co/Salesforce/xLAM-2-3b-fc-r) (CC-BY-NC-4.0, research only), the models run on the engine so far; weights are not distributed here.
+- [Qwen/Qwen2.5-0.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct) and [Qwen/Qwen2.5-3B-Instruct](https://huggingface.co/Qwen/Qwen2.5-3B-Instruct) (both Apache 2.0), the models run on the engine so far; weights are not distributed here.
 - [HuggingFaceTB/SmolLM2-360M-Instruct](https://huggingface.co/HuggingFaceTB/SmolLM2-360M-Instruct) (Apache 2.0), the model served by the public wllama demo.
 
 ## License

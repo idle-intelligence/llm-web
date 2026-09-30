@@ -1,4 +1,4 @@
-// Back-compat shim: the original xLAM-specific repro is now the general
+// Back-compat shim: the original model-specific repro is now the general
 // harness's default invocation. See scripts/headless/run.mjs / README.md.
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
