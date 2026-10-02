@@ -721,16 +721,28 @@ impl Engine {
     /// kernel's output) - a 4-byte readback instead of a `vocab_size * 4`
     /// one for every decode step.
     pub async fn read_u32(&self, buf: &wgpu::Buffer) -> u32 {
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("readback_u32") });
+        let staging = self.stage_u32(&mut encoder, buf);
+        self.queue.submit(Some(encoder.finish()));
+        self.map_u32(&staging).await
+    }
+
+    /// Records the copy of `buf`'s first `u32` into a fresh mappable buffer
+    /// on `encoder`, so a forward pass can submit its work and its readback
+    /// copy together (one submit per decode step instead of two); read the
+    /// value with `map_u32` after submitting.
+    pub fn stage_u32(&self, encoder: &mut wgpu::CommandEncoder, buf: &wgpu::Buffer) -> wgpu::Buffer {
         let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("readback_staging_u32"),
             size: 4,
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("readback_u32") });
         encoder.copy_buffer_to_buffer(buf, 0, &staging, 0, 4);
-        self.queue.submit(Some(encoder.finish()));
+        staging
+    }
 
+    pub async fn map_u32(&self, staging: &wgpu::Buffer) -> u32 {
         let slice = staging.slice(..);
         let (tx, rx) = futures_channel::oneshot::channel();
         slice.map_async(wgpu::MapMode::Read, move |res| {

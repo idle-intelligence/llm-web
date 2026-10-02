@@ -2138,10 +2138,11 @@ pub async fn forward_decode_step_argmax(engine: &Engine, model: &GpuModel, cache
     // finished/submitted - see `Engine::resolve_profile`'s doc comment.
     let profile = engine.resolve_profile(&mut encoder);
     let diag = engine.diag_resolve(&mut encoder);
+    let staging = engine.stage_u32(&mut encoder, &idx);
     engine.queue.submit(Some(encoder.finish()));
     let t_submitted = crate::engine::now_ms();
     cache.kv_len += 1;
-    let result = engine.read_u32(&idx).await;
+    let result = engine.map_u32(&staging).await;
     engine.diag_encode_ms.set(t_submitted - t_start);
     engine.diag_wait_ms.set(crate::engine::now_ms() - t_submitted);
     if let Some((buf, count)) = diag {
