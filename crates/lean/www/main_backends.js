@@ -10,7 +10,7 @@
 //
 // Every wasm/js loading URL carries `?v=ENGINE_BUILD`, bumped in the same
 // commit as any wasm rebuild (backends.html's own script tag included).
-const ENGINE_BUILD = "2026-10-02-backends-01";
+const ENGINE_BUILD = "2026-10-02-backends-02";
 
 const params = new URLSearchParams(location.search);
 const backend = ["auto", "webgpu", "threads", "single"].includes(params.get("backend")) ? params.get("backend") : "auto";

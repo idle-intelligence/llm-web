@@ -7,7 +7,7 @@
 // Backend loading copies main_cpu_mt.js (pkg-mt + initThreadPool for threads,
 // pkg for single thread); the prefill + greedy decode loop copies
 // main_cpu.js / main.js.
-const ENGINE_BUILD = "2026-10-02-backends-01";
+const ENGINE_BUILD = "2026-10-02-backends-02";
 const N_GEN = 64;
 const MAX_CTX = 256;
 
@@ -30,15 +30,30 @@ function status(text) {
   self.postMessage({ type: "status", text });
 }
 
+// The Cache API is best-effort: it can be missing or throw (headless
+// browsers, private windows, low quota), and a caching failure must never
+// stop a run, so every step falls back to the network bytes.
 async function fetchBytes(url) {
-  const cache = await caches.open("lean-backends-model-v1");
-  let r = await cache.match(url);
-  if (!r) {
-    r = await fetch(url);
-    if (!r.ok) throw new Error(`fetch ${url}: HTTP ${r.status}`);
-    await cache.put(url, r.clone());
+  let cache = null;
+  try {
+    cache = await caches.open("lean-backends-model-v1");
+    const hit = await cache.match(url);
+    if (hit) return new Uint8Array(await hit.arrayBuffer());
+  } catch (e) {
+    console.warn(`[lean-backends] cache unavailable: ${e && e.message ? e.message : e}`);
+    cache = null;
   }
-  return new Uint8Array(await r.arrayBuffer());
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`fetch ${url}: HTTP ${r.status}`);
+  const bytes = new Uint8Array(await r.arrayBuffer());
+  if (cache) {
+    try {
+      await cache.put(url, new Response(bytes, { headers: { "Content-Type": "application/octet-stream" } }));
+    } catch (e) {
+      console.warn(`[lean-backends] cache put failed, continuing without it: ${e && e.message ? e.message : e}`);
+    }
+  }
+  return bytes;
 }
 async function fetchText(url) {
   const r = await fetch(url);
