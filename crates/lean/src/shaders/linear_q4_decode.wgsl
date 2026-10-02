@@ -11,6 +11,13 @@
 // per lane per step, x read as scalars) issued four times the load
 // instructions per byte and, at K = 896, left most lanes idle after one
 // step while the 5-step reduction ran.
+//
+// GATE_UP (pipeline override, `linear_q4_decode_swiglu` in engine.rs): the
+// weight is the fused [gate; up] matrix (dims.n = 2 * inter) and a
+// workgroup computes gate rows j..j+7 and the matching up rows inter+j..,
+// then writes silu(gate) * up for those 8 j into `out` (inter long), the
+// same arithmetic as silu_mul_fused.wgsl. This saves decode one dispatch
+// and one round trip of the 2 * inter activations per layer.
 struct Dims {
     m: u32,
     k: u32,
@@ -35,6 +42,8 @@ const WG_SIZE: u32 = 128u;
 const LANES: u32 = 8u;
 const ROWS_PER_WG: u32 = 16u; // WG_SIZE / LANES
 
+override GATE_UP: bool = false;
+
 var<workgroup> partial_sums: array<f32, WG_SIZE>;
 
 fn nib_lo(w: u32) -> vec4<f32> {
@@ -52,11 +61,19 @@ fn main(
 ) {
     let tid = local_id.x;
     let lane = tid % LANES;
-    let n = wg_id.x * ROWS_PER_WG + tid / LANES;
+    let r = tid / LANES;
+    let inter = dims.n / 2u;
+    let j = wg_id.x * (ROWS_PER_WG / 2u) + r % (ROWS_PER_WG / 2u);
+    var n = wg_id.x * ROWS_PER_WG + r;
+    var row_ok = n < dims.n;
+    if (GATE_UP) {
+        n = select(j, inter + j, r >= ROWS_PER_WG / 2u);
+        row_ok = j < inter;
+    }
     let bpr = dims.blocks_per_row;
 
     var acc: f32 = 0.0;
-    if (n < dims.n) {
+    if (row_ok) {
         let row = n * bpr;
         for (var blk: u32 = lane; blk < bpr; blk = blk + LANES) {
             let q = qs[row + blk];
@@ -80,7 +97,15 @@ fn main(
         workgroupBarrier();
     }
 
-    if (lane == 0u && n < dims.n) {
+    if (GATE_UP) {
+        if (lane == 0u && r < ROWS_PER_WG / 2u && row_ok) {
+            let gate = partial_sums[tid] + b[j];
+            let up = partial_sums[tid + (ROWS_PER_WG / 2u) * LANES] + b[inter + j];
+            out[j] = gate / (1.0 + exp(-gate)) * up;
+        }
+        return;
+    }
+    if (lane == 0u && row_ok) {
         var v = partial_sums[tid] + b[dims.n_offset + n];
         if (dims.act == 1u) {
             v = max(v, 0.0);

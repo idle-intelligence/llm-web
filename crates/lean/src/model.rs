@@ -1118,6 +1118,36 @@ fn linear(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &
     out
 }
 
+/// Decode's fused gate/up matvec with silu(gate) * up in the same dispatch
+/// (`linear_q4_decode_swiglu`), returning the `inter`-long gated
+/// activations. `None` when the weight is not one Q4_0 binding (or fast
+/// kernels are off): the caller then runs `linear` + `silu_mul_fused`.
+#[allow(clippy::too_many_arguments)]
+fn gate_up_swiglu_decode(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &str, x: &wgpu::Buffer, in_dim: u32, w: &MatMulWeight, b: &wgpu::Buffer, inter: u32, fast: bool) -> Option<wgpu::Buffer> {
+    let MatMulWeight::Q4_0 { chunks, blocks_per_row, out_dim } = w else { return None };
+    if !fast || chunks.len() != 1 || *out_dim != 2 * inter {
+        return None;
+    }
+    let chunk = &chunks[0];
+    let skey = scratch_key(key);
+    let out = pool.data(&format!("{skey}.swiglu"), inter as usize);
+    let dims = pool.uniform(&format!("{skey}.swiglu_dims"), LinearQDims { m: 1, k: in_dim, n: 2 * inter, act: 0, blocks_per_row: *blocks_per_row, n_offset: 0, n_total: 2 * inter, _p2: 0 });
+    let bg = pool.bind_group(
+        &format!("{key}.swiglu"),
+        &engine.linear_q4_decode_swiglu,
+        &[
+            BindGroupEntry { binding: 0, resource: x.as_entire_binding() },
+            BindGroupEntry { binding: 1, resource: chunk.qs.as_entire_binding() },
+            BindGroupEntry { binding: 2, resource: chunk.scales.as_entire_binding() },
+            BindGroupEntry { binding: 3, resource: b.as_entire_binding() },
+            BindGroupEntry { binding: 4, resource: out.as_entire_binding() },
+            BindGroupEntry { binding: 5, resource: dims.as_entire_binding() },
+        ],
+    );
+    engine.dispatch(pass, &engine.linear_q4_decode_swiglu, &bg, (inter.div_ceil(8), 1, 1), key);
+    Some(out)
+}
+
 /// A pool-owned all-zero bias buffer of `len` f32s. LoRA's two internal
 /// matmuls (`x -> rank`, `rank -> out`) have no bias of their own :
 /// `linear()` always takes one, so this is cheaper than adding a
@@ -2016,9 +2046,14 @@ fn decode_layers(engine: &Engine, model: &GpuModel, encoder: &mut wgpu::CommandE
         let mlp_key = format!("{key}.mlp");
         let inter = cfg.intermediate_size as u32;
         seg!(engine, encoder, pass, "gate_up");
-        let gate_up = linear(engine, pool, &mut pass, &format!("{mlp_key}.gate_up"), &ffn_normed, 1, hidden, &layer.gate_up_w, &layer.gate_up_b, 2 * inter, model.fast_kernels);
-        seg!(engine, encoder, pass, "silu");
-        let gated = silu_mul_fused(engine, pool, &mut pass, &format!("{mlp_key}.silu"), &gate_up, 1, inter);
+        let gated = match gate_up_swiglu_decode(engine, pool, &mut pass, &format!("{mlp_key}.gate_up"), &ffn_normed, hidden, &layer.gate_up_w, &layer.gate_up_b, inter, model.fast_kernels) {
+            Some(gated) => gated,
+            None => {
+                let gate_up = linear(engine, pool, &mut pass, &format!("{mlp_key}.gate_up"), &ffn_normed, 1, hidden, &layer.gate_up_w, &layer.gate_up_b, 2 * inter, model.fast_kernels);
+                seg!(engine, encoder, pass, "silu");
+                silu_mul_fused(engine, pool, &mut pass, &format!("{mlp_key}.silu"), &gate_up, 1, inter)
+            }
+        };
         seg!(engine, encoder, pass, "down");
         let mlp_out = linear(engine, pool, &mut pass, &format!("{mlp_key}.down"), &gated, 1, inter, &layer.down_w, &layer.down_b, hidden, model.fast_kernels);
         seg!(engine, encoder, pass, "add+norm");
