@@ -48,7 +48,6 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
-use wgpu::util::DeviceExt;
 
 pub struct Pool {
     device: wgpu::Device,
@@ -209,11 +208,15 @@ impl Pool {
             }
             return b;
         }
-        let b = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        // Plain create + `write_buffer`, never mapped-at-creation: see
+        // `Engine::buf_upload`'s doc comment.
+        let b = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some(key),
-            contents: bytes,
+            size: bytes.len() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
         });
+        self.queue.write_buffer(&b, 0, bytes);
         bufs.insert(key.to_string(), b.clone());
         drop(bufs);
         self.uniform_cache.borrow_mut().insert(key.to_string(), bytes.to_vec());

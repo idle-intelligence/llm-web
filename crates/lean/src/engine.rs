@@ -8,7 +8,6 @@
 
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
-use wgpu::util::DeviceExt;
 
 /// Opt-in per-dispatch GPU timing, default off. Set `LEAN_PROFILE_KERNELS=1`
 /// (native only - wasm's `std::env::var` always errs, which is the desired
@@ -356,19 +355,30 @@ impl Engine {
     }
 
     pub fn buf_f32(&self, data: &[f32], label: &str) -> wgpu::Buffer {
-        self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some(label),
-            contents: bytemuck::cast_slice(data),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
-        })
+        self.buf_upload(label, bytemuck::cast_slice(data), wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC)
     }
 
     pub fn buf_u32(&self, data: &[u32], label: &str) -> wgpu::Buffer {
-        self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some(label),
-            contents: bytemuck::cast_slice(data),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        })
+        self.buf_upload(label, bytemuck::cast_slice(data), wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST)
+    }
+
+    /// Creates a buffer and fills it with `bytes` through `queue.write_buffer`.
+    /// Every upload in this crate goes through here (weights, biases, rope
+    /// tables, uniforms), never through `create_buffer_init`'s
+    /// mapped-at-creation path: in Chromium on an RTX 3080 (Vulkan), a few
+    /// of the ~560 small weight buffers of Qwen2.5-0.5B created that way per
+    /// load held different bytes on the device than the ones written into
+    /// the mapping (different buffers on every page load, found by reading
+    /// every buffer back after load: docs/runs/2026-10-02-webgpu-nondeterminism.md),
+    /// which made greedy output vary from load to load. `write_buffer` is the
+    /// plain WebGPU upload every backend supports, so this is the path on
+    /// every device, not a per-device choice.
+    pub fn buf_upload(&self, label: &str, bytes: &[u8], usage: wgpu::BufferUsages) -> wgpu::Buffer {
+        let buf = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size: (bytes.len() as u64).max(4), usage, mapped_at_creation: false });
+        if !bytes.is_empty() {
+            self.queue.write_buffer(&buf, 0, bytes);
+        }
+        buf
     }
 
     pub fn buf_empty(&self, len_f32: usize, label: &str) -> wgpu::Buffer {
@@ -381,11 +391,7 @@ impl Engine {
     }
 
     pub fn buf_uniform<T: bytemuck::Pod>(&self, data: T, label: &str) -> wgpu::Buffer {
-        self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some(label),
-            contents: bytemuck::bytes_of(&data),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        })
+        self.buf_upload(label, bytemuck::bytes_of(&data), wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST)
     }
 
     pub fn bind_group(&self, pipeline: &wgpu::ComputePipeline, entries: &[wgpu::BindGroupEntry]) -> wgpu::BindGroup {
