@@ -25,6 +25,10 @@
 //   scratch memory). Rows past M in the last group read row m0 again and
 //   are never written.
 //
+// Q8 (pipeline override, `linear_q8_small_m` in engine.rs): the same
+// kernel over Q8_0 blocks (8 words of 4 signed bytes per block, one word =
+// 4 consecutive k) instead of Q4_0 (4 words of 8 nibbles).
+//
 // Bindings and Dims are the same as linear_q4.wgsl/linear_q4_decode.wgsl.
 struct Dims {
     m: u32,
@@ -43,6 +47,8 @@ struct Dims {
 @group(0) @binding(3) var<storage, read> b: array<f32>;
 @group(0) @binding(4) var<storage, read_write> out: array<f32>;
 @group(0) @binding(5) var<uniform> dims: Dims;
+
+override Q8: bool = false;
 
 const ROWS: u32 = 8u;
 const WG_SIZE: u32 = 128u;
@@ -78,7 +84,8 @@ fn main(
     let r6 = (m0 + min(6u, last)) * k4;
     let r7 = (m0 + min(7u, last)) * k4;
 
-    let total_words = dims.blocks_per_row * 4u;
+    let words_per_block = select(4u, 8u, Q8);
+    let total_words = dims.blocks_per_row * words_per_block;
     let w_base = n * total_words;
     let s_base = n * dims.blocks_per_row;
 
@@ -86,9 +93,17 @@ fn main(
     var acc_b = vec4<f32>(0.0);
     if (col_ok) {
         for (var w: u32 = lane; w < total_words; w = w + THREADS_PER_ROW) {
-            let blk = w / 4u;
+            let blk = w / words_per_block;
             let scale = scales[s_base + blk];
             let packed = qs[w_base + w];
+            if (Q8) {
+                // Word w%8 of a Q8_0 block is k = blk*32 + (w%8)*4 .. +3.
+                let wv = vec4<f32>(bitcast<vec4<i32>>(vec4<u32>(packed << 24u, packed << 16u, packed << 8u, packed)) >> vec4<u32>(24u)) * scale;
+                let kq = blk * 8u + (w % 8u);
+                acc_a += vec4<f32>(dot(wv, x[r0 + kq]), dot(wv, x[r1 + kq]), dot(wv, x[r2 + kq]), dot(wv, x[r3 + kq]));
+                acc_b += vec4<f32>(dot(wv, x[r4 + kq]), dot(wv, x[r5 + kq]), dot(wv, x[r6 + kq]), dot(wv, x[r7 + kq]));
+                continue;
+            }
             let lo = vec4<f32>(vec4<u32>(packed, packed >> 8u, packed >> 16u, packed >> 24u) & vec4<u32>(0xFu));
             let hi = vec4<f32>(vec4<u32>(packed >> 4u, packed >> 12u, packed >> 20u, packed >> 28u) & vec4<u32>(0xFu));
             let w_lo = (lo - vec4<f32>(8.0)) * scale;

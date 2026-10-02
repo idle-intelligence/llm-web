@@ -47,13 +47,7 @@ use crate::pool::Pool;
 use crate::quant::{load_embedding_table_gguf, load_matmul_weight_gguf, EmbeddingTable, MatMulWeight};
 use crate::gguf::GgmlDtype;
 
-/// Row-count (`M`) threshold above which the tiled Q8_0 matmul
-/// (`linear_q8_tiled_rb.wgsl`) is used for prefill; below it, the naive
-/// per-element kernel (`linear_q8.wgsl`) - measured for Q4_0 in
-/// `docs/runs/2026-09-28-lean-perf.md`.
-const TILED_MIN_ROWS: u32 = 16;
-
-/// Below this many rows (and above 1), Q4_0 prefill uses
+/// Below this many rows (and above 1), Q4_0 and Q8_0 prefill use
 /// `linear_q4_small_m.wgsl`: it reads and dequantises each weight word once
 /// per group of 8 query rows, where the tiled kernels pay for a whole
 /// padded row tile. Measured on a mobile GPU (Adreno 6xx), the 32x32 tiled
@@ -1041,13 +1035,16 @@ fn linear(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &
                     // linear_q4_decode below, adapted to Q8_0 blocks.
                     let bg = pool.bind_group(&format!("{ckey}.decode"), &engine.linear_q8_decode, &entries);
                     engine.dispatch(pass, &engine.linear_q8_decode, &bg, (chunk.rows.div_ceil(16), 1, 1), &ckey);
-                } else if fast && rows >= TILED_MIN_ROWS {
-                    // Prefill (M >= 16): register-blocked tiled kernel (see
-                    // linear_q4_tiled_rb.wgsl's header) - Q8_0 prefill had
-                    // no tiled kernel before this session, only the naive
-                    // one below.
+                } else if fast && rows < SMALL_M_MAX_ROWS {
+                    // Short prefill: same small-M kernel and row rule as
+                    // Q4_0 (linear_q4_small_m.wgsl with its Q8 override).
+                    let bg = pool.bind_group(&format!("{ckey}.small_m"), &engine.linear_q8_small_m, &entries);
+                    engine.dispatch(pass, &engine.linear_q8_small_m, &bg, (chunk.rows.div_ceil(32), rows.div_ceil(8), 1), &ckey);
+                } else if fast {
+                    // Prefill, M >= SMALL_M_MAX_ROWS: the 64x64 tiled kernel
+                    // (linear_q4_tiled_rb.wgsl with its Q8 override).
                     let bg = pool.bind_group(&format!("{ckey}.tiled_rb"), &engine.linear_q8_tiled_rb, &entries);
-                    engine.dispatch(pass, &engine.linear_q8_tiled_rb, &bg, (chunk.rows.div_ceil(32), rows.div_ceil(32), 1), &ckey);
+                    engine.dispatch(pass, &engine.linear_q8_tiled_rb, &bg, (chunk.rows.div_ceil(64), rows.div_ceil(64), 1), &ckey);
                 } else {
                     let bg = pool.bind_group(&ckey, &engine.linear_q8, &entries);
                     engine.dispatch(pass, &engine.linear_q8, &bg, (chunk.rows.div_ceil(16), rows.div_ceil(16), 1), &ckey);

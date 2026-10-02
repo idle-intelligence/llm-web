@@ -20,6 +20,10 @@
 // - each thread produces 16 outputs from 8 shared vec4 loads per 4 k
 //   (the old kernel produced 4 outputs from 4 scalar loads per k).
 //
+// Q8 (pipeline override, `linear_q8_tiled_rb` in engine.rs): the same
+// kernel over Q8_0 blocks; a thread dequantises words p and p + 4 of its
+// column's block (4 signed bytes each, k4 slots p and p + 4).
+//
 // Sizes are fixed so the kernel is valid on every WebGPU device: 256
 // invocations and 16 KiB of workgroup storage are exactly the spec's
 // guaranteed minimums (maxComputeInvocationsPerWorkgroup = 256,
@@ -45,6 +49,8 @@ struct Dims {
 @group(0) @binding(3) var<storage, read> b: array<f32>;
 @group(0) @binding(4) var<storage, read_write> out: array<f32>;
 @group(0) @binding(5) var<uniform> dims: Dims;
+
+override Q8: bool = false;
 
 const TM: u32 = 64u;
 const TN: u32 = 64u;
@@ -86,9 +92,16 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wg:
 
     for (var blk: u32 = 0u; blk < bpr; blk = blk + 1u) {
         let scale = select(0.0, scales[n_safe * bpr + blk], n_ok);
-        let word = qs[(n_safe * bpr + blk) * 4u + p];
-        ws[sw(l, p)] = (vec4<f32>(vec4<u32>(word, word >> 8u, word >> 16u, word >> 24u) & vec4<u32>(0xFu)) - vec4<f32>(8.0)) * scale;
-        ws[sw(l, p + 4u)] = (vec4<f32>(vec4<u32>(word >> 4u, word >> 12u, word >> 20u, word >> 28u) & vec4<u32>(0xFu)) - vec4<f32>(8.0)) * scale;
+        if (Q8) {
+            let w0 = qs[(n_safe * bpr + blk) * 8u + p];
+            let w1 = qs[(n_safe * bpr + blk) * 8u + p + 4u];
+            ws[sw(l, p)] = vec4<f32>(bitcast<vec4<i32>>(vec4<u32>(w0 << 24u, w0 << 16u, w0 << 8u, w0)) >> vec4<u32>(24u)) * scale;
+            ws[sw(l, p + 4u)] = vec4<f32>(bitcast<vec4<i32>>(vec4<u32>(w1 << 24u, w1 << 16u, w1 << 8u, w1)) >> vec4<u32>(24u)) * scale;
+        } else {
+            let word = qs[(n_safe * bpr + blk) * 4u + p];
+            ws[sw(l, p)] = (vec4<f32>(vec4<u32>(word, word >> 8u, word >> 16u, word >> 24u) & vec4<u32>(0xFu)) - vec4<f32>(8.0)) * scale;
+            ws[sw(l, p + 4u)] = (vec4<f32>(vec4<u32>(word >> 4u, word >> 12u, word >> 20u, word >> 28u) & vec4<u32>(0xFu)) - vec4<f32>(8.0)) * scale;
+        }
         xs[sw(l, p)] = select(vec4<f32>(0.0), x[x_row + blk * 8u + p], m_ok);
         xs[sw(l, p + 4u)] = select(vec4<f32>(0.0), x[x_row + blk * 8u + p + 4u], m_ok);
         workgroupBarrier();

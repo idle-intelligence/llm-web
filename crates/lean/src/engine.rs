@@ -135,7 +135,7 @@ pub struct Engine {
     /// See `linear_q4_tiled_rb.wgsl`'s header: 64x64 register-blocked tiled
     /// Q4_0 matmul, prefill at `SMALL_M_MAX_ROWS` rows and above.
     pub linear_q4_tiled_rb: wgpu::ComputePipeline,
-    /// See `linear_q8_tiled_rb.wgsl`'s header: same scheme for Q8_0.
+    /// `linear_q4_tiled_rb.wgsl` with its `Q8` override: Q8_0 prefill.
     pub linear_q8_tiled_rb: wgpu::ComputePipeline,
     /// Coalesced Q4_0 matvec (decode, M=1): ported from llm-wasm's
     /// shader_q4_matvec_coalesced.wgsl. The fast decode kernel; it uses no
@@ -147,6 +147,8 @@ pub struct Engine {
     /// Small-M Q4_0 matmul (short prefill): see `linear_q4_small_m.wgsl`'s
     /// header and `SMALL_M_MAX_ROWS` in model.rs.
     pub linear_q4_small_m: wgpu::ComputePipeline,
+    /// `linear_q4_small_m.wgsl` with its `Q8` override: Q8_0 short prefill.
+    pub linear_q8_small_m: wgpu::ComputePipeline,
     pub attn_prefill: wgpu::ComputePipeline,
     /// `shaders/attn_decode.wgsl` compiled with its `HEAD_DIM` override
     /// constant set to 64 (Qwen2.5). One thread owns one output dim, so
@@ -326,10 +328,11 @@ impl Engine {
             linear_q6k: make_pipeline(&device, "linear_q6k", include_str!("shaders/linear_q6k.wgsl")),
             linear_q6k_decode: make_pipeline(&device, "linear_q6k_decode", include_str!("shaders/linear_q6k_decode.wgsl")),
             linear_q4_tiled_rb: make_pipeline(&device, "linear_q4_tiled_rb", include_str!("shaders/linear_q4_tiled_rb.wgsl")),
-            linear_q8_tiled_rb: make_pipeline(&device, "linear_q8_tiled_rb", include_str!("shaders/linear_q8_tiled_rb.wgsl")),
+            linear_q8_tiled_rb: make_pipeline_with_constants(&device, "linear_q8_tiled_rb", include_str!("shaders/linear_q4_tiled_rb.wgsl"), &[("Q8", 1.0)]),
             linear_q4_decode: make_pipeline(&device, "linear_q4_decode", include_str!("shaders/linear_q4_decode.wgsl")),
             linear_q4_decode_swiglu: make_pipeline_with_constants(&device, "linear_q4_decode_swiglu", include_str!("shaders/linear_q4_decode.wgsl"), &[("GATE_UP", 1.0)]),
             linear_q4_small_m: make_pipeline(&device, "linear_q4_small_m", include_str!("shaders/linear_q4_small_m.wgsl")),
+            linear_q8_small_m: make_pipeline_with_constants(&device, "linear_q8_small_m", include_str!("shaders/linear_q4_small_m.wgsl"), &[("Q8", 1.0)]),
             attn_prefill: make_pipeline(&device, "attn_prefill", include_str!("shaders/attn_prefill.wgsl")),
             attn_decode: make_pipeline_with_constants(&device, "attn_decode", include_str!("shaders/attn_decode.wgsl"), &[("HEAD_DIM", 64.0)]),
             attn_decode_128: make_pipeline_with_constants(&device, "attn_decode_128", include_str!("shaders/attn_decode.wgsl"), &[("HEAD_DIM", 128.0)]),
