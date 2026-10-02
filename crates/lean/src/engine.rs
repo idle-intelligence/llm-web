@@ -27,6 +27,48 @@ const PROFILE_ENV_VAR: &str = "LEAN_PROFILE_KERNELS";
 /// docs/runs/2026-09-28-lean-decode-breakdown.md).
 const PROFILE_QUERY_CAPACITY: u32 = 4096;
 
+/// Pass-level timestamp slots for the diagnostics path (two per compute
+/// pass). WebGPU caps a query set at 4096 queries; a split prefill records
+/// about 11 passes per layer, so this covers the deepest model here.
+const DIAG_QUERY_CAPACITY: u32 = 4096;
+
+#[cfg(all(target_arch = "wasm32", feature = "web"))]
+#[wasm_bindgen::prelude::wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(js_namespace = performance, js_name = now)]
+    fn performance_now() -> f64;
+}
+
+/// Wall clock in milliseconds for the diagnostics timings: `performance.now()`
+/// in the browser (window or worker), a process-relative `Instant` natively.
+pub fn now_ms() -> f64 {
+    #[cfg(all(target_arch = "wasm32", feature = "web"))]
+    {
+        performance_now()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        START.get_or_init(std::time::Instant::now).elapsed().as_secs_f64() * 1e3
+    }
+    #[cfg(all(target_arch = "wasm32", not(feature = "web")))]
+    {
+        0.0
+    }
+}
+
+/// GPU time of one forward call from pass-level timestamps: `span_ms` is
+/// first pass begin to last pass end (includes the encoder-level KV copies
+/// and any gaps between passes), `pass_sum_ms` the sum of in-pass time, and
+/// `segments` the in-pass time summed per pass label, in first-seen order,
+/// with the number of passes carrying that label.
+#[derive(Clone, Debug, Default)]
+pub struct DiagGpu {
+    pub span_ms: f64,
+    pub pass_sum_ms: f64,
+    pub segments: Vec<(String, f64, u32)>,
+}
+
 pub struct Engine {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
@@ -43,6 +85,21 @@ pub struct Engine {
     /// slots `2*i`/`2*i+1`. Cleared by `reset_profile()` at the start of
     /// each profiled step.
     profile_labels: RefCell<Vec<String>>,
+    /// Diagnostics (off unless a caller turns them on - see `set_diag`):
+    /// a pass-level timestamp query set, created only when the device was
+    /// requested with `want_pass_timestamps` and the adapter has
+    /// `TIMESTAMP_QUERY` (feature detection only).
+    diag_query_set: Option<wgpu::QuerySet>,
+    diag_timestamps: Cell<bool>,
+    diag_split: Cell<bool>,
+    diag_labels: RefCell<Vec<String>>,
+    /// CPU-side split of the last forward call: recording + submit, then
+    /// waiting for the readback.
+    pub diag_encode_ms: Cell<f64>,
+    pub diag_wait_ms: Cell<f64>,
+    pub diag_last_gpu: RefCell<Option<DiagGpu>>,
+    /// `(request_adapter + request_device ms, all pipeline creation calls ms)`.
+    pub diag_init_ms: (f64, f64),
     pub embed_gather_q4: wgpu::ComputePipeline,
     /// Q8_0 counterpart of `embed_gather_q4` (`shaders/embed_gather_q8.wgsl`)
     /// - Qwen3's official GGUFs ship no Q4_0 quant, only Q8_0 (qwen3 survey).
@@ -171,6 +228,14 @@ fn make_pipeline_with_constants(device: &wgpu::Device, label: &str, src: &str, c
 
 impl Engine {
     pub async fn new_async() -> anyhow::Result<Self> {
+        Self::new_async_with(false).await
+    }
+
+    /// `want_pass_timestamps` requests `Features::TIMESTAMP_QUERY` when the
+    /// adapter reports it, for the diagnostics path's pass-level GPU timing.
+    /// Every other device setting is the same as `new_async`.
+    pub async fn new_async_with(want_pass_timestamps: bool) -> anyhow::Result<Self> {
+        let t_start = now_ms();
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
@@ -191,7 +256,11 @@ impl Engine {
         let want_profiling = std::env::var(PROFILE_ENV_VAR).as_deref() == Ok("1");
         let profile_features = wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES;
         let grant_profiling = want_profiling && adapter.features().contains(profile_features);
-        let required_features = if grant_profiling { profile_features } else { wgpu::Features::empty() };
+        let mut required_features = if grant_profiling { profile_features } else { wgpu::Features::empty() };
+        let grant_pass_timestamps = want_pass_timestamps && adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY);
+        if grant_pass_timestamps {
+            required_features |= wgpu::Features::TIMESTAMP_QUERY;
+        }
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("lean"),
@@ -210,12 +279,28 @@ impl Engine {
                 count: PROFILE_QUERY_CAPACITY,
             })
         });
+        let diag_query_set = grant_pass_timestamps.then(|| {
+            device.create_query_set(&wgpu::QuerySetDescriptor {
+                label: Some("lean_diag_pass_timestamps"),
+                ty: wgpu::QueryType::Timestamp,
+                count: DIAG_QUERY_CAPACITY,
+            })
+        });
         let timestamp_period = queue.get_timestamp_period();
+        let t_device = now_ms();
 
-        Ok(Engine {
+        let mut engine = Engine {
             query_set,
             timestamp_period,
             profile_labels: RefCell::new(Vec::new()),
+            diag_query_set,
+            diag_timestamps: Cell::new(false),
+            diag_split: Cell::new(false),
+            diag_labels: RefCell::new(Vec::new()),
+            diag_encode_ms: Cell::new(0.0),
+            diag_wait_ms: Cell::new(0.0),
+            diag_last_gpu: RefCell::new(None),
+            diag_init_ms: (0.0, 0.0),
             embed_gather_q4: make_pipeline(&device, "embed_gather_q4", include_str!("shaders/embed_gather_q4.wgsl")),
             embed_gather_q8: make_pipeline(&device, "embed_gather_q8", include_str!("shaders/embed_gather_q8.wgsl")),
             embed_gather_q6k: make_pipeline(&device, "embed_gather_q6k", include_str!("shaders/embed_gather_q6k.wgsl")),
@@ -250,7 +335,9 @@ impl Engine {
             device,
             queue,
             dispatch_count: Cell::new(0),
-        })
+        };
+        engine.diag_init_ms = (t_device - t_start, now_ms() - t_device);
+        Ok(engine)
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -407,7 +494,116 @@ impl Engine {
     }
 
     pub fn begin_pass<'e>(&self, encoder: &'e mut wgpu::CommandEncoder, label: &str) -> wgpu::ComputePass<'e> {
-        encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some(label), timestamp_writes: None })
+        let timestamp_writes = self.diag_pass_writes(label);
+        encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some(label), timestamp_writes })
+    }
+
+    /// Diagnostics switches. `timestamps` records a begin/end timestamp on
+    /// every compute pass (no-op without `TIMESTAMP_QUERY`); `split` makes
+    /// the forward pass close and reopen its compute pass at each op group
+    /// so each group gets its own timestamps (see `model.rs`'s `seg!`).
+    /// Both off by default: the forward pass's command stream is then the
+    /// same as without diagnostics.
+    pub fn set_diag(&self, timestamps: bool, split: bool) {
+        self.diag_timestamps.set(timestamps && self.diag_query_set.is_some());
+        self.diag_split.set(split);
+    }
+
+    pub fn diag_split(&self) -> bool {
+        self.diag_split.get()
+    }
+
+    pub fn has_pass_timestamps(&self) -> bool {
+        self.diag_query_set.is_some()
+    }
+
+    fn diag_pass_writes(&self, label: &str) -> Option<wgpu::ComputePassTimestampWrites<'_>> {
+        if !self.diag_timestamps.get() {
+            return None;
+        }
+        let qs = self.diag_query_set.as_ref()?;
+        let mut labels = self.diag_labels.borrow_mut();
+        let i = labels.len() as u32;
+        if i * 2 + 1 >= DIAG_QUERY_CAPACITY {
+            return None;
+        }
+        labels.push(label.to_string());
+        Some(wgpu::ComputePassTimestampWrites { query_set: qs, beginning_of_pass_write_index: Some(i * 2), end_of_pass_write_index: Some(i * 2 + 1) })
+    }
+
+    /// Start of a forward call: clears the previous call's pass labels.
+    pub fn diag_begin(&self) {
+        self.diag_labels.borrow_mut().clear();
+    }
+
+    /// Resolves every pass timestamp recorded since `diag_begin` (including
+    /// ones in encoders already submitted - query slots persist) into a
+    /// buffer, on the forward call's last encoder before it is finished.
+    pub fn diag_resolve(&self, encoder: &mut wgpu::CommandEncoder) -> Option<(wgpu::Buffer, u32)> {
+        if !self.diag_timestamps.get() {
+            return None;
+        }
+        let qs = self.diag_query_set.as_ref()?;
+        let count = self.diag_labels.borrow().len() as u32;
+        if count == 0 {
+            return None;
+        }
+        let size = u64::from(count) * 2 * 8;
+        let resolve = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("diag_resolve"),
+            size,
+            usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        encoder.resolve_query_set(qs, 0..count * 2, &resolve, 0);
+        Some((resolve, count))
+    }
+
+    /// Reads `diag_resolve`'s buffer back (async) and stores the per-label
+    /// GPU times in `diag_last_gpu`.
+    pub async fn diag_collect(&self, resolve: &wgpu::Buffer, count: u32) {
+        let size = u64::from(count) * 2 * 8;
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("diag_staging"),
+            size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("diag_readback") });
+        encoder.copy_buffer_to_buffer(resolve, 0, &staging, 0, size);
+        self.queue.submit(Some(encoder.finish()));
+        let slice = staging.slice(..);
+        let (tx, rx) = futures_channel::oneshot::channel();
+        slice.map_async(wgpu::MapMode::Read, move |res| {
+            let _ = tx.send(res);
+        });
+        #[cfg(not(target_arch = "wasm32"))]
+        self.device.poll(wgpu::PollType::Wait).expect("device poll failed");
+        rx.await.expect("map_async channel dropped").expect("buffer map failed");
+        let data = slice.get_mapped_range();
+        let raw: &[u64] = bytemuck::cast_slice(&data);
+        let period = f64::from(self.timestamp_period);
+        let labels = self.diag_labels.borrow();
+        let mut out = DiagGpu::default();
+        let (mut first, mut last) = (u64::MAX, 0u64);
+        for i in 0..count as usize {
+            let (b, e) = (raw[i * 2], raw[i * 2 + 1]);
+            first = first.min(b);
+            last = last.max(e);
+            let ms = e.saturating_sub(b) as f64 * period / 1e6;
+            out.pass_sum_ms += ms;
+            match out.segments.iter_mut().find(|s| s.0 == labels[i]) {
+                Some(s) => {
+                    s.1 += ms;
+                    s.2 += 1;
+                }
+                None => out.segments.push((labels[i].clone(), ms, 1)),
+            }
+        }
+        out.span_ms = last.saturating_sub(first) as f64 * period / 1e6;
+        drop(data);
+        staging.unmap();
+        *self.diag_last_gpu.borrow_mut() = Some(out);
     }
 
     /// Submits `encoder`'s recorded work, replaces it with a fresh encoder

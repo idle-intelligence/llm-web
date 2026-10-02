@@ -1745,6 +1745,19 @@ fn gather_dequant_head_rows(engine: &Engine, pool: &Pool, pass: &mut wgpu::Compu
     (out, hidden)
 }
 
+/// Diagnostics split point: when `Engine::diag_split()` is on, closes the
+/// open compute pass and opens a new one labelled `$label`, so the pass-level
+/// timestamps time each op group separately. A no-op otherwise: the default
+/// command stream keeps its one-pass-per-layer-half shape.
+macro_rules! seg {
+    ($engine:expr, $encoder:expr, $pass:ident, $label:expr) => {
+        if $engine.diag_split() {
+            drop($pass);
+            $pass = $engine.begin_pass($encoder, $label);
+        }
+    };
+}
+
 /// Prefill: runs every layer over the whole prompt with causal attention
 /// (no cache read needed - attends directly over this call's own q/k/v),
 /// GPU-scatters every position's K/V into `cache`, and returns the last
@@ -1754,6 +1767,8 @@ pub async fn forward_prefill(engine: &Engine, model: &GpuModel, cache: &mut KvCa
     let seq = token_ids.len() as u32;
     let hidden = cfg.hidden_size as u32;
     let pool = &model.pool;
+    let t_start = crate::engine::now_ms();
+    engine.diag_begin();
 
     let mut encoder = engine.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("prefill") });
     // One open ComputePass per layer-half instead of one per dispatch: see
@@ -1761,28 +1776,42 @@ pub async fn forward_prefill(engine: &Engine, model: &GpuModel, cache: &mut KvCa
     // `copy_buffer_to_buffer` calls are encoder-level (not pass-level), so
     // the pass must close before them and reopen after - two passes per
     // layer instead of ~15.
-    let mut pass = engine.begin_pass(&mut encoder, "prefill");
+    let mut pass = engine.begin_pass(&mut encoder, "embed");
     let x = embed_gather(engine, pool, &mut pass, model, token_ids);
+    seg!(engine, &mut encoder, pass, "norm");
 
     for (i, layer) in model.layers.iter().enumerate() {
         let key = format!("layer{i}");
         let normed = rmsnorm(engine, pool, &mut pass, &format!("{key}.norm"), &x, &layer.attn_norm, seq, hidden, cfg.rms_norm_eps);
         let lora_layer = model.lora.as_ref().map(|l| &l.layers[i]);
+        seg!(engine, &mut encoder, pass, "qkv");
         let (q, k, v) = qkv_proj(engine, pool, &mut pass, &format!("{key}.qkv"), &normed, seq, cfg, layer, model.fast_kernels, lora_layer);
+        seg!(engine, &mut encoder, pass, "rope");
         rope(engine, pool, &mut pass, &format!("{key}.ropeq"), &q, cos, sin, seq, cfg.num_heads as u32, cfg.head_dim as u32, 0);
         rope(engine, pool, &mut pass, &format!("{key}.ropek"), &k, cos, sin, seq, cfg.num_kv_heads as u32, cfg.head_dim as u32, 0);
+        seg!(engine, &mut encoder, pass, "attn");
         let attn_out = attn_prefill(engine, pool, &mut pass, &format!("{key}.attn"), &q, &k, &v, seq, cfg);
         drop(pass);
         scatter_kv_gpu(&mut encoder, &cache.k[i], &k, seq, cfg, 0, cache.max_ctx);
         scatter_kv_gpu(&mut encoder, &cache.v[i], &v, seq, cfg, 0, cache.max_ctx);
-        pass = engine.begin_pass(&mut encoder, "prefill");
+        pass = engine.begin_pass(&mut encoder, "o_proj");
 
         let attn_dim = (cfg.num_heads * cfg.head_dim) as u32;
         let o = linear_lora(engine, pool, &mut pass, &format!("{key}.wo"), &attn_out, seq, attn_dim, &layer.o_w, &layer.o_b, hidden, model.fast_kernels, lora_layer.map(|l| &l.o));
+        seg!(engine, &mut encoder, pass, "add+norm");
         add_inplace(engine, pool, &mut pass, &format!("{key}.add1"), &x, &o, seq * hidden);
 
         let ffn_normed = rmsnorm(engine, pool, &mut pass, &format!("{key}.ffnnorm"), &x, &layer.ffn_norm, seq, hidden, cfg.rms_norm_eps);
-        let mlp_out = mlp(engine, pool, &mut pass, &format!("{key}.mlp"), &ffn_normed, seq, cfg, layer, model.fast_kernels);
+        // `mlp()`'s three calls, inlined so `seg!` can time them apart.
+        let mlp_key = format!("{key}.mlp");
+        let inter = cfg.intermediate_size as u32;
+        seg!(engine, &mut encoder, pass, "gate_up");
+        let gate_up = linear(engine, pool, &mut pass, &format!("{mlp_key}.gate_up"), &ffn_normed, seq, hidden, &layer.gate_up_w, &layer.gate_up_b, 2 * inter, model.fast_kernels);
+        seg!(engine, &mut encoder, pass, "silu");
+        let gated = silu_mul_fused(engine, pool, &mut pass, &format!("{mlp_key}.silu"), &gate_up, seq, inter);
+        seg!(engine, &mut encoder, pass, "down");
+        let mlp_out = linear(engine, pool, &mut pass, &format!("{mlp_key}.down"), &gated, seq, inter, &layer.down_w, &layer.down_b, hidden, model.fast_kernels);
+        seg!(engine, &mut encoder, pass, "add");
         add_inplace(engine, pool, &mut pass, &format!("{key}.add2"), &x, &mlp_out, seq * hidden);
 
         // Flush per layer - see `Engine::flush_encoder`'s doc comment for
@@ -1790,7 +1819,7 @@ pub async fn forward_prefill(engine: &Engine, model: &GpuModel, cache: &mut KvCa
         // Qwen3-0.6B's depth (28 layers).
         drop(pass);
         engine.flush_encoder(&mut encoder, "prefill");
-        pass = engine.begin_pass(&mut encoder, "prefill");
+        pass = engine.begin_pass(&mut encoder, if i + 1 < model.layers.len() { "norm" } else { "tail" });
     }
 
     // Only the last position's row ever feeds the next token (this fn's
@@ -1817,7 +1846,7 @@ pub async fn forward_prefill(engine: &Engine, model: &GpuModel, cache: &mut KvCa
     let last_row = pool.data("prefill_last_row", hidden as usize);
     drop(pass);
     encoder.copy_buffer_to_buffer(&x, ((seq - 1) * hidden * 4) as u64, &last_row, 0, (hidden * 4) as u64);
-    pass = engine.begin_pass(&mut encoder, "prefill");
+    pass = engine.begin_pass(&mut encoder, "lm_head");
 
     let normed_final = rmsnorm(engine, pool, &mut pass, "out_norm", &last_row, &model.out_norm, 1, hidden, cfg.rms_norm_eps);
     let logits = linear(engine, pool, &mut pass, "lm_head", &normed_final, 1, hidden, &model.lm_head, &model.zero_bias_vocab, cfg.vocab_size as u32, false);
@@ -1826,9 +1855,16 @@ pub async fn forward_prefill(engine: &Engine, model: &GpuModel, cache: &mut KvCa
     }
     drop(pass);
 
+    let diag = engine.diag_resolve(&mut encoder);
     engine.queue.submit(Some(encoder.finish()));
+    let t_submitted = crate::engine::now_ms();
     let vocab = cfg.vocab_size;
     let all_logits = engine.read_buffer(&logits, vocab).await;
+    engine.diag_encode_ms.set(t_submitted - t_start);
+    engine.diag_wait_ms.set(crate::engine::now_ms() - t_submitted);
+    if let Some((buf, count)) = diag {
+        engine.diag_collect(&buf, count).await;
+    }
     cache.kv_len = seq;
     all_logits
 }
@@ -1907,8 +1943,9 @@ fn decode_layers(engine: &Engine, model: &GpuModel, encoder: &mut wgpu::CommandE
     // no pass boundary otherwise, including across the layer loop (a
     // layer's tail dispatches and the next layer's head dispatches share
     // one pass).
-    let mut pass = engine.begin_pass(encoder, "decode");
+    let mut pass = engine.begin_pass(encoder, "embed");
     let x = embed_gather(engine, pool, &mut pass, model, &[token_id]);
+    seg!(engine, encoder, pass, "norm");
 
     // `normed` carries the *next* dispatch's already-computed rmsnorm input:
     // seeded here from a plain rmsnorm on the fresh embedding (layer 0's
@@ -1922,23 +1959,36 @@ fn decode_layers(engine: &Engine, model: &GpuModel, encoder: &mut wgpu::CommandE
     for (i, layer) in model.layers.iter().enumerate() {
         let key = format!("dec_layer{i}");
         let lora_layer = model.lora.as_ref().map(|l| &l.layers[i]);
+        seg!(engine, encoder, pass, "qkv");
         let (q, k, v) = qkv_proj(engine, pool, &mut pass, &format!("{key}.qkv"), &normed, 1, cfg, layer, model.fast_kernels, lora_layer);
+        seg!(engine, encoder, pass, "rope");
         rope(engine, pool, &mut pass, &format!("{key}.ropeq"), &q, cos, sin, 1, cfg.num_heads as u32, cfg.head_dim as u32, pos);
         rope(engine, pool, &mut pass, &format!("{key}.ropek"), &k, cos, sin, 1, cfg.num_kv_heads as u32, cfg.head_dim as u32, pos);
 
         drop(pass);
         scatter_kv_gpu(encoder, &cache.k[i], &k, 1, cfg, pos, cache.max_ctx);
         scatter_kv_gpu(encoder, &cache.v[i], &v, 1, cfg, pos, cache.max_ctx);
-        pass = engine.begin_pass(encoder, "decode");
+        pass = engine.begin_pass(encoder, "attn");
 
         let attn_out = attn_decode(engine, pool, &mut pass, &format!("{key}.attn"), &q, &cache.k[i], &cache.v[i], pos + 1, cache.max_ctx, cfg);
 
         let attn_dim = (cfg.num_heads * cfg.head_dim) as u32;
+        seg!(engine, encoder, pass, "o_proj");
         let o = linear_lora(engine, pool, &mut pass, &format!("{key}.wo"), &attn_out, 1, attn_dim, &layer.o_w, &layer.o_b, hidden, model.fast_kernels, lora_layer.map(|l| &l.o));
         // Fused add1 (x += o) + ffnnorm(x) - one dispatch instead of two
         // (docs/runs/2026-09-29-lean-kernels.md).
+        seg!(engine, encoder, pass, "add+norm");
         let ffn_normed = add_rmsnorm(engine, pool, &mut pass, &format!("{key}.add1_ffnnorm"), &x, &o, &layer.ffn_norm, 1, hidden, cfg.rms_norm_eps);
-        let mlp_out = mlp(engine, pool, &mut pass, &format!("{key}.mlp"), &ffn_normed, 1, cfg, layer, model.fast_kernels);
+        // `mlp()`'s three calls, inlined so `seg!` can time them apart.
+        let mlp_key = format!("{key}.mlp");
+        let inter = cfg.intermediate_size as u32;
+        seg!(engine, encoder, pass, "gate_up");
+        let gate_up = linear(engine, pool, &mut pass, &format!("{mlp_key}.gate_up"), &ffn_normed, 1, hidden, &layer.gate_up_w, &layer.gate_up_b, 2 * inter, model.fast_kernels);
+        seg!(engine, encoder, pass, "silu");
+        let gated = silu_mul_fused(engine, pool, &mut pass, &format!("{mlp_key}.silu"), &gate_up, 1, inter);
+        seg!(engine, encoder, pass, "down");
+        let mlp_out = linear(engine, pool, &mut pass, &format!("{mlp_key}.down"), &gated, 1, inter, &layer.down_w, &layer.down_b, hidden, model.fast_kernels);
+        seg!(engine, encoder, pass, "add+norm");
         // Fused add2 (x += mlp_out) + the *next* dispatch's rmsnorm: the
         // following layer's attn_norm, or (last layer) the final out_norm -
         // either way `x`'s next reader is always exactly one rmsnorm, so
@@ -1962,9 +2012,13 @@ fn decode_layers(engine: &Engine, model: &GpuModel, encoder: &mut wgpu::CommandE
     }
 
     let normed_final = normed;
+    seg!(engine, encoder, pass, "lm_head");
     let logits = linear(engine, pool, &mut pass, "dec_lm_head", &normed_final, 1, hidden, &model.lm_head, &model.zero_bias_vocab, cfg.vocab_size as u32, model.fast_kernels);
     if let Some(mask) = mask {
         mask_logits_gpu(engine, pool, &mut pass, "dec_mask", &logits, mask, cfg.vocab_size as u32, 0);
+    }
+    if argmax {
+        seg!(engine, encoder, pass, "argmax");
     }
     let idx = argmax.then(|| argmax_gpu(engine, pool, &mut pass, "dec_argmax", &logits, cfg.vocab_size as u32));
     drop(pass);
@@ -1999,6 +2053,8 @@ pub async fn forward_decode_step(engine: &Engine, model: &GpuModel, cache: &mut 
 /// extra readback over the unconstrained path.
 #[allow(clippy::too_many_arguments)]
 pub async fn forward_decode_step_argmax(engine: &Engine, model: &GpuModel, cache: &mut KvCache, token_id: u32, cos: &wgpu::Buffer, sin: &wgpu::Buffer, mask: Option<&wgpu::Buffer>) -> u32 {
+    let t_start = crate::engine::now_ms();
+    engine.diag_begin();
     let mut encoder = engine.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("decode_argmax") });
     if engine.profiling_enabled() {
         engine.reset_profile();
@@ -2008,9 +2064,16 @@ pub async fn forward_decode_step_argmax(engine: &Engine, model: &GpuModel, cache
     // Resolve on the same encoder as the profiled dispatches, before it's
     // finished/submitted - see `Engine::resolve_profile`'s doc comment.
     let profile = engine.resolve_profile(&mut encoder);
+    let diag = engine.diag_resolve(&mut encoder);
     engine.queue.submit(Some(encoder.finish()));
+    let t_submitted = crate::engine::now_ms();
     cache.kv_len += 1;
     let result = engine.read_u32(&idx).await;
+    engine.diag_encode_ms.set(t_submitted - t_start);
+    engine.diag_wait_ms.set(crate::engine::now_ms() - t_submitted);
+    if let Some((buf, count)) = diag {
+        engine.diag_collect(&buf, count).await;
+    }
     if let Some((buf, count)) = profile {
         let data = engine.read_profile(&buf, count).await;
         crate::profile_report::record_step(&data);

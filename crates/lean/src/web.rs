@@ -24,7 +24,7 @@ use tokenizers::Tokenizer;
 
 use crate::chat_template::{chat_template_from_config_json, render_conversation, render_user_prompt};
 use crate::cpu::{forward_decode_step_argmax as cpu_decode_step_argmax, forward_prefill as cpu_forward_prefill, CpuKvCache, CpuModel};
-use crate::engine::Engine;
+use crate::engine::{now_ms, Engine};
 use crate::generate::decode_loop;
 use crate::model::{build_mask_bitset, build_rope_tables, forward_decode_step_argmax, forward_prefill, forward_prefill_suffix, GpuModel, KvCache, KvSnapshot};
 use crate::sampling::SamplingParams;
@@ -192,6 +192,9 @@ pub struct LeanEngine {
     /// by `generate()`/`generateStream()`, which remain single-turn (reset
     /// the KV cache to 0 every call, same as before this field existed).
     chat_history: Vec<(String, String)>,
+    /// `(GGUF parse + weight upload calls ms, tokenizer + chat template ms)`
+    /// from the last `load()`, for the diagnostics page.
+    load_ms: (f64, f64),
 }
 
 #[wasm_bindgen]
@@ -204,11 +207,70 @@ impl LeanEngine {
     pub async fn create() -> Result<LeanEngine, JsError> {
         console_error_panic_hook::set_once();
         let engine = Engine::new_async().await.map_err(|e| JsError::new(&format!("{e}")))?;
-        wasm_log(&format!(
-            "[lean] device ready, max_storage_buffer_binding_size={}",
-            engine.max_storage_buffer_binding_size()
-        ));
-        Ok(LeanEngine { engine, model: None, cache: None, cos_buf: None, sin_buf: None, tokenizer: None, chat_template: None, chat_history: Vec::new() })
+        Ok(LeanEngine::from_engine(engine))
+    }
+
+    /// Same as `create()`, but also requests WebGPU's `timestamp-query`
+    /// feature when the adapter has it (feature detection only), so the
+    /// diagnostics calls below can report GPU time. Nothing else differs.
+    #[wasm_bindgen(js_name = createDiag)]
+    pub async fn create_diag() -> Result<LeanEngine, JsError> {
+        console_error_panic_hook::set_once();
+        let engine = Engine::new_async_with(true).await.map_err(|e| JsError::new(&format!("{e}")))?;
+        Ok(LeanEngine::from_engine(engine))
+    }
+
+    /// JSON: device request ms, pipeline creation calls ms (all of them, in
+    /// total), whether pass timestamps are available, and the last `load()`'s
+    /// split.
+    #[wasm_bindgen(js_name = diagInfo)]
+    pub fn diag_info(&self) -> String {
+        serde_json::json!({
+            "deviceMs": self.engine.diag_init_ms.0,
+            "pipelinesMs": self.engine.diag_init_ms.1,
+            "timestampQuery": self.engine.has_pass_timestamps(),
+            "loadWeightsMs": self.load_ms.0,
+            "loadTokenizerMs": self.load_ms.1,
+        })
+        .to_string()
+    }
+
+    /// Diagnostics switches, both off by default - see `Engine::set_diag`.
+    #[wasm_bindgen(js_name = diagSet)]
+    pub fn diag_set(&self, timestamps: bool, split: bool) {
+        self.engine.set_diag(timestamps, split);
+    }
+
+    /// JSON for the last `prefillTokens`/`decodeStepArgmax` call:
+    /// `encodeMs` (recording + submit, CPU), `waitMs` (submit to result in
+    /// hand), and `gpu` (`null` unless timestamps were on: `spanMs`,
+    /// `passSumMs`, `segments` as `[label, ms, passes]`).
+    #[wasm_bindgen(js_name = diagLast)]
+    pub fn diag_last(&self) -> String {
+        let gpu = self.engine.diag_last_gpu.borrow_mut().take().map(|g| {
+            serde_json::json!({
+                "spanMs": g.span_ms,
+                "passSumMs": g.pass_sum_ms,
+                "segments": g.segments.iter().map(|(l, ms, n)| serde_json::json!([l, ms, n])).collect::<Vec<_>>(),
+            })
+        });
+        serde_json::json!({
+            "encodeMs": self.engine.diag_encode_ms.get(),
+            "waitMs": self.engine.diag_wait_ms.get(),
+            "gpu": gpu,
+        })
+        .to_string()
+    }
+
+    /// Milliseconds for one 4-byte copy + `mapAsync` round trip with no
+    /// other work: the per-readback floor, and (right after `create`/`load`)
+    /// the time for the GPU process to drain what was queued before it.
+    #[wasm_bindgen(js_name = diagRoundTrip)]
+    pub async fn diag_round_trip(&self) -> f64 {
+        let t = now_ms();
+        let buf = self.engine.buf_empty(1, "diag_round_trip");
+        let _ = self.engine.read_u32(&buf).await;
+        now_ms() - t
     }
 
     /// Parses `gguf_bytes` (the whole GGUF file, fetched by JS, passed as a
@@ -225,15 +287,18 @@ impl LeanEngine {
     /// the JS heap can reclaim it too (see `www/main.js`'s call site).
     #[wasm_bindgen(js_name = load)]
     pub fn load(&mut self, gguf_bytes: js_sys::Uint8Array, tokenizer_json: String, tokenizer_config_json: String, max_ctx: u32) -> Result<(), JsError> {
+        let t_start = now_ms();
         let model = GpuModel::load_from_reader(&self.engine, JsBytesReader::new(gguf_bytes), true)
             .map_err(|e| JsError::new(&format!("failed to load model: {e}")))?;
         let cache = KvCache::new(&self.engine, &model.config, max_ctx);
         let (cos, sin) = build_rope_tables(model.config.head_dim, model.config.rope_theta, max_ctx as usize);
         let cos_buf = self.engine.buf_f32(&cos, "rope_cos");
         let sin_buf = self.engine.buf_f32(&sin, "rope_sin");
+        let t_weights = now_ms();
 
         let tokenizer = Tokenizer::from_bytes(tokenizer_json.as_bytes()).map_err(|e| JsError::new(&format!("failed to load tokenizer.json: {e}")))?;
         let chat_template = chat_template_from_config_json(&tokenizer_config_json).map_err(|e| JsError::new(&format!("{e}")))?;
+        self.load_ms = (t_weights - t_start, now_ms() - t_weights);
 
         wasm_log(&format!(
             "[lean] model loaded: layers={} hidden={} vocab={}",
@@ -692,6 +757,13 @@ impl LeanEngine {
         }
 
         Ok(text)
+    }
+}
+
+impl LeanEngine {
+    fn from_engine(engine: Engine) -> LeanEngine {
+        wasm_log(&format!("[lean] device ready, max_storage_buffer_binding_size={}", engine.max_storage_buffer_binding_size()));
+        LeanEngine { engine, model: None, cache: None, cos_buf: None, sin_buf: None, tokenizer: None, chat_template: None, chat_history: Vec::new(), load_ms: (0.0, 0.0) }
     }
 }
 
