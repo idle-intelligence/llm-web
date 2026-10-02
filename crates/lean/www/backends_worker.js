@@ -1,18 +1,18 @@
-// Module Worker behind rungs.html. Picks the rung by capability only (never
+// Module Worker behind backends.html. Picks the backend by capability only (never
 // by a benchmark): auto = WebGPU if an adapter is granted, else CPU threads
 // if the page is cross-origin isolated with SharedArrayBuffer and more than
-// one hardware thread, else single-thread CPU (WASM SIMD128). A forced rung
+// one hardware thread, else single-thread CPU (WASM SIMD128). A forced backend
 // that is unavailable is an error, not a silent fallback.
 //
-// Rung loading copies main_cpu_mt.js (pkg-mt + initThreadPool for threads,
+// Backend loading copies main_cpu_mt.js (pkg-mt + initThreadPool for threads,
 // pkg for single thread); the prefill + greedy decode loop copies
 // main_cpu.js / main.js.
-const ENGINE_BUILD = "2026-10-02-rungs-02";
+const ENGINE_BUILD = "2026-10-02-backends-01";
 const N_GEN = 64;
 const MAX_CTX = 256;
 
 // crates/lean/reference/fixture.json, case "short" ("What is the capital of
-// France?", chat-templated), so every rung sees the same ids without
+// France?", chat-templated), so every backend sees the same ids without
 // depending on the tokenizer.
 const PROMPT_IDS = [
   151644, 8948, 198, 2610, 525, 1207, 16948, 11, 3465, 553, 54364, 14817, 13, 1446, 525, 264, 10950, 17847, 13,
@@ -31,7 +31,7 @@ function status(text) {
 }
 
 async function fetchBytes(url) {
-  const cache = await caches.open("lean-rungs-model-v1");
+  const cache = await caches.open("lean-backends-model-v1");
   let r = await cache.match(url);
   if (!r) {
     r = await fetch(url);
@@ -91,15 +91,15 @@ async function capabilities() {
   return caps;
 }
 
-async function createEngine(rung, caps) {
-  if (rung === "webgpu") {
+async function createEngine(backend, caps) {
+  if (backend === "webgpu") {
     if (!caps.hasAdapter) throw new Error(`no WebGPU adapter (${caps.adapter})`);
     const mod = await import(`../pkg/lean.js?v=${ENGINE_BUILD}`);
     await mod.default(`../pkg/lean_bg.wasm?v=${ENGINE_BUILD}`);
     mod.leanInit();
     return { engine: await mod.LeanEngine.create(), gpu: true };
   }
-  if (rung === "threads") {
+  if (backend === "threads") {
     if (!caps.threadsCapable) {
       throw new Error(
         `threads need crossOriginIsolated, SharedArrayBuffer and >1 hardware thread ` +
@@ -118,7 +118,7 @@ async function createEngine(rung, caps) {
   return { engine: mod.LeanEngineCpu.create(), gpu: false };
 }
 
-async function run({ rung: requested, local }) {
+async function run({ backend: requested, local }) {
   status(`engine build ${ENGINE_BUILD}, checking capabilities...`);
   const caps = await capabilities();
   const candidates =
@@ -134,25 +134,25 @@ async function run({ rung: requested, local }) {
   ]);
 
   const skipped = [];
-  let engine, gpu, rung;
+  let engine, gpu, backend;
   for (const c of candidates) {
     try {
-      status(`starting ${c} rung...`);
+      status(`starting ${c} backend...`);
       ({ engine, gpu } = await createEngine(c, caps));
-      status(`loading weights on ${c} rung...`);
+      status(`loading weights on ${c} backend...`);
       engine.load(ggufBytes, tokenizerJson, tokenizerCfgJson, MAX_CTX);
-      rung = c;
+      backend = c;
       break;
     } catch (e) {
       const msg = e && e.message ? e.message : String(e);
-      if (requested !== "auto") throw new Error(`${c} rung unavailable: ${msg}`);
+      if (requested !== "auto") throw new Error(`${c} backend unavailable: ${msg}`);
       skipped.push(`${c}: ${msg}`);
       engine = null;
     }
   }
   ggufBytes = null;
 
-  status(`running ${N_GEN} greedy tokens on ${rung} rung...`);
+  status(`running ${N_GEN} greedy tokens on ${backend} backend...`);
   const t0 = performance.now();
   const logits = gpu ? await engine.prefillTokens(PROMPT_IDS, []) : engine.prefillTokens(PROMPT_IDS);
   const t1 = performance.now();
@@ -165,7 +165,7 @@ async function run({ rung: requested, local }) {
   const hash = await sha256Hex(ids);
   return {
     requested,
-    rung,
+    backend,
     skipped,
     engineBuild: ENGINE_BUILD,
     caps,

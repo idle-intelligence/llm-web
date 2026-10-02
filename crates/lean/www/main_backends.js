@@ -1,30 +1,30 @@
-// Rung measurement page: runs one fixed greedy generation (Qwen2.5-0.5B-
-// Instruct Q4_0, the fixture's "short" prompt, 64 tokens) on the rung the
-// visitor picks (?rung=auto|webgpu|threads|single) and shows the rung used,
+// Backend measurement page: runs one fixed greedy generation (Qwen2.5-0.5B-
+// Instruct Q4_0, the fixture's "short" prompt, 64 tokens) on the backend the
+// visitor picks (?backend=auto|webgpu|threads|single) and shows the backend used,
 // what the page can see of the device, prefill ms, decode ms/token and a
-// hash of the 64 generated ids. Token-exact rungs give the same hash.
+// hash of the 64 generated ids. Token-exact backends give the same hash.
 //
-// Inference runs in rungs_worker.js (a module Worker), so the threads
-// rung's rayon pool never blocks the main thread. Served cross-origin
-// isolated (scripts/serve_coi.py) so the threads rung is available.
+// Inference runs in backends_worker.js (a module Worker), so the threads
+// backend's rayon pool never blocks the main thread. Served cross-origin
+// isolated (scripts/serve_coi.py) so the threads backend is available.
 //
 // Every wasm/js loading URL carries `?v=ENGINE_BUILD`, bumped in the same
-// commit as any wasm rebuild (rungs.html's own script tag included).
-const ENGINE_BUILD = "2026-10-02-rungs-02";
+// commit as any wasm rebuild (backends.html's own script tag included).
+const ENGINE_BUILD = "2026-10-02-backends-01";
 
 const params = new URLSearchParams(location.search);
-const rung = ["auto", "webgpu", "threads", "single"].includes(params.get("rung")) ? params.get("rung") : "auto";
+const backend = ["auto", "webgpu", "threads", "single"].includes(params.get("backend")) ? params.get("backend") : "auto";
 const local = params.get("local") !== "0";
 
 const statusEl = document.getElementById("status");
 const resultsEl = document.getElementById("results");
-for (const a of document.querySelectorAll("#rungs a")) {
-  if (a.getAttribute("href") === `?rung=${rung}`) a.className = "on";
+for (const a of document.querySelectorAll("#backends a")) {
+  if (a.getAttribute("href") === `?backend=${backend}`) a.className = "on";
 }
 
 function status(s) {
   statusEl.textContent = s;
-  console.log("[lean-rungs] " + s);
+  console.log("[lean-backends] " + s);
 }
 
 function row(k, v) {
@@ -37,7 +37,7 @@ function row(k, v) {
   resultsEl.appendChild(tr);
 }
 
-const worker = new Worker(`./rungs_worker.js?v=${ENGINE_BUILD}`, { type: "module" });
+const worker = new Worker(`./backends_worker.js?v=${ENGINE_BUILD}`, { type: "module" });
 worker.onmessage = (e) => {
   const m = e.data;
   if (m.type === "status") {
@@ -45,9 +45,9 @@ worker.onmessage = (e) => {
   } else if (m.type === "done") {
     const r = m.result;
     resultsEl.textContent = "";
-    row("rung requested", r.requested);
-    row("rung used", r.rung);
-    if (r.skipped.length) row("rungs skipped", r.skipped.join("; "));
+    row("backend requested", r.requested);
+    row("backend used", r.backend);
+    if (r.skipped.length) row("backends skipped", r.skipped.join("; "));
     row("engine build", r.engineBuild);
     row("hardwareConcurrency", String(r.caps.hardwareConcurrency));
     row("crossOriginIsolated", String(r.caps.crossOriginIsolated));
@@ -58,17 +58,17 @@ worker.onmessage = (e) => {
     row("token hash", r.hash.slice(0, 16));
     row("same as transformers", r.matchesReference ? "yes" : "no");
     row("text", r.text);
-    window.__leanRungs = r;
-    status(`done: ${r.rung}, decode ${r.decodeMsPerTok.toFixed(1)} ms/token, hash ${r.hash.slice(0, 16)}`);
+    window.__leanBackends = r;
+    status(`done: ${r.backend}, decode ${r.decodeMsPerTok.toFixed(1)} ms/token, hash ${r.hash.slice(0, 16)}`);
   } else if (m.type === "error") {
     status("ERROR: " + m.text);
     console.error(m.text);
-    window.__leanRungs = { error: m.text };
+    window.__leanBackends = { error: m.text };
   }
 };
 worker.onerror = (e) => {
   status("ERROR: " + (e.message || "worker failed to start"));
   console.error(e);
-  window.__leanRungs = { error: String(e.message) };
+  window.__leanBackends = { error: String(e.message) };
 };
-worker.postMessage({ rung, local });
+worker.postMessage({ backend, local });

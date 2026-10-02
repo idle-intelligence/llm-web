@@ -3,12 +3,12 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>lean engine - rungs</title>
+<title>lean engine - backends</title>
 <style>
   body { font-family: monospace; max-width: 720px; margin: 24px auto; padding: 0 16px; }
-  #rungs { margin-bottom: 12px; }
-  #rungs a { margin-right: 12px; }
-  #rungs a.on { font-weight: bold; color: #073; }
+  #backends { margin-bottom: 12px; }
+  #backends a { margin-right: 12px; }
+  #backends a.on { font-weight: bold; color: #073; }
   #status { margin-bottom: 12px; }
   table { border-collapse: collapse; width: 100%; }
   td { border-bottom: 1px solid #ccc; padding: 4px 8px 4px 0; vertical-align: top; overflow-wrap: anywhere; }
@@ -16,12 +16,12 @@
 </style>
 </head>
 <body>
-<h3>lean engine - rungs</h3>
-<div id="rungs">
-  <a href="?rung=auto">auto</a><a href="?rung=webgpu">webgpu</a><a href="?rung=threads">threads</a><a href="?rung=single">single</a>
+<h3>lean engine - backends</h3>
+<div id="backends">
+  <a href="?backend=auto">auto</a><a href="?backend=webgpu">webgpu</a><a href="?backend=threads">threads</a><a href="?backend=single">single</a>
 </div>
 <div id="status">loading...</div>
 <table id="results"></table>
-<script type="module" src="./main_rungs.js?v=2026-10-02-rungs-02"></script>
+<script type="module" src="./main_backends.js?v=2026-10-02-backends-01"></script>
 </body>
 </html>
