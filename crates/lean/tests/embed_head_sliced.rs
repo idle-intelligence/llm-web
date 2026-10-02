@@ -1,9 +1,13 @@
 //! `GpuModel::embed_head_sliced` against a CPU reference: the hidden states
 //! of one prompt, read back, dotted with the CPU-dequantized
-//! `token_embd.weight` rows (`gguf::dequantize_for`).
+//! `token_embd.weight` rows (`gguf::dequantize_for`). Also checks that
+//! swapping one LoRA adapter for another, with no pool reset by the caller,
+//! gives the second adapter's numbers (`apply_lora` resets the pool).
 //!
 //! ```sh
 //! LEAN_GGUF=/path/to/qwen2.5-0.5b-instruct-q4_0.gguf \
+//! LEAN_LORA_BIN=/path/to/lora-a-rules-300.bin \
+//! LEAN_LORA_BIN2=/path/to/lora-a-norules-300.bin \
 //! cargo test -p lean --release -- --ignored embed_head
 //! ```
 
@@ -65,4 +69,47 @@ fn embed_head_matches_cpu_dequant() {
     }
     eprintln!("[embed_head] {t} rows, max |gpu - cpu| = {max_diff:.3e}");
     assert!(max_diff < 1e-3, "embed_head_sliced diverges from the CPU dequant reference: {max_diff}");
+}
+
+#[test]
+#[ignore = "needs LEAN_GGUF, LEAN_LORA_BIN and LEAN_LORA_BIN2 on disk; never committed to this repo"]
+fn adapter_swap_uses_the_new_adapter() {
+    let gguf_path = std::env::var("LEAN_GGUF").expect("set LEAN_GGUF to run this test");
+    let a = std::fs::read(std::env::var("LEAN_LORA_BIN").expect("set LEAN_LORA_BIN")).unwrap();
+    let b = std::fs::read(std::env::var("LEAN_LORA_BIN2").expect("set LEAN_LORA_BIN2")).unwrap();
+    let engine = Engine::new().expect("wgpu engine init");
+    let ids = fixture_ids();
+    let t = ids.len() as u32;
+    let mut model = GpuModel::load(&engine, &gguf_path, true).expect("loading model");
+    let (cos, sin) = build_rope_tables(model.config.head_dim, model.config.rope_theta, t as usize + 4);
+    let cos_buf = engine.buf_f32(&cos, "rope_cos");
+    let sin_buf = engine.buf_f32(&sin, "rope_sin");
+
+    // One cache for the whole test, no caller-side pool reset: the only
+    // thing that changes between the two forwards is the adapter.
+    let run = |model: &GpuModel, cache: &mut KvCache| -> Vec<f32> {
+        cache.kv_len = 0;
+        let hidden = pollster::block_on(forward_chunk_spec(&engine, model, cache, &ids, &cos_buf, &sin_buf, &ForwardSpec::default()));
+        pollster::block_on(model.embed_head_sliced(&engine, &hidden, t, &IDS))
+    };
+
+    let mut cache = KvCache::new(&engine, &model.config, t + 4);
+    model.apply_lora(&engine, &a).unwrap();
+    // Twice: the first call allocates every pool buffer (bumping the pool
+    // generation), so only from the second call on are the cached bind
+    // groups reused as-is, which is the state an adapter swap meets.
+    let _ = run(&model, &mut cache);
+    let with_a = run(&model, &mut cache);
+    model.apply_lora(&engine, &b).unwrap();
+    let swapped_to_b = run(&model, &mut cache);
+
+    let mut fresh = GpuModel::load(&engine, &gguf_path, true).expect("loading model");
+    let mut cache2 = KvCache::new(&engine, &fresh.config, t + 4);
+    fresh.apply_lora(&engine, &b).unwrap();
+    let only_b = run(&fresh, &mut cache2);
+
+    let last = |v: &[f32]| (v[(t as usize - 1) * 2], v[(t as usize - 1) * 2 + 1]);
+    eprintln!("[swap] a={:?} a->b={:?} b alone={:?}", last(&with_a), last(&swapped_to_b), last(&only_b));
+    let diff = swapped_to_b.iter().zip(&only_b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
+    assert!(diff < 1e-4, "after apply_lora(b), the model still runs adapter a: max diff {diff}");
 }

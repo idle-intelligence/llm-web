@@ -828,6 +828,12 @@ impl GpuModel {
     pub fn apply_lora(&mut self, engine: &Engine, bytes: &[u8]) -> Result<()> {
         let adapter = crate::lora::LoraAdapter::from_bytes(engine, bytes, self.config.num_layers)?;
         self.lora = Some(adapter);
+        // The adapter's buffers are allocated on the engine, not the pool,
+        // so swapping one adapter for another of the same shape bumps no
+        // pool generation: without this reset, the cached LoRA bind groups
+        // keep pointing at the previous adapter's buffers (see pool.rs's
+        // bug note on KvCache, same mechanism).
+        self.pool.reset();
         Ok(())
     }
 
@@ -835,6 +841,7 @@ impl GpuModel {
     /// forward calls run the frozen base only, with no base reload.
     pub fn clear_lora(&mut self) {
         self.lora = None;
+        self.pool.reset();
     }
 
     pub fn has_lora(&self) -> bool {
