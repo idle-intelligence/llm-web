@@ -7,7 +7,7 @@
 // Rung loading copies main_cpu_mt.js (pkg-mt + initThreadPool for threads,
 // pkg for single thread); the prefill + greedy decode loop copies
 // main_cpu.js / main.js.
-const ENGINE_BUILD = "2026-10-02-rungs-01";
+const ENGINE_BUILD = "2026-10-02-rungs-02";
 const N_GEN = 64;
 const MAX_CTX = 256;
 
@@ -31,8 +31,13 @@ function status(text) {
 }
 
 async function fetchBytes(url) {
-  const r = await fetch(url);
-  if (!r.ok) throw new Error(`fetch ${url}: HTTP ${r.status}`);
+  const cache = await caches.open("lean-rungs-model-v1");
+  let r = await cache.match(url);
+  if (!r) {
+    r = await fetch(url);
+    if (!r.ok) throw new Error(`fetch ${url}: HTTP ${r.status}`);
+    await cache.put(url, r.clone());
+  }
   return new Uint8Array(await r.arrayBuffer());
 }
 async function fetchText(url) {

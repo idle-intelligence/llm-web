@@ -10,7 +10,7 @@
 //
 // Every wasm/js loading URL carries `?v=ENGINE_BUILD`, bumped in the same
 // commit as any wasm rebuild (rungs.html's own script tag included).
-const ENGINE_BUILD = "2026-10-02-rungs-01";
+const ENGINE_BUILD = "2026-10-02-rungs-02";
 
 const params = new URLSearchParams(location.search);
 const rung = ["auto", "webgpu", "threads", "single"].includes(params.get("rung")) ? params.get("rung") : "auto";
