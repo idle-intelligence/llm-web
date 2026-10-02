@@ -25,11 +25,12 @@
 //! `[n_kv_heads, max_ctx, head_dim]`, head-major and contiguous per head -
 //! matches `shaders/attn_decode.wgsl`'s indexing. Not a ring buffer: `kv_len`
 //! only grows, capped by `max_ctx` (the CLI's fixed context, not the
-//! model's `qwen2.context_length`). Writes into it are plain
-//! `copy_buffer_to_buffer` calls recorded in the same encoder as the
-//! dispatch that produced the source K/V - GPU-resident, no CPU readback -
-//! so a freshly-computed decode step's own K/V is visible to that same
-//! step's causal attention (`kv_len` passed to `attn_decode` already
+//! model's `qwen2.context_length`). Writes into it are GPU-resident, no CPU
+//! readback, recorded in the same encoder as the dispatch that produced the
+//! source K/V: plain `copy_buffer_to_buffer` calls for a decode step's one
+//! row, one `kv_scatter` dispatch per buffer for multi-row prefill/chunk
+//! writes - so a freshly-computed decode step's own K/V is visible to that
+//! same step's causal attention (`kv_len` passed to `attn_decode` already
 //! includes the current position).
 
 use anyhow::{Context, Result};
@@ -46,26 +47,17 @@ use crate::pool::Pool;
 use crate::quant::{load_embedding_table_gguf, load_matmul_weight_gguf, EmbeddingTable, MatMulWeight};
 use crate::gguf::GgmlDtype;
 
-/// Row-count (`M`) threshold above which the tiled Q4_0 matmul
-/// (`linear_q4_tiled.wgsl`) is used for prefill; below it, the naive
-/// per-element kernel (`linear_q4.wgsl`) is faster (see `linear()`'s match
-/// arm doc comment) - measured in `docs/runs/2026-09-28-lean-perf.md`.
-const TILED_MIN_ROWS: u32 = 16;
-
-/// Row-count (`M`) threshold below which the register-blocked 32x32/TK=16
-/// tiled kernel (`linear_q4_tiled_rb.wgsl`/`linear_q8_tiled_rb.wgsl`, this
-/// project's own port of t0-web's tile/register-blocking scheme, see that
-/// file's header) beats the larger TM=TN=64/MICRO=4 kernel
-/// (`linear_q4_tiled.wgsl`); at or above it, the bigger tile's 4x4/16
-/// outputs-per-thread reuse wins. Measured on the RTX 3080 (Vulkan) at
-/// Qwen2.5-0.5B/Qwen3-1.7B prompt lengths 36/86/256/512/1024/2225 - see
-/// this session's run doc for the crossover table. Set from `rows` alone,
-/// not the device: the mechanism this threshold tracks (arithmetic
-/// intensity per shared-memory tile load crossing over as `M` grows) is a
-/// GEMM-shape property, not a vendor-specific one, so the same threshold is
-/// expected to hold on other GPUs; only its exact value would need
-/// re-measuring if it turned out not to.
-const PREFILL_RB_MAX_ROWS: u32 = 512;
+/// Below this many rows (and above 1), Q4_0 and Q8_0 prefill use
+/// `linear_q4_small_m.wgsl`: it reads and dequantises each weight word once
+/// per group of 8 query rows, where the tiled kernels pay for a whole
+/// padded row tile. Measured on a mobile GPU (Adreno 6xx), the 32x32 tiled
+/// kernel ran a 36-token prompt's MLP matmuls about 5x slower than 36
+/// decode-style matvecs would have; see docs/runs/2026-10-02-lean-mobile.md
+/// for the M2 sweep this value comes from. A row-count rule, the same on
+/// every device: below 64 rows the 64-row tile of `linear_q4_tiled_rb.wgsl`
+/// is mostly padding, at and above it that kernel reuses each dequantised
+/// weight stage across 64 rows instead of 8.
+const SMALL_M_MAX_ROWS: u32 = 64;
 
 /// WebGPU's `max_compute_workgroups_per_dimension`: 65535 on every backend
 /// (spec-mandated minimum-and-typical value, not a per-device tuned
@@ -140,6 +132,18 @@ struct RmsDims {
     dim: u32,
     eps: f32,
     _p0: u32,
+}
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct RopeKvDims {
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    pos: u32,
+    max_ctx: u32,
+    _p0: u32,
+    _p1: u32,
+    _p2: u32,
 }
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -407,14 +411,20 @@ pub struct KvCache {
     pub kv_len: u32,
     num_kv_heads: u32,
     head_dim: u32,
+    /// Process-unique id, so `Pool::use_kv_cache` can tell a new cache (whose
+    /// buffers no cached bind group points at yet) from the one it last saw.
+    id: u64,
 }
+
+static NEXT_KV_CACHE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl KvCache {
     pub fn new(engine: &Engine, config: &Qwen2Config, max_ctx: u32) -> Self {
         let per_layer = (config.num_kv_heads * config.head_dim) as u32 * max_ctx;
         let k = (0..config.num_layers).map(|i| engine.buf_empty(per_layer as usize, &format!("kv{i}.k"))).collect();
         let v = (0..config.num_layers).map(|i| engine.buf_empty(per_layer as usize, &format!("kv{i}.v"))).collect();
-        KvCache { k, v, max_ctx, kv_len: 0, num_kv_heads: config.num_kv_heads as u32, head_dim: config.head_dim as u32 }
+        let id = NEXT_KV_CACHE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        KvCache { k, v, max_ctx, kv_len: 0, num_kv_heads: config.num_kv_heads as u32, head_dim: config.head_dim as u32, id }
     }
 
     /// Sum of every layer's K+V buffer size, at this cache's `max_ctx` (the
@@ -1024,14 +1034,17 @@ fn linear(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &
                     // Decode: coalesced matvec, same kernel shape as
                     // linear_q4_decode below, adapted to Q8_0 blocks.
                     let bg = pool.bind_group(&format!("{ckey}.decode"), &engine.linear_q8_decode, &entries);
-                    engine.dispatch(pass, &engine.linear_q8_decode, &bg, (chunk.rows.div_ceil(4), 1, 1), &ckey);
-                } else if fast && rows >= TILED_MIN_ROWS {
-                    // Prefill (M >= 16): register-blocked tiled kernel (see
-                    // linear_q4_tiled_rb.wgsl's header) - Q8_0 prefill had
-                    // no tiled kernel before this session, only the naive
-                    // one below.
+                    engine.dispatch(pass, &engine.linear_q8_decode, &bg, (chunk.rows.div_ceil(16), 1, 1), &ckey);
+                } else if fast && rows < SMALL_M_MAX_ROWS {
+                    // Short prefill: same small-M kernel and row rule as
+                    // Q4_0 (linear_q4_small_m.wgsl with its Q8 override).
+                    let bg = pool.bind_group(&format!("{ckey}.small_m"), &engine.linear_q8_small_m, &entries);
+                    engine.dispatch(pass, &engine.linear_q8_small_m, &bg, (chunk.rows.div_ceil(32), rows.div_ceil(8), 1), &ckey);
+                } else if fast {
+                    // Prefill, M >= SMALL_M_MAX_ROWS: the 64x64 tiled kernel
+                    // (linear_q4_tiled_rb.wgsl with its Q8 override).
                     let bg = pool.bind_group(&format!("{ckey}.tiled_rb"), &engine.linear_q8_tiled_rb, &entries);
-                    engine.dispatch(pass, &engine.linear_q8_tiled_rb, &bg, (chunk.rows.div_ceil(32), rows.div_ceil(32), 1), &ckey);
+                    engine.dispatch(pass, &engine.linear_q8_tiled_rb, &bg, (chunk.rows.div_ceil(64), rows.div_ceil(64), 1), &ckey);
                 } else {
                     let bg = pool.bind_group(&ckey, &engine.linear_q8, &entries);
                     engine.dispatch(pass, &engine.linear_q8, &bg, (chunk.rows.div_ceil(16), rows.div_ceil(16), 1), &ckey);
@@ -1090,37 +1103,52 @@ fn linear(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &
                 } else if rows == 1 {
                     // Decode: coalesced matvec (llm-wasm's shader_q4_matvec_coalesced.wgsl port).
                     let bg = pool.bind_group(&format!("{ckey}.decode"), &engine.linear_q4_decode, &entries);
-                    engine.dispatch(pass, &engine.linear_q4_decode, &bg, (chunk.rows.div_ceil(4), 1, 1), &ckey);
-                } else if (TILED_MIN_ROWS..PREFILL_RB_MAX_ROWS).contains(&rows) {
-                    // Prefill, TILED_MIN_ROWS <= M < PREFILL_RB_MAX_ROWS:
-                    // register-blocked 32x32/TK=16 kernel (see
-                    // linear_q4_tiled_rb.wgsl's header) - faster than the
-                    // bigger tile below at short-to-medium prefill lengths.
-                    let bg = pool.bind_group(&format!("{ckey}.tiled_rb"), &engine.linear_q4_tiled_rb, &entries);
-                    engine.dispatch(pass, &engine.linear_q4_tiled_rb, &bg, (chunk.rows.div_ceil(32), rows.div_ceil(32), 1), &ckey);
-                } else if rows >= PREFILL_RB_MAX_ROWS {
-                    // Prefill (M >= PREFILL_RB_MAX_ROWS): tiled matmul
-                    // (llm-wasm's shader_q4_tiled.wgsl port). llm-wasm
-                    // measured this kernel 3-4x slower than the naive one at
-                    // M=1 (tile/barrier overhead not amortized) - it only
-                    // pays off once weight reuse across enough rows
-                    // outweighs that, hence the size gate rather than "any
-                    // M > 1"; above PREFILL_RB_MAX_ROWS it also beats the
-                    // smaller register-blocked tile above (see
-                    // PREFILL_RB_MAX_ROWS's own doc comment).
-                    let bg = pool.bind_group(&format!("{ckey}.tiled"), &engine.linear_q4_tiled, &entries);
-                    engine.dispatch(pass, &engine.linear_q4_tiled, &bg, (chunk.rows.div_ceil(64), rows.div_ceil(64), 1), &ckey);
+                    engine.dispatch(pass, &engine.linear_q4_decode, &bg, (chunk.rows.div_ceil(16), 1, 1), &ckey);
+                } else if rows < SMALL_M_MAX_ROWS {
+                    // Short prefill: weight words read and dequantised once
+                    // per group of 8 query rows (see linear_q4_small_m.wgsl).
+                    let bg = pool.bind_group(&format!("{ckey}.small_m"), &engine.linear_q4_small_m, &entries);
+                    engine.dispatch(pass, &engine.linear_q4_small_m, &bg, (chunk.rows.div_ceil(32), rows.div_ceil(8), 1), &ckey);
                 } else {
-                    // 2 <= M < 16: below the tiled kernel's break-even point
-                    // and not the M=1 shape the coalesced matvec assumes -
-                    // fall back to the naive per-element kernel.
-                    let bg = pool.bind_group(&format!("{ckey}.naive_small_m"), &engine.linear_q4, &entries);
-                    engine.dispatch(pass, &engine.linear_q4, &bg, (chunk.rows.div_ceil(16), rows.div_ceil(16), 1), &ckey);
+                    // Prefill, M >= SMALL_M_MAX_ROWS: 64x64 register-blocked
+                    // tiled kernel (see linear_q4_tiled_rb.wgsl's header).
+                    let bg = pool.bind_group(&format!("{ckey}.tiled_rb"), &engine.linear_q4_tiled_rb, &entries);
+                    engine.dispatch(pass, &engine.linear_q4_tiled_rb, &bg, (chunk.rows.div_ceil(64), rows.div_ceil(64), 1), &ckey);
                 }
             }
         }
     }
     out
+}
+
+/// Decode's fused gate/up matvec with silu(gate) * up in the same dispatch
+/// (`linear_q4_decode_swiglu`), returning the `inter`-long gated
+/// activations. `None` when the weight is not one Q4_0 binding (or fast
+/// kernels are off): the caller then runs `linear` + `silu_mul_fused`.
+#[allow(clippy::too_many_arguments)]
+fn gate_up_swiglu_decode(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &str, x: &wgpu::Buffer, in_dim: u32, w: &MatMulWeight, b: &wgpu::Buffer, inter: u32, fast: bool) -> Option<wgpu::Buffer> {
+    let MatMulWeight::Q4_0 { chunks, blocks_per_row, out_dim } = w else { return None };
+    if !fast || chunks.len() != 1 || *out_dim != 2 * inter {
+        return None;
+    }
+    let chunk = &chunks[0];
+    let skey = scratch_key(key);
+    let out = pool.data(&format!("{skey}.swiglu"), inter as usize);
+    let dims = pool.uniform(&format!("{skey}.swiglu_dims"), LinearQDims { m: 1, k: in_dim, n: 2 * inter, act: 0, blocks_per_row: *blocks_per_row, n_offset: 0, n_total: 2 * inter, _p2: 0 });
+    let bg = pool.bind_group(
+        &format!("{key}.swiglu"),
+        &engine.linear_q4_decode_swiglu,
+        &[
+            BindGroupEntry { binding: 0, resource: x.as_entire_binding() },
+            BindGroupEntry { binding: 1, resource: chunk.qs.as_entire_binding() },
+            BindGroupEntry { binding: 2, resource: chunk.scales.as_entire_binding() },
+            BindGroupEntry { binding: 3, resource: b.as_entire_binding() },
+            BindGroupEntry { binding: 4, resource: out.as_entire_binding() },
+            BindGroupEntry { binding: 5, resource: dims.as_entire_binding() },
+        ],
+    );
+    engine.dispatch(pass, &engine.linear_q4_decode_swiglu, &bg, (inter.div_ceil(8), 1, 1), key);
+    Some(out)
 }
 
 /// A pool-owned all-zero bias buffer of `len` f32s. LoRA's two internal
@@ -1276,6 +1304,37 @@ fn rope<'a>(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key:
 /// Same RoPE as `rope()` but each row's absolute position comes from a
 /// caller-supplied buffer (`ForwardSpec::positions`) instead of a
 /// contiguous `pos_base + row` run: see `shaders/rope_positions.wgsl`.
+/// Decode (one row): RoPE on q and k plus the K/V cache write at `pos`, one
+/// dispatch (see `rope_kv_decode.wgsl`). Returns the rotated q.
+#[allow(clippy::too_many_arguments)]
+fn rope_kv_decode<'a>(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &str, q: impl Into<BufView<'a>>, k: impl Into<BufView<'a>>, v: impl Into<BufView<'a>>, cos: &wgpu::Buffer, sin: &wgpu::Buffer, k_cache: &wgpu::Buffer, v_cache: &wgpu::Buffer, pos: u32, max_ctx: u32, cfg: &Qwen2Config) -> wgpu::Buffer {
+    let (q, k, v) = (q.into(), k.into(), v.into());
+    let skey = scratch_key(key);
+    let n_heads = cfg.num_heads as u32;
+    let n_kv_heads = cfg.num_kv_heads as u32;
+    let head_dim = cfg.head_dim as u32;
+    let q_out = pool.data(&format!("{skey}.q"), (n_heads * head_dim) as usize);
+    let dims = pool.uniform(&format!("{skey}.dims"), RopeKvDims { n_heads, n_kv_heads, head_dim, pos, max_ctx, _p0: 0, _p1: 0, _p2: 0 });
+    let bg = pool.bind_group(
+        key,
+        &engine.rope_kv_decode,
+        &[
+            BindGroupEntry { binding: 0, resource: q.binding() },
+            BindGroupEntry { binding: 1, resource: k.binding() },
+            BindGroupEntry { binding: 2, resource: v.binding() },
+            BindGroupEntry { binding: 3, resource: cos.as_entire_binding() },
+            BindGroupEntry { binding: 4, resource: sin.as_entire_binding() },
+            BindGroupEntry { binding: 5, resource: q_out.as_entire_binding() },
+            BindGroupEntry { binding: 6, resource: k_cache.as_entire_binding() },
+            BindGroupEntry { binding: 7, resource: v_cache.as_entire_binding() },
+            BindGroupEntry { binding: 8, resource: dims.as_entire_binding() },
+        ],
+    );
+    let total = (n_heads + n_kv_heads) * (head_dim / 2) + n_kv_heads * head_dim;
+    engine.dispatch(pass, &engine.rope_kv_decode, &bg, (total.div_ceil(64), 1, 1), key);
+    q_out
+}
+
 #[allow(clippy::too_many_arguments)]
 fn rope_positions<'a>(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &str, buf: impl Into<BufView<'a>>, cos: &wgpu::Buffer, sin: &wgpu::Buffer, positions: &wgpu::Buffer, rows: u32, heads: u32, head_dim: u32) {
     let buf = buf.into();
@@ -1488,26 +1547,43 @@ fn embed_gather(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, 
     out
 }
 
-/// GPU-side scatter of `rows` freshly-computed K/V rows
-/// (`[rows, kv_heads, head_dim]`, row-major) into the cache's
-/// `[kv_head, kv_base+row, head_dim]` layout, via one `copy_buffer_to_buffer`
-/// per (row, kv_head) recorded into the same encoder as the dispatch that
-/// produced `src` - no CPU readback, so this can run before the attention
-/// dispatch that needs to see it (decode's self-attention).
-fn scatter_kv_gpu<'a>(encoder: &mut wgpu::CommandEncoder, cache_buf: &wgpu::Buffer, src: impl Into<BufView<'a>>, rows: u32, cfg: &Qwen2Config, kv_base: u32, max_ctx: u32) {
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct KvScatterDims {
+    rows: u32,
+    kv_heads: u32,
+    head_dim: u32,
+    kv_base: u32,
+    max_ctx: u32,
+    src_offset: u32,
+    stride_x: u32,
+    _p0: u32,
+}
+
+/// GPU-side write of `rows` freshly computed K/V rows (`[rows, kv_heads,
+/// head_dim]`, row-major) into the cache's `[kv_head, kv_base+row,
+/// head_dim]` layout, as one compute dispatch inside the open pass
+/// (`shaders/kv_scatter.wgsl`) instead of `rows * kv_heads` encoder-level
+/// copies: the multi-row paths (prefill, chunk) use this; the one-row
+/// decode path writes K/V in `rope_kv_decode` instead.
+#[allow(clippy::too_many_arguments)]
+fn scatter_kv_kernel<'a>(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &str, cache_buf: &wgpu::Buffer, src: impl Into<BufView<'a>>, rows: u32, cfg: &Qwen2Config, kv_base: u32, max_ctx: u32) {
     let src = src.into();
-    let src_base = (src.elem_offset as u64) * 4;
     let kv_heads = cfg.num_kv_heads as u32;
     let head_dim = cfg.head_dim as u32;
-    let row_bytes = (head_dim * 4) as u64;
-    for row in 0..rows {
-        for h in 0..kv_heads {
-            let src_off = src_base + (((row * kv_heads + h) * head_dim) as u64) * 4;
-            let dst_pos = kv_base + row;
-            let dst_off = (((h * max_ctx + dst_pos) * head_dim) as u64) * 4;
-            encoder.copy_buffer_to_buffer(src.buffer, src_off, cache_buf, dst_off, row_bytes);
-        }
-    }
+    let (gx, gy, stride_x) = grid1d(rows * kv_heads * head_dim);
+    let skey = scratch_key(key);
+    let dims = pool.uniform(&format!("{skey}.dims"), KvScatterDims { rows, kv_heads, head_dim, kv_base, max_ctx, src_offset: src.elem_offset, stride_x, _p0: 0 });
+    let bg = pool.bind_group(
+        key,
+        &engine.kv_scatter,
+        &[
+            BindGroupEntry { binding: 0, resource: src.buffer.as_entire_binding() },
+            BindGroupEntry { binding: 1, resource: cache_buf.as_entire_binding() },
+            BindGroupEntry { binding: 2, resource: dims.as_entire_binding() },
+        ],
+    );
+    engine.dispatch(pass, &engine.kv_scatter, &bg, (gx, gy, 1), key);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1777,6 +1853,7 @@ macro_rules! tap {
 /// GPU-scatters every position's K/V into `cache`, and returns the last
 /// position's logits ([vocab]).
 pub async fn forward_prefill(engine: &Engine, model: &GpuModel, cache: &mut KvCache, token_ids: &[u32], cos: &wgpu::Buffer, sin: &wgpu::Buffer, mask: Option<&wgpu::Buffer>) -> Vec<f32> {
+    model.pool.use_kv_cache(cache.id);
     let cfg = &model.config;
     let seq = token_ids.len() as u32;
     let hidden = cfg.hidden_size as u32;
@@ -1785,11 +1862,10 @@ pub async fn forward_prefill(engine: &Engine, model: &GpuModel, cache: &mut KvCa
     engine.diag_begin();
 
     let mut encoder = engine.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("prefill") });
-    // One open ComputePass per layer-half instead of one per dispatch: see
-    // `Engine::dispatch`'s doc comment. `scatter_kv_gpu`'s
-    // `copy_buffer_to_buffer` calls are encoder-level (not pass-level), so
-    // the pass must close before them and reopen after - two passes per
-    // layer instead of ~15.
+    // One open ComputePass for the whole prefill outside the per-layer
+    // flushes: see `Engine::dispatch`'s doc comment (the K/V cache writes
+    // are dispatches too, `scatter_kv_kernel`, so the pass stays open
+    // across them).
     let mut pass = engine.begin_pass(&mut encoder, "embed");
     let x = embed_gather(engine, pool, &mut pass, model, token_ids);
     tap!(engine, &mut encoder, pass, "embed", &x, seq * hidden);
@@ -1815,10 +1891,10 @@ pub async fn forward_prefill(engine: &Engine, model: &GpuModel, cache: &mut KvCa
         seg!(engine, &mut encoder, pass, "attn");
         let attn_out = attn_prefill(engine, pool, &mut pass, &format!("{key}.attn"), &q, &k, &v, seq, cfg);
         tap!(engine, &mut encoder, pass, format!("{key}.attn"), &attn_out, seq * q_dim);
-        drop(pass);
-        scatter_kv_gpu(&mut encoder, &cache.k[i], &k, seq, cfg, 0, cache.max_ctx);
-        scatter_kv_gpu(&mut encoder, &cache.v[i], &v, seq, cfg, 0, cache.max_ctx);
-        pass = engine.begin_pass(&mut encoder, "o_proj");
+        seg!(engine, &mut encoder, pass, "kv");
+        scatter_kv_kernel(engine, pool, &mut pass, &format!("{key}.kscatter"), &cache.k[i], &k, seq, cfg, 0, cache.max_ctx);
+        scatter_kv_kernel(engine, pool, &mut pass, &format!("{key}.vscatter"), &cache.v[i], &v, seq, cfg, 0, cache.max_ctx);
+        seg!(engine, &mut encoder, pass, "o_proj");
 
         let attn_dim = (cfg.num_heads * cfg.head_dim) as u32;
         let o = linear_lora(engine, pool, &mut pass, &format!("{key}.wo"), &attn_out, seq, attn_dim, &layer.o_w, &layer.o_b, hidden, model.fast_kernels, lora_layer.map(|l| &l.o));
@@ -1881,7 +1957,7 @@ pub async fn forward_prefill(engine: &Engine, model: &GpuModel, cache: &mut KvCa
 
     let normed_final = rmsnorm(engine, pool, &mut pass, "out_norm", &last_row, &model.out_norm, 1, hidden, cfg.rms_norm_eps);
     tap!(engine, &mut encoder, pass, "out_norm", &normed_final, hidden);
-    let logits = linear(engine, pool, &mut pass, "lm_head", &normed_final, 1, hidden, &model.lm_head, &model.zero_bias_vocab, cfg.vocab_size as u32, false);
+    let logits = linear(engine, pool, &mut pass, "lm_head", &normed_final, 1, hidden, &model.lm_head, &model.zero_bias_vocab, cfg.vocab_size as u32, model.fast_kernels);
     tap!(engine, &mut encoder, pass, "lm_head", &logits, cfg.vocab_size as u32);
     if let Some(mask) = mask {
         mask_logits_gpu(engine, pool, &mut pass, "prefill_mask", &logits, mask, cfg.vocab_size as u32, 0);
@@ -1960,22 +2036,20 @@ fn argmax_gpu(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, ke
 /// that need the full vocab never pay for the extra dispatch).
 #[allow(clippy::too_many_arguments)]
 fn decode_layers(engine: &Engine, model: &GpuModel, encoder: &mut wgpu::CommandEncoder, cache: &mut KvCache, token_id: u32, cos: &wgpu::Buffer, sin: &wgpu::Buffer, mask: Option<&wgpu::Buffer>, argmax: bool) -> (wgpu::Buffer, Option<wgpu::Buffer>) {
+    model.pool.use_kv_cache(cache.id);
     let cfg = &model.config;
     let hidden = cfg.hidden_size as u32;
     let pool = &model.pool;
     let pos = cache.kv_len;
 
-    // One open ComputePass per layer-half instead of one per dispatch (same
+    // One open ComputePass instead of one per dispatch (same
     // rationale as `forward_prefill` - see `Engine::dispatch`'s doc
     // comment): decode's per-step dispatch count doesn't scale with
     // kv_len, but at ~15 dispatches/layer every one was still its own
     // `MTLComputeCommandEncoder` session before this change (532
     // single-dispatch passes/step measured on Qwen2.5-3B, 36 layers).
-    // `scatter_kv_gpu`'s two `copy_buffer_to_buffer` calls are
-    // encoder-level, so the pass closes for them and reopens right after -
-    // no pass boundary otherwise, including across the layer loop (a
-    // layer's tail dispatches and the next layer's head dispatches share
-    // one pass).
+    // The K/V cache write is a dispatch (`rope_kv_decode`), so the whole
+    // step is one pass, across the layer loop too.
     let mut pass = engine.begin_pass(encoder, "embed");
     let x = embed_gather(engine, pool, &mut pass, model, &[token_id]);
     seg!(engine, encoder, pass, "norm");
@@ -1995,14 +2069,8 @@ fn decode_layers(engine: &Engine, model: &GpuModel, encoder: &mut wgpu::CommandE
         seg!(engine, encoder, pass, "qkv");
         let (q, k, v) = qkv_proj(engine, pool, &mut pass, &format!("{key}.qkv"), &normed, 1, cfg, layer, model.fast_kernels, lora_layer);
         seg!(engine, encoder, pass, "rope");
-        rope(engine, pool, &mut pass, &format!("{key}.ropeq"), &q, cos, sin, 1, cfg.num_heads as u32, cfg.head_dim as u32, pos);
-        rope(engine, pool, &mut pass, &format!("{key}.ropek"), &k, cos, sin, 1, cfg.num_kv_heads as u32, cfg.head_dim as u32, pos);
-
-        drop(pass);
-        scatter_kv_gpu(encoder, &cache.k[i], &k, 1, cfg, pos, cache.max_ctx);
-        scatter_kv_gpu(encoder, &cache.v[i], &v, 1, cfg, pos, cache.max_ctx);
-        pass = engine.begin_pass(encoder, "attn");
-
+        let q = rope_kv_decode(engine, pool, &mut pass, &format!("{key}.ropekv"), &q, &k, &v, cos, sin, &cache.k[i], &cache.v[i], pos, cache.max_ctx, cfg);
+        seg!(engine, encoder, pass, "attn");
         let attn_out = attn_decode(engine, pool, &mut pass, &format!("{key}.attn"), &q, &cache.k[i], &cache.v[i], pos + 1, cache.max_ctx, cfg);
 
         let attn_dim = (cfg.num_heads * cfg.head_dim) as u32;
@@ -2016,9 +2084,14 @@ fn decode_layers(engine: &Engine, model: &GpuModel, encoder: &mut wgpu::CommandE
         let mlp_key = format!("{key}.mlp");
         let inter = cfg.intermediate_size as u32;
         seg!(engine, encoder, pass, "gate_up");
-        let gate_up = linear(engine, pool, &mut pass, &format!("{mlp_key}.gate_up"), &ffn_normed, 1, hidden, &layer.gate_up_w, &layer.gate_up_b, 2 * inter, model.fast_kernels);
-        seg!(engine, encoder, pass, "silu");
-        let gated = silu_mul_fused(engine, pool, &mut pass, &format!("{mlp_key}.silu"), &gate_up, 1, inter);
+        let gated = match gate_up_swiglu_decode(engine, pool, &mut pass, &format!("{mlp_key}.gate_up"), &ffn_normed, hidden, &layer.gate_up_w, &layer.gate_up_b, inter, model.fast_kernels) {
+            Some(gated) => gated,
+            None => {
+                let gate_up = linear(engine, pool, &mut pass, &format!("{mlp_key}.gate_up"), &ffn_normed, 1, hidden, &layer.gate_up_w, &layer.gate_up_b, 2 * inter, model.fast_kernels);
+                seg!(engine, encoder, pass, "silu");
+                silu_mul_fused(engine, pool, &mut pass, &format!("{mlp_key}.silu"), &gate_up, 1, inter)
+            }
+        };
         seg!(engine, encoder, pass, "down");
         let mlp_out = linear(engine, pool, &mut pass, &format!("{mlp_key}.down"), &gated, 1, inter, &layer.down_w, &layer.down_b, hidden, model.fast_kernels);
         seg!(engine, encoder, pass, "add+norm");
@@ -2098,10 +2171,11 @@ pub async fn forward_decode_step_argmax(engine: &Engine, model: &GpuModel, cache
     // finished/submitted - see `Engine::resolve_profile`'s doc comment.
     let profile = engine.resolve_profile(&mut encoder);
     let diag = engine.diag_resolve(&mut encoder);
+    let staging = engine.stage_u32(&mut encoder, &idx);
     engine.queue.submit(Some(encoder.finish()));
     let t_submitted = crate::engine::now_ms();
     cache.kv_len += 1;
-    let result = engine.read_u32(&idx).await;
+    let result = engine.map_u32(&staging).await;
     engine.diag_encode_ms.set(t_submitted - t_start);
     engine.diag_wait_ms.set(crate::engine::now_ms() - t_submitted);
     if let Some((buf, count)) = diag {
@@ -2175,6 +2249,7 @@ pub async fn forward_prefill_suffix(engine: &Engine, model: &GpuModel, cache: &m
 /// per-chunk rewind, `LifeEngine::step_ids_a`'s pattern in the Burn
 /// engine).
 pub async fn forward_chunk_spec(engine: &Engine, model: &GpuModel, cache: &mut KvCache, token_ids: &[u32], cos: &wgpu::Buffer, sin: &wgpu::Buffer, spec: &ForwardSpec) -> wgpu::Buffer {
+    model.pool.use_kv_cache(cache.id);
     let cfg = &model.config;
     let t = token_ids.len() as u32;
     let hidden = cfg.hidden_size as u32;
@@ -2216,10 +2291,8 @@ pub async fn forward_chunk_spec(engine: &Engine, model: &GpuModel, cache: &mut K
         rope_positions(engine, pool, &mut pass, &format!("{key}.ropeq"), &q, cos, sin, &pos_buf, t, cfg.num_heads as u32, cfg.head_dim as u32);
         rope_positions(engine, pool, &mut pass, &format!("{key}.ropek"), &k, cos, sin, &pos_buf, t, cfg.num_kv_heads as u32, cfg.head_dim as u32);
 
-        drop(pass);
-        scatter_kv_gpu(&mut encoder, &cache.k[i], &k, t, cfg, prefix_len, cache.max_ctx);
-        scatter_kv_gpu(&mut encoder, &cache.v[i], &v, t, cfg, prefix_len, cache.max_ctx);
-        pass = engine.begin_pass(&mut encoder, "chunk");
+        scatter_kv_kernel(engine, pool, &mut pass, &format!("{key}.kscatter"), &cache.k[i], &k, t, cfg, prefix_len, cache.max_ctx);
+        scatter_kv_kernel(engine, pool, &mut pass, &format!("{key}.vscatter"), &cache.v[i], &v, t, cfg, prefix_len, cache.max_ctx);
 
         let attn_out = attn_chunk_masked(engine, pool, &mut pass, &format!("{key}.attn"), &q, &cache.k[i], &cache.v[i], &mask_buf, t, kv_total, cache.max_ctx, cfg);
 

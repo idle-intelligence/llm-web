@@ -146,20 +146,23 @@ pub struct Engine {
     /// rows-per-workgroup structure as `linear_q4_decode`/`linear_q8_decode`,
     /// see `shaders/linear_q6k_decode.wgsl`'s header for the per-block split.
     pub linear_q6k_decode: wgpu::ComputePipeline,
-    /// Tiled Q4_0 matmul (prefill, M>1): ported from llm-wasm's
-    /// shader_q4_tiled.wgsl. Only faster than `linear_q4` once weight reuse
-    /// across rows outweighs the tile/barrier overhead: see the shader's
-    /// doc comment for llm-wasm's own measured regression at small M.
-    pub linear_q4_tiled: wgpu::ComputePipeline,
-    /// See `linear_q4_tiled_rb.wgsl`'s header: register-blocked 32x32/TK=16
-    /// alternative to `linear_q4_tiled`, size-gated in `model.rs::linear`.
+    /// See `linear_q4_tiled_rb.wgsl`'s header: 64x64 register-blocked tiled
+    /// Q4_0 matmul, prefill at `SMALL_M_MAX_ROWS` rows and above.
     pub linear_q4_tiled_rb: wgpu::ComputePipeline,
-    /// See `linear_q8_tiled_rb.wgsl`'s header: same scheme for Q8_0.
+    /// `linear_q4_tiled_rb.wgsl` with its `Q8` override: Q8_0 prefill.
     pub linear_q8_tiled_rb: wgpu::ComputePipeline,
     /// Coalesced Q4_0 matvec (decode, M=1): ported from llm-wasm's
     /// shader_q4_matvec_coalesced.wgsl. The fast decode kernel; it uses no
     /// cooperative-group extension, so it runs on any WebGPU adapter.
     pub linear_q4_decode: wgpu::ComputePipeline,
+    /// `linear_q4_decode.wgsl` with `GATE_UP`: the fused gate/up matvec
+    /// with silu(gate) * up in its epilogue (decode MLP).
+    pub linear_q4_decode_swiglu: wgpu::ComputePipeline,
+    /// Small-M Q4_0 matmul (short prefill): see `linear_q4_small_m.wgsl`'s
+    /// header and `SMALL_M_MAX_ROWS` in model.rs.
+    pub linear_q4_small_m: wgpu::ComputePipeline,
+    /// `linear_q4_small_m.wgsl` with its `Q8` override: Q8_0 short prefill.
+    pub linear_q8_small_m: wgpu::ComputePipeline,
     pub attn_prefill: wgpu::ComputePipeline,
     /// `shaders/attn_decode.wgsl` compiled with its `HEAD_DIM` override
     /// constant set to 64 (Qwen2.5). One thread owns one output dim, so
@@ -182,6 +185,9 @@ pub struct Engine {
     /// Same shader as `attn_decode_reduce`, `HEAD_DIM` overridden to 128.
     pub attn_decode_reduce_128: wgpu::ComputePipeline,
     pub add_inplace: wgpu::ComputePipeline,
+    pub kv_scatter: wgpu::ComputePipeline,
+    /// Decode's RoPE + K/V cache write in one dispatch (`rope_kv_decode.wgsl`).
+    pub rope_kv_decode: wgpu::ComputePipeline,
     /// `shaders/add_rmsnorm.wgsl`: fuses a residual `add_inplace` with the
     /// rmsnorm that always immediately follows it in the decoder layer's
     /// decode path (see that shader's header). Used only by decode's
@@ -304,6 +310,15 @@ impl Engine {
         // whatever WebGPU's downlevel limits actually allow and split
         // large tensors across bindings if it doesn't.
         let adapter_limits = adapter.limits();
+        // The tiled prefill kernels use a 16x16 workgroup and 16 KiB of
+        // workgroup storage: the WebGPU spec's guaranteed minimums, so every
+        // conforming adapter passes this.
+        anyhow::ensure!(
+            adapter_limits.max_compute_invocations_per_workgroup >= 256 && adapter_limits.max_compute_workgroup_storage_size >= 16384,
+            "adapter below the WebGPU minimum compute limits (invocations {}, workgroup storage {})",
+            adapter_limits.max_compute_invocations_per_workgroup,
+            adapter_limits.max_compute_workgroup_storage_size
+        );
         let want_profiling = std::env::var(PROFILE_ENV_VAR).as_deref() == Ok("1");
         let profile_features = wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES;
         let grant_profiling = want_profiling && adapter.features().contains(profile_features);
@@ -368,10 +383,12 @@ impl Engine {
             linear_q8_decode: make_pipeline(&device, "linear_q8_decode", include_str!("shaders/linear_q8_decode.wgsl")),
             linear_q6k: make_pipeline(&device, "linear_q6k", include_str!("shaders/linear_q6k.wgsl")),
             linear_q6k_decode: make_pipeline(&device, "linear_q6k_decode", include_str!("shaders/linear_q6k_decode.wgsl")),
-            linear_q4_tiled: make_pipeline(&device, "linear_q4_tiled", include_str!("shaders/linear_q4_tiled.wgsl")),
             linear_q4_tiled_rb: make_pipeline(&device, "linear_q4_tiled_rb", include_str!("shaders/linear_q4_tiled_rb.wgsl")),
-            linear_q8_tiled_rb: make_pipeline(&device, "linear_q8_tiled_rb", include_str!("shaders/linear_q8_tiled_rb.wgsl")),
+            linear_q8_tiled_rb: make_pipeline_with_constants(&device, "linear_q8_tiled_rb", include_str!("shaders/linear_q4_tiled_rb.wgsl"), &[("Q8", 1.0)]),
             linear_q4_decode: make_pipeline(&device, "linear_q4_decode", include_str!("shaders/linear_q4_decode.wgsl")),
+            linear_q4_decode_swiglu: make_pipeline_with_constants(&device, "linear_q4_decode_swiglu", include_str!("shaders/linear_q4_decode.wgsl"), &[("GATE_UP", 1.0)]),
+            linear_q4_small_m: make_pipeline(&device, "linear_q4_small_m", include_str!("shaders/linear_q4_small_m.wgsl")),
+            linear_q8_small_m: make_pipeline_with_constants(&device, "linear_q8_small_m", include_str!("shaders/linear_q4_small_m.wgsl"), &[("Q8", 1.0)]),
             attn_prefill: make_pipeline(&device, "attn_prefill", include_str!("shaders/attn_prefill.wgsl")),
             attn_decode: make_pipeline_with_constants(&device, "attn_decode", include_str!("shaders/attn_decode.wgsl"), &[("HEAD_DIM", 64.0)]),
             attn_decode_128: make_pipeline_with_constants(&device, "attn_decode_128", include_str!("shaders/attn_decode.wgsl"), &[("HEAD_DIM", 128.0)]),
@@ -380,6 +397,8 @@ impl Engine {
             attn_decode_reduce: make_pipeline_with_constants(&device, "attn_decode_reduce", include_str!("shaders/attn_decode_reduce.wgsl"), &[("HEAD_DIM", 64.0)]),
             attn_decode_reduce_128: make_pipeline_with_constants(&device, "attn_decode_reduce_128", include_str!("shaders/attn_decode_reduce.wgsl"), &[("HEAD_DIM", 128.0)]),
             add_inplace: make_pipeline(&device, "add_inplace", include_str!("shaders/add_inplace.wgsl")),
+            kv_scatter: make_pipeline(&device, "kv_scatter", include_str!("shaders/kv_scatter.wgsl")),
+            rope_kv_decode: make_pipeline(&device, "rope_kv_decode", include_str!("shaders/rope_kv_decode.wgsl")),
             add_rmsnorm: make_pipeline(&device, "add_rmsnorm", include_str!("shaders/add_rmsnorm.wgsl")),
             silu_mul_fused: make_pipeline(&device, "silu_mul_fused", include_str!("shaders/silu_mul_fused.wgsl")),
             argmax: make_pipeline(&device, "argmax", include_str!("shaders/argmax.wgsl")),
@@ -846,16 +865,28 @@ impl Engine {
     /// kernel's output) - a 4-byte readback instead of a `vocab_size * 4`
     /// one for every decode step.
     pub async fn read_u32(&self, buf: &wgpu::Buffer) -> u32 {
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("readback_u32") });
+        let staging = self.stage_u32(&mut encoder, buf);
+        self.queue.submit(Some(encoder.finish()));
+        self.map_u32(&staging).await
+    }
+
+    /// Records the copy of `buf`'s first `u32` into a fresh mappable buffer
+    /// on `encoder`, so a forward pass can submit its work and its readback
+    /// copy together (one submit per decode step instead of two); read the
+    /// value with `map_u32` after submitting.
+    pub fn stage_u32(&self, encoder: &mut wgpu::CommandEncoder, buf: &wgpu::Buffer) -> wgpu::Buffer {
         let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("readback_staging_u32"),
             size: 4,
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("readback_u32") });
         encoder.copy_buffer_to_buffer(buf, 0, &staging, 0, 4);
-        self.queue.submit(Some(encoder.finish()));
+        staging
+    }
 
+    pub async fn map_u32(&self, staging: &wgpu::Buffer) -> u32 {
         let slice = staging.slice(..);
         let (tx, rx) = futures_channel::oneshot::channel();
         slice.map_async(wgpu::MapMode::Read, move |res| {

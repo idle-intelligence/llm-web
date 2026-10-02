@@ -65,6 +65,8 @@ pub struct Pool {
     uniform_cache: RefCell<HashMap<String, Vec<u8>>>,
     bind_groups: RefCell<HashMap<String, (wgpu::BindGroup, u64)>>,
     alloc_count: Cell<u64>,
+    /// `KvCache` id the cached bind groups were built against (0 = none).
+    kv_cache_id: Cell<u64>,
 }
 
 impl Pool {
@@ -83,6 +85,19 @@ impl Pool {
 }
 
 impl Pool {
+    /// Called by every forward function with its `KvCache`'s id: a cache
+    /// other than the last one seen invalidates every cached bind group
+    /// (they may bind the previous cache's K/V buffers), the same effect
+    /// `reset()` has on bind groups, without dropping the pooled buffers.
+    /// With this, reusing one `KvCache` across generations (the browser
+    /// engine does) needs no `reset()` and keeps every bind group.
+    pub fn use_kv_cache(&self, id: u64) {
+        if self.kv_cache_id.get() != id {
+            self.kv_cache_id.set(id);
+            self.generation.set(self.generation.get() + 1);
+        }
+    }
+
     pub fn new(device: wgpu::Device, queue: wgpu::Queue) -> Self {
         Pool {
             device,
@@ -92,6 +107,7 @@ impl Pool {
             uniform_cache: RefCell::new(HashMap::new()),
             bind_groups: RefCell::new(HashMap::new()),
             alloc_count: Cell::new(0),
+            kv_cache_id: Cell::new(0),
         }
     }
 
