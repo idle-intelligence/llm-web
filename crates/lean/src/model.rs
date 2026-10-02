@@ -67,6 +67,17 @@ const TILED_MIN_ROWS: u32 = 16;
 /// re-measuring if it turned out not to.
 const PREFILL_RB_MAX_ROWS: u32 = 512;
 
+/// Below this many rows (and above 1), Q4_0 prefill uses
+/// `linear_q4_small_m.wgsl`: it reads and dequantises each weight word once
+/// per group of 8 query rows, where the tiled kernels pay for a whole
+/// padded row tile. Measured on a mobile GPU (Adreno 6xx), the 32x32 tiled
+/// kernel ran a 36-token prompt's MLP matmuls about 5x slower than 36
+/// decode-style matvecs would have; see docs/runs/2026-10-02-lean-mobile.md
+/// for the M2 sweep this value comes from. A row-count rule, the same on
+/// every device.
+const SMALL_M_MAX_ROWS: u32 = 64;
+
+
 /// WebGPU's `max_compute_workgroups_per_dimension`: 65535 on every backend
 /// (spec-mandated minimum-and-typical value, not a per-device tuned
 /// number - `wgpu::Limits::default()` and this project's adapters alike
@@ -1091,14 +1102,19 @@ fn linear(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &
                     // Decode: coalesced matvec (llm-wasm's shader_q4_matvec_coalesced.wgsl port).
                     let bg = pool.bind_group(&format!("{ckey}.decode"), &engine.linear_q4_decode, &entries);
                     engine.dispatch(pass, &engine.linear_q4_decode, &bg, (chunk.rows.div_ceil(4), 1, 1), &ckey);
-                } else if (TILED_MIN_ROWS..PREFILL_RB_MAX_ROWS).contains(&rows) {
-                    // Prefill, TILED_MIN_ROWS <= M < PREFILL_RB_MAX_ROWS:
+                } else if rows < SMALL_M_MAX_ROWS {
+                    // Short prefill: weight words read and dequantised once
+                    // per group of 8 query rows (see linear_q4_small_m.wgsl).
+                    let bg = pool.bind_group(&format!("{ckey}.small_m"), &engine.linear_q4_small_m, &entries);
+                    engine.dispatch(pass, &engine.linear_q4_small_m, &bg, (chunk.rows.div_ceil(32), rows.div_ceil(8), 1), &ckey);
+                } else if rows < PREFILL_RB_MAX_ROWS {
+                    // Prefill, SMALL_M_MAX_ROWS <= M < PREFILL_RB_MAX_ROWS:
                     // register-blocked 32x32/TK=16 kernel (see
                     // linear_q4_tiled_rb.wgsl's header) - faster than the
                     // bigger tile below at short-to-medium prefill lengths.
                     let bg = pool.bind_group(&format!("{ckey}.tiled_rb"), &engine.linear_q4_tiled_rb, &entries);
                     engine.dispatch(pass, &engine.linear_q4_tiled_rb, &bg, (chunk.rows.div_ceil(32), rows.div_ceil(32), 1), &ckey);
-                } else if rows >= PREFILL_RB_MAX_ROWS {
+                } else {
                     // Prefill (M >= PREFILL_RB_MAX_ROWS): tiled matmul
                     // (llm-wasm's shader_q4_tiled.wgsl port). llm-wasm
                     // measured this kernel 3-4x slower than the naive one at
@@ -1110,12 +1126,6 @@ fn linear(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &
                     // PREFILL_RB_MAX_ROWS's own doc comment).
                     let bg = pool.bind_group(&format!("{ckey}.tiled"), &engine.linear_q4_tiled, &entries);
                     engine.dispatch(pass, &engine.linear_q4_tiled, &bg, (chunk.rows.div_ceil(64), rows.div_ceil(64), 1), &ckey);
-                } else {
-                    // 2 <= M < 16: below the tiled kernel's break-even point
-                    // and not the M=1 shape the coalesced matvec assumes -
-                    // fall back to the naive per-element kernel.
-                    let bg = pool.bind_group(&format!("{ckey}.naive_small_m"), &engine.linear_q4, &entries);
-                    engine.dispatch(pass, &engine.linear_q4, &bg, (chunk.rows.div_ceil(16), rows.div_ceil(16), 1), &ckey);
                 }
             }
         }

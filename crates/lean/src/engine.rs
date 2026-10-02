@@ -146,6 +146,9 @@ pub struct Engine {
     /// shader_q4_matvec_coalesced.wgsl. The fast decode kernel; it uses no
     /// cooperative-group extension, so it runs on any WebGPU adapter.
     pub linear_q4_decode: wgpu::ComputePipeline,
+    /// Small-M Q4_0 matmul (short prefill): see `linear_q4_small_m.wgsl`'s
+    /// header and `SMALL_M_MAX_ROWS` in model.rs.
+    pub linear_q4_small_m: wgpu::ComputePipeline,
     pub attn_prefill: wgpu::ComputePipeline,
     /// `shaders/attn_decode.wgsl` compiled with its `HEAD_DIM` override
     /// constant set to 64 (Qwen2.5). One thread owns one output dim, so
@@ -316,6 +319,7 @@ impl Engine {
             linear_q4_tiled_rb: make_pipeline(&device, "linear_q4_tiled_rb", include_str!("shaders/linear_q4_tiled_rb.wgsl")),
             linear_q8_tiled_rb: make_pipeline(&device, "linear_q8_tiled_rb", include_str!("shaders/linear_q8_tiled_rb.wgsl")),
             linear_q4_decode: make_pipeline(&device, "linear_q4_decode", include_str!("shaders/linear_q4_decode.wgsl")),
+            linear_q4_small_m: make_pipeline(&device, "linear_q4_small_m", include_str!("shaders/linear_q4_small_m.wgsl")),
             attn_prefill: make_pipeline(&device, "attn_prefill", include_str!("shaders/attn_prefill.wgsl")),
             attn_decode: make_pipeline_with_constants(&device, "attn_decode", include_str!("shaders/attn_decode.wgsl"), &[("HEAD_DIM", 64.0)]),
             attn_decode_128: make_pipeline_with_constants(&device, "attn_decode_128", include_str!("shaders/attn_decode.wgsl"), &[("HEAD_DIM", 128.0)]),
