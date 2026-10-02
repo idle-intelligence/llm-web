@@ -141,6 +141,18 @@ struct RmsDims {
 }
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct RopeKvDims {
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    pos: u32,
+    max_ctx: u32,
+    _p0: u32,
+    _p1: u32,
+    _p2: u32,
+}
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct RopeDims {
     rows: u32,
     heads: u32,
@@ -1259,6 +1271,37 @@ fn rope<'a>(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key:
 /// Same RoPE as `rope()` but each row's absolute position comes from a
 /// caller-supplied buffer (`ForwardSpec::positions`) instead of a
 /// contiguous `pos_base + row` run: see `shaders/rope_positions.wgsl`.
+/// Decode (one row): RoPE on q and k plus the K/V cache write at `pos`, one
+/// dispatch (see `rope_kv_decode.wgsl`). Returns the rotated q.
+#[allow(clippy::too_many_arguments)]
+fn rope_kv_decode<'a>(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &str, q: impl Into<BufView<'a>>, k: impl Into<BufView<'a>>, v: impl Into<BufView<'a>>, cos: &wgpu::Buffer, sin: &wgpu::Buffer, k_cache: &wgpu::Buffer, v_cache: &wgpu::Buffer, pos: u32, max_ctx: u32, cfg: &Qwen2Config) -> wgpu::Buffer {
+    let (q, k, v) = (q.into(), k.into(), v.into());
+    let skey = scratch_key(key);
+    let n_heads = cfg.num_heads as u32;
+    let n_kv_heads = cfg.num_kv_heads as u32;
+    let head_dim = cfg.head_dim as u32;
+    let q_out = pool.data(&format!("{skey}.q"), (n_heads * head_dim) as usize);
+    let dims = pool.uniform(&format!("{skey}.dims"), RopeKvDims { n_heads, n_kv_heads, head_dim, pos, max_ctx, _p0: 0, _p1: 0, _p2: 0 });
+    let bg = pool.bind_group(
+        key,
+        &engine.rope_kv_decode,
+        &[
+            BindGroupEntry { binding: 0, resource: q.binding() },
+            BindGroupEntry { binding: 1, resource: k.binding() },
+            BindGroupEntry { binding: 2, resource: v.binding() },
+            BindGroupEntry { binding: 3, resource: cos.as_entire_binding() },
+            BindGroupEntry { binding: 4, resource: sin.as_entire_binding() },
+            BindGroupEntry { binding: 5, resource: q_out.as_entire_binding() },
+            BindGroupEntry { binding: 6, resource: k_cache.as_entire_binding() },
+            BindGroupEntry { binding: 7, resource: v_cache.as_entire_binding() },
+            BindGroupEntry { binding: 8, resource: dims.as_entire_binding() },
+        ],
+    );
+    let total = (n_heads + n_kv_heads) * (head_dim / 2) + n_kv_heads * head_dim;
+    engine.dispatch(pass, &engine.rope_kv_decode, &bg, (total.div_ceil(64), 1, 1), key);
+    q_out
+}
+
 #[allow(clippy::too_many_arguments)]
 fn rope_positions<'a>(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &str, buf: impl Into<BufView<'a>>, cos: &wgpu::Buffer, sin: &wgpu::Buffer, positions: &wgpu::Buffer, rows: u32, heads: u32, head_dim: u32) {
     let buf = buf.into();
@@ -1471,28 +1514,6 @@ fn embed_gather(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, 
     out
 }
 
-/// GPU-side scatter of `rows` freshly-computed K/V rows
-/// (`[rows, kv_heads, head_dim]`, row-major) into the cache's
-/// `[kv_head, kv_base+row, head_dim]` layout, via one `copy_buffer_to_buffer`
-/// per (row, kv_head) recorded into the same encoder as the dispatch that
-/// produced `src` - no CPU readback, so this can run before the attention
-/// dispatch that needs to see it (decode's self-attention).
-fn scatter_kv_gpu<'a>(encoder: &mut wgpu::CommandEncoder, cache_buf: &wgpu::Buffer, src: impl Into<BufView<'a>>, rows: u32, cfg: &Qwen2Config, kv_base: u32, max_ctx: u32) {
-    let src = src.into();
-    let src_base = (src.elem_offset as u64) * 4;
-    let kv_heads = cfg.num_kv_heads as u32;
-    let head_dim = cfg.head_dim as u32;
-    let row_bytes = (head_dim * 4) as u64;
-    for row in 0..rows {
-        for h in 0..kv_heads {
-            let src_off = src_base + (((row * kv_heads + h) * head_dim) as u64) * 4;
-            let dst_pos = kv_base + row;
-            let dst_off = (((h * max_ctx + dst_pos) * head_dim) as u64) * 4;
-            encoder.copy_buffer_to_buffer(src.buffer, src_off, cache_buf, dst_off, row_bytes);
-        }
-    }
-}
-
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct KvScatterDims {
@@ -1506,10 +1527,12 @@ struct KvScatterDims {
     _p0: u32,
 }
 
-/// Same write as [`scatter_kv_gpu`], as one compute dispatch inside the
-/// open pass (`shaders/kv_scatter.wgsl`) instead of `rows * kv_heads`
-/// encoder-level copies: the multi-row paths (prefill, chunk) use this; the
-/// one-row decode path keeps its two copies.
+/// GPU-side write of `rows` freshly computed K/V rows (`[rows, kv_heads,
+/// head_dim]`, row-major) into the cache's `[kv_head, kv_base+row,
+/// head_dim]` layout, as one compute dispatch inside the open pass
+/// (`shaders/kv_scatter.wgsl`) instead of `rows * kv_heads` encoder-level
+/// copies: the multi-row paths (prefill, chunk) use this; the one-row
+/// decode path writes K/V in `rope_kv_decode` instead.
 #[allow(clippy::too_many_arguments)]
 fn scatter_kv_kernel<'a>(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &str, cache_buf: &wgpu::Buffer, src: impl Into<BufView<'a>>, rows: u32, cfg: &Qwen2Config, kv_base: u32, max_ctx: u32) {
     let src = src.into();
@@ -1951,17 +1974,14 @@ fn decode_layers(engine: &Engine, model: &GpuModel, encoder: &mut wgpu::CommandE
     let pool = &model.pool;
     let pos = cache.kv_len;
 
-    // One open ComputePass per layer-half instead of one per dispatch (same
+    // One open ComputePass instead of one per dispatch (same
     // rationale as `forward_prefill` - see `Engine::dispatch`'s doc
     // comment): decode's per-step dispatch count doesn't scale with
     // kv_len, but at ~15 dispatches/layer every one was still its own
     // `MTLComputeCommandEncoder` session before this change (532
     // single-dispatch passes/step measured on Qwen2.5-3B, 36 layers).
-    // `scatter_kv_gpu`'s two `copy_buffer_to_buffer` calls are
-    // encoder-level, so the pass closes for them and reopens right after -
-    // no pass boundary otherwise, including across the layer loop (a
-    // layer's tail dispatches and the next layer's head dispatches share
-    // one pass).
+    // The K/V cache write is a dispatch (`rope_kv_decode`), so the whole
+    // step is one pass, across the layer loop too.
     let mut pass = engine.begin_pass(encoder, "embed");
     let x = embed_gather(engine, pool, &mut pass, model, &[token_id]);
     seg!(engine, encoder, pass, "norm");
@@ -1981,14 +2001,8 @@ fn decode_layers(engine: &Engine, model: &GpuModel, encoder: &mut wgpu::CommandE
         seg!(engine, encoder, pass, "qkv");
         let (q, k, v) = qkv_proj(engine, pool, &mut pass, &format!("{key}.qkv"), &normed, 1, cfg, layer, model.fast_kernels, lora_layer);
         seg!(engine, encoder, pass, "rope");
-        rope(engine, pool, &mut pass, &format!("{key}.ropeq"), &q, cos, sin, 1, cfg.num_heads as u32, cfg.head_dim as u32, pos);
-        rope(engine, pool, &mut pass, &format!("{key}.ropek"), &k, cos, sin, 1, cfg.num_kv_heads as u32, cfg.head_dim as u32, pos);
-
-        drop(pass);
-        scatter_kv_gpu(encoder, &cache.k[i], &k, 1, cfg, pos, cache.max_ctx);
-        scatter_kv_gpu(encoder, &cache.v[i], &v, 1, cfg, pos, cache.max_ctx);
-        pass = engine.begin_pass(encoder, "attn");
-
+        let q = rope_kv_decode(engine, pool, &mut pass, &format!("{key}.ropekv"), &q, &k, &v, cos, sin, &cache.k[i], &cache.v[i], pos, cache.max_ctx, cfg);
+        seg!(engine, encoder, pass, "attn");
         let attn_out = attn_decode(engine, pool, &mut pass, &format!("{key}.attn"), &q, &cache.k[i], &cache.v[i], pos + 1, cache.max_ctx, cfg);
 
         let attn_dim = (cfg.num_heads * cfg.head_dim) as u32;
