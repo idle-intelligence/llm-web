@@ -1021,7 +1021,7 @@ fn linear(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &
                     // Decode: coalesced matvec, same kernel shape as
                     // linear_q4_decode below, adapted to Q8_0 blocks.
                     let bg = pool.bind_group(&format!("{ckey}.decode"), &engine.linear_q8_decode, &entries);
-                    engine.dispatch(pass, &engine.linear_q8_decode, &bg, (chunk.rows.div_ceil(4), 1, 1), &ckey);
+                    engine.dispatch(pass, &engine.linear_q8_decode, &bg, (chunk.rows.div_ceil(16), 1, 1), &ckey);
                 } else if fast && rows >= TILED_MIN_ROWS {
                     // Prefill (M >= 16): register-blocked tiled kernel (see
                     // linear_q4_tiled_rb.wgsl's header) - Q8_0 prefill had
