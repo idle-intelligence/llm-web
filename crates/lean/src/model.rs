@@ -893,6 +893,27 @@ impl GpuModel {
         engine.queue.submit(Some(encoder.finish()));
         engine.read_buffer(&logits, (rows * n) as usize).await
     }
+
+    /// Same as [`GpuModel::lm_head_sliced`], but the head rows are read from
+    /// the token embedding table (`token_embd.weight`) instead of the lm
+    /// head (`output.weight`). Qwen2.5-0.5B ties the two in its HF
+    /// checkpoint, but its GGUF stores them separately quantized (Q4_0
+    /// embedding, Q8_0 output), so the two slices differ by quantization
+    /// noise. llm-life's adapters were trained (and its reference computes
+    /// logits) against the embedding rows, which is what this reads.
+    pub async fn embed_head_sliced(&self, engine: &Engine, hidden_states: &wgpu::Buffer, rows: u32, token_ids: &[u32]) -> Vec<f32> {
+        let mut encoder = engine.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("embed_head_sliced") });
+        let n = token_ids.len() as u32;
+        let hidden_dim = self.config.hidden_size as u32;
+        let mut pass = engine.begin_pass(&mut encoder, "embed_head_sliced");
+        let gathered = embed_gather(engine, &self.pool, &mut pass, self, token_ids);
+        let w = MatMulWeight::F32 { w: gathered };
+        let zero_b = zero_bias(engine, &self.pool, "embed_head.bias", n);
+        let logits = linear(engine, &self.pool, &mut pass, "embed_head.linear", hidden_states, rows, hidden_dim, &w, &zero_b, n, false);
+        drop(pass);
+        engine.queue.submit(Some(encoder.finish()));
+        engine.read_buffer(&logits, (rows * n) as usize).await
+    }
 }
 
 /// RoPE cos/sin tables for absolute positions `[0, max_pos)`, `half =
