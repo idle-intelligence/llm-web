@@ -330,10 +330,9 @@ impl LeanEngine {
         let cos_buf = self.cos_buf.as_ref().ok_or_else(|| JsError::new("load() must be called first"))?;
         let sin_buf = self.sin_buf.as_ref().ok_or_else(|| JsError::new("load() must be called first"))?;
 
-        // A fresh generation per call: reset the pool's stale bind-group
-        // cache (see pool.rs's bug note referenced in lean_cli.rs) and
-        // restart the KV cache from position 0.
-        model.pool.reset();
+        // A fresh generation per call: restart the KV cache from position 0.
+        // The pool keeps its buffers and bind groups (same KvCache, see
+        // `Pool::use_kv_cache`).
         cache.kv_len = 0;
 
         let rendered = render_user_prompt(chat_template, &prompt).map_err(|e| JsError::new(&format!("failed to render prompt: {e}")))?;
@@ -421,7 +420,6 @@ impl LeanEngine {
         let cos_buf = self.cos_buf.as_ref().ok_or_else(|| JsError::new("load() must be called first"))?;
         let sin_buf = self.sin_buf.as_ref().ok_or_else(|| JsError::new("load() must be called first"))?;
 
-        model.pool.reset();
         cache.kv_len = 0;
 
         let rendered = render_user_prompt(chat_template, &prompt).map_err(|e| JsError::new(&format!("failed to render prompt: {e}")))?;
@@ -563,7 +561,6 @@ impl LeanEngine {
         if token_ids.len() as u32 > cache.max_ctx {
             return Err(JsError::new("token_ids exceeds max_ctx"));
         }
-        model.pool.reset();
         cache.kv_len = 0;
         let mask = mask_buf(&self.engine, &mask_bits);
         Ok(forward_prefill(&self.engine, model, cache, &token_ids, cos_buf, sin_buf, mask.as_ref()).await)
@@ -655,9 +652,7 @@ impl LeanEngine {
     /// `chatGenerate` use.
     #[wasm_bindgen(js_name = chatReset)]
     pub fn chat_reset(&mut self) -> Result<(), JsError> {
-        let model = self.model.as_ref().ok_or_else(|| JsError::new("load() must be called first"))?;
         let cache = self.cache.as_mut().ok_or_else(|| JsError::new("load() must be called first"))?;
-        model.pool.reset();
         cache.kv_len = 0;
         self.chat_history.clear();
         Ok(())

@@ -417,14 +417,20 @@ pub struct KvCache {
     pub kv_len: u32,
     num_kv_heads: u32,
     head_dim: u32,
+    /// Process-unique id, so `Pool::use_kv_cache` can tell a new cache (whose
+    /// buffers no cached bind group points at yet) from the one it last saw.
+    id: u64,
 }
+
+static NEXT_KV_CACHE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl KvCache {
     pub fn new(engine: &Engine, config: &Qwen2Config, max_ctx: u32) -> Self {
         let per_layer = (config.num_kv_heads * config.head_dim) as u32 * max_ctx;
         let k = (0..config.num_layers).map(|i| engine.buf_empty(per_layer as usize, &format!("kv{i}.k"))).collect();
         let v = (0..config.num_layers).map(|i| engine.buf_empty(per_layer as usize, &format!("kv{i}.v"))).collect();
-        KvCache { k, v, max_ctx, kv_len: 0, num_kv_heads: config.num_kv_heads as u32, head_dim: config.head_dim as u32 }
+        let id = NEXT_KV_CACHE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        KvCache { k, v, max_ctx, kv_len: 0, num_kv_heads: config.num_kv_heads as u32, head_dim: config.head_dim as u32, id }
     }
 
     /// Sum of every layer's K+V buffer size, at this cache's `max_ctx` (the
@@ -1836,6 +1842,7 @@ macro_rules! seg {
 /// GPU-scatters every position's K/V into `cache`, and returns the last
 /// position's logits ([vocab]).
 pub async fn forward_prefill(engine: &Engine, model: &GpuModel, cache: &mut KvCache, token_ids: &[u32], cos: &wgpu::Buffer, sin: &wgpu::Buffer, mask: Option<&wgpu::Buffer>) -> Vec<f32> {
+    model.pool.use_kv_cache(cache.id);
     let cfg = &model.config;
     let seq = token_ids.len() as u32;
     let hidden = cfg.hidden_size as u32;
@@ -1999,6 +2006,7 @@ fn argmax_gpu(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, ke
 /// that need the full vocab never pay for the extra dispatch).
 #[allow(clippy::too_many_arguments)]
 fn decode_layers(engine: &Engine, model: &GpuModel, encoder: &mut wgpu::CommandEncoder, cache: &mut KvCache, token_id: u32, cos: &wgpu::Buffer, sin: &wgpu::Buffer, mask: Option<&wgpu::Buffer>, argmax: bool) -> (wgpu::Buffer, Option<wgpu::Buffer>) {
+    model.pool.use_kv_cache(cache.id);
     let cfg = &model.config;
     let hidden = cfg.hidden_size as u32;
     let pool = &model.pool;
@@ -2210,6 +2218,7 @@ pub async fn forward_prefill_suffix(engine: &Engine, model: &GpuModel, cache: &m
 /// per-chunk rewind, `LifeEngine::step_ids_a`'s pattern in the Burn
 /// engine).
 pub async fn forward_chunk_spec(engine: &Engine, model: &GpuModel, cache: &mut KvCache, token_ids: &[u32], cos: &wgpu::Buffer, sin: &wgpu::Buffer, spec: &ForwardSpec) -> wgpu::Buffer {
+    model.pool.use_kv_cache(cache.id);
     let cfg = &model.config;
     let t = token_ids.len() as u32;
     let hidden = cfg.hidden_size as u32;
