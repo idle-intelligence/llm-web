@@ -1,0 +1,6 @@
+fixture_parity: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 206.27s (207s)
+fixture_parity_qwen25_3b: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 78.26s (78s)
+fixture_parity_qwen3: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 132.79s (135s)
+fixture_parity_llama_360m: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 21.48s (22s)
+kv_snapshot: test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 169.09s (170s)
+logit_mask: test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 11.63s (13s)
