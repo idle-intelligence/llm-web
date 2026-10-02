@@ -25,11 +25,12 @@
 //! `[n_kv_heads, max_ctx, head_dim]`, head-major and contiguous per head -
 //! matches `shaders/attn_decode.wgsl`'s indexing. Not a ring buffer: `kv_len`
 //! only grows, capped by `max_ctx` (the CLI's fixed context, not the
-//! model's `qwen2.context_length`). Writes into it are plain
-//! `copy_buffer_to_buffer` calls recorded in the same encoder as the
-//! dispatch that produced the source K/V - GPU-resident, no CPU readback -
-//! so a freshly-computed decode step's own K/V is visible to that same
-//! step's causal attention (`kv_len` passed to `attn_decode` already
+//! model's `qwen2.context_length`). Writes into it are GPU-resident, no CPU
+//! readback, recorded in the same encoder as the dispatch that produced the
+//! source K/V: plain `copy_buffer_to_buffer` calls for a decode step's one
+//! row, one `kv_scatter` dispatch per buffer for multi-row prefill/chunk
+//! writes - so a freshly-computed decode step's own K/V is visible to that
+//! same step's causal attention (`kv_len` passed to `attn_decode` already
 //! includes the current position).
 
 use anyhow::{Context, Result};
@@ -1538,6 +1539,43 @@ fn scatter_kv_gpu<'a>(encoder: &mut wgpu::CommandEncoder, cache_buf: &wgpu::Buff
     }
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct KvScatterDims {
+    rows: u32,
+    kv_heads: u32,
+    head_dim: u32,
+    kv_base: u32,
+    max_ctx: u32,
+    src_offset: u32,
+    stride_x: u32,
+    _p0: u32,
+}
+
+/// Same write as [`scatter_kv_gpu`], as one compute dispatch inside the
+/// open pass (`shaders/kv_scatter.wgsl`) instead of `rows * kv_heads`
+/// encoder-level copies: the multi-row paths (prefill, chunk) use this; the
+/// one-row decode path keeps its two copies.
+#[allow(clippy::too_many_arguments)]
+fn scatter_kv_kernel<'a>(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &str, cache_buf: &wgpu::Buffer, src: impl Into<BufView<'a>>, rows: u32, cfg: &Qwen2Config, kv_base: u32, max_ctx: u32) {
+    let src = src.into();
+    let kv_heads = cfg.num_kv_heads as u32;
+    let head_dim = cfg.head_dim as u32;
+    let (gx, gy, stride_x) = grid1d(rows * kv_heads * head_dim);
+    let skey = scratch_key(key);
+    let dims = pool.uniform(&format!("{skey}.dims"), KvScatterDims { rows, kv_heads, head_dim, kv_base, max_ctx, src_offset: src.elem_offset, stride_x, _p0: 0 });
+    let bg = pool.bind_group(
+        key,
+        &engine.kv_scatter,
+        &[
+            BindGroupEntry { binding: 0, resource: src.buffer.as_entire_binding() },
+            BindGroupEntry { binding: 1, resource: cache_buf.as_entire_binding() },
+            BindGroupEntry { binding: 2, resource: dims.as_entire_binding() },
+        ],
+    );
+    engine.dispatch(pass, &engine.kv_scatter, &bg, (gx, gy, 1), key);
+}
+
 #[allow(clippy::too_many_arguments)]
 fn attn_prefill<'a>(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &str, q: impl Into<BufView<'a>>, k: impl Into<BufView<'a>>, v: impl Into<BufView<'a>>, seq: u32, cfg: &Qwen2Config) -> wgpu::Buffer {
     let (q, k, v) = (q.into(), k.into(), v.into());
@@ -1784,11 +1822,9 @@ pub async fn forward_prefill(engine: &Engine, model: &GpuModel, cache: &mut KvCa
     let pool = &model.pool;
 
     let mut encoder = engine.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("prefill") });
-    // One open ComputePass per layer-half instead of one per dispatch: see
-    // `Engine::dispatch`'s doc comment. `scatter_kv_gpu`'s
-    // `copy_buffer_to_buffer` calls are encoder-level (not pass-level), so
-    // the pass must close before them and reopen after - two passes per
-    // layer instead of ~15.
+    // One open ComputePass per layer instead of one per dispatch: see
+    // `Engine::dispatch`'s doc comment (the K/V cache writes are dispatches
+    // too, `scatter_kv_kernel`, so the pass stays open across them).
     let mut pass = engine.begin_pass(&mut encoder, "prefill");
     let x = embed_gather(engine, pool, &mut pass, model, token_ids);
 
@@ -1800,10 +1836,8 @@ pub async fn forward_prefill(engine: &Engine, model: &GpuModel, cache: &mut KvCa
         rope(engine, pool, &mut pass, &format!("{key}.ropeq"), &q, cos, sin, seq, cfg.num_heads as u32, cfg.head_dim as u32, 0);
         rope(engine, pool, &mut pass, &format!("{key}.ropek"), &k, cos, sin, seq, cfg.num_kv_heads as u32, cfg.head_dim as u32, 0);
         let attn_out = attn_prefill(engine, pool, &mut pass, &format!("{key}.attn"), &q, &k, &v, seq, cfg);
-        drop(pass);
-        scatter_kv_gpu(&mut encoder, &cache.k[i], &k, seq, cfg, 0, cache.max_ctx);
-        scatter_kv_gpu(&mut encoder, &cache.v[i], &v, seq, cfg, 0, cache.max_ctx);
-        pass = engine.begin_pass(&mut encoder, "prefill");
+        scatter_kv_kernel(engine, pool, &mut pass, &format!("{key}.kscatter"), &cache.k[i], &k, seq, cfg, 0, cache.max_ctx);
+        scatter_kv_kernel(engine, pool, &mut pass, &format!("{key}.vscatter"), &cache.v[i], &v, seq, cfg, 0, cache.max_ctx);
 
         let attn_dim = (cfg.num_heads * cfg.head_dim) as u32;
         let o = linear_lora(engine, pool, &mut pass, &format!("{key}.wo"), &attn_out, seq, attn_dim, &layer.o_w, &layer.o_b, hidden, model.fast_kernels, lora_layer.map(|l| &l.o));
@@ -2148,10 +2182,8 @@ pub async fn forward_chunk_spec(engine: &Engine, model: &GpuModel, cache: &mut K
         rope_positions(engine, pool, &mut pass, &format!("{key}.ropeq"), &q, cos, sin, &pos_buf, t, cfg.num_heads as u32, cfg.head_dim as u32);
         rope_positions(engine, pool, &mut pass, &format!("{key}.ropek"), &k, cos, sin, &pos_buf, t, cfg.num_kv_heads as u32, cfg.head_dim as u32);
 
-        drop(pass);
-        scatter_kv_gpu(&mut encoder, &cache.k[i], &k, t, cfg, prefix_len, cache.max_ctx);
-        scatter_kv_gpu(&mut encoder, &cache.v[i], &v, t, cfg, prefix_len, cache.max_ctx);
-        pass = engine.begin_pass(&mut encoder, "chunk");
+        scatter_kv_kernel(engine, pool, &mut pass, &format!("{key}.kscatter"), &cache.k[i], &k, t, cfg, prefix_len, cache.max_ctx);
+        scatter_kv_kernel(engine, pool, &mut pass, &format!("{key}.vscatter"), &cache.v[i], &v, t, cfg, prefix_len, cache.max_ctx);
 
         let attn_out = attn_chunk_masked(engine, pool, &mut pass, &format!("{key}.attn"), &q, &cache.k[i], &cache.v[i], &mask_buf, t, kv_total, cache.max_ctx, cfg);
 

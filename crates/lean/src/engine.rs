@@ -112,6 +112,7 @@ pub struct Engine {
     /// Same shader as `attn_decode_reduce`, `HEAD_DIM` overridden to 128.
     pub attn_decode_reduce_128: wgpu::ComputePipeline,
     pub add_inplace: wgpu::ComputePipeline,
+    pub kv_scatter: wgpu::ComputePipeline,
     /// `shaders/add_rmsnorm.wgsl`: fuses a residual `add_inplace` with the
     /// rmsnorm that always immediately follows it in the decoder layer's
     /// decode path (see that shader's header). Used only by decode's
@@ -240,6 +241,7 @@ impl Engine {
             attn_decode_reduce: make_pipeline_with_constants(&device, "attn_decode_reduce", include_str!("shaders/attn_decode_reduce.wgsl"), &[("HEAD_DIM", 64.0)]),
             attn_decode_reduce_128: make_pipeline_with_constants(&device, "attn_decode_reduce_128", include_str!("shaders/attn_decode_reduce.wgsl"), &[("HEAD_DIM", 128.0)]),
             add_inplace: make_pipeline(&device, "add_inplace", include_str!("shaders/add_inplace.wgsl")),
+            kv_scatter: make_pipeline(&device, "kv_scatter", include_str!("shaders/kv_scatter.wgsl")),
             add_rmsnorm: make_pipeline(&device, "add_rmsnorm", include_str!("shaders/add_rmsnorm.wgsl")),
             silu_mul_fused: make_pipeline(&device, "silu_mul_fused", include_str!("shaders/silu_mul_fused.wgsl")),
             argmax: make_pipeline(&device, "argmax", include_str!("shaders/argmax.wgsl")),
