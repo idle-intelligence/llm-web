@@ -1,10 +1,16 @@
-// Adapted from llm-wasm/src/wgsl/shader_q4_matvec_coalesced.wgsl (Q4_0
-// Coalesced Matvec, M=1/decode — see that file's header for the full
-// word-interleaved coalescing rationale). Differences from the llm-wasm
-// original: bias folded in (`b[n]`, this crate's linear-layer contract),
-// `info` replaced by a `Dims` uniform struct, and `B` (batch) dropped since
-// this crate never batches decode (always exactly one token/step) — so the
-// wg_id.y/`b` axis and its `b_valid` guard are gone entirely.
+// Q4_0 matvec for decode (M = 1). Started from llm-wasm's
+// shader_q4_matvec_coalesced.wgsl (lanes of one output row striding over
+// that row's weights, shared-memory tree reduction), with this crate's
+// bias and Dims contract and no batch axis.
+//
+// Each lane now reads a whole Q4_0 block per step: one 16-byte vec4<u32>
+// load for its 32 nibbles, one scale load, and the 32 matching x values as
+// 8 vec4 loads. 8 lanes share an output row (8 consecutive blocks, 128
+// contiguous bytes per step) and a 128-thread workgroup covers 16 rows.
+// The earlier layout (32 lanes per row, one u32 word and one scale load
+// per lane per step, x read as scalars) issued four times the load
+// instructions per byte and, at K = 896, left most lanes idle after one
+// step while the 5-step reduction ran.
 struct Dims {
     m: u32,
     k: u32,
@@ -18,46 +24,25 @@ struct Dims {
     _p2: u32,
 };
 
-@group(0) @binding(0) var<storage, read> x: array<f32>;
-@group(0) @binding(1) var<storage, read> qs: array<u32>;
+@group(0) @binding(0) var<storage, read> x: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read> qs: array<vec4<u32>>;
 @group(0) @binding(2) var<storage, read> scales: array<f32>;
 @group(0) @binding(3) var<storage, read> b: array<f32>;
 @group(0) @binding(4) var<storage, read_write> out: array<f32>;
 @group(0) @binding(5) var<uniform> dims: Dims;
 
 const WG_SIZE: u32 = 128u;
-const THREADS_PER_ROW: u32 = 32u;
-const ROWS_PER_WG: u32 = 4u; // WG_SIZE / THREADS_PER_ROW
+const LANES: u32 = 8u;
+const ROWS_PER_WG: u32 = 16u; // WG_SIZE / LANES
 
 var<workgroup> partial_sums: array<f32, WG_SIZE>;
 
-fn accumulate_word(word_idx: u32, weights_row_base: u32, scale_row_base: u32) -> f32 {
-    let blk = word_idx / 4u;
-    let wj = word_idx % 4u;
-    let scale = scales[scale_row_base + blk];
-    let packed = qs[weights_row_base + word_idx];
+fn nib_lo(w: u32) -> vec4<f32> {
+    return vec4<f32>(vec4<u32>(w, w >> 8u, w >> 16u, w >> 24u) & vec4<u32>(0xFu)) - vec4<f32>(8.0);
+}
 
-    let b0 = packed & 0xFFu;
-    let b1 = (packed >> 8u) & 0xFFu;
-    let b2 = (packed >> 16u) & 0xFFu;
-    let b3 = (packed >> 24u) & 0xFFu;
-
-    let k_lo = blk * 32u + wj * 4u;
-    let k_hi = k_lo + 16u;
-
-    let w_lo = (vec4<f32>(
-        f32(b0 & 0xFu), f32(b1 & 0xFu),
-        f32(b2 & 0xFu), f32(b3 & 0xFu)
-    ) - vec4<f32>(8.0)) * scale;
-    let in_lo = vec4<f32>(x[k_lo], x[k_lo + 1u], x[k_lo + 2u], x[k_lo + 3u]);
-
-    let w_hi = (vec4<f32>(
-        f32((b0 >> 4u) & 0xFu), f32((b1 >> 4u) & 0xFu),
-        f32((b2 >> 4u) & 0xFu), f32((b3 >> 4u) & 0xFu)
-    ) - vec4<f32>(8.0)) * scale;
-    let in_hi = vec4<f32>(x[k_hi], x[k_hi + 1u], x[k_hi + 2u], x[k_hi + 3u]);
-
-    return dot(w_lo, in_lo) + dot(w_hi, in_hi);
+fn nib_hi(w: u32) -> vec4<f32> {
+    return vec4<f32>(vec4<u32>(w >> 4u, w >> 12u, w >> 20u, w >> 28u) & vec4<u32>(0xFu)) - vec4<f32>(8.0);
 }
 
 @compute @workgroup_size(128, 1, 1)
@@ -65,58 +50,37 @@ fn main(
     @builtin(workgroup_id) wg_id: vec3<u32>,
     @builtin(local_invocation_id) local_id: vec3<u32>,
 ) {
-    let N = dims.n;
-    let blocks_per_row = dims.blocks_per_row;
-
     let tid = local_id.x;
-    let row_in_wg = tid / THREADS_PER_ROW;
-    let lane = tid % THREADS_PER_ROW;
-    let n = wg_id.x * ROWS_PER_WG + row_in_wg;
-    let row_has_output = n < N;
-
-    let weights_row_base = n * blocks_per_row * 4u;
-    let scale_row_base = n * blocks_per_row;
-    let total_words = blocks_per_row * 4u;
+    let lane = tid % LANES;
+    let n = wg_id.x * ROWS_PER_WG + tid / LANES;
+    let bpr = dims.blocks_per_row;
 
     var acc: f32 = 0.0;
-    if (row_has_output) {
-        var w0: u32 = lane;
-        loop {
-            if (w0 >= total_words) {
-                break;
-            }
-            acc += accumulate_word(w0, weights_row_base, scale_row_base);
-            let w1 = w0 + 32u;
-            if (w1 < total_words) {
-                acc += accumulate_word(w1, weights_row_base, scale_row_base);
-            }
-            let w2 = w0 + 64u;
-            if (w2 < total_words) {
-                acc += accumulate_word(w2, weights_row_base, scale_row_base);
-            }
-            let w3 = w0 + 96u;
-            if (w3 < total_words) {
-                acc += accumulate_word(w3, weights_row_base, scale_row_base);
-            }
-            w0 = w0 + 128u;
+    if (n < dims.n) {
+        let row = n * bpr;
+        for (var blk: u32 = lane; blk < bpr; blk = blk + LANES) {
+            let q = qs[row + blk];
+            let s = scales[row + blk];
+            // Word j holds k = 4j..4j+3 (low nibbles) and 16+4j.. (high).
+            let xb = blk * 8u;
+            let d = dot(nib_lo(q.x), x[xb]) + dot(nib_lo(q.y), x[xb + 1u])
+                + dot(nib_lo(q.z), x[xb + 2u]) + dot(nib_lo(q.w), x[xb + 3u])
+                + dot(nib_hi(q.x), x[xb + 4u]) + dot(nib_hi(q.y), x[xb + 5u])
+                + dot(nib_hi(q.z), x[xb + 6u]) + dot(nib_hi(q.w), x[xb + 7u]);
+            acc += d * s;
         }
     }
 
     partial_sums[tid] = acc;
     workgroupBarrier();
-    var stride: u32 = THREADS_PER_ROW / 2u;
-    loop {
-        if (stride == 0u) {
-            break;
-        }
+    for (var stride: u32 = LANES / 2u; stride > 0u; stride = stride / 2u) {
         if (lane < stride) {
             partial_sums[tid] += partial_sums[tid + stride];
         }
         workgroupBarrier();
-        stride = stride / 2u;
     }
 
-    if (lane == 0u && row_has_output) {
+    if (lane == 0u && n < dims.n) {
         var v = partial_sums[tid] + b[dims.n_offset + n];
         if (dims.act == 1u) {
             v = max(v, 0.0);

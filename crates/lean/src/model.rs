@@ -1087,7 +1087,7 @@ fn linear(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &
                 } else if rows == 1 {
                     // Decode: coalesced matvec (llm-wasm's shader_q4_matvec_coalesced.wgsl port).
                     let bg = pool.bind_group(&format!("{ckey}.decode"), &engine.linear_q4_decode, &entries);
-                    engine.dispatch(pass, &engine.linear_q4_decode, &bg, (chunk.rows.div_ceil(4), 1, 1), &ckey);
+                    engine.dispatch(pass, &engine.linear_q4_decode, &bg, (chunk.rows.div_ceil(16), 1, 1), &ckey);
                 } else if rows < SMALL_M_MAX_ROWS {
                     // Short prefill: weight words read and dequantised once
                     // per group of 8 query rows (see linear_q4_small_m.wgsl).
