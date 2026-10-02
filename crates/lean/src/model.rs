@@ -1831,7 +1831,7 @@ pub async fn forward_prefill(engine: &Engine, model: &GpuModel, cache: &mut KvCa
     pass = engine.begin_pass(&mut encoder, "lm_head");
 
     let normed_final = rmsnorm(engine, pool, &mut pass, "out_norm", &last_row, &model.out_norm, 1, hidden, cfg.rms_norm_eps);
-    let logits = linear(engine, pool, &mut pass, "lm_head", &normed_final, 1, hidden, &model.lm_head, &model.zero_bias_vocab, cfg.vocab_size as u32, false);
+    let logits = linear(engine, pool, &mut pass, "lm_head", &normed_final, 1, hidden, &model.lm_head, &model.zero_bias_vocab, cfg.vocab_size as u32, model.fast_kernels);
     if let Some(mask) = mask {
         mask_logits_gpu(engine, pool, &mut pass, "prefill_mask", &logits, mask, cfg.vocab_size as u32, 0);
     }
