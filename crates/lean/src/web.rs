@@ -244,7 +244,8 @@ impl LeanEngine {
     /// JSON for the last `prefillTokens`/`decodeStepArgmax` call:
     /// `encodeMs` (recording + submit, CPU), `waitMs` (submit to result in
     /// hand), and `gpu` (`null` unless timestamps were on: `spanMs`,
-    /// `passSumMs`, `segments` as `[label, ms, passes]`).
+    /// `passSumMs`, `segments` as `[label, ms, passes]`, `unwritten`; a
+    /// span or segment with no written timestamp is `null`).
     #[wasm_bindgen(js_name = diagLast)]
     pub fn diag_last(&self) -> String {
         let gpu = self.engine.diag_last_gpu.borrow_mut().take().map(|g| {
@@ -252,6 +253,7 @@ impl LeanEngine {
                 "spanMs": g.span_ms,
                 "passSumMs": g.pass_sum_ms,
                 "segments": g.segments.iter().map(|(l, ms, n)| serde_json::json!([l, ms, n])).collect::<Vec<_>>(),
+                "unwritten": g.unwritten,
             })
         });
         serde_json::json!({

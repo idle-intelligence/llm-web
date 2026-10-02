@@ -26,8 +26,9 @@ fn arg(args: &[String], name: &str) -> Option<String> {
 
 fn print_split(label: &str, engine: &Engine) {
     if let Some(g) = engine.diag_last_gpu.borrow().as_ref() {
-        let segs: Vec<String> = g.segments.iter().map(|(l, ms, _)| format!("{l}={ms:.2}")).collect();
-        println!("  {label} gpu span {:.2} ms: {}", g.span_ms, segs.join(" "));
+        let fmt = |ms: Option<f64>| ms.map_or("n/a".to_string(), |ms| format!("{ms:.2}"));
+        let segs: Vec<String> = g.segments.iter().map(|(l, ms, _)| format!("{l}={}", fmt(*ms))).collect();
+        println!("  {label} gpu span {} ms: {}", fmt(g.span_ms), segs.join(" "));
     }
 }
 

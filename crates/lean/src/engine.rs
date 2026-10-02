@@ -60,12 +60,17 @@ pub fn now_ms() -> f64 {
 /// first pass begin to last pass end (includes the encoder-level KV copies
 /// and any gaps between passes), `pass_sum_ms` the sum of in-pass time, and
 /// `segments` the in-pass time summed per pass label, in first-seen order,
-/// with the number of passes carrying that label.
+/// with the number of passes carrying that label. A pass whose begin or
+/// end slot reads back as 0 (or ends before it begins) was never written
+/// (an empty pass can be skipped by the browser's timestamp writes): it is
+/// counted in `unwritten` and left out of every sum; a segment with no
+/// written pass, and the span when no slot was written, are `None`.
 #[derive(Clone, Debug, Default)]
 pub struct DiagGpu {
-    pub span_ms: f64,
+    pub span_ms: Option<f64>,
     pub pass_sum_ms: f64,
-    pub segments: Vec<(String, f64, u32)>,
+    pub segments: Vec<(String, Option<f64>, u32)>,
+    pub unwritten: u32,
 }
 
 pub struct Engine {
@@ -707,19 +712,28 @@ impl Engine {
         let (mut first, mut last) = (u64::MAX, 0u64);
         for i in 0..count as usize {
             let (b, e) = (raw[i * 2], raw[i * 2 + 1]);
-            first = first.min(b);
-            last = last.max(e);
-            let ms = e.saturating_sub(b) as f64 * period / 1e6;
-            out.pass_sum_ms += ms;
+            let ms = if b == 0 || e < b {
+                out.unwritten += 1;
+                None
+            } else {
+                first = first.min(b);
+                last = last.max(e);
+                let ms = (e - b) as f64 * period / 1e6;
+                out.pass_sum_ms += ms;
+                Some(ms)
+            };
             match out.segments.iter_mut().find(|s| s.0 == labels[i]) {
                 Some(s) => {
-                    s.1 += ms;
+                    s.1 = match (s.1, ms) {
+                        (Some(a), Some(b)) => Some(a + b),
+                        (a, b) => a.or(b),
+                    };
                     s.2 += 1;
                 }
                 None => out.segments.push((labels[i].clone(), ms, 1)),
             }
         }
-        out.span_ms = last.saturating_sub(first) as f64 * period / 1e6;
+        out.span_ms = (first <= last).then(|| (last - first) as f64 * period / 1e6);
         drop(data);
         staging.unmap();
         *self.diag_last_gpu.borrow_mut() = Some(out);

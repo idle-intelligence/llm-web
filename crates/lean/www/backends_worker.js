@@ -63,15 +63,22 @@ const split = (d) => `${ms(d.encodeMs + d.waitMs)} (encode+submit ${ms(d.encodeM
 function gpuRows(prefix, gpus) {
   const rows = [];
   const n = gpus.length;
-  const span = gpus.reduce((a, g) => a + g.spanMs, 0) / n;
-  const inPass = gpus.reduce((a, g) => a + g.passSumMs, 0) / n;
-  rows.push([`${prefix} gpu span`, `${ms(span)} (in passes ${ms(inPass)}, outside passes ${ms(span - inPass)})`]);
+  // A null span or segment time means no timestamp slot was written for
+  // it; any null makes the average null ("n/a"), never a 0.
+  const avg = (xs) => (xs.some((x) => x === null || x === undefined) ? null : xs.reduce((a, x) => a + x, 0) / n);
+  const span = avg(gpus.map((g) => g.spanMs));
+  const inPass = avg(gpus.map((g) => g.passSumMs));
+  const unwritten = gpus.reduce((a, g) => a + (g.unwritten || 0), 0);
+  const outside = unwritten > 0 || span === null ? null : span - inPass;
+  rows.push([`${prefix} gpu span`, `${ms(span)} (in passes ${ms(inPass)}, outside passes ${ms(outside)})`]);
+  if (unwritten > 0) rows.push([`${prefix} gpu unwritten timestamp slots`, `${unwritten / n} passes per call (left out of every sum)`]);
   const seg = new Map();
   for (const g of gpus) for (const [label, t, c] of g.segments) {
-    const s = seg.get(label) || [0, 0];
-    seg.set(label, [s[0] + t / n, s[1] + c / n]);
+    const s = seg.get(label) || [[], 0];
+    s[0].push(t);
+    seg.set(label, [s[0], s[1] + c / n]);
   }
-  for (const [label, [t, c]] of seg) rows.push([`${prefix} gpu ${label}`, `${ms(t)} (${Math.round(c)} passes)`]);
+  for (const [label, [ts, c]] of seg) rows.push([`${prefix} gpu ${label}`, `${ms(ts.length === n ? avg(ts) : null)} (${Math.round(c)} passes)`]);
   return rows;
 }
 
@@ -137,7 +144,7 @@ async function runDiag(engine, gpu, ids, prompt, initT, decodeSplits, prefillCol
         gpus.push(JSON.parse(engine.diagLast()).gpu);
       }
       d.decodeGpu = gpus;
-      const span = median(gpus.map((g) => g.spanMs));
+      const span = gpus.some((g) => g.spanMs === null) ? null : median(gpus.map((g) => g.spanMs));
       const inPass = median(gpus.map((g) => g.passSumMs));
       rows.push(["decode gpu span median", `${ms(span)} (in passes ${ms(inPass)})`]);
 
