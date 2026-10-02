@@ -1758,6 +1758,20 @@ macro_rules! seg {
     };
 }
 
+/// Debug-only op tap (see `Engine::debug_tap`): when taps are on, closes
+/// the pass, copies `n` f32 of `view` into a tap buffer, reopens the pass.
+/// A no-op (one borrow) otherwise.
+macro_rules! tap {
+    ($engine:expr, $encoder:expr, $pass:ident, $label:expr, $view:expr, $n:expr) => {
+        if $engine.debug_taps_on() {
+            drop($pass);
+            let v: BufView = $view.into();
+            $engine.debug_tap($encoder, &$label, v.buffer, (v.elem_offset as u64) * 4, ($n as u64) * 4);
+            $pass = $engine.begin_pass($encoder, "tap");
+        }
+    };
+}
+
 /// Prefill: runs every layer over the whole prompt with causal attention
 /// (no cache read needed - attends directly over this call's own q/k/v),
 /// GPU-scatters every position's K/V into `cache`, and returns the last
@@ -1778,19 +1792,29 @@ pub async fn forward_prefill(engine: &Engine, model: &GpuModel, cache: &mut KvCa
     // layer instead of ~15.
     let mut pass = engine.begin_pass(&mut encoder, "embed");
     let x = embed_gather(engine, pool, &mut pass, model, token_ids);
+    tap!(engine, &mut encoder, pass, "embed", &x, seq * hidden);
     seg!(engine, &mut encoder, pass, "norm");
+    let q_dim = (cfg.num_heads * cfg.head_dim) as u32;
+    let kv_dim = (cfg.num_kv_heads * cfg.head_dim) as u32;
 
     for (i, layer) in model.layers.iter().enumerate() {
         let key = format!("layer{i}");
         let normed = rmsnorm(engine, pool, &mut pass, &format!("{key}.norm"), &x, &layer.attn_norm, seq, hidden, cfg.rms_norm_eps);
+        tap!(engine, &mut encoder, pass, format!("{key}.norm"), &normed, seq * hidden);
         let lora_layer = model.lora.as_ref().map(|l| &l.layers[i]);
         seg!(engine, &mut encoder, pass, "qkv");
         let (q, k, v) = qkv_proj(engine, pool, &mut pass, &format!("{key}.qkv"), &normed, seq, cfg, layer, model.fast_kernels, lora_layer);
+        tap!(engine, &mut encoder, pass, format!("{key}.q"), &q, seq * q_dim);
+        tap!(engine, &mut encoder, pass, format!("{key}.k"), &k, seq * kv_dim);
+        tap!(engine, &mut encoder, pass, format!("{key}.v"), &v, seq * kv_dim);
         seg!(engine, &mut encoder, pass, "rope");
         rope(engine, pool, &mut pass, &format!("{key}.ropeq"), &q, cos, sin, seq, cfg.num_heads as u32, cfg.head_dim as u32, 0);
         rope(engine, pool, &mut pass, &format!("{key}.ropek"), &k, cos, sin, seq, cfg.num_kv_heads as u32, cfg.head_dim as u32, 0);
+        tap!(engine, &mut encoder, pass, format!("{key}.ropeq"), &q, seq * q_dim);
+        tap!(engine, &mut encoder, pass, format!("{key}.ropek"), &k, seq * kv_dim);
         seg!(engine, &mut encoder, pass, "attn");
         let attn_out = attn_prefill(engine, pool, &mut pass, &format!("{key}.attn"), &q, &k, &v, seq, cfg);
+        tap!(engine, &mut encoder, pass, format!("{key}.attn"), &attn_out, seq * q_dim);
         drop(pass);
         scatter_kv_gpu(&mut encoder, &cache.k[i], &k, seq, cfg, 0, cache.max_ctx);
         scatter_kv_gpu(&mut encoder, &cache.v[i], &v, seq, cfg, 0, cache.max_ctx);
@@ -1798,21 +1822,28 @@ pub async fn forward_prefill(engine: &Engine, model: &GpuModel, cache: &mut KvCa
 
         let attn_dim = (cfg.num_heads * cfg.head_dim) as u32;
         let o = linear_lora(engine, pool, &mut pass, &format!("{key}.wo"), &attn_out, seq, attn_dim, &layer.o_w, &layer.o_b, hidden, model.fast_kernels, lora_layer.map(|l| &l.o));
+        tap!(engine, &mut encoder, pass, format!("{key}.o"), &o, seq * hidden);
         seg!(engine, &mut encoder, pass, "add+norm");
         add_inplace(engine, pool, &mut pass, &format!("{key}.add1"), &x, &o, seq * hidden);
+        tap!(engine, &mut encoder, pass, format!("{key}.add1"), &x, seq * hidden);
 
         let ffn_normed = rmsnorm(engine, pool, &mut pass, &format!("{key}.ffnnorm"), &x, &layer.ffn_norm, seq, hidden, cfg.rms_norm_eps);
+        tap!(engine, &mut encoder, pass, format!("{key}.ffnnorm"), &ffn_normed, seq * hidden);
         // `mlp()`'s three calls, inlined so `seg!` can time them apart.
         let mlp_key = format!("{key}.mlp");
         let inter = cfg.intermediate_size as u32;
         seg!(engine, &mut encoder, pass, "gate_up");
         let gate_up = linear(engine, pool, &mut pass, &format!("{mlp_key}.gate_up"), &ffn_normed, seq, hidden, &layer.gate_up_w, &layer.gate_up_b, 2 * inter, model.fast_kernels);
+        tap!(engine, &mut encoder, pass, format!("{key}.gate_up"), &gate_up, seq * 2 * inter);
         seg!(engine, &mut encoder, pass, "silu");
         let gated = silu_mul_fused(engine, pool, &mut pass, &format!("{mlp_key}.silu"), &gate_up, seq, inter);
+        tap!(engine, &mut encoder, pass, format!("{key}.silu"), &gated, seq * inter);
         seg!(engine, &mut encoder, pass, "down");
         let mlp_out = linear(engine, pool, &mut pass, &format!("{mlp_key}.down"), &gated, seq, inter, &layer.down_w, &layer.down_b, hidden, model.fast_kernels);
+        tap!(engine, &mut encoder, pass, format!("{key}.down"), &mlp_out, seq * hidden);
         seg!(engine, &mut encoder, pass, "add");
         add_inplace(engine, pool, &mut pass, &format!("{key}.add2"), &x, &mlp_out, seq * hidden);
+        tap!(engine, &mut encoder, pass, format!("{key}.add2"), &x, seq * hidden);
 
         // Flush per layer - see `Engine::flush_encoder`'s doc comment for
         // why a single encoder covering every layer hangs on Metal at
@@ -1849,7 +1880,9 @@ pub async fn forward_prefill(engine: &Engine, model: &GpuModel, cache: &mut KvCa
     pass = engine.begin_pass(&mut encoder, "lm_head");
 
     let normed_final = rmsnorm(engine, pool, &mut pass, "out_norm", &last_row, &model.out_norm, 1, hidden, cfg.rms_norm_eps);
+    tap!(engine, &mut encoder, pass, "out_norm", &normed_final, hidden);
     let logits = linear(engine, pool, &mut pass, "lm_head", &normed_final, 1, hidden, &model.lm_head, &model.zero_bias_vocab, cfg.vocab_size as u32, false);
+    tap!(engine, &mut encoder, pass, "lm_head", &logits, cfg.vocab_size as u32);
     if let Some(mask) = mask {
         mask_logits_gpu(engine, pool, &mut pass, "prefill_mask", &logits, mask, cfg.vocab_size as u32, 0);
     }

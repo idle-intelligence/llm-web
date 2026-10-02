@@ -426,6 +426,9 @@ fn main() -> Result<()> {
     }
 
     let engine = lean::engine::Engine::new()?;
+    if std::env::var("LEAN_DEBUG_ADAPTER").as_deref() == Ok("1") {
+        eprintln!("adapter: {}", engine.adapter_report);
+    }
     let load_start = Instant::now();
     let model = GpuModel::load(&engine, &args.gguf, args.kernel == Kernel::Fast)?;
     eprintln!("loaded model in {:?} (kernel={:?})", load_start.elapsed(), args.kernel);

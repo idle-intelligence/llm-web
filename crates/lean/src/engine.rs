@@ -100,6 +100,20 @@ pub struct Engine {
     pub diag_last_gpu: RefCell<Option<DiagGpu>>,
     /// `(request_adapter + request_device ms, all pipeline creation calls ms)`.
     pub diag_init_ms: (f64, f64),
+    /// Debug-only op taps (off unless `set_debug_taps(true)`): every
+    /// `model.rs` `tap!` site copies its op's output into a fresh buffer
+    /// here, so `debug_collect` can checksum each op of one forward call
+    /// and two runs can be compared op by op. `None` costs one borrow per
+    /// tap site and changes nothing in the command stream.
+    debug_taps: RefCell<Option<Vec<(String, wgpu::Buffer, u64)>>>,
+    /// Debug-only upload check (off unless `set_debug_uploads(true)`):
+    /// every `buf_f32`/`buf_u32` upload is recorded with the FNV-1a hash of
+    /// the bytes handed to the GPU, so `debug_verify_uploads` can read each
+    /// buffer back and say whether the device holds what was uploaded.
+    debug_uploads: RefCell<Option<Vec<(String, wgpu::Buffer, u64)>>>,
+    /// Adapter name/backend, features and the limits kernel selection or
+    /// buffer chunking depends on, as seen at device creation (JSON).
+    pub adapter_report: String,
     pub embed_gather_q4: wgpu::ComputePipeline,
     /// Q8_0 counterpart of `embed_gather_q4` (`shaders/embed_gather_q8.wgsl`)
     /// - Qwen3's official GGUFs ship no Q4_0 quant, only Q8_0 (qwen3 survey).
@@ -226,6 +240,44 @@ fn make_pipeline_with_constants(device: &wgpu::Device, label: &str, src: &str, c
     })
 }
 
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        h = (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3);
+    }
+    h
+}
+
+fn adapter_report(adapter: &wgpu::Adapter, device: &wgpu::Device) -> String {
+    let info = adapter.get_info();
+    let l = device.limits();
+    let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+    format!(
+        "{{\"name\":\"{}\",\"vendor\":{},\"device\":{},\"backend\":\"{:?}\",\"driver\":\"{}\",\"driverInfo\":\"{}\",\"adapterFeatures\":\"{}\",\"deviceFeatures\":\"{}\",\
+\"maxStorageBufferBindingSize\":{},\"maxBufferSize\":{},\"maxStorageBuffersPerShaderStage\":{},\"maxComputeWorkgroupStorageSize\":{},\
+\"maxComputeInvocationsPerWorkgroup\":{},\"maxComputeWorkgroupSizeX\":{},\"minStorageBufferOffsetAlignment\":{},\"minUniformBufferOffsetAlignment\":{},\
+\"minSubgroupSize\":{},\"maxSubgroupSize\":{}}}",
+        esc(&info.name),
+        info.vendor,
+        info.device,
+        info.backend,
+        esc(&info.driver),
+        esc(&info.driver_info),
+        esc(&format!("{:?}", adapter.features())),
+        esc(&format!("{:?}", device.features())),
+        l.max_storage_buffer_binding_size,
+        l.max_buffer_size,
+        l.max_storage_buffers_per_shader_stage,
+        l.max_compute_workgroup_storage_size,
+        l.max_compute_invocations_per_workgroup,
+        l.max_compute_workgroup_size_x,
+        l.min_storage_buffer_offset_alignment,
+        l.min_uniform_buffer_offset_alignment,
+        l.min_subgroup_size,
+        l.max_subgroup_size,
+    )
+}
+
 impl Engine {
     pub async fn new_async() -> anyhow::Result<Self> {
         Self::new_async_with(false).await
@@ -288,6 +340,7 @@ impl Engine {
         });
         let timestamp_period = queue.get_timestamp_period();
         let t_device = now_ms();
+        let adapter_report = adapter_report(&adapter, &device);
 
         let mut engine = Engine {
             query_set,
@@ -301,6 +354,9 @@ impl Engine {
             diag_wait_ms: Cell::new(0.0),
             diag_last_gpu: RefCell::new(None),
             diag_init_ms: (0.0, 0.0),
+            debug_taps: RefCell::new(None),
+            debug_uploads: RefCell::new(None),
+            adapter_report,
             embed_gather_q4: make_pipeline(&device, "embed_gather_q4", include_str!("shaders/embed_gather_q4.wgsl")),
             embed_gather_q8: make_pipeline(&device, "embed_gather_q8", include_str!("shaders/embed_gather_q8.wgsl")),
             embed_gather_q6k: make_pipeline(&device, "embed_gather_q6k", include_str!("shaders/embed_gather_q6k.wgsl")),
@@ -356,19 +412,53 @@ impl Engine {
     }
 
     pub fn buf_f32(&self, data: &[f32], label: &str) -> wgpu::Buffer {
-        self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        let buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some(label),
             contents: bytemuck::cast_slice(data),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
-        })
+        });
+        self.debug_record_upload(label, &buf, bytemuck::cast_slice(data));
+        buf
     }
 
     pub fn buf_u32(&self, data: &[u32], label: &str) -> wgpu::Buffer {
-        self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some(label),
-            contents: bytemuck::cast_slice(data),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        })
+        let mut usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
+        if self.debug_uploads.borrow().is_some() {
+            usage |= wgpu::BufferUsages::COPY_SRC;
+        }
+        let buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some(label), contents: bytemuck::cast_slice(data), usage });
+        self.debug_record_upload(label, &buf, bytemuck::cast_slice(data));
+        buf
+    }
+
+    pub fn set_debug_uploads(&self, on: bool) {
+        *self.debug_uploads.borrow_mut() = on.then(Vec::new);
+    }
+
+    fn debug_record_upload(&self, label: &str, buf: &wgpu::Buffer, bytes: &[u8]) {
+        if let Some(list) = self.debug_uploads.borrow_mut().as_mut() {
+            list.push((label.to_string(), buf.clone(), fnv1a(bytes)));
+        }
+    }
+
+    /// Reads back every buffer recorded since `set_debug_uploads(true)` and
+    /// returns JSON: how many were checked, and for each one whose device
+    /// bytes differ from what was uploaded, its label, size, and the first
+    /// and last differing byte offsets.
+    pub async fn debug_verify_uploads(&self) -> String {
+        let list: Vec<(String, wgpu::Buffer, u64)> = self.debug_uploads.borrow().clone().unwrap_or_default();
+        let mut bad = Vec::new();
+        let mut bytes_checked = 0u64;
+        for (label, buf, want) in &list {
+            let size = buf.size();
+            bytes_checked += size;
+            let got = self.read_buffer(buf, (size / 4) as usize).await;
+            let got: &[u8] = bytemuck::cast_slice(&got);
+            if fnv1a(got) != *want {
+                bad.push(format!("{{\"label\":\"{label}\",\"bytes\":{size}}}"));
+            }
+        }
+        format!("{{\"checked\":{},\"bytes\":{bytes_checked},\"mismatched\":[{}]}}", list.len(), bad.join(","))
     }
 
     pub fn buf_empty(&self, len_f32: usize, label: &str) -> wgpu::Buffer {
@@ -652,6 +742,56 @@ impl Engine {
         self.queue.submit(Some(old.finish()));
         #[cfg(not(target_arch = "wasm32"))]
         let _ = self.device.poll(wgpu::PollType::Wait);
+    }
+
+    pub fn set_debug_taps(&self, on: bool) {
+        *self.debug_taps.borrow_mut() = on.then(Vec::new);
+    }
+
+    pub fn debug_taps_on(&self) -> bool {
+        self.debug_taps.borrow().is_some()
+    }
+
+    /// Records a copy of `size` bytes of `src` at `offset` into a fresh
+    /// buffer, labelled, on `encoder` (outside any compute pass).
+    pub fn debug_tap(&self, encoder: &mut wgpu::CommandEncoder, label: &str, src: &wgpu::Buffer, offset: u64, size: u64) {
+        let mut taps = self.debug_taps.borrow_mut();
+        let Some(taps) = taps.as_mut() else { return };
+        let dst = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("debug_tap"),
+            size,
+            usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        encoder.copy_buffer_to_buffer(src, offset, &dst, 0, size);
+        taps.push((label.to_string(), dst, size));
+    }
+
+    /// Reads every tap recorded since `set_debug_taps(true)` (or the last
+    /// collect) and returns one JSON object per tap, in recording order:
+    /// `op`, `n` (f32 count), `hash` (FNV-1a 64 of the raw bits), `sum`,
+    /// `maxAbs`, and the first four values (every value when `n <= 8192`).
+    pub async fn debug_collect(&self) -> String {
+        let taps = self.debug_taps.borrow_mut().as_mut().map(std::mem::take).unwrap_or_default();
+        let mut rows = Vec::with_capacity(taps.len());
+        for (label, buf, size) in taps {
+            let v = self.read_buffer(&buf, (size / 4) as usize).await;
+            let h = fnv1a(bytemuck::cast_slice(&v));
+            let (mut sum, mut max_abs) = (0f64, 0f32);
+            for x in &v {
+                sum += f64::from(*x);
+                max_abs = max_abs.max(x.abs());
+            }
+            // Small taps (q/k/v of a short prompt) carry every value, so
+            // two runs can be diffed element by element.
+            let head: Vec<String> = v.iter().take(if v.len() <= 8192 { v.len() } else { 4 }).map(|x| format!("{x:e}")).collect();
+            rows.push(format!(
+                "{{\"op\":\"{label}\",\"n\":{},\"hash\":\"{h:016x}\",\"sum\":{sum:e},\"maxAbs\":{max_abs:e},\"head\":[{}]}}",
+                v.len(),
+                head.iter().map(|x| format!("\"{x}\"")).collect::<Vec<_>>().join(",")
+            ));
+        }
+        format!("[{}]", rows.join(","))
     }
 
     pub fn reset_dispatch_count(&self) {

@@ -569,6 +569,49 @@ impl LeanEngine {
         Ok(forward_prefill(&self.engine, model, cache, &token_ids, cos_buf, sin_buf, mask.as_ref()).await)
     }
 
+    /// Debug only: the adapter/device features and limits this engine was
+    /// created with (JSON, see `Engine::adapter_report`).
+    #[wasm_bindgen(js_name = debugAdapter)]
+    pub fn debug_adapter(&self) -> String {
+        self.engine.adapter_report.clone()
+    }
+
+    /// Debug only: record every weight upload from now on (call before
+    /// `load`), so `debugVerifyUploads` can check the device copies.
+    #[wasm_bindgen(js_name = debugRecordUploads)]
+    pub fn debug_record_uploads(&self, on: bool) {
+        self.engine.set_debug_uploads(on);
+    }
+
+    /// Debug only: reads back every recorded upload and reports the buffers
+    /// whose device bytes differ from what was uploaded (JSON).
+    #[wasm_bindgen(js_name = debugVerifyUploads)]
+    pub async fn debug_verify_uploads(&self) -> String {
+        self.engine.debug_verify_uploads().await
+    }
+
+    /// Debug only: a fresh prefill of `token_ids` (same as `prefillTokens`
+    /// with no mask) with op taps on, returning one checksum row per op
+    /// (JSON array, see `Engine::debug_collect`). The taps split compute
+    /// passes, so use it to compare runs with each other, not for timing.
+    #[wasm_bindgen(js_name = debugPrefill)]
+    pub async fn debug_prefill(&mut self, token_ids: Vec<u32>) -> Result<String, JsError> {
+        let model = self.model.as_ref().ok_or_else(|| JsError::new("load() must be called first"))?;
+        let cache = self.cache.as_mut().ok_or_else(|| JsError::new("load() must be called first"))?;
+        let cos_buf = self.cos_buf.as_ref().ok_or_else(|| JsError::new("load() must be called first"))?;
+        let sin_buf = self.sin_buf.as_ref().ok_or_else(|| JsError::new("load() must be called first"))?;
+        if token_ids.len() as u32 > cache.max_ctx {
+            return Err(JsError::new("token_ids exceeds max_ctx"));
+        }
+        model.pool.reset();
+        cache.kv_len = 0;
+        self.engine.set_debug_taps(true);
+        let _ = forward_prefill(&self.engine, model, cache, &token_ids, cos_buf, sin_buf, None).await;
+        let rows = self.engine.debug_collect().await;
+        self.engine.set_debug_taps(false);
+        Ok(rows)
+    }
+
     /// Appends `token_ids` onto the *existing* KV cache (typically just
     /// after `restoreKv` from a resident-prefix snapshot, or continuing a
     /// live session) instead of starting a fresh one - the "prefill(suffix)"

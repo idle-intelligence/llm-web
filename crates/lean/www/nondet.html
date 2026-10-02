@@ -1,0 +1,44 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>lean engine - determinism probe</title>
+<style>
+  body { font-family: monospace; max-width: 720px; margin: 24px auto; padding: 0 16px; }
+  pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+</style>
+</head>
+<body>
+<h3>lean engine - determinism probe (webgpu)</h3>
+<div id="status">loading...</div>
+<pre id="out"></pre>
+<script type="module">
+  const ENGINE_BUILD = "2026-10-02-nondet-01";
+  const p = new URLSearchParams(location.search);
+  const args = {
+    model: p.get("model") || "qwen25-0.5b",
+    trials: Number(p.get("trials") || 4),
+    steps: Number(p.get("steps") || 63),
+    ops: p.get("ops") === "1",
+    verify: p.get("verify") === "1",
+    local: p.get("local") === "1",
+  };
+  const worker = new Worker(`./nondet_worker.js?v=${ENGINE_BUILD}`, { type: "module" });
+  const statusEl = document.getElementById("status");
+  worker.onmessage = (ev) => {
+    const m = ev.data;
+    if (m.type === "status") statusEl.textContent = m.text;
+    else if (m.type === "done") {
+      statusEl.textContent = "done";
+      document.getElementById("out").textContent = JSON.stringify(m.result, null, 1);
+      window.__leanBackends = m.result;
+    } else {
+      statusEl.textContent = `error: ${m.text}`;
+      window.__leanBackends = { error: m.text };
+    }
+  };
+  worker.postMessage(args);
+</script>
+</body>
+</html>
