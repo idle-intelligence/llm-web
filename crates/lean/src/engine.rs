@@ -132,13 +132,8 @@ pub struct Engine {
     /// rows-per-workgroup structure as `linear_q4_decode`/`linear_q8_decode`,
     /// see `shaders/linear_q6k_decode.wgsl`'s header for the per-block split.
     pub linear_q6k_decode: wgpu::ComputePipeline,
-    /// Tiled Q4_0 matmul (prefill, M>1): ported from llm-wasm's
-    /// shader_q4_tiled.wgsl. Only faster than `linear_q4` once weight reuse
-    /// across rows outweighs the tile/barrier overhead: see the shader's
-    /// doc comment for llm-wasm's own measured regression at small M.
-    pub linear_q4_tiled: wgpu::ComputePipeline,
-    /// See `linear_q4_tiled_rb.wgsl`'s header: register-blocked 32x32/TK=16
-    /// alternative to `linear_q4_tiled`, size-gated in `model.rs::linear`.
+    /// See `linear_q4_tiled_rb.wgsl`'s header: 64x64 register-blocked tiled
+    /// Q4_0 matmul, prefill at `SMALL_M_MAX_ROWS` rows and above.
     pub linear_q4_tiled_rb: wgpu::ComputePipeline,
     /// See `linear_q8_tiled_rb.wgsl`'s header: same scheme for Q8_0.
     pub linear_q8_tiled_rb: wgpu::ComputePipeline,
@@ -255,6 +250,15 @@ impl Engine {
         // whatever WebGPU's downlevel limits actually allow and split
         // large tensors across bindings if it doesn't.
         let adapter_limits = adapter.limits();
+        // The tiled prefill kernels use a 16x16 workgroup and 16 KiB of
+        // workgroup storage: the WebGPU spec's guaranteed minimums, so every
+        // conforming adapter passes this.
+        anyhow::ensure!(
+            adapter_limits.max_compute_invocations_per_workgroup >= 256 && adapter_limits.max_compute_workgroup_storage_size >= 16384,
+            "adapter below the WebGPU minimum compute limits (invocations {}, workgroup storage {})",
+            adapter_limits.max_compute_invocations_per_workgroup,
+            adapter_limits.max_compute_workgroup_storage_size
+        );
         let want_profiling = std::env::var(PROFILE_ENV_VAR).as_deref() == Ok("1");
         let profile_features = wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES;
         let grant_profiling = want_profiling && adapter.features().contains(profile_features);
@@ -315,7 +319,6 @@ impl Engine {
             linear_q8_decode: make_pipeline(&device, "linear_q8_decode", include_str!("shaders/linear_q8_decode.wgsl")),
             linear_q6k: make_pipeline(&device, "linear_q6k", include_str!("shaders/linear_q6k.wgsl")),
             linear_q6k_decode: make_pipeline(&device, "linear_q6k_decode", include_str!("shaders/linear_q6k_decode.wgsl")),
-            linear_q4_tiled: make_pipeline(&device, "linear_q4_tiled", include_str!("shaders/linear_q4_tiled.wgsl")),
             linear_q4_tiled_rb: make_pipeline(&device, "linear_q4_tiled_rb", include_str!("shaders/linear_q4_tiled_rb.wgsl")),
             linear_q8_tiled_rb: make_pipeline(&device, "linear_q8_tiled_rb", include_str!("shaders/linear_q8_tiled_rb.wgsl")),
             linear_q4_decode: make_pipeline(&device, "linear_q4_decode", include_str!("shaders/linear_q4_decode.wgsl")),

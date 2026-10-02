@@ -46,26 +46,11 @@ use crate::pool::Pool;
 use crate::quant::{load_embedding_table_gguf, load_matmul_weight_gguf, EmbeddingTable, MatMulWeight};
 use crate::gguf::GgmlDtype;
 
-/// Row-count (`M`) threshold above which the tiled Q4_0 matmul
-/// (`linear_q4_tiled.wgsl`) is used for prefill; below it, the naive
-/// per-element kernel (`linear_q4.wgsl`) is faster (see `linear()`'s match
-/// arm doc comment) - measured in `docs/runs/2026-09-28-lean-perf.md`.
+/// Row-count (`M`) threshold above which the tiled Q8_0 matmul
+/// (`linear_q8_tiled_rb.wgsl`) is used for prefill; below it, the naive
+/// per-element kernel (`linear_q8.wgsl`) - measured for Q4_0 in
+/// `docs/runs/2026-09-28-lean-perf.md`.
 const TILED_MIN_ROWS: u32 = 16;
-
-/// Row-count (`M`) threshold below which the register-blocked 32x32/TK=16
-/// tiled kernel (`linear_q4_tiled_rb.wgsl`/`linear_q8_tiled_rb.wgsl`, this
-/// project's own port of t0-web's tile/register-blocking scheme, see that
-/// file's header) beats the larger TM=TN=64/MICRO=4 kernel
-/// (`linear_q4_tiled.wgsl`); at or above it, the bigger tile's 4x4/16
-/// outputs-per-thread reuse wins. Measured on the RTX 3080 (Vulkan) at
-/// Qwen2.5-0.5B/Qwen3-1.7B prompt lengths 36/86/256/512/1024/2225 - see
-/// this session's run doc for the crossover table. Set from `rows` alone,
-/// not the device: the mechanism this threshold tracks (arithmetic
-/// intensity per shared-memory tile load crossing over as `M` grows) is a
-/// GEMM-shape property, not a vendor-specific one, so the same threshold is
-/// expected to hold on other GPUs; only its exact value would need
-/// re-measuring if it turned out not to.
-const PREFILL_RB_MAX_ROWS: u32 = 512;
 
 /// Below this many rows (and above 1), Q4_0 prefill uses
 /// `linear_q4_small_m.wgsl`: it reads and dequantises each weight word once
@@ -74,9 +59,10 @@ const PREFILL_RB_MAX_ROWS: u32 = 512;
 /// kernel ran a 36-token prompt's MLP matmuls about 5x slower than 36
 /// decode-style matvecs would have; see docs/runs/2026-10-02-lean-mobile.md
 /// for the M2 sweep this value comes from. A row-count rule, the same on
-/// every device.
+/// every device: below 64 rows the 64-row tile of `linear_q4_tiled_rb.wgsl`
+/// is mostly padding, at and above it that kernel reuses each dequantised
+/// weight stage across 64 rows instead of 8.
 const SMALL_M_MAX_ROWS: u32 = 64;
-
 
 /// WebGPU's `max_compute_workgroups_per_dimension`: 65535 on every backend
 /// (spec-mandated minimum-and-typical value, not a per-device tuned
@@ -1107,25 +1093,11 @@ fn linear(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &
                     // per group of 8 query rows (see linear_q4_small_m.wgsl).
                     let bg = pool.bind_group(&format!("{ckey}.small_m"), &engine.linear_q4_small_m, &entries);
                     engine.dispatch(pass, &engine.linear_q4_small_m, &bg, (chunk.rows.div_ceil(32), rows.div_ceil(8), 1), &ckey);
-                } else if rows < PREFILL_RB_MAX_ROWS {
-                    // Prefill, SMALL_M_MAX_ROWS <= M < PREFILL_RB_MAX_ROWS:
-                    // register-blocked 32x32/TK=16 kernel (see
-                    // linear_q4_tiled_rb.wgsl's header) - faster than the
-                    // bigger tile below at short-to-medium prefill lengths.
-                    let bg = pool.bind_group(&format!("{ckey}.tiled_rb"), &engine.linear_q4_tiled_rb, &entries);
-                    engine.dispatch(pass, &engine.linear_q4_tiled_rb, &bg, (chunk.rows.div_ceil(32), rows.div_ceil(32), 1), &ckey);
                 } else {
-                    // Prefill (M >= PREFILL_RB_MAX_ROWS): tiled matmul
-                    // (llm-wasm's shader_q4_tiled.wgsl port). llm-wasm
-                    // measured this kernel 3-4x slower than the naive one at
-                    // M=1 (tile/barrier overhead not amortized) - it only
-                    // pays off once weight reuse across enough rows
-                    // outweighs that, hence the size gate rather than "any
-                    // M > 1"; above PREFILL_RB_MAX_ROWS it also beats the
-                    // smaller register-blocked tile above (see
-                    // PREFILL_RB_MAX_ROWS's own doc comment).
-                    let bg = pool.bind_group(&format!("{ckey}.tiled"), &engine.linear_q4_tiled, &entries);
-                    engine.dispatch(pass, &engine.linear_q4_tiled, &bg, (chunk.rows.div_ceil(64), rows.div_ceil(64), 1), &ckey);
+                    // Prefill, M >= SMALL_M_MAX_ROWS: 64x64 register-blocked
+                    // tiled kernel (see linear_q4_tiled_rb.wgsl's header).
+                    let bg = pool.bind_group(&format!("{ckey}.tiled_rb"), &engine.linear_q4_tiled_rb, &entries);
+                    engine.dispatch(pass, &engine.linear_q4_tiled_rb, &bg, (chunk.rows.div_ceil(64), rows.div_ceil(64), 1), &ckey);
                 }
             }
         }
