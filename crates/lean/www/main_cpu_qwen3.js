@@ -9,7 +9,7 @@
 //
 // Every wasm/js loading URL below carries `?v=ENGINE_BUILD`, bumped in the
 // same commit as any wasm/model rebuild - see docs/runs/2026-09-28-lean-cpu.md.
-const ENGINE_BUILD = "2026-09-30-stream-01";
+const ENGINE_BUILD = "2026-10-02-rungs-01";
 
 const params = new URLSearchParams(location.search);
 const local = params.get("local") !== "0"; // local model files by default - see this dir's model/
