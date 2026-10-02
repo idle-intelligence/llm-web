@@ -7,112 +7,29 @@
 // Backend loading copies main_cpu_mt.js (pkg-mt + initThreadPool for threads,
 // pkg for single thread); the prefill + greedy decode loop copies
 // main_cpu.js / main.js.
-const ENGINE_BUILD = "2026-10-02-backends-02";
-const N_GEN = 64;
-const MAX_CTX = 256;
-
-// crates/lean/reference/fixture.json, case "short" ("What is the capital of
-// France?", chat-templated), so every backend sees the same ids without
-// depending on the tokenizer.
-const PROMPT_IDS = [
-  151644, 8948, 198, 2610, 525, 1207, 16948, 11, 3465, 553, 54364, 14817, 13, 1446, 525, 264, 10950, 17847, 13,
-  151645, 198, 151644, 872, 198, 3838, 374, 279, 6722, 315, 9625, 30, 151645, 198, 151644, 77091, 198,
-];
-// SHA-256 of the 64 greedy ids (u32 little-endian) from transformers
-// (float32, weights dequantized from the same Q4_0 GGUF, greedy, no EOS stop).
-const REFERENCE_HASH = "a454748c60e238419186f89709a2b6eee17bcf53b4253a575dfa32691dad04d5";
-
-const HF_GGUF = "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_0.gguf";
-const HF_TOKENIZER = "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct/resolve/main/tokenizer.json";
-const HF_TOKENIZER_CFG = "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct/resolve/main/tokenizer_config.json";
+//
+// ?diag=1 adds measurements after the default run (which stays exactly as
+// without it): engine init split, a warm prefill, the per-token decode split,
+// pass-level GPU timings when timestamp-query exists, and a bandwidth probe.
+import { MODELS, N_GEN, MAX_CTX, modelUrls, fetchBytes, fetchText, argmaxJs, sha256Hex, capabilities, median, bandwidthProbe } from "./backends_common.js?v=2026-10-02-backends-03";
+const ENGINE_BUILD = "2026-10-02-backends-03";
 
 function status(text) {
   self.postMessage({ type: "status", text });
 }
 
-// The Cache API is best-effort: it can be missing or throw (headless
-// browsers, private windows, low quota), and a caching failure must never
-// stop a run, so every step falls back to the network bytes.
-async function fetchBytes(url) {
-  let cache = null;
-  try {
-    cache = await caches.open("lean-backends-model-v1");
-    const hit = await cache.match(url);
-    if (hit) return new Uint8Array(await hit.arrayBuffer());
-  } catch (e) {
-    console.warn(`[lean-backends] cache unavailable: ${e && e.message ? e.message : e}`);
-    cache = null;
-  }
-  const r = await fetch(url);
-  if (!r.ok) throw new Error(`fetch ${url}: HTTP ${r.status}`);
-  const bytes = new Uint8Array(await r.arrayBuffer());
-  if (cache) {
-    try {
-      await cache.put(url, new Response(bytes, { headers: { "Content-Type": "application/octet-stream" } }));
-    } catch (e) {
-      console.warn(`[lean-backends] cache put failed, continuing without it: ${e && e.message ? e.message : e}`);
-    }
-  }
-  return bytes;
-}
-async function fetchText(url) {
-  const r = await fetch(url);
-  if (!r.ok) throw new Error(`fetch ${url}: HTTP ${r.status}`);
-  return await r.text();
-}
-
-function argmaxJs(arr) {
-  let best = 0;
-  for (let i = 1; i < arr.length; i++) if (arr[i] > arr[best]) best = i;
-  return best;
-}
-
-async function sha256Hex(ids) {
-  const buf = new ArrayBuffer(ids.length * 4);
-  const view = new DataView(buf);
-  ids.forEach((id, i) => view.setUint32(i * 4, id, true));
-  const digest = await crypto.subtle.digest("SHA-256", buf);
-  return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, "0")).join("");
-}
-
-async function capabilities() {
-  const caps = {
-    hardwareConcurrency: navigator.hardwareConcurrency || 1,
-    crossOriginIsolated: self.crossOriginIsolated === true,
-    sharedArrayBuffer: typeof SharedArrayBuffer !== "undefined",
-    adapter: "none",
-    hasAdapter: false,
-  };
-  if (navigator.gpu) {
-    try {
-      const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
-      if (adapter) {
-        caps.hasAdapter = true;
-        const i = adapter.info || {};
-        const l = adapter.limits;
-        caps.adapter =
-          [i.vendor, i.architecture, i.device, i.description].filter(Boolean).join(" / ") +
-          ` (storage buffers/stage ${l.maxStorageBuffersPerShaderStage}, max binding ${l.maxStorageBufferBindingSize}, shader-f16 ${adapter.features.has("shader-f16")})`;
-      } else {
-        caps.adapter = "navigator.gpu present, no adapter";
-      }
-    } catch (e) {
-      caps.adapter = `requestAdapter failed: ${e && e.message ? e.message : e}`;
-    }
-  } else {
-    caps.adapter = "no navigator.gpu";
-  }
-  caps.threadsCapable = caps.crossOriginIsolated && caps.sharedArrayBuffer && caps.hardwareConcurrency > 1;
-  return caps;
-}
-
-async function createEngine(backend, caps) {
+async function createEngine(backend, caps, diag, t) {
   if (backend === "webgpu") {
     if (!caps.hasAdapter) throw new Error(`no WebGPU adapter (${caps.adapter})`);
     const mod = await import(`../pkg/lean.js?v=${ENGINE_BUILD}`);
+    let t0 = performance.now();
     await mod.default(`../pkg/lean_bg.wasm?v=${ENGINE_BUILD}`);
+    t.wasmInitMs = performance.now() - t0;
     mod.leanInit();
-    return { engine: await mod.LeanEngine.create(), gpu: true };
+    t0 = performance.now();
+    const engine = diag ? await mod.LeanEngine.createDiag() : await mod.LeanEngine.create();
+    t.createMs = performance.now() - t0;
+    return { engine, gpu: true };
   }
   if (backend === "threads") {
     if (!caps.threadsCapable) {
@@ -122,18 +39,154 @@ async function createEngine(backend, caps) {
       );
     }
     const mod = await import(`../pkg-mt/lean.js?v=${ENGINE_BUILD}`);
+    let t0 = performance.now();
     await mod.default(`../pkg-mt/lean_bg.wasm?v=${ENGINE_BUILD}`);
+    t.wasmInitMs = performance.now() - t0;
+    t0 = performance.now();
     await mod.initThreadPool(caps.hardwareConcurrency);
+    t.threadPoolMs = performance.now() - t0;
     mod.leanInit();
     return { engine: mod.LeanEngineCpu.create(), gpu: false };
   }
   const mod = await import(`../pkg/lean.js?v=${ENGINE_BUILD}`);
+  const t0 = performance.now();
   await mod.default(`../pkg/lean_bg.wasm?v=${ENGINE_BUILD}`);
+  t.wasmInitMs = performance.now() - t0;
   mod.leanInit();
   return { engine: mod.LeanEngineCpu.create(), gpu: false };
 }
 
-async function run({ backend: requested, local }) {
+const ms = (x) => (x === undefined || x === null || Number.isNaN(x) ? "n/a" : `${x.toFixed(1)} ms`);
+const split = (d) => `${ms(d.encodeMs + d.waitMs)} (encode+submit ${ms(d.encodeMs)}, wait ${ms(d.waitMs)})`;
+
+// Average per call of a list of diagLast().gpu results, as rows.
+function gpuRows(prefix, gpus) {
+  const rows = [];
+  const n = gpus.length;
+  const span = gpus.reduce((a, g) => a + g.spanMs, 0) / n;
+  const inPass = gpus.reduce((a, g) => a + g.passSumMs, 0) / n;
+  rows.push([`${prefix} gpu span`, `${ms(span)} (in passes ${ms(inPass)}, outside passes ${ms(span - inPass)})`]);
+  const seg = new Map();
+  for (const g of gpus) for (const [label, t, c] of g.segments) {
+    const s = seg.get(label) || [0, 0];
+    seg.set(label, [s[0] + t / n, s[1] + c / n]);
+  }
+  for (const [label, [t, c]] of seg) rows.push([`${prefix} gpu ${label}`, `${ms(t)} (${Math.round(c)} passes)`]);
+  return rows;
+}
+
+async function runDiag(engine, gpu, ids, prompt, initT, decodeSplits, prefillCold) {
+  const rows = [];
+  const d = { init: initT };
+  rows.push(["wasm init", ms(initT.wasmInitMs)]);
+  if (initT.threadPoolMs !== undefined) rows.push(["thread pool init", ms(initT.threadPoolMs)]);
+  if (gpu) {
+    const info = JSON.parse(engine.diagInfo());
+    d.info = info;
+    rows.push(["adapter + device", ms(info.deviceMs)]);
+    rows.push(["pipeline creation calls", ms(info.pipelinesMs)]);
+    rows.push(["queue drain after create", ms(initT.drainCreateMs)]);
+    rows.push(["weights parse + upload calls", ms(info.loadWeightsMs)]);
+    rows.push(["tokenizer load", ms(info.loadTokenizerMs)]);
+    rows.push(["queue drain after load", ms(initT.drainLoadMs)]);
+    rows.push(["timestamp-query", info.timestampQuery ? "yes" : "n/a"]);
+  } else {
+    rows.push(["load (weights + tokenizer)", ms(initT.loadMs)]);
+  }
+
+  // Prefill cold is the default run's prefill (first dispatch of every
+  // prefill pipeline); warm is the same call again, KV reset.
+  status("diagnostics: warm prefill...");
+  let t0 = performance.now();
+  const logits = gpu ? await engine.prefillTokens(prompt, []) : engine.prefillTokens(prompt);
+  const warmMs = performance.now() - t0;
+  const warmSame = argmaxJs(logits) === ids[0];
+  if (gpu) {
+    rows.push(["prefill cold", split(prefillCold)]);
+    const w = JSON.parse(engine.diagLast());
+    rows.push(["prefill warm", `${split(w)}${warmSame ? "" : ", first token differs"}`]);
+    d.prefillWarm = w;
+  } else {
+    rows.push(["prefill cold", ms(prefillCold.totalMs)]);
+    rows.push(["prefill warm", `${ms(warmMs)}${warmSame ? "" : ", first token differs"}`]);
+  }
+  d.prefillWarmMs = warmMs;
+
+  const stepMs = decodeSplits.map((s) => s.totalMs);
+  rows.push(["decode first step", ms(stepMs[0])]);
+  rows.push(["decode step median (min/max)", `${ms(median(stepMs))} (${ms(Math.min(...stepMs))} / ${ms(Math.max(...stepMs))})`]);
+  if (gpu) {
+    const rest = decodeSplits.slice(1);
+    rows.push(["decode encode+submit median", ms(median(rest.map((s) => s.encodeMs)))]);
+    rows.push(["decode wait median", ms(median(rest.map((s) => s.waitMs)))]);
+    rows.push(["decode readback per step", "yes (4-byte argmax id; no GPU-only token feed in lean)"]);
+  }
+  d.decodeSplits = decodeSplits;
+
+  if (gpu) {
+    const info = d.info;
+    const STEPS = 8;
+    if (info.timestampQuery) {
+      // Decode GPU time with the default one-pass-per-layer-half shape,
+      // continuing from the warm prefill (same positions as the run).
+      status("diagnostics: decode GPU time...");
+      engine.diagSet(true, false);
+      const gpus = [];
+      for (let i = 0; i < STEPS; i++) {
+        await engine.decodeStepArgmax(ids[i], []);
+        gpus.push(JSON.parse(engine.diagLast()).gpu);
+      }
+      d.decodeGpu = gpus;
+      const span = median(gpus.map((g) => g.spanMs));
+      const inPass = median(gpus.map((g) => g.passSumMs));
+      rows.push(["decode gpu span median", `${ms(span)} (in passes ${ms(inPass)})`]);
+
+      // Op-group split: one pass per op group (diagnostics only).
+      status("diagnostics: prefill and decode split by op group...");
+      engine.diagSet(true, true);
+      await engine.prefillTokens(prompt, []);
+      const pre = JSON.parse(engine.diagLast()).gpu;
+      const decs = [];
+      for (let i = 0; i < STEPS; i++) {
+        await engine.decodeStepArgmax(ids[i], []);
+        decs.push(JSON.parse(engine.diagLast()).gpu);
+      }
+      engine.diagSet(false, false);
+      d.prefillSplitGpu = pre;
+      d.decodeSplitGpu = decs;
+      rows.push(...gpuRows("prefill split", [pre]));
+      rows.push(...gpuRows("decode split/step", decs));
+    } else {
+      rows.push(["gpu time", "n/a (no timestamp-query)"]);
+    }
+    const rts = [];
+    for (let i = 0; i < 5; i++) rts.push(await engine.diagRoundTrip());
+    rows.push(["4-byte readback round trip median", ms(median(rts))]);
+    const mem = JSON.parse(engine.gpuMemoryInfo());
+    rows.push(["weights on GPU", `${(mem.weightBytes / 1e6).toFixed(1)} MB`]);
+    d.roundTrips = rts;
+    d.gpuMemory = mem;
+  }
+
+  status("diagnostics: bandwidth probe...");
+  try {
+    const bw = await bandwidthProbe();
+    d.bandwidth = bw;
+    if (bw.error) rows.push(["bandwidth probe", `n/a (${bw.error})`]);
+    else {
+      rows.push(["probe read 256 MB (read + reduce)", `${bw.readGBs.toFixed(1)} GB/s`]);
+      rows.push(["probe copy 128 MB (read + write)", `${bw.copyGBs.toFixed(1)} GB/s`]);
+      rows.push(["probe empty submit round trip", ms(bw.emptySubmitMs)]);
+    }
+  } catch (e) {
+    rows.push(["bandwidth probe", `n/a (${e && e.message ? e.message : e})`]);
+  }
+  return { rows, data: d };
+}
+
+async function run({ backend: requested, local, diag, model }) {
+  const m = MODELS[model];
+  const prompt = m.promptIds;
   status(`engine build ${ENGINE_BUILD}, checking capabilities...`);
   const caps = await capabilities();
   const candidates =
@@ -141,21 +194,23 @@ async function run({ backend: requested, local }) {
       ? [caps.hasAdapter && "webgpu", caps.threadsCapable && "threads", "single"].filter(Boolean)
       : [requested];
 
-  status(`fetching model (${local ? "local" : "huggingface"})...`);
-  let [ggufBytes, tokenizerJson, tokenizerCfgJson] = await Promise.all([
-    fetchBytes(local ? "./model/qwen2.5-0.5b-instruct-q4_0.gguf" : HF_GGUF),
-    fetchText(local ? "./model/tokenizer.json" : HF_TOKENIZER),
-    fetchText(local ? "./model/tokenizer_config.json" : HF_TOKENIZER_CFG),
-  ]);
+  status(`fetching ${m.label} (${local ? "local" : "huggingface"})...`);
+  const urls = modelUrls(model, local);
+  let [ggufBytes, tokenizerJson, tokenizerCfgJson] = await Promise.all([fetchBytes(urls.gguf), fetchText(urls.tokenizer), fetchText(urls.tokenizerCfg)]);
 
   const skipped = [];
+  const initT = {};
   let engine, gpu, backend;
   for (const c of candidates) {
     try {
       status(`starting ${c} backend...`);
-      ({ engine, gpu } = await createEngine(c, caps));
+      ({ engine, gpu } = await createEngine(c, caps, diag, initT));
+      if (diag && gpu) initT.drainCreateMs = await engine.diagRoundTrip();
       status(`loading weights on ${c} backend...`);
+      const t0 = performance.now();
       engine.load(ggufBytes, tokenizerJson, tokenizerCfgJson, MAX_CTX);
+      initT.loadMs = performance.now() - t0;
+      if (diag && gpu) initT.drainLoadMs = await engine.diagRoundTrip();
       backend = c;
       break;
     } catch (e) {
@@ -169,30 +224,46 @@ async function run({ backend: requested, local }) {
 
   status(`running ${N_GEN} greedy tokens on ${backend} backend...`);
   const t0 = performance.now();
-  const logits = gpu ? await engine.prefillTokens(PROMPT_IDS, []) : engine.prefillTokens(PROMPT_IDS);
+  const logits = gpu ? await engine.prefillTokens(prompt, []) : engine.prefillTokens(prompt);
   const t1 = performance.now();
+  const prefillCold = diag && gpu ? JSON.parse(engine.diagLast()) : { totalMs: t1 - t0 };
   const ids = [argmaxJs(logits)];
+  const decodeSplits = [];
   for (let i = 1; i < N_GEN; i++) {
+    const ts = diag ? performance.now() : 0;
     ids.push(gpu ? await engine.decodeStepArgmax(ids[i - 1], []) : engine.decodeStepArgmax(ids[i - 1]));
+    if (diag) {
+      const s = gpu ? JSON.parse(engine.diagLast()) : {};
+      s.totalMs = performance.now() - ts;
+      decodeSplits.push(s);
+    }
   }
   const t2 = performance.now();
 
   const hash = await sha256Hex(ids);
-  return {
+  const result = {
     requested,
     backend,
+    model,
+    modelLabel: m.label,
     skipped,
     engineBuild: ENGINE_BUILD,
     caps,
     info: engine.info(),
-    promptLen: PROMPT_IDS.length,
+    promptLen: prompt.length,
     prefillMs: t1 - t0,
     decodeMsPerTok: (t2 - t1) / (N_GEN - 1),
     ids,
     hash,
-    matchesReference: hash === REFERENCE_HASH,
+    matchesReference: hash === m.referenceHash,
     text: engine.decodeIds(Uint32Array.from(ids)),
   };
+  if (diag) {
+    const { rows, data } = await runDiag(engine, gpu, ids, prompt, initT, decodeSplits, prefillCold);
+    result.diagRows = rows;
+    result.diag = data;
+  }
+  return result;
 }
 
 self.onmessage = async (e) => {

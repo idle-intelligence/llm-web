@@ -6,11 +6,12 @@
 <title>lean engine - backends</title>
 <style>
   body { font-family: monospace; max-width: 720px; margin: 24px auto; padding: 0 16px; }
-  #backends { margin-bottom: 12px; }
-  #backends a { margin-right: 12px; }
-  #backends a.on { font-weight: bold; color: #073; }
+  #backends, #models { margin-bottom: 12px; }
+  #backends a, #models a { margin-right: 12px; }
+  #backends a.on, #models a.on { font-weight: bold; color: #073; }
   #status { margin-bottom: 12px; }
   table { border-collapse: collapse; width: 100%; }
+  #diag { margin-top: 16px; }
   td { border-bottom: 1px solid #ccc; padding: 4px 8px 4px 0; vertical-align: top; overflow-wrap: anywhere; }
   td:first-child { color: #555; white-space: nowrap; }
 </style>
@@ -18,10 +19,14 @@
 <body>
 <h3>lean engine - backends</h3>
 <div id="backends">
-  <a href="?backend=auto">auto</a><a href="?backend=webgpu">webgpu</a><a href="?backend=threads">threads</a><a href="?backend=single">single</a>
+  <a href="?backend=auto">auto</a><a href="?backend=webgpu">webgpu</a><a href="?backend=threads">threads</a><a href="?backend=single">single</a><a href="?backend=wllama">wllama</a>
+</div>
+<div id="models">
+  <a href="?model=qwen25-0.5b">qwen2.5-0.5b</a><a href="?model=smollm2-360m">smollm2-360m</a>
 </div>
 <div id="status">loading...</div>
 <table id="results"></table>
-<script type="module" src="./main_backends.js?v=2026-10-02-backends-02"></script>
+<table id="diag"></table>
+<script type="module" src="./main_backends.js?v=2026-10-02-backends-03"></script>
 </body>
 </html>
