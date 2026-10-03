@@ -2084,8 +2084,16 @@ fn argmax_gpu(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, ke
 /// returned alongside the logits when requested, `None` otherwise (samplers
 /// that need the full vocab never pay for the extra dispatch).
 #[allow(clippy::too_many_arguments)]
-fn decode_layers(engine: &Engine, model: &GpuModel, encoder: &mut wgpu::CommandEncoder, cache: &mut KvCache, token_id: u32, cos: &wgpu::Buffer, sin: &wgpu::Buffer, mask: Option<&wgpu::Buffer>, argmax: bool) -> (wgpu::Buffer, Option<wgpu::Buffer>) {
+fn decode_layers(engine: &Engine, model: &GpuModel, encoder: &mut wgpu::CommandEncoder, cache: &mut KvCache, token_id: u32, token_src: Option<&wgpu::Buffer>, cos: &wgpu::Buffer, sin: &wgpu::Buffer, mask: Option<&wgpu::Buffer>, argmax: bool) -> (wgpu::Buffer, Option<wgpu::Buffer>) {
     model.pool.use_kv_cache(cache.id);
+    // `token_src`: the input token id is the first u32 of a GPU buffer (the
+    // previous step's argmax), copied into the embedding's id buffer on
+    // this encoder, so the step can be submitted before that id is read
+    // back (`decode_greedy_pipelined`). `token_id` is then a placeholder.
+    if let Some(src) = token_src {
+        let ids = model.pool.upload_u32("embed.ids", &[token_id]);
+        encoder.copy_buffer_to_buffer(src, 0, &ids, 0, 4);
+    }
     let cfg = &model.config;
     let hidden = cfg.hidden_size as u32;
     let pool = &model.pool;
@@ -2191,7 +2199,7 @@ fn decode_layers(engine: &Engine, model: &GpuModel, encoder: &mut wgpu::CommandE
 /// applied.
 pub async fn forward_decode_step(engine: &Engine, model: &GpuModel, cache: &mut KvCache, token_id: u32, cos: &wgpu::Buffer, sin: &wgpu::Buffer, mask: Option<&wgpu::Buffer>) -> Vec<f32> {
     let mut encoder = engine.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("decode") });
-    let (logits, _) = decode_layers(engine, model, &mut encoder, cache, token_id, cos, sin, mask, false);
+    let (logits, _) = decode_layers(engine, model, &mut encoder, cache, token_id, None, cos, sin, mask, false);
     engine.queue.submit(Some(encoder.finish()));
     cache.kv_len += 1;
     engine.read_buffer(&logits, model.config.vocab_size).await
@@ -2214,7 +2222,7 @@ pub async fn forward_decode_step_argmax(engine: &Engine, model: &GpuModel, cache
     if engine.profiling_enabled() {
         engine.reset_profile();
     }
-    let (_, idx) = decode_layers(engine, model, &mut encoder, cache, token_id, cos, sin, mask, true);
+    let (_, idx) = decode_layers(engine, model, &mut encoder, cache, token_id, None, cos, sin, mask, true);
     let idx = idx.expect("decode_layers(argmax=true) always returns Some");
     // Resolve on the same encoder as the profiled dispatches, before it's
     // finished/submitted - see `Engine::resolve_profile`'s doc comment.
@@ -2235,6 +2243,75 @@ pub async fn forward_decode_step_argmax(engine: &Engine, model: &GpuModel, cache
         crate::profile_report::record_step(&data);
     }
     result
+}
+
+/// One submitted greedy decode step: its argmax id on the GPU (`idx`) and
+/// the 4-byte staging copy of it that `read` maps.
+struct PendingToken {
+    idx: wgpu::Buffer,
+    staging: wgpu::Buffer,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn submit_greedy_step(engine: &Engine, model: &GpuModel, cache: &mut KvCache, token_id: u32, token_src: Option<&wgpu::Buffer>, cos: &wgpu::Buffer, sin: &wgpu::Buffer, mask: Option<&wgpu::Buffer>) -> PendingToken {
+    let t_start = crate::engine::now_ms();
+    let mut encoder = engine.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("decode_greedy") });
+    let (_, idx) = decode_layers(engine, model, &mut encoder, cache, token_id, token_src, cos, sin, mask, true);
+    let idx = idx.expect("decode_layers(argmax=true) always returns Some");
+    let staging = engine.stage_u32(&mut encoder, &idx);
+    engine.queue.submit(Some(encoder.finish()));
+    engine.diag_encode_ms.set(crate::engine::now_ms() - t_start);
+    cache.kv_len += 1;
+    PendingToken { idx, staging }
+}
+
+/// Greedy decode of up to `max_steps` forward steps from `first_id`, with
+/// the same tokens, stop rule and final `cache.kv_len` as calling
+/// `forward_decode_step_argmax` in the loop
+///
+/// ```text
+/// next = first_id
+/// repeat max_steps times: stop if next is EOS (and stop_at_eos) or
+///     on_token(next) returns false; next = decode(next)
+/// ```
+///
+/// but each step is submitted before the previous step's id is read back:
+/// its embedding reads that id from the GPU buffer the previous argmax
+/// wrote (`decode_layers`'s `token_src`). The CPU encodes step t+1 and the
+/// readback latency of step t overlaps the GPU work instead of adding to
+/// it. When the loop stops, the one step submitted ahead is discarded
+/// (its K/V row lies past `cache.kv_len` and is overwritten by the next
+/// write). The pool's uniforms are rewritten between the two submits with
+/// `queue.write_buffer`, which the queue orders after the earlier submit,
+/// so each step sees its own positions. `mask` stays the same for every
+/// step. Returns the tokens passed to `on_token`, in order, and the last id
+/// read back that was not passed to it (the output of the last step run;
+/// `None` when no step ran).
+#[allow(clippy::too_many_arguments)]
+pub async fn decode_greedy_pipelined(engine: &Engine, model: &GpuModel, cache: &mut KvCache, first_id: u32, max_steps: u32, stop_at_eos: bool, cos: &wgpu::Buffer, sin: &wgpu::Buffer, mask: Option<&wgpu::Buffer>, mut on_token: impl FnMut(u32) -> bool) -> (Vec<u32>, Option<u32>) {
+    let is_stop = |id: u32| stop_at_eos && model.config.eos_token_ids.contains(&id);
+    let mut out = Vec::new();
+    if max_steps == 0 || is_stop(first_id) || !on_token(first_id) {
+        return (out, None);
+    }
+    out.push(first_id);
+    let mut pending = submit_greedy_step(engine, model, cache, first_id, None, cos, sin, mask);
+    let mut steps = 1;
+    loop {
+        let ahead = (steps < max_steps).then(|| submit_greedy_step(engine, model, cache, 0, Some(&pending.idx), cos, sin, mask));
+        let id = engine.map_u32(&pending.staging).await;
+        let Some(ahead) = ahead else { return (out, Some(id)) };
+        if is_stop(id) || !on_token(id) {
+            // The discarded step's staging buffer is dropped unread; any
+            // later GPU work is queued after it.
+            drop(ahead);
+            cache.kv_len -= 1;
+            return (out, Some(id));
+        }
+        out.push(id);
+        steps += 1;
+        pending = ahead;
+    }
 }
 
 /// Appends `token_ids` onto a cache already populated up to `cache.kv_len`
@@ -2266,12 +2343,12 @@ pub async fn forward_prefill_suffix(engine: &Engine, model: &GpuModel, cache: &m
     let (last, rest) = token_ids.split_last().expect("forward_prefill_suffix needs at least one token");
     for &tok in rest {
         let mut encoder = engine.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("prefill_suffix_step") });
-        let _ = decode_layers(engine, model, &mut encoder, cache, tok, cos, sin, None, false);
+        let _ = decode_layers(engine, model, &mut encoder, cache, tok, None, cos, sin, None, false);
         engine.queue.submit(Some(encoder.finish()));
         cache.kv_len += 1;
     }
     let mut encoder = engine.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("prefill_suffix_last") });
-    let (logits, _) = decode_layers(engine, model, &mut encoder, cache, *last, cos, sin, mask, false);
+    let (logits, _) = decode_layers(engine, model, &mut encoder, cache, *last, None, cos, sin, mask, false);
     engine.queue.submit(Some(encoder.finish()));
     cache.kv_len += 1;
     engine.read_buffer(&logits, model.config.vocab_size).await

@@ -14,7 +14,7 @@
 use lean::chat_template::{read_chat_template, render_conversation, render_user_prompt};
 use lean::engine::Engine;
 use lean::generate::decode_loop;
-use lean::model::{argmax, build_rope_tables, forward_prefill, forward_prefill_suffix, GpuModel, KvCache};
+use lean::model::{argmax, build_rope_tables, decode_greedy_pipelined, forward_decode_step_argmax, forward_prefill, forward_prefill_suffix, GpuModel, KvCache};
 use lean::sampling::SamplingParams;
 use tokenizers::Tokenizer;
 
@@ -72,6 +72,50 @@ fn greedy_streaming_matches_whole_reply() {
 
     assert_eq!(got, expected, "decode_loop's greedy output must match the pre-existing whole-reply greedy path token for token");
     assert_eq!(streamed, expected, "on_token callback must fire with exactly the tokens returned");
+    assert_eq!(cache_b.kv_len, cache_a.kv_len, "the pipelined greedy loop must leave the same KV length as the step loop");
+}
+
+/// `decode_greedy_pipelined` without the EOS stop (runs to `max_steps`)
+/// and stopped by its callback midway: same ids and the same `kv_len` as
+/// the step-by-step `forward_decode_step_argmax` loop, and a step after it
+/// continues identically.
+#[test]
+#[ignore = "needs LEAN_GGUF and LEAN_TOKENIZER_DIR on disk; never committed to this repo"]
+fn pipelined_greedy_matches_step_loop() {
+    let (engine, model, tokenizer, chat_template) = setup();
+    let prompt_ids = tokenize(&tokenizer, &chat_template, "Write a long story about a lighthouse keeper.");
+    let max_ctx = prompt_ids.len() as u32 + 80;
+    let (cos, sin) = build_rope_tables(model.config.head_dim, model.config.rope_theta, max_ctx as usize);
+    let cos_buf = engine.buf_f32(&cos, "rope_cos");
+    let sin_buf = engine.buf_f32(&sin, "rope_sin");
+    let steps = 40u32;
+
+    let mut cache_a = KvCache::new(&engine, &model.config, max_ctx);
+    let logits = pollster::block_on(forward_prefill(&engine, &model, &mut cache_a, &prompt_ids, &cos_buf, &sin_buf, None));
+    let first = argmax(&logits);
+    let mut expected = vec![first];
+    for _ in 0..=steps {
+        let next = pollster::block_on(forward_decode_step_argmax(&engine, &model, &mut cache_a, *expected.last().unwrap(), &cos_buf, &sin_buf, None));
+        expected.push(next);
+    }
+
+    for stop_after in [steps, 7] {
+        let mut cache_b = KvCache::new(&engine, &model.config, max_ctx);
+        let logits = pollster::block_on(forward_prefill(&engine, &model, &mut cache_b, &prompt_ids, &cos_buf, &sin_buf, None));
+        assert_eq!(argmax(&logits), first);
+        let mut seen = 0u32;
+        let (ids, last) = pollster::block_on(decode_greedy_pipelined(&engine, &model, &mut cache_b, first, steps, false, &cos_buf, &sin_buf, None, |_| {
+            seen += 1;
+            seen <= stop_after
+        }));
+        let n = ids.len();
+        assert_eq!(n as u32, stop_after.min(steps), "stop_after {stop_after}");
+        assert_eq!(&ids[..], &expected[..n], "stop_after {stop_after}");
+        assert_eq!(last, Some(expected[n]), "stop_after {stop_after}");
+        assert_eq!(cache_b.kv_len, prompt_ids.len() as u32 + n as u32, "stop_after {stop_after}");
+        let next = pollster::block_on(forward_decode_step_argmax(&engine, &model, &mut cache_b, expected[n], &cos_buf, &sin_buf, None));
+        assert_eq!(next, expected[n + 1], "stop_after {stop_after}: step after the pipelined loop");
+    }
 }
 
 #[test]

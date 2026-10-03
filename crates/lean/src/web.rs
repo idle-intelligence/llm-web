@@ -26,7 +26,7 @@ use crate::chat_template::{chat_template_from_config_json, render_conversation, 
 use crate::cpu::{forward_decode_step_argmax as cpu_decode_step_argmax, forward_prefill as cpu_forward_prefill, CpuKvCache, CpuModel};
 use crate::engine::{now_ms, Engine};
 use crate::generate::decode_loop;
-use crate::model::{build_mask_bitset, build_rope_tables, forward_decode_step_argmax, forward_prefill, forward_prefill_suffix, GpuModel, KvCache, KvSnapshot};
+use crate::model::{build_mask_bitset, build_rope_tables, decode_greedy_pipelined, forward_decode_step_argmax, forward_prefill, forward_prefill_suffix, GpuModel, KvCache, KvSnapshot};
 use crate::sampling::SamplingParams;
 
 /// `Read + Seek` adapter over a JS-owned `js_sys::Uint8Array`, so the whole
@@ -359,18 +359,15 @@ impl LeanEngine {
         // argmax runs on the GPU inside `forward_decode_step_argmax`, so
         // decode's readback is 4 bytes/step, not `vocab_size * 4` - see
         // model.rs's doc comment.
-        let mut next_id = argmax(&logits);
+        let next_id = argmax(&logits);
 
         self.engine.reset_dispatch_count();
-        let mut generated = Vec::with_capacity(max_new_tokens as usize);
-        for _ in 0..max_new_tokens {
-            if model.config.eos_token_ids.contains(&next_id) {
-                break;
-            }
-            generated.push(next_id);
-            call_on_token(next_id);
-            next_id = forward_decode_step_argmax(&self.engine, model, cache, next_id, cos_buf, sin_buf, None).await;
-        }
+        let generated = decode_greedy_pipelined(&self.engine, model, cache, next_id, max_new_tokens, true, cos_buf, sin_buf, None, |id| {
+            call_on_token(id);
+            true
+        })
+        .await
+        .0;
         let decode_steps = generated.len().max(1) as u64;
         wasm_log(&format!(
             "[lean] seq={} prefill_dispatches={} ({:.1}/token) decode_dispatches_per_step={}",
@@ -649,6 +646,31 @@ impl LeanEngine {
         }
         let mask = mask_buf(&self.engine, &mask_bits);
         Ok(forward_decode_step_argmax(&self.engine, model, cache, token_id, cos_buf, sin_buf, mask.as_ref()).await)
+    }
+
+    /// Greedy decode of `steps` forward steps from `token_id` (no EOS stop),
+    /// pipelined: each step is submitted before the previous step's id is
+    /// read back (see `model::decode_greedy_pipelined`). Returns the ids the
+    /// steps produced, the same as `steps` calls of `decodeStepArgmax`
+    /// chained on their own outputs.
+    #[wasm_bindgen(js_name = decodeGreedy)]
+    pub async fn decode_greedy(&mut self, token_id: u32, steps: u32) -> Result<Vec<u32>, JsError> {
+        let model = self.model.as_ref().ok_or_else(|| JsError::new("load() must be called first"))?;
+        let cache = self.cache.as_mut().ok_or_else(|| JsError::new("load() must be called first"))?;
+        let cos_buf = self.cos_buf.as_ref().ok_or_else(|| JsError::new("load() must be called first"))?;
+        let sin_buf = self.sin_buf.as_ref().ok_or_else(|| JsError::new("load() must be called first"))?;
+        if cache.kv_len + steps > cache.max_ctx {
+            return Err(JsError::new("decodeGreedy would exceed max_ctx"));
+        }
+        if steps == 0 {
+            return Ok(Vec::new());
+        }
+        // `on_token` sees each step's input (token_id first); the last
+        // step's output comes back separately.
+        let (mut ids, last) = decode_greedy_pipelined(&self.engine, model, cache, token_id, steps, false, cos_buf, sin_buf, None, |_| true).await;
+        ids.extend(last);
+        ids.remove(0);
+        Ok(ids)
     }
 
     /// The number of positions currently populated in the KV cache (0 right
