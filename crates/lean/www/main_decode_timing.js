@@ -14,7 +14,7 @@
 //
 // Every wasm/js loading URL below carries `?v=ENGINE_BUILD`, bumped in the
 // same commit as any wasm/model rebuild - see docs/runs/2026-09-28-lean-web.md.
-const ENGINE_BUILD = "2026-10-03-next-01";
+const ENGINE_BUILD = "2026-10-03-prefill-01";
 
 const params = new URLSearchParams(location.search);
 const modelKey = params.get("model") || "05b";
