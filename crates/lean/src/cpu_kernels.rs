@@ -427,6 +427,65 @@ mod simd128 {
     }
 }
 
+/// Four f32 lanes for the CPU backend's multi-row kernels (`cpu.rs`'s
+/// `dot_tile`/`dot_f32`): NEON on aarch64, SIMD128 on a `+simd128` wasm32
+/// build, a plain array elsewhere - chosen at compile time like the dot
+/// kernels above. Only lane-wise IEEE add and mul (no FMA), so every
+/// implementation gives the same bits.
+#[derive(Clone, Copy)]
+pub struct F4(
+    #[cfg(all(target_arch = "aarch64", not(feature = "force_scalar")))] std::arch::aarch64::float32x4_t,
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))] std::arch::wasm32::v128,
+    #[cfg(not(any(all(target_arch = "aarch64", not(feature = "force_scalar")), all(target_arch = "wasm32", target_feature = "simd128"))))] [f32; 4],
+);
+
+impl F4 {
+    #[inline(always)]
+    pub fn zero() -> F4 {
+        #[cfg(all(target_arch = "aarch64", not(feature = "force_scalar")))]
+        return F4(unsafe { std::arch::aarch64::vdupq_n_f32(0.0) });
+        #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+        return F4(std::arch::wasm32::f32x4_splat(0.0));
+        #[cfg(not(any(all(target_arch = "aarch64", not(feature = "force_scalar")), all(target_arch = "wasm32", target_feature = "simd128"))))]
+        return F4([0.0; 4]);
+    }
+
+    /// `s[0..4]`.
+    #[inline(always)]
+    pub fn load(s: &[f32]) -> F4 {
+        assert!(s.len() >= 4);
+        #[cfg(all(target_arch = "aarch64", not(feature = "force_scalar")))]
+        return F4(unsafe { std::arch::aarch64::vld1q_f32(s.as_ptr()) });
+        #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+        return F4(unsafe { std::arch::wasm32::v128_load(s.as_ptr() as *const std::arch::wasm32::v128) });
+        #[cfg(not(any(all(target_arch = "aarch64", not(feature = "force_scalar")), all(target_arch = "wasm32", target_feature = "simd128"))))]
+        return F4([s[0], s[1], s[2], s[3]]);
+    }
+
+    /// `self + a * b`, as a separate multiply and add.
+    #[inline(always)]
+    pub fn add_mul(self, a: F4, b: F4) -> F4 {
+        #[cfg(all(target_arch = "aarch64", not(feature = "force_scalar")))]
+        return F4(unsafe { std::arch::aarch64::vaddq_f32(self.0, std::arch::aarch64::vmulq_f32(a.0, b.0)) });
+        #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+        return F4(std::arch::wasm32::f32x4_add(self.0, std::arch::wasm32::f32x4_mul(a.0, b.0)));
+        #[cfg(not(any(all(target_arch = "aarch64", not(feature = "force_scalar")), all(target_arch = "wasm32", target_feature = "simd128"))))]
+        return F4([self.0[0] + a.0[0] * b.0[0], self.0[1] + a.0[1] * b.0[1], self.0[2] + a.0[2] * b.0[2], self.0[3] + a.0[3] * b.0[3]]);
+    }
+
+    /// `(l0 + l1) + (l2 + l3)`.
+    #[inline(always)]
+    pub fn sum(self) -> f32 {
+        #[cfg(all(target_arch = "aarch64", not(feature = "force_scalar")))]
+        let l: [f32; 4] = unsafe { std::mem::transmute(self.0) };
+        #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+        let l: [f32; 4] = unsafe { std::mem::transmute(self.0) };
+        #[cfg(not(any(all(target_arch = "aarch64", not(feature = "force_scalar")), all(target_arch = "wasm32", target_feature = "simd128"))))]
+        let l = self.0;
+        (l[0] + l[1]) + (l[2] + l[3])
+    }
+}
+
 /// One row's Q4_0 block bytes dotted against `x` (`x.len()` must equal
 /// `blocks_per_row * 32`). Dispatches to the NEON path on aarch64, simd128
 /// on a wasm32 build compiled with `+simd128`, scalar everywhere else -
