@@ -11,13 +11,15 @@
 // CPU threads if the page is cross-origin isolated with SharedArrayBuffer
 // and more than one hardware thread, else single-thread CPU (WASM SIMD128).
 //
-// Capability gap, observed while wiring this page (not something to fix
-// here): only the GPU engine (LeanEngine) exposes multi-turn
-// chatGenerate/chatReset/abort. The CPU rung (LeanEngineCpu) only has a
-// single-turn, greedy, non-abortable generate() — no chat-history state.
-// So on a CPU backend this worker treats every message as an independent
-// single-turn exchange (no memory of earlier turns) and Stop is a no-op;
-// the page's status line says so.
+// Both LeanEngine (GPU) and LeanEngineCpu (threads/single) expose the same
+// multi-turn chatGenerate/chatReset/AbortFlag surface as of
+// crates/lean/src/chat.rs + src/web.rs (merged from lean-chat-api,
+// ENGINE_BUILD 2026-10-04-pages-on-lean-02) - every backend gets real
+// conversation memory, sampling and a working Stop button. on_token's
+// second argument (`text`) is the already-decoded delta for this token;
+// this worker streams that directly and never calls decodeIds per token
+// itself (an earlier version did, which produced empty output for
+// SmolLM2's byte-level BPE tokenizer - fixed upstream in lean, not here).
 //
 // This file intentionally has NO top-level `import` or `await`: a module
 // worker with a top-level await can drop messages posted before it
@@ -28,7 +30,7 @@
 const EARLY = [];
 self.onmessage = (e) => EARLY.push(e);
 
-const ENGINE_BUILD = "2026-10-03-pages-on-lean-01";
+const ENGINE_BUILD = "2026-10-04-pages-on-lean-02";
 
 // Same model the chat.html test harness validates against
 // (crates/lean/www/backends_common.js's "smollm2-360m" entry, referenceHash
@@ -74,19 +76,19 @@ async function createEngine(which) {
     const mod = await import(`../crates/lean/pkg/lean.js?v=${ENGINE_BUILD}`);
     await mod.default(`../crates/lean/pkg/lean_bg.wasm?v=${ENGINE_BUILD}`);
     mod.leanInit();
-    return { engine: await mod.LeanEngine.create(), gpu: true, AbortFlag: mod.AbortFlag };
+    return { engine: await mod.LeanEngine.create(), AbortFlag: mod.AbortFlag };
   }
   if (which === "threads") {
     const mod = await import(`../crates/lean/pkg-mt/lean.js?v=${ENGINE_BUILD}`);
     await mod.default(`../crates/lean/pkg-mt/lean_bg.wasm?v=${ENGINE_BUILD}`);
     await mod.initThreadPool(navigator.hardwareConcurrency);
     mod.leanInit();
-    return { engine: mod.LeanEngineCpu.create(), gpu: false, AbortFlag: null };
+    return { engine: mod.LeanEngineCpu.create(), AbortFlag: mod.AbortFlag };
   }
   const mod = await import(`../crates/lean/pkg/lean.js?v=${ENGINE_BUILD}`);
   await mod.default(`../crates/lean/pkg/lean_bg.wasm?v=${ENGINE_BUILD}`);
   mod.leanInit();
-  return { engine: mod.LeanEngineCpu.create(), gpu: false, AbortFlag: null };
+  return { engine: mod.LeanEngineCpu.create(), AbortFlag: mod.AbortFlag };
 }
 
 function backendLabel(b) {
@@ -130,11 +132,7 @@ async function load() {
   }
   if (!engine) throw new Error(`no backend available (${skipped.join("; ")})`);
 
-  const note =
-    backend === "webgpu"
-      ? ""
-      : " — single-turn only on this backend (no conversation memory, no mid-reply stop)";
-  status(`ready — ${backendLabel(backend)}${note}`, true);
+  status(`ready — ${backendLabel(backend)}`, true);
 }
 
 async function chat(text) {
@@ -143,26 +141,19 @@ async function chat(text) {
     return;
   }
   try {
-    if (backend === "webgpu") {
-      abortFlag = new AbortFlagCtor();
-      await engine.chatGenerate(
-        text,
-        256,
-        0.7,
-        40,
-        0.9,
-        1.1,
-        0,
-        new Uint32Array(0),
-        (id) => self.postMessage({ type: "token", text: engine.decodeIds(Uint32Array.from([id])) }),
-        abortFlag.cloneFlag()
-      );
-    } else {
-      // CPU rung: single-turn, greedy, synchronous — no abort mid-call.
-      engine.generate(text, 256, (id) =>
-        self.postMessage({ type: "token", text: engine.decodeIds(Uint32Array.from([id])) })
-      );
-    }
+    abortFlag = new AbortFlagCtor();
+    await engine.chatGenerate(
+      text,
+      256,
+      0.7,
+      40,
+      0.9,
+      1.1,
+      0,
+      new Uint32Array(0),
+      (_id, text) => self.postMessage({ type: "token", text }),
+      abortFlag.cloneFlag()
+    );
     self.postMessage({ type: "done" });
   } catch (e) {
     self.postMessage({ type: "error", message: e && e.message ? e.message : String(e) });
@@ -176,8 +167,7 @@ function stop() {
 }
 
 function reset() {
-  if (backend === "webgpu" && engine) engine.chatReset();
-  // CPU backends have no chat-history state to reset.
+  if (engine) engine.chatReset();
 }
 
 const handlers = {

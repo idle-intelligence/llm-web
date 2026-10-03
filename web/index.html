@@ -341,7 +341,6 @@
 
         let worker = null;
         let generating = false;
-        let singleTurnOnly = false; // CPU backends: no chat memory, no mid-reply stop
         let tokenCount = 0;
         let startTime = 0;
 
@@ -369,8 +368,7 @@
                 if (msg.type === 'status') {
                     if (msg.ready) {
                         updateStatus('ready', msg.text);
-                        singleTurnOnly = /single-turn only/.test(msg.text);
-                        resetBtn.style.display = singleTurnOnly ? 'none' : '';
+                        resetBtn.style.display = '';
                         sendBtn.disabled = false;
                         progressBar.classList.remove('visible');
                         progressInfo.textContent = '';
@@ -427,7 +425,7 @@
             tokenCount = 0;
             startTime = performance.now();
             sendBtn.disabled = true;
-            stopBtn.style.display = singleTurnOnly ? 'none' : '';
+            stopBtn.style.display = '';
             outputEl.classList.remove('empty');
             outputText.textContent = '';
             streamingCursor.style.display = 'inline-block';
