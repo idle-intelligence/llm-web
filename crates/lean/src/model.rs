@@ -1067,7 +1067,7 @@ fn linear(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &
                     // Short prefill: same small-M kernel and row rule as
                     // Q4_0 (linear_q4_small_m.wgsl with its Q8 override).
                     let bg = pool.bind_group(&format!("{ckey}.small_m"), &engine.linear_q8_small_m, &entries);
-                    engine.dispatch(pass, &engine.linear_q8_small_m, &bg, (chunk.rows.div_ceil(32), rows.div_ceil(8), 1), &ckey);
+                    engine.dispatch(pass, &engine.linear_q8_small_m, &bg, (rows.div_ceil(8), chunk.rows.div_ceil(64), 1), &ckey);
                 } else if fast {
                     // Prefill, M >= SMALL_M_MAX_ROWS: the 64x64 tiled kernel
                     // (linear_q4_tiled_rb.wgsl with its Q8 override).
@@ -1136,7 +1136,7 @@ fn linear(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &
                     // Short prefill: weight words read and dequantised once
                     // per group of 8 query rows (see linear_q4_small_m.wgsl).
                     let bg = pool.bind_group(&format!("{ckey}.small_m"), &engine.linear_q4_small_m, &entries);
-                    engine.dispatch(pass, &engine.linear_q4_small_m, &bg, (chunk.rows.div_ceil(32), rows.div_ceil(8), 1), &ckey);
+                    engine.dispatch(pass, &engine.linear_q4_small_m, &bg, (rows.div_ceil(8), chunk.rows.div_ceil(64), 1), &ckey);
                 } else {
                     // Prefill, M >= SMALL_M_MAX_ROWS: 64x64 register-blocked
                     // tiled kernel (see linear_q4_tiled_rb.wgsl's header).
