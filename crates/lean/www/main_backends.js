@@ -14,7 +14,7 @@
 //
 // Every wasm/js loading URL carries `?v=ENGINE_BUILD`, bumped in the same
 // commit as any wasm rebuild (backends.html's own script tag included).
-import { MODELS, DEFAULT_MODEL } from "./backends_common.js?v=2026-10-03-main-01";
+import { MODELS, DEFAULT_MODEL } from "./backends_common.js?v=2026-10-03-main-02";
 
 const ENGINE_BUILD = "2026-10-03-main-01";
 

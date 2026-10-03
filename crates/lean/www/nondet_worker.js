@@ -13,7 +13,7 @@
 //      the bytes uploaded.
 // Any hash that differs between trials of the same input is
 // non-determinism inside the engine; the report gives the first one.
-import { MODELS, MAX_CTX, modelUrls, fetchBytes, fetchText } from "./backends_common.js?v=2026-10-03-main-01";
+import { MODELS, MAX_CTX, modelUrls, fetchBytes, fetchText } from "./backends_common.js?v=2026-10-03-main-02";
 const ENGINE_BUILD = "2026-10-03-main-01";
 
 // transformers greedy ids for the "short" prompt (the ids behind

@@ -53,6 +53,15 @@ export function modelUrls(model, local) {
 // The Cache API is best-effort: it can be missing or throw (headless
 // browsers, private windows, low quota), and a caching failure must never
 // stop a run, so every step falls back to the network bytes.
+//
+// On a miss, the response body is teed: one branch streams straight into
+// cache.put (the browser writes to disk without JS buffering the whole
+// file) while the other is drained and discarded. The bytes handed back
+// come from one read of the cache entry, so peak JS memory holds one copy
+// of the file instead of a chunk buffer plus a second copy inside
+// cache.put's own Response (on a 430 MB GGUF this was over 1 GB peak,
+// enough to hang a phone). If teeing or the put fails, falls back to a
+// plain fetch + arrayBuffer (the old behaviour).
 export async function fetchBytes(url) {
   let cache = null;
   try {
@@ -63,6 +72,28 @@ export async function fetchBytes(url) {
     console.warn(`[lean-backends] cache unavailable: ${e && e.message ? e.message : e}`);
     cache = null;
   }
+
+  if (cache) {
+    try {
+      const r = await fetch(url);
+      if (!r.ok) throw new Error(`fetch ${url}: HTTP ${r.status}`);
+      const [forCache, forDiscard] = r.body.tee();
+      const putPromise = cache.put(url, new Response(forCache, { headers: { "Content-Type": "application/octet-stream" } }));
+      const drainPromise = (async () => {
+        const reader = forDiscard.getReader();
+        for (;;) {
+          const { done } = await reader.read();
+          if (done) break;
+        }
+      })();
+      await Promise.all([putPromise, drainPromise]);
+      const cached = await cache.match(url);
+      return new Uint8Array(await cached.arrayBuffer());
+    } catch (e) {
+      console.warn(`[lean-backends] streaming cache put failed, falling back: ${e && e.message ? e.message : e}`);
+    }
+  }
+
   const r = await fetch(url);
   if (!r.ok) throw new Error(`fetch ${url}: HTTP ${r.status}`);
   const bytes = new Uint8Array(await r.arrayBuffer());

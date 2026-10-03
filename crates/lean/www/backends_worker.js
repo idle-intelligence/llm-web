@@ -11,7 +11,7 @@
 // ?diag=1 adds measurements after the default run (which stays exactly as
 // without it): engine init split, a warm prefill, the per-token decode split,
 // pass-level GPU timings when timestamp-query exists, and a bandwidth probe.
-import { MODELS, N_GEN, MAX_CTX, modelUrls, fetchBytes, fetchText, argmaxJs, sha256Hex, capabilities, median, bandwidthProbe } from "./backends_common.js?v=2026-10-03-main-01";
+import { MODELS, N_GEN, MAX_CTX, modelUrls, fetchBytes, fetchText, argmaxJs, sha256Hex, capabilities, median, bandwidthProbe } from "./backends_common.js?v=2026-10-03-main-02";
 const ENGINE_BUILD = "2026-10-03-main-01";
 
 function status(text) {
