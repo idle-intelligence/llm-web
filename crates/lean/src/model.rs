@@ -64,6 +64,11 @@ const SMALL_M_MAX_ROWS: u32 = 64;
 const SMALL_M_ROWS: u32 = 8;
 const SMALL_M_COLS: u32 = 64;
 
+/// Output rows per workgroup of the decode matvecs `linear_q4_decode.wgsl` and
+/// `linear_q8_decode.wgsl` (8 row groups of 4 rows); their GATE_UP variant
+/// writes half as many gated outputs.
+const DECODE_ROWS_PER_WG: u32 = 32;
+
 /// WebGPU's `max_compute_workgroups_per_dimension`: 65535 on every backend
 /// (spec-mandated minimum-and-typical value, not a per-device tuned
 /// number - `wgpu::Limits::default()` and this project's adapters alike
@@ -1067,7 +1072,7 @@ fn linear(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &
                     // Decode: coalesced matvec, same kernel shape as
                     // linear_q4_decode below, adapted to Q8_0 blocks.
                     let bg = pool.bind_group(&format!("{ckey}.decode"), &engine.linear_q8_decode, &entries);
-                    engine.dispatch(pass, &engine.linear_q8_decode, &bg, (chunk.rows.div_ceil(16), 1, 1), &ckey);
+                    engine.dispatch(pass, &engine.linear_q8_decode, &bg, (chunk.rows.div_ceil(DECODE_ROWS_PER_WG), 1, 1), &ckey);
                 } else if fast && rows < SMALL_M_MAX_ROWS {
                     // Short prefill: same small-M kernel and row rule as
                     // Q4_0 (linear_q4_small_m.wgsl with its Q8 override).
@@ -1136,7 +1141,7 @@ fn linear(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &
                 } else if rows == 1 {
                     // Decode: coalesced matvec (llm-wasm's shader_q4_matvec_coalesced.wgsl port).
                     let bg = pool.bind_group(&format!("{ckey}.decode"), &engine.linear_q4_decode, &entries);
-                    engine.dispatch(pass, &engine.linear_q4_decode, &bg, (chunk.rows.div_ceil(16), 1, 1), &ckey);
+                    engine.dispatch(pass, &engine.linear_q4_decode, &bg, (chunk.rows.div_ceil(DECODE_ROWS_PER_WG), 1, 1), &ckey);
                 } else if rows < SMALL_M_MAX_ROWS {
                     // Short prefill: weight words read and dequantised once
                     // per group of 8 query rows (see linear_q4_small_m.wgsl).
@@ -1155,12 +1160,16 @@ fn linear(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &
 }
 
 /// Decode's fused gate/up matvec with silu(gate) * up in the same dispatch
-/// (`linear_q4_decode_swiglu`), returning the `inter`-long gated
-/// activations. `None` when the weight is not one Q4_0 binding (or fast
+/// (`linear_q4_decode_swiglu` / `linear_q8_decode_swiglu`), returning the
+/// `inter`-long gated activations. `None` when the weight is not one Q4_0 or Q8_0 binding (or fast
 /// kernels are off): the caller then runs `linear` + `silu_mul_fused`.
 #[allow(clippy::too_many_arguments)]
 fn gate_up_swiglu_decode(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &str, x: &wgpu::Buffer, in_dim: u32, w: &MatMulWeight, b: &wgpu::Buffer, inter: u32, fast: bool) -> Option<wgpu::Buffer> {
-    let MatMulWeight::Q4_0 { chunks, blocks_per_row, out_dim } = w else { return None };
+    let (chunks, blocks_per_row, out_dim, pipeline) = match w {
+        MatMulWeight::Q4_0 { chunks, blocks_per_row, out_dim } => (chunks, blocks_per_row, out_dim, &engine.linear_q4_decode_swiglu),
+        MatMulWeight::Q8_0 { chunks, blocks_per_row, out_dim } => (chunks, blocks_per_row, out_dim, &engine.linear_q8_decode_swiglu),
+        _ => return None,
+    };
     if !fast || chunks.len() != 1 || *out_dim != 2 * inter {
         return None;
     }
@@ -1170,7 +1179,7 @@ fn gate_up_swiglu_decode(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputeP
     let dims = pool.uniform(&format!("{skey}.swiglu_dims"), LinearQDims { m: 1, k: in_dim, n: 2 * inter, act: 0, blocks_per_row: *blocks_per_row, n_offset: 0, n_total: 2 * inter, _p2: 0 });
     let bg = pool.bind_group(
         &format!("{key}.swiglu"),
-        &engine.linear_q4_decode_swiglu,
+        pipeline,
         &[
             BindGroupEntry { binding: 0, resource: x.as_entire_binding() },
             BindGroupEntry { binding: 1, resource: chunk.qs.as_entire_binding() },
@@ -1180,7 +1189,7 @@ fn gate_up_swiglu_decode(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputeP
             BindGroupEntry { binding: 5, resource: dims.as_entire_binding() },
         ],
     );
-    engine.dispatch(pass, &engine.linear_q4_decode_swiglu, &bg, (inter.div_ceil(8), 1, 1), key);
+    engine.dispatch(pass, pipeline, &bg, (inter.div_ceil(DECODE_ROWS_PER_WG / 2), 1, 1), key);
     Some(out)
 }
 

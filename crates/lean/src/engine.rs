@@ -163,6 +163,8 @@ pub struct Engine {
     /// `linear_q4_decode.wgsl` with `GATE_UP`: the fused gate/up matvec
     /// with silu(gate) * up in its epilogue (decode MLP).
     pub linear_q4_decode_swiglu: wgpu::ComputePipeline,
+    /// `linear_q8_decode.wgsl` with `GATE_UP`: the Q8_0 counterpart.
+    pub linear_q8_decode_swiglu: wgpu::ComputePipeline,
     /// Small-M Q4_0 matmul (short prefill): see `linear_q4_small_m.wgsl`'s
     /// header and `SMALL_M_MAX_ROWS` in model.rs.
     pub linear_q4_small_m: wgpu::ComputePipeline,
@@ -395,6 +397,7 @@ impl Engine {
             linear_q8_tiled_rb: make_pipeline_with_constants(&device, "linear_q8_tiled_rb", include_str!("shaders/linear_q4_tiled_rb.wgsl"), &[("Q8", 1.0)]),
             linear_q4_decode: make_pipeline(&device, "linear_q4_decode", include_str!("shaders/linear_q4_decode.wgsl")),
             linear_q4_decode_swiglu: make_pipeline_with_constants(&device, "linear_q4_decode_swiglu", include_str!("shaders/linear_q4_decode.wgsl"), &[("GATE_UP", 1.0)]),
+            linear_q8_decode_swiglu: make_pipeline_with_constants(&device, "linear_q8_decode_swiglu", include_str!("shaders/linear_q8_decode.wgsl"), &[("GATE_UP", 1.0)]),
             linear_q4_small_m: make_pipeline(&device, "linear_q4_small_m", include_str!("shaders/linear_q4_small_m.wgsl")),
             linear_q8_small_m: make_pipeline_with_constants(&device, "linear_q8_small_m", include_str!("shaders/linear_q4_small_m.wgsl"), &[("Q8", 1.0)]),
             attn_prefill: make_pipeline(&device, "attn_prefill", include_str!("shaders/attn_prefill.wgsl")),
