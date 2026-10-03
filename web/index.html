@@ -312,7 +312,6 @@
 
         const MODEL_REPO = 'bartowski/SmolLM2-360M-Instruct-GGUF';
         const MODEL_FILE = 'SmolLM2-360M-Instruct-Q4_K_M.gguf';
-        const MODEL_CACHE = 'wllama-model-v1';
 
         const statusDot = document.getElementById('statusDot');
         const statusText = document.getElementById('statusText');
@@ -345,12 +344,16 @@
             return mb >= 1 ? `${mb.toFixed(1)} MB` : `${(bytes / 1024).toFixed(0)} KB`;
         }
 
+        // wllama stores models in OPFS (cache/ directory), not the Cache API.
         async function isModelCached() {
             try {
-                const cache = await caches.open(MODEL_CACHE);
-                const keys = await cache.keys();
-                return keys.length > 0;
-            } catch { return false; }
+                const opfsRoot = await navigator.storage.getDirectory();
+                const cacheDir = await opfsRoot.getDirectoryHandle('cache');
+                for await (const [name] of cacheDir.entries()) {
+                    if (name.includes('SmolLM2-360M-Instruct-Q4_K_M')) return true;
+                }
+            } catch {}
+            return false;
         }
 
         async function initWllama() {
