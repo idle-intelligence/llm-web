@@ -59,6 +59,11 @@ use crate::gguf::GgmlDtype;
 /// weight stage across 64 rows instead of 8.
 const SMALL_M_MAX_ROWS: u32 = 64;
 
+/// Rows and output columns per workgroup of `linear_q4_small_m.wgsl` (its
+/// ROWS and COLS).
+const SMALL_M_ROWS: u32 = 8;
+const SMALL_M_COLS: u32 = 64;
+
 /// WebGPU's `max_compute_workgroups_per_dimension`: 65535 on every backend
 /// (spec-mandated minimum-and-typical value, not a per-device tuned
 /// number - `wgpu::Limits::default()` and this project's adapters alike
@@ -1067,7 +1072,7 @@ fn linear(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &
                     // Short prefill: same small-M kernel and row rule as
                     // Q4_0 (linear_q4_small_m.wgsl with its Q8 override).
                     let bg = pool.bind_group(&format!("{ckey}.small_m"), &engine.linear_q8_small_m, &entries);
-                    engine.dispatch(pass, &engine.linear_q8_small_m, &bg, (rows.div_ceil(8), chunk.rows.div_ceil(64), 1), &ckey);
+                    engine.dispatch(pass, &engine.linear_q8_small_m, &bg, (rows.div_ceil(SMALL_M_ROWS), chunk.rows.div_ceil(SMALL_M_COLS), 1), &ckey);
                 } else if fast {
                     // Prefill, M >= SMALL_M_MAX_ROWS: the 64x64 tiled kernel
                     // (linear_q4_tiled_rb.wgsl with its Q8 override).
@@ -1136,7 +1141,7 @@ fn linear(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &
                     // Short prefill: weight words read and dequantised once
                     // per group of 8 query rows (see linear_q4_small_m.wgsl).
                     let bg = pool.bind_group(&format!("{ckey}.small_m"), &engine.linear_q4_small_m, &entries);
-                    engine.dispatch(pass, &engine.linear_q4_small_m, &bg, (rows.div_ceil(8), chunk.rows.div_ceil(64), 1), &ckey);
+                    engine.dispatch(pass, &engine.linear_q4_small_m, &bg, (rows.div_ceil(SMALL_M_ROWS), chunk.rows.div_ceil(SMALL_M_COLS), 1), &ckey);
                 } else {
                     // Prefill, M >= SMALL_M_MAX_ROWS: 64x64 register-blocked
                     // tiled kernel (see linear_q4_tiled_rb.wgsl's header).
@@ -1629,9 +1634,18 @@ fn attn_prefill<'a>(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'
         &format!("{skey}.dims"),
         AttnPrefillDims { seq, n_heads: cfg.num_heads as u32, n_kv_heads: cfg.num_kv_heads as u32, head_dim: cfg.head_dim as u32, scale, _p0: 0, _p1: 0, _p2: 0 },
     );
+    // head_dim 64 and 128: the tiled kernel (attn_prefill_tiled.wgsl); any
+    // other head_dim: the one-thread-per-row kernel.
+    let (pipeline, wgs) = match cfg.head_dim {
+        64 => (&engine.attn_prefill_tiled, (cfg.num_heads as u32, seq.div_ceil(8), 1)),
+        128 => (&engine.attn_prefill_tiled_128, (cfg.num_heads as u32, seq.div_ceil(8), 1)),
+        // wg.y = query tile index (256 rows/tile, see attn_prefill.wgsl's doc
+        // comment on why this scales with `seq` instead of a fixed dispatch).
+        _ => (&engine.attn_prefill, (cfg.num_heads as u32, seq.div_ceil(256), 1)),
+    };
     let bg = pool.bind_group(
         key,
-        &engine.attn_prefill,
+        pipeline,
         &[
             BindGroupEntry { binding: 0, resource: q.binding() },
             BindGroupEntry { binding: 1, resource: k.binding() },
@@ -1640,9 +1654,7 @@ fn attn_prefill<'a>(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'
             BindGroupEntry { binding: 4, resource: dims.as_entire_binding() },
         ],
     );
-    // wg.y = query tile index (256 rows/tile, see attn_prefill.wgsl's doc
-    // comment on why this scales with `seq` instead of a fixed dispatch).
-    engine.dispatch(pass, &engine.attn_prefill, &bg, (cfg.num_heads as u32, seq.div_ceil(256), 1), key);
+    engine.dispatch(pass, pipeline, &bg, wgs, key);
     out
 }
 

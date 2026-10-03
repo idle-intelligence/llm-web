@@ -169,6 +169,9 @@ pub struct Engine {
     /// `linear_q4_small_m.wgsl` with its `Q8` override: Q8_0 short prefill.
     pub linear_q8_small_m: wgpu::ComputePipeline,
     pub attn_prefill: wgpu::ComputePipeline,
+    /// `attn_prefill_tiled.wgsl` (head_dim 64) and its HEAD_DIM = 128 build.
+    pub attn_prefill_tiled: wgpu::ComputePipeline,
+    pub attn_prefill_tiled_128: wgpu::ComputePipeline,
     /// `shaders/attn_decode.wgsl` compiled with its `HEAD_DIM` override
     /// constant set to 64 (Qwen2.5). One thread owns one output dim, so
     /// workgroup width must equal head_dim exactly - see the shader's doc
@@ -395,6 +398,8 @@ impl Engine {
             linear_q4_small_m: make_pipeline(&device, "linear_q4_small_m", include_str!("shaders/linear_q4_small_m.wgsl")),
             linear_q8_small_m: make_pipeline_with_constants(&device, "linear_q8_small_m", include_str!("shaders/linear_q4_small_m.wgsl"), &[("Q8", 1.0)]),
             attn_prefill: make_pipeline(&device, "attn_prefill", include_str!("shaders/attn_prefill.wgsl")),
+            attn_prefill_tiled: make_pipeline(&device, "attn_prefill_tiled", include_str!("shaders/attn_prefill_tiled.wgsl")),
+            attn_prefill_tiled_128: make_pipeline_with_constants(&device, "attn_prefill_tiled_128", include_str!("shaders/attn_prefill_tiled.wgsl"), &[("HEAD_DIM", 128.0)]),
             attn_decode: make_pipeline_with_constants(&device, "attn_decode", include_str!("shaders/attn_decode.wgsl"), &[("HEAD_DIM", 64.0)]),
             attn_decode_128: make_pipeline_with_constants(&device, "attn_decode_128", include_str!("shaders/attn_decode.wgsl"), &[("HEAD_DIM", 128.0)]),
             attn_decode_split: make_pipeline_with_constants(&device, "attn_decode_split", include_str!("shaders/attn_decode_split.wgsl"), &[("HEAD_DIM", 64.0)]),
