@@ -11,8 +11,8 @@
 // ?diag=1 adds measurements after the default run (which stays exactly as
 // without it): engine init split, a warm prefill, the per-token decode split,
 // pass-level GPU timings when timestamp-query exists, and a bandwidth probe.
-import { MODELS, N_GEN, MAX_CTX, modelUrls, fetchBytes, fetchText, argmaxJs, sha256Hex, capabilities, median, bandwidthProbe } from "./backends_common.js?v=2026-10-03-main-01";
-const ENGINE_BUILD = "2026-10-03-main-01";
+import { MODELS, N_GEN, MAX_CTX, modelUrls, fetchBytes, fetchText, argmaxJs, sha256Hex, capabilities, median, bandwidthProbe } from "./backends_common.js?v=2026-10-04-night-01";
+const ENGINE_BUILD = "2026-10-04-night-01";
 
 function status(text) {
   self.postMessage({ type: "status", text });
@@ -119,6 +119,10 @@ async function runDiag(engine, gpu, ids, prompt, initT, decodeSplits, prefillCol
   }
   d.prefillWarmMs = warmMs;
 
+  if (gpu) {
+    rows.push(["decode step by step ms/token", ms(decodeSplits.stepByStepMsPerTok)]);
+    rows.push(["step-by-step ids same as pipelined", decodeSplits.stepByStepSame ? "yes" : "NO"]);
+  }
   const stepMs = decodeSplits.map((s) => s.totalMs);
   rows.push(["decode first step", ms(stepMs[0])]);
   rows.push(["decode step median (min/max)", `${ms(median(stepMs))} (${ms(Math.min(...stepMs))} / ${ms(Math.max(...stepMs))})`]);
@@ -126,7 +130,7 @@ async function runDiag(engine, gpu, ids, prompt, initT, decodeSplits, prefillCol
     const rest = decodeSplits.slice(1);
     rows.push(["decode encode+submit median", ms(median(rest.map((s) => s.encodeMs)))]);
     rows.push(["decode wait median", ms(median(rest.map((s) => s.waitMs)))]);
-    rows.push(["decode readback per step", "yes (4-byte argmax id; no GPU-only token feed in lean)"]);
+    rows.push(["decode readback per step", "yes (4-byte argmax id); the pipelined run feeds each id to the next step on the GPU"]);
   }
   d.decodeSplits = decodeSplits;
 
@@ -236,16 +240,33 @@ async function run({ backend: requested, local, diag, model }) {
   const prefillCold = diag && gpu ? JSON.parse(engine.diagLast()) : { totalMs: t1 - t0 };
   const ids = [argmaxJs(logits)];
   const decodeSplits = [];
-  for (let i = 1; i < N_GEN; i++) {
-    const ts = diag ? performance.now() : 0;
-    ids.push(gpu ? await engine.decodeStepArgmax(ids[i - 1], []) : engine.decodeStepArgmax(ids[i - 1]));
-    if (diag) {
-      const s = gpu ? JSON.parse(engine.diagLast()) : {};
-      s.totalMs = performance.now() - ts;
-      decodeSplits.push(s);
+  if (gpu) {
+    // WebGPU: pipelined greedy decode (each step is submitted before the
+    // previous token is read back).
+    ids.push(...(await engine.decodeGreedy(ids[0], N_GEN - 1)));
+  } else {
+    for (let i = 1; i < N_GEN; i++) {
+      const ts = diag ? performance.now() : 0;
+      ids.push(engine.decodeStepArgmax(ids[i - 1]));
+      if (diag) decodeSplits.push({ totalMs: performance.now() - ts });
     }
   }
   const t2 = performance.now();
+  if (diag && gpu) {
+    // Diagnostics: the same tokens step by step, for the per-step split.
+    await engine.prefillTokens(prompt, []);
+    const stepIds = [ids[0]];
+    const ts0 = performance.now();
+    for (let i = 1; i < N_GEN; i++) {
+      const ts = performance.now();
+      stepIds.push(await engine.decodeStepArgmax(stepIds[i - 1], []));
+      const s = JSON.parse(engine.diagLast());
+      s.totalMs = performance.now() - ts;
+      decodeSplits.push(s);
+    }
+    decodeSplits.stepByStepMsPerTok = (performance.now() - ts0) / (N_GEN - 1);
+    decodeSplits.stepByStepSame = stepIds.every((v, i) => v === ids[i]);
+  }
 
   const hash = await sha256Hex(ids);
   const result = {

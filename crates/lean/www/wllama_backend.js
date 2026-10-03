@@ -10,10 +10,10 @@
 // path map) is copied from web/index.html; the model comes from the same
 // best-effort Cache API path as the lean backends (backends_common.js)
 // and is handed to wllama as a Blob instead of loadModelFromHF.
-import { Wllama } from "./wllama/index.js?v=2026-10-03-main-01";
-import { MODELS, N_GEN, MAX_CTX, modelUrls, fetchBytes, sha256Hex, capabilities, bandwidthProbe } from "./backends_common.js?v=2026-10-03-main-01";
+import { Wllama } from "./wllama/index.js?v=2026-10-04-night-01";
+import { MODELS, N_GEN, MAX_CTX, modelUrls, fetchBytes, sha256Hex, capabilities, bandwidthProbe } from "./backends_common.js?v=2026-10-04-night-01";
 
-const ENGINE_BUILD = "2026-10-03-main-01";
+const ENGINE_BUILD = "2026-10-04-night-01";
 
 export async function runWllama({ local, diag, model }, status) {
   const m = MODELS[model];
