@@ -167,19 +167,50 @@ fn transpose(data: &[f32], rows: usize, cols: usize) -> Vec<f32> {
     out
 }
 
-impl LoraProj {
-    fn upload(engine: &Engine, label: &str, raw: &RawProj, scale: f32) -> Self {
+/// One projection's factors in the `[out, in]` layout both backends run
+/// them in: `a_t` is `[rank, in_features]`, `b_t` is `[out_features,
+/// rank]` with `alpha / rank` folded in. The GPU backend uploads these
+/// (`LoraProj::upload`), the CPU backend keeps them (`cpu::CpuModel::apply_lora`),
+/// so the two apply the same numbers.
+pub struct HostLoraProj {
+    pub a_t: Vec<f32>,
+    pub b_t: Vec<f32>,
+    pub rank: usize,
+    pub in_features: usize,
+    pub out_features: usize,
+}
+
+impl HostLoraProj {
+    fn new(raw: &RawProj, scale: f32) -> Self {
         // a: [in_features, rank] -> transposed to [rank, in_features].
         let a_t = transpose(&raw.a.data, raw.a.rows, raw.a.cols);
-        let a = engine.buf_f32(&a_t, &format!("{label}.a"));
         // b: [rank, out_features] -> transposed to [out_features, rank], scaled by alpha/rank.
         let b_t: Vec<f32> = transpose(&raw.b.data, raw.b.rows, raw.b.cols).iter().map(|&x| x * scale).collect();
-        let b = engine.buf_f32(&b_t, &format!("{label}.b"));
+        HostLoraProj { a_t, b_t, rank: raw.a.cols, in_features: raw.a.rows, out_features: raw.b.cols }
+    }
+}
+
+impl RawLoraAdapter {
+    /// Every layer's `[q, k, v, o]` factors, transposed and scaled (see
+    /// [`HostLoraProj`]).
+    pub fn host_layers(&self) -> Vec<[HostLoraProj; 4]> {
+        let scale = self.alpha / self.rank as f32;
+        self.layers
+            .iter()
+            .map(|l| [HostLoraProj::new(&l.q, scale), HostLoraProj::new(&l.k, scale), HostLoraProj::new(&l.v, scale), HostLoraProj::new(&l.o, scale)])
+            .collect()
+    }
+}
+
+impl LoraProj {
+    fn upload(engine: &Engine, label: &str, host: &HostLoraProj) -> Self {
+        let a = engine.buf_f32(&host.a_t, &format!("{label}.a"));
+        let b = engine.buf_f32(&host.b_t, &format!("{label}.b"));
         LoraProj {
             a: MatMulWeight::F32 { w: a },
             b: MatMulWeight::F32 { w: b },
-            rank: raw.a.cols as u32,
-            out_features: raw.b.cols as u32,
+            rank: host.rank as u32,
+            out_features: host.out_features as u32,
         }
     }
 }
@@ -203,16 +234,15 @@ pub struct LoraAdapter {
 
 impl LoraAdapter {
     pub fn from_raw(engine: &Engine, raw: &RawLoraAdapter) -> Self {
-        let scale = raw.alpha / raw.rank as f32;
         let layers = raw
-            .layers
+            .host_layers()
             .iter()
             .enumerate()
-            .map(|(i, l)| LoraLayer {
-                q: LoraProj::upload(engine, &format!("lora{i}.q"), &l.q, scale),
-                k: LoraProj::upload(engine, &format!("lora{i}.k"), &l.k, scale),
-                v: LoraProj::upload(engine, &format!("lora{i}.v"), &l.v, scale),
-                o: LoraProj::upload(engine, &format!("lora{i}.o"), &l.o, scale),
+            .map(|(i, [q, k, v, o])| LoraLayer {
+                q: LoraProj::upload(engine, &format!("lora{i}.q"), q),
+                k: LoraProj::upload(engine, &format!("lora{i}.k"), k),
+                v: LoraProj::upload(engine, &format!("lora{i}.v"), v),
+                o: LoraProj::upload(engine, &format!("lora{i}.o"), o),
             })
             .collect();
         Self { layers }

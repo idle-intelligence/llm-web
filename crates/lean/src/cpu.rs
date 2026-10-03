@@ -21,7 +21,7 @@ use anyhow::{Context, Result};
 use std::io::{Read, Seek};
 
 use crate::config::{config_from_gguf, Architecture, Qwen2Config};
-use crate::cpu_kernels::{dot_q4_0, dot_q6_k, dot_q8_0};
+use crate::cpu_kernels::{dot_q4_0, dot_q6_k, dot_q8_0, F4};
 use crate::gguf::{dequantize_for, GgmlDtype, GgufReader};
 use crate::model::unpermute_rope_rows;
 
@@ -76,6 +76,151 @@ impl CpuWeight {
     }
 }
 
+impl CpuWeight {
+    /// Output row `row`'s weights as f32 into `out` (`out.len() == in_dim`),
+    /// the same per-element values as `gguf::dequantize_for` (`(q - 8) *
+    /// scale` for Q4_0, `q * scale` for Q8_0).
+    fn dequant_row(&self, row: usize, out: &mut [f32]) {
+        match self {
+            CpuWeight::F32 { data, in_dim, .. } => out.copy_from_slice(&data[row * in_dim..(row + 1) * in_dim]),
+            CpuWeight::Q4_0 { bytes, blocks_per_row, .. } => {
+                let n = blocks_per_row * 18;
+                for (block, o) in bytes[row * n..(row + 1) * n].chunks_exact(18).zip(out.chunks_exact_mut(32)) {
+                    let scale = half::f16::from_le_bytes([block[0], block[1]]).to_f32();
+                    for j in 0..16 {
+                        let byte = block[2 + j];
+                        o[j] = ((byte & 0x0F) as f32 - 8.0) * scale;
+                        o[16 + j] = ((byte >> 4) as f32 - 8.0) * scale;
+                    }
+                }
+            }
+            CpuWeight::Q8_0 { bytes, blocks_per_row, .. } => {
+                let n = blocks_per_row * 34;
+                for (block, o) in bytes[row * n..(row + 1) * n].chunks_exact(34).zip(out.chunks_exact_mut(32)) {
+                    let scale = half::f16::from_le_bytes([block[0], block[1]]).to_f32();
+                    for j in 0..32 {
+                        o[j] = (block[2 + j] as i8) as f32 * scale;
+                    }
+                }
+            }
+            CpuWeight::Q6_K { bytes, blocks_per_row, .. } => {
+                let n = blocks_per_row * 210;
+                out.copy_from_slice(&crate::gguf::dequantize_q6_k(&bytes[row * n..(row + 1) * n], out.len()));
+            }
+        }
+    }
+}
+
+/// f32 dot product with four lane accumulators (`acc[l]` sums the
+/// elements `k = l mod 4`, in order), reduced as `(a0 + a1) + (a2 + a3)`.
+/// `dot_tile` below computes every element of its tile with exactly this
+/// sequence of operations, so an element's value does not depend on whether
+/// it landed in a full tile or an edge. `a.len()` is a multiple of 4.
+#[inline]
+fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
+    let mut acc = F4::zero();
+    for (ca, cb) in a.chunks_exact(4).zip(b.chunks_exact(4)) {
+        acc = acc.add_mul(F4::load(cb), F4::load(ca));
+    }
+    acc.sum()
+}
+
+/// 4 activation rows by 4 weight rows: sixteen `dot_f32`s sharing their
+/// loads (each 4-lane chunk of a row is read once for four products), the
+/// register-blocked inner kernel of the multi-row path; 16 accumulators in
+/// SIMD registers (`cpu_kernels::F4`).
+#[inline]
+fn dot_tile(x: [&[f32]; 4], w: [&[f32]; 4]) -> [[f32; 4]; 4] {
+    let mut acc = [[F4::zero(); 4]; 4];
+    let n = x[0].len();
+    let mut k = 0;
+    while k + 4 <= n {
+        let xs = [F4::load(&x[0][k..]), F4::load(&x[1][k..]), F4::load(&x[2][k..]), F4::load(&x[3][k..])];
+        let ws = [F4::load(&w[0][k..]), F4::load(&w[1][k..]), F4::load(&w[2][k..]), F4::load(&w[3][k..])];
+        for i in 0..4 {
+            for j in 0..4 {
+                acc[i][j] = acc[i][j].add_mul(xs[i], ws[j]);
+            }
+        }
+        k += 4;
+    }
+    acc.map(|row| row.map(F4::sum))
+}
+
+/// Output columns per unit of work of the multi-row path: their weight
+/// rows are dequantized once (`COLS_PER_TASK * in_dim` floats, cache
+/// resident) and reused for every activation row. A multiple of
+/// `dot_tile`'s 4.
+const COLS_PER_TASK: usize = 16;
+
+/// Output columns `cols` of `linear` for every row, written column-major
+/// into `out_t` (`[cols.len(), rows]`): the multi-row path's unit of work.
+/// Each element is `dot_f32(weight row, activation row) + bias` computed by
+/// the same operation sequence whether it falls in a 4x4 `dot_tile` or an
+/// edge, so any split of rows or columns (tiles, threads) gives the same
+/// bits.
+fn linear_cols(x: &[f32], rows: usize, in_dim: usize, w: &CpuWeight, b: &[f32], cols: std::ops::Range<usize>, out_t: &mut [f32]) {
+    let ncols = cols.len();
+    let mut wrows = vec![0f32; ncols * in_dim];
+    for (j, c) in cols.clone().enumerate() {
+        w.dequant_row(c, &mut wrows[j * in_dim..(j + 1) * in_dim]);
+    }
+    let wrow = |j: usize| &wrows[j * in_dim..(j + 1) * in_dim];
+    let xrow = |r: usize| &x[r * in_dim..(r + 1) * in_dim];
+    let bias = |j: usize| b[cols.start + j];
+    let full_c = ncols / 4 * 4;
+    let mut r = 0;
+    while r + 4 <= rows {
+        let xs = [xrow(r), xrow(r + 1), xrow(r + 2), xrow(r + 3)];
+        for c0 in (0..full_c).step_by(4) {
+            let t = dot_tile(xs, [wrow(c0), wrow(c0 + 1), wrow(c0 + 2), wrow(c0 + 3)]);
+            for (i, ti) in t.iter().enumerate() {
+                for (j, v) in ti.iter().enumerate() {
+                    out_t[(c0 + j) * rows + r + i] = v + bias(c0 + j);
+                }
+            }
+        }
+        for j in full_c..ncols {
+            for (i, xr) in xs.iter().enumerate() {
+                out_t[j * rows + r + i] = dot_f32(wrow(j), xr) + bias(j);
+            }
+        }
+        r += 4;
+    }
+    for rr in r..rows {
+        for j in 0..ncols {
+            out_t[j * rows + rr] = dot_f32(wrow(j), xrow(rr)) + bias(j);
+        }
+    }
+}
+
+/// Multi-row `linear` (prefill, chunks): dequantize each weight row once
+/// per call instead of once per output element, and run 4x4 register
+/// tiles. Column blocks are spread over rayon's pool under the `threads`
+/// feature (pure capability read, as in `linear_threads`); same bits either
+/// way (`linear_cols`).
+fn linear_multi_row(x: &[f32], rows: usize, in_dim: usize, w: &CpuWeight, b: &[f32], out_dim: usize) -> Vec<f32> {
+    let mut out_t = vec![0f32; rows * out_dim];
+    let block = |(i, chunk): (usize, &mut [f32])| {
+        let c0 = i * COLS_PER_TASK;
+        linear_cols(x, rows, in_dim, w, b, c0..(c0 + chunk.len() / rows), chunk);
+    };
+    #[cfg(feature = "threads")]
+    {
+        use rayon::prelude::*;
+        out_t.par_chunks_mut(COLS_PER_TASK * rows).enumerate().for_each(block);
+    }
+    #[cfg(not(feature = "threads"))]
+    out_t.chunks_mut(COLS_PER_TASK * rows).enumerate().for_each(block);
+    let mut out = vec![0f32; rows * out_dim];
+    for c in 0..out_dim {
+        for r in 0..rows {
+            out[r * out_dim + c] = out_t[c * rows + r];
+        }
+    }
+    out
+}
+
 /// `x`: `[rows, in_dim]` row-major. Returns `[rows, out_dim]` row-major, `+
 /// bias` per output column - same shape/semantics as `model.rs::linear`'s
 /// GPU kernel, computed as `rows * out_dim` independent dot products (no
@@ -87,7 +232,14 @@ impl CpuWeight {
 /// only which thread computes which element, not the arithmetic each
 /// element does. Unlike a tree-reduction split, this makes the threaded and
 /// single-thread paths bit-for-bit identical, not just token-exact.
+///
+/// Two or more rows (`in_dim` a multiple of 4) take `linear_multi_row` instead (same values up to
+/// float summation order; a one-row decode step keeps the per-row dot
+/// kernels the fixtures were gated on).
 fn linear(x: &[f32], rows: usize, in_dim: usize, w: &CpuWeight, b: &[f32], out_dim: usize) -> Vec<f32> {
+    if rows >= 2 && in_dim.is_multiple_of(4) {
+        return linear_multi_row(x, rows, in_dim, w, b, out_dim);
+    }
     #[cfg(feature = "threads")]
     {
         if let Some(out) = linear_threads(x, rows, in_dim, w, b, out_dim) {
@@ -179,12 +331,14 @@ fn silu_mul(gate: &[f32], up: &[f32]) -> Vec<f32> {
 }
 
 /// Split-half RoPE (`rotate_half`, matches `shaders/rope_neox.wgsl`), in
-/// place on `buf` (`[rows, heads, head_dim]` row-major). `pos_base + row` is
-/// each row's absolute position - same convention as `model.rs::rope`.
-fn rope_inplace(buf: &mut [f32], rows: usize, heads: usize, head_dim: usize, pos_base: usize, theta: f32) {
+/// place on `buf` (`[rows, heads, head_dim]` row-major). `positions[row]` is
+/// each row's absolute position: `pos_base + row` for a causal
+/// continuation (`model.rs::rope`), caller-chosen for a `ForwardSpec` chunk
+/// (`model.rs::rope_positions`).
+fn rope_inplace(buf: &mut [f32], rows: usize, heads: usize, head_dim: usize, positions: &[u32], theta: f32) {
     let half = head_dim / 2;
-    for row in 0..rows {
-        let pos = (pos_base + row) as f32;
+    for (row, &pos) in positions.iter().enumerate().take(rows) {
+        let pos = pos as f32;
         for head in 0..heads {
             let base = (row * heads + head) * head_dim;
             for j in 0..half {
@@ -253,12 +407,32 @@ impl CpuEmbed {
     }
 }
 
+/// One projection's runtime LoRA delta on the CPU backend: `a` is
+/// `[rank, in]`, `b` is `[out, rank]` with `alpha / rank` folded in, both
+/// plain F32 weights run through `linear()` - the same two-matmul-plus-add
+/// the GPU backend does (`model.rs::apply_lora_proj`), from the same
+/// host-side factors (`lora::HostLoraProj`).
+struct CpuLoraProj {
+    a: CpuWeight,
+    b: CpuWeight,
+    rank: usize,
+    out_features: usize,
+}
+
+/// `[q, k, v, o]` per layer.
+struct CpuLora {
+    layers: Vec<[CpuLoraProj; 4]>,
+}
+
 pub struct CpuModel {
     pub config: Qwen2Config,
     embed: CpuEmbed,
     layers: Vec<CpuLayer>,
     out_norm: Vec<f32>,
     lm_head: CpuWeight,
+    /// Runtime LoRA adapter (q/k/v/o), added to each projection's output on
+    /// every forward; the base weights are never touched. See `lora.rs`.
+    lora: Option<CpuLora>,
 }
 
 fn gguf_f32_vec<R: Read + Seek>(reader: &mut GgufReader<R>, name: &str) -> Result<Vec<f32>> {
@@ -390,8 +564,63 @@ impl CpuModel {
 
         drop(reader);
 
-        Ok(CpuModel { config, embed, layers, out_norm, lm_head })
+        Ok(CpuModel { config, embed, layers, out_norm, lm_head, lora: None })
     }
+
+    /// Parse an LLMLIFE2 adapter (q/k/v/o, see `lora.rs`) and apply it,
+    /// replacing any adapter applied earlier: CPU mirror of
+    /// `GpuModel::apply_lora`.
+    pub fn apply_lora(&mut self, bytes: &[u8]) -> Result<()> {
+        let raw = crate::lora::RawLoraAdapter::parse(bytes, self.config.num_layers)?;
+        let proj = |h: crate::lora::HostLoraProj| CpuLoraProj {
+            a: CpuWeight::F32 { data: h.a_t, out_dim: h.rank, in_dim: h.in_features },
+            b: CpuWeight::F32 { data: h.b_t, out_dim: h.out_features, in_dim: h.rank },
+            rank: h.rank,
+            out_features: h.out_features,
+        };
+        let layers = raw.host_layers().into_iter().map(|l| l.map(proj)).collect();
+        self.lora = Some(CpuLora { layers });
+        Ok(())
+    }
+
+    /// Back to the base model: CPU mirror of `GpuModel::clear_lora`.
+    pub fn clear_lora(&mut self) {
+        self.lora = None;
+    }
+
+    pub fn has_lora(&self) -> bool {
+        self.lora.is_some()
+    }
+
+    /// Logits for a few vocab ids at every row of `hidden` (`[rows,
+    /// hidden]`, as `forward_chunk_spec` returns it), read through the token
+    /// embedding rows: CPU mirror of `GpuModel::embed_head_sliced` (see its
+    /// doc comment on why the embedding rows and not `output.weight`).
+    /// Returns `[rows, token_ids.len()]`, row-major.
+    pub fn embed_head_sliced(&self, hidden: &[f32], rows: usize, token_ids: &[u32]) -> Vec<f32> {
+        let h = self.config.hidden_size;
+        let head: Vec<Vec<f32>> = token_ids.iter().map(|&id| self.embed.row(id)).collect();
+        let mut out = vec![0f32; rows * token_ids.len()];
+        for r in 0..rows {
+            let x = &hidden[r * h..(r + 1) * h];
+            for (k, w) in head.iter().enumerate() {
+                out[r * token_ids.len() + k] = x.iter().zip(w).map(|(a, b)| a * b).sum();
+            }
+        }
+        out
+    }
+}
+
+/// `linear()` plus, when `lora` is `Some`, that projection's LoRA delta
+/// `(x A^T) B^T` added to the output - CPU mirror of `model.rs::linear_lora`.
+fn linear_lora(x: &[f32], rows: usize, in_dim: usize, w: &CpuWeight, b: &[f32], out_dim: usize, lora: Option<&CpuLoraProj>) -> Vec<f32> {
+    let mut out = linear(x, rows, in_dim, w, b, out_dim);
+    if let Some(p) = lora {
+        let mid = linear(x, rows, in_dim, &p.a, &vec![0f32; p.rank], p.rank);
+        let delta = linear(&mid, rows, p.rank, &p.b, &vec![0f32; p.out_features], p.out_features);
+        add_inplace(&mut out, &delta);
+    }
+    out
 }
 
 /// Same layout convention as `model.rs::KvCache` (see this file's top doc
@@ -456,21 +685,35 @@ impl CpuKvCache {
 /// convention and `model.rs`'s doc comment: "kv_len passed to attn_decode
 /// already includes the current position"). `q`: `[t, n_heads, head_dim]`.
 /// Returns `[t, n_heads, head_dim]`.
+///
+/// `allowed`: `None` is the causal rule above; `Some(bits)` is a
+/// `ForwardSpec` bitset (`[t, kv_len]`, bit `i * kv_len + j` set when row
+/// `i` may attend key `j`) - the CPU mirror of `attn_chunk_masked.wgsl`.
 #[allow(clippy::too_many_arguments)]
-fn attention(q: &[f32], k_cache: &[f32], v_cache: &[f32], t: usize, kv_len: usize, n_heads: usize, n_kv_heads: usize, head_dim: usize, max_ctx: usize, query_pos_base: usize) -> Vec<f32> {
+fn attention(q: &[f32], k_cache: &[f32], v_cache: &[f32], t: usize, kv_len: usize, n_heads: usize, n_kv_heads: usize, head_dim: usize, max_ctx: usize, query_pos_base: usize, allowed: Option<&[u32]>) -> Vec<f32> {
     let n_rep = n_heads / n_kv_heads;
     let scale = 1.0 / (head_dim as f32).sqrt();
     let mut out = vec![0f32; t * n_heads * head_dim];
+    let mut keys: Vec<usize> = Vec::with_capacity(kv_len);
     for i in 0..t {
-        let causal_len = query_pos_base + i + 1; // this row may attend keys [0, causal_len)
-        let causal_len = causal_len.min(kv_len);
+        keys.clear();
+        match allowed {
+            None => {
+                let causal_len = query_pos_base + i + 1; // this row may attend keys [0, causal_len)
+                keys.extend(0..causal_len.min(kv_len));
+            }
+            Some(bits) => keys.extend((0..kv_len).filter(|j| {
+                let idx = i * kv_len + j;
+                (bits[idx / 32] >> (idx % 32)) & 1 != 0
+            })),
+        }
         for head in 0..n_heads {
             let kv_head = head / n_rep;
             let q_base = (i * n_heads + head) * head_dim;
             let qr = &q[q_base..q_base + head_dim];
-            let mut scores = vec![0f32; causal_len];
+            let mut scores = vec![0f32; keys.len()];
             let mut max_score = f32::NEG_INFINITY;
-            for (j, score) in scores.iter_mut().enumerate() {
+            for (&j, score) in keys.iter().zip(scores.iter_mut()) {
                 let k_base = (kv_head * max_ctx + j) * head_dim;
                 let kr = &k_cache[k_base..k_base + head_dim];
                 let dot: f32 = qr.iter().zip(kr).map(|(a, b)| a * b).sum();
@@ -483,7 +726,7 @@ fn attention(q: &[f32], k_cache: &[f32], v_cache: &[f32], t: usize, kv_len: usiz
                 sum += *s;
             }
             let out_base = (i * n_heads + head) * head_dim;
-            for (j, &score) in scores.iter().enumerate() {
+            for (&j, &score) in keys.iter().zip(scores.iter()) {
                 let w = score / sum;
                 let v_base = (kv_head * max_ctx + j) * head_dim;
                 let vr = &v_cache[v_base..v_base + head_dim];
@@ -497,20 +740,34 @@ fn attention(q: &[f32], k_cache: &[f32], v_cache: &[f32], t: usize, kv_len: usiz
 }
 
 /// One layer's forward, in place on `x` (`[rows, hidden]`, returned as a new
-/// `Vec<f32>` - residual add is internal). `query_pos_base` is `x`'s first
-/// row's absolute position (0 for a from-scratch prefill, `cache.kv_len`
-/// for a decode/suffix step) - same role as `model.rs::attn_decode`'s
-/// `pos`/`rope`'s `pos_base`.
+/// `Vec<f32>` - residual add is internal). `kv_base` is the cache slot of
+/// `x`'s first row (0 for a from-scratch prefill, `cache.kv_len` for a
+/// decode/suffix/chunk step); `positions` holds each row's RoPE position
+/// (`kv_base + row` for a causal continuation, caller-chosen for a
+/// `ForwardSpec` chunk); `allowed` is the chunk's attention bitset (`None`:
+/// causal) - see `attention`. `lora` is this layer's `[q, k, v, o]` adapter.
 #[allow(clippy::too_many_arguments)]
-fn layer_forward(layer: &CpuLayer, x: &[f32], rows: usize, cfg: &Qwen2Config, k_cache: &mut [f32], v_cache: &mut [f32], query_pos_base: usize) -> Vec<f32> {
+fn layer_forward(
+    layer: &CpuLayer,
+    x: &[f32],
+    rows: usize,
+    cfg: &Qwen2Config,
+    k_cache: &mut [f32],
+    v_cache: &mut [f32],
+    kv_base: usize,
+    positions: &[u32],
+    allowed: Option<&[u32]>,
+    lora: Option<&[CpuLoraProj; 4]>,
+) -> Vec<f32> {
     let hidden = cfg.hidden_size;
     let q_dim = cfg.num_heads * cfg.head_dim;
     let kv_dim = cfg.num_kv_heads * cfg.head_dim;
+    let lora_proj = |i: usize| lora.map(|l| &l[i]);
 
     let normed = rmsnorm(x, &layer.attn_norm, rows, hidden, cfg.rms_norm_eps);
-    let mut q = linear(&normed, rows, hidden, &layer.q_w, &layer.q_b, q_dim);
-    let mut k = linear(&normed, rows, hidden, &layer.k_w, &layer.k_b, kv_dim);
-    let v = linear(&normed, rows, hidden, &layer.v_w, &layer.v_b, kv_dim);
+    let mut q = linear_lora(&normed, rows, hidden, &layer.q_w, &layer.q_b, q_dim, lora_proj(0));
+    let mut k = linear_lora(&normed, rows, hidden, &layer.k_w, &layer.k_b, kv_dim, lora_proj(1));
+    let v = linear_lora(&normed, rows, hidden, &layer.v_w, &layer.v_b, kv_dim, lora_proj(2));
 
     if let Some(scale) = &layer.q_norm {
         q = rmsnorm(&q, scale, rows * cfg.num_heads, cfg.head_dim, cfg.rms_norm_eps);
@@ -519,17 +776,17 @@ fn layer_forward(layer: &CpuLayer, x: &[f32], rows: usize, cfg: &Qwen2Config, k_
         k = rmsnorm(&k, scale, rows * cfg.num_kv_heads, cfg.head_dim, cfg.rms_norm_eps);
     }
 
-    rope_inplace(&mut q, rows, cfg.num_heads, cfg.head_dim, query_pos_base, cfg.rope_theta);
-    rope_inplace(&mut k, rows, cfg.num_kv_heads, cfg.head_dim, query_pos_base, cfg.rope_theta);
-
-    CpuKvCache::scatter(k_cache, &k, rows, cfg.num_kv_heads, cfg.head_dim, query_pos_base, k_cache.len() / (cfg.num_kv_heads * cfg.head_dim));
-    CpuKvCache::scatter(v_cache, &v, rows, cfg.num_kv_heads, cfg.head_dim, query_pos_base, v_cache.len() / (cfg.num_kv_heads * cfg.head_dim));
+    rope_inplace(&mut q, rows, cfg.num_heads, cfg.head_dim, positions, cfg.rope_theta);
+    rope_inplace(&mut k, rows, cfg.num_kv_heads, cfg.head_dim, positions, cfg.rope_theta);
 
     let max_ctx = k_cache.len() / (cfg.num_kv_heads * cfg.head_dim);
-    let kv_len = query_pos_base + rows;
-    let attn_out = attention(&q, k_cache, v_cache, rows, kv_len, cfg.num_heads, cfg.num_kv_heads, cfg.head_dim, max_ctx, query_pos_base);
+    CpuKvCache::scatter(k_cache, &k, rows, cfg.num_kv_heads, cfg.head_dim, kv_base, max_ctx);
+    CpuKvCache::scatter(v_cache, &v, rows, cfg.num_kv_heads, cfg.head_dim, kv_base, max_ctx);
 
-    let o = linear(&attn_out, rows, q_dim, &layer.o_w, &layer.o_b, hidden);
+    let kv_len = kv_base + rows;
+    let attn_out = attention(&q, k_cache, v_cache, rows, kv_len, cfg.num_heads, cfg.num_kv_heads, cfg.head_dim, max_ctx, kv_base, allowed);
+
+    let o = linear_lora(&attn_out, rows, q_dim, &layer.o_w, &layer.o_b, hidden, lora_proj(3));
     let mut x = x.to_vec();
     add_inplace(&mut x, &o);
 
@@ -551,18 +808,53 @@ fn embed_gather(model: &CpuModel, token_ids: &[u32]) -> Vec<f32> {
     out
 }
 
-fn forward_layers(model: &CpuModel, cache: &mut CpuKvCache, token_ids: &[u32]) -> Vec<f32> {
+/// Every layer plus `output_norm` over `token_ids` written at cache slots
+/// `[kv_len, kv_len + t)`; returns the normed hidden states `[t, hidden]`
+/// and leaves `cache.kv_len` at `kv_len + t`.
+fn forward_hidden(model: &CpuModel, cache: &mut CpuKvCache, token_ids: &[u32], positions: &[u32], allowed: Option<&[u32]>) -> Vec<f32> {
     let cfg = &model.config;
     cache.assert_matches(cfg);
     let rows = token_ids.len();
-    let query_pos_base = cache.kv_len;
+    let kv_base = cache.kv_len;
+    assert!(kv_base + rows <= cache.max_ctx, "CPU forward: kv_len {kv_base} + {rows} rows exceeds max_ctx {}", cache.max_ctx);
     let mut x = embed_gather(model, token_ids);
     for (i, layer) in model.layers.iter().enumerate() {
-        x = layer_forward(layer, &x, rows, cfg, &mut cache.k[i], &mut cache.v[i], query_pos_base);
+        let lora = model.lora.as_ref().map(|l| &l.layers[i]);
+        x = layer_forward(layer, &x, rows, cfg, &mut cache.k[i], &mut cache.v[i], kv_base, positions, allowed, lora);
     }
-    cache.kv_len = query_pos_base + rows;
-    let normed = rmsnorm(&x, &model.out_norm, rows, cfg.hidden_size, cfg.rms_norm_eps);
+    cache.kv_len = kv_base + rows;
+    rmsnorm(&x, &model.out_norm, rows, cfg.hidden_size, cfg.rms_norm_eps)
+}
+
+fn forward_layers(model: &CpuModel, cache: &mut CpuKvCache, token_ids: &[u32]) -> Vec<f32> {
+    let cfg = &model.config;
+    let rows = token_ids.len();
+    let positions: Vec<u32> = (0..rows).map(|r| (cache.kv_len + r) as u32).collect();
+    let normed = forward_hidden(model, cache, token_ids, &positions, None);
     linear(&normed, rows, cfg.hidden_size, &model.lm_head, &vec![0f32; cfg.vocab_size], cfg.vocab_size)
+}
+
+/// CPU mirror of `model.rs::forward_chunk_spec`: one chunk of `token_ids`
+/// against the cache's resident prefix (`cache.kv_len` positions), with
+/// the caller's positions and attention bitset (`ForwardSpec`; defaults:
+/// continue counting from `kv_len`, causal over prefix plus chunk).
+/// Returns the hidden states `[t, hidden]` (post `output_norm`, pre head:
+/// slice with `CpuModel::embed_head_sliced`) and leaves `cache.kv_len` at
+/// `prefix_len + t`; rewind by setting `kv_len` back to the prefix length.
+pub fn forward_chunk_spec(model: &CpuModel, cache: &mut CpuKvCache, token_ids: &[u32], spec: &crate::model::ForwardSpec) -> Vec<f32> {
+    let t = token_ids.len();
+    let prefix_len = cache.kv_len;
+    let positions: Vec<u32> = match &spec.positions {
+        Some(p) => {
+            assert_eq!(p.len(), t, "ForwardSpec positions must be one per token");
+            p.clone()
+        }
+        None => (0..t).map(|r| (prefix_len + r) as u32).collect(),
+    };
+    if let Some(bits) = &spec.allowed_bits {
+        assert!(bits.len() * 32 >= t * (prefix_len + t), "ForwardSpec mask must cover [t, prefix_len + t]");
+    }
+    forward_hidden(model, cache, token_ids, &positions, spec.allowed_bits.as_deref())
 }
 
 fn argmax(logits: &[f32]) -> u32 {
@@ -698,5 +990,41 @@ mod threads_tests {
         let single = linear_with_pool(1, &x, 1, in_dim, &w, &b, out_dim);
         let threaded = linear_with_pool(8, &x, 1, in_dim, &w, &b, out_dim);
         assert_eq!(single, threaded);
+    }
+}
+
+/// The multi-row path (`linear_multi_row`): every element equals
+/// `dot_f32(weight row, activation row) + bias` bit for bit, in a full 4x4
+/// tile or an edge, and agrees with the per-row decode kernels up to float
+/// summation order.
+#[cfg(test)]
+mod multi_row_tests {
+    use super::*;
+
+    #[test]
+    fn multi_row_matches_per_element_dot_and_per_row_kernel() {
+        let (out_dim, in_dim, rows) = (37usize, 64usize, 11usize); // edges in both rows and columns
+        let blocks_per_row = in_dim / 32;
+        let mut bytes = vec![0u8; out_dim * blocks_per_row * 18];
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = ((i * 11 + 5) % 256) as u8;
+        }
+        for blk in 0..out_dim * blocks_per_row {
+            bytes[blk * 18..blk * 18 + 2].copy_from_slice(&half::f16::from_f32(0.01 + (blk % 5) as f32 * 0.004).to_le_bytes());
+        }
+        let w = CpuWeight::Q4_0 { bytes, out_dim, in_dim, blocks_per_row };
+        let b: Vec<f32> = (0..out_dim).map(|c| c as f32 * 0.01).collect();
+        let x: Vec<f32> = (0..rows * in_dim).map(|i| ((i * 7) % 251) as f32 * 0.01 - 1.0).collect();
+        let got = linear_multi_row(&x, rows, in_dim, &w, &b, out_dim);
+        let reference = linear_serial(&x, rows, in_dim, &w, &b, out_dim);
+        let mut wrow = vec![0f32; in_dim];
+        for c in 0..out_dim {
+            w.dequant_row(c, &mut wrow);
+            for r in 0..rows {
+                let want = dot_f32(&wrow, &x[r * in_dim..(r + 1) * in_dim]) + b[c];
+                assert_eq!(got[r * out_dim + c].to_bits(), want.to_bits(), "row {r} col {c}");
+                assert!((got[r * out_dim + c] - reference[r * out_dim + c]).abs() < 1e-4, "row {r} col {c} vs per-row kernel");
+            }
+        }
     }
 }
