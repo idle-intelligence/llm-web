@@ -114,11 +114,14 @@ it ran faster than the base.
 
 ### Phone (Adreno 6xx, Android Chrome, 36 tokens)
 
-| build | prefill | gate_up | down | qkv | o_proj | attn | lm_head |
-|---|---|---|---|---|---|---|---|
-| b63ff51 (reported) | 954 | 464 | 230 | 58 | 44 | 57 | 11 |
-| 2026-10-03-prefill-01 | pending | | | | | | |
-| 2026-10-03-prefill-01-tiled (experiment) | pending | | | | | | |
+Run by TC, values as reported back. All runs gave token hash
+a454748c60e23841.
+
+| build | prefill | prefill warm | gpu span | gate_up | down | qkv | o_proj | attn | lm_head | decode ms/token | probe read GB/s |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 2026-10-03-next-01 (b63ff51) | 953.7 | 943.5 | | 464.0 | 229.8 | 57.6 | 43.9 | 56.6 | | | |
+| 2026-10-03-prefill-01 (160d015) | 565.7 | 469.2 | 440.9 | 203.3 | 109.9 | 29.8 | 21.7 | 59.1 | 10.7 | 62.9 | 17.8 |
+| 2026-10-03-prefill-01-tiled (experiment) | 2075.1 | 2038.4 | | 1054.1 | 603.3 | 166.4 | 112.5 | 55.4 | | | |
 
 ### Gates (native, M2, at 652f98c)
 
@@ -149,9 +152,15 @@ it ran faster than the base.
 - The 64x64 tiled kernel at 36 rows was slower on the M2 than both small-M
   kernels (gate_up 31.5 ms). Whether that holds on the phone is what the
   experiment build measures.
-- The working hypothesis (x loads, not weight bandwidth) is tested only by
-  the phone run of 2026-10-03-prefill-01. Its x traffic from the storage
-  buffer is K x 4 B per row and column tile (about 4.9 MB per layer for
-  gate_up at 36 rows, down from 1.25 GB).
+- On the phone the rewrite took gate_up from 464.0 to 203.3 ms (-56%),
+  down from 229.8 to 109.9 (-52%), qkv from 57.6 to 29.8 and o_proj from
+  43.9 to 21.7 ms. Prefill went from 953.7 to 565.7 ms (warm 943.5 to
+  469.2). x traffic from the storage buffer fell from about 1.25 GB to
+  about 4.9 MB per layer for gate_up at 36 rows.
+- The 64x64 tiled kernel at 36 rows took 1054.1 ms for gate_up on the
+  phone, 5.2x the new small-M kernel. That kernel reads each weight once
+  per 64-row tile, where the small-M kernel reads it 5 times at 36 rows.
+  Per multiply-add, it makes more workgroup-memory loads, and more of them
+  to distinct addresses (its weight tile loads are not broadcasts).
 - On Metal, module-scope `var<private>` accumulators updated through a
   function made the kernel 5x slower than function-local variables.
