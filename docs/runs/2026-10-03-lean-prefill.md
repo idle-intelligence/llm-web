@@ -164,3 +164,101 @@ a454748c60e23841.
   to distinct addresses (its weight tile loads are not broadcasts).
 - On Metal, module-scope `var<private>` accumulators updated through a
   function made the kernel 5x slower than function-local variables.
+
+## Checkpoint 2
+
+### Changes
+
+| commit | change |
+|---|---|
+| 1a5c955 | `attn_prefill_tiled.wgsl`: causal GQA prefill attention, 64 threads per (head, 8 query rows), 8 lanes per row, K/V tiles of 8 keys and the tile's q rows staged as vec4s in workgroup memory (rows padded by one vec4), online softmax per key tile, fixed vec4 accumulators. Pipelines for head_dim 64 and 128 (`HEAD_DIM` override); other head_dims keep `attn_prefill.wgsl`. Also names the small-M kernel's rows/columns per workgroup (`SMALL_M_ROWS`, `SMALL_M_COLS`) at its dispatch sites |
+| 504ca0a | ENGINE_BUILD 2026-10-03-prefill-02 on every loading URL |
+
+### Small-M matmul variants (experiments, not on the branch)
+
+Generated from one template: R query rows x C columns per thread, 16
+column lanes x 4 K-split lanes, 64 threads, x staged in workgroup memory.
+Per thread and k4 slot: R workgroup-memory vec4 loads for 4RC
+multiply-adds. Weights are read ceil(M / R) times.
+
+| name | R x C | columns per workgroup | x loads per multiply-add (vs prefill-01) | weight reads at M = 36 | accumulator floats per thread |
+|---|---|---|---|---|---|
+| prefill-01 (branch) | 8 x 4 | 64 | 1x | 5 | 32 |
+| A | 4 x 8 | 128 | 0.5x | 9 | 32 |
+| B | 8 x 8 | 128 | 0.5x | 5 | 64 |
+| C | 16 x 4 | 64 | 1x | 3 | 64 |
+
+A first version of the template unrolled the 8 k4 slots of a block in the
+source, instead of the runtime loop prefill-01 uses. On the M2 (native,
+36 tokens, load 1.5-1.7) its 8 x 4 build ran gate_up in 162-164 ms against
+45-52 ms for prefill-01; with a runtime slot loop the same 8 x 4 build ran
+at prefill-01's speed (gate_up 24-46 vs 45-46 ms, bimodal in both). This
+is the same 5x Metal slowdown as the `var<private>` version in checkpoint 1.
+
+### Native, M2, prefill attention (one run each, load 1.4)
+
+| prompt tokens | prefill-01 attn | tiled attn | prefill-01 wall | tiled wall |
+|---|---|---|---|---|
+| 36 | 33.03 | 4.28 | 119.56 | 80.94 |
+| 128 | 70.35 | 10.21 | 270.00 | 194.44 |
+| 512 | 683.02 | 120.11 | 1248.04 | 698.02 |
+
+GPU split ms (`--split`) and wall ms (median of 3).
+
+### Browser, M2, prefill-01 vs prefill-02, ABAB x5 (load average 2.1-2.8), and one run of each variant
+
+| | prefill-01 (160d015) | prefill-02 (504ca0a) | A 4x8 | B 8x8 | C 16x4 |
+|---|---|---|---|---|---|
+| prefill ms | 74.7 (68.0 / 77.2) | 52.9 (52.0 / 60.9) | 89.1 | 161.0 | 183.0 |
+| prefill warm ms | 60.8 (60.3 / 61.5) | 45.6 (45.5 / 45.7) | 72.4 | 147.0 | 166.9 |
+| gate_up | 21.8 | 21.8 | 34.7 | 69.9 | 84.4 |
+| down | 12.2 | 12.3 | 20.9 | 41.5 | 44.1 |
+| qkv | 4.3 | 4.3 | 7.7 | 21.7 | 24.1 |
+| o_proj | 2.6 | 2.6 | 4.2 | 8.1 | 8.5 |
+| attn | 15.4 | 0.7 | 0.7 | 0.7 | 0.7 |
+| decode ms/token | 7.1 | 7.1 | 7.1 | 7.1 | 7.1 |
+| token hash | a454748c60e23841 (all) | a454748c60e23841 (all) | a454748c60e23841 | a454748c60e23841 | a454748c60e23841 |
+
+Medians (min / max) over 5 runs for the first two columns; GPU split in ms.
+The variants are built from 504ca0a (with the tiled attention) and differ
+from prefill-02 only in the small-M kernel.
+
+### Phone, checkpoint 2
+
+| build | prefill | prefill warm | gate_up | down | qkv | o_proj | attn |
+|---|---|---|---|---|---|---|---|
+| 2026-10-03-prefill-02 | pending | | | | | | |
+| 2026-10-03-prefill-02-A | pending | | | | | | |
+| 2026-10-03-prefill-02-B | pending | | | | | | |
+| 2026-10-03-prefill-02-C | pending | | | | | | |
+
+### Gates (native, M2, at 1a5c955)
+
+| test | result |
+|---|---|
+| fixture_parity (both kernel paths) | ok (58.5 s) |
+| fixture_parity_qwen25_3b | ok (40.5 s) |
+| fixture_parity_qwen3 | ok (62.8 s) |
+| fixture_parity_qwen3_1_7b | ok (182.0 s) |
+| fixture_parity_llama_360m | ok (13.9 s) |
+| kv_snapshot | ok, 2 tests (44.4 s) |
+| logit_mask | ok, 3 tests (2.9 s) |
+| pool_reuse | ok (3.0 s) |
+| embed_head_sliced (incl. adapter swap) | ok, 2 tests (3.6 s) |
+| cargo clippy -D warnings, native all targets and wasm32 `web` | clean |
+| backends.html webgpu, M2 | a454748c60e23841, same as transformers |
+
+### Observations
+
+- Prefill attention on the M2 browser went from 15.4 to 0.7 ms at 36
+  tokens. Natively it went from 683 to 120 ms at 512 tokens. The M2
+  browser prefill went from 74.7 to 52.9 ms (warm 60.8 to 45.6).
+- The fixture tests with long prompts ran in less time: fixture_parity
+  179.1 to 58.5 s, qwen3_1_7b 369.4 to 182.0 s, kv_snapshot 109.0 to
+  44.4 s.
+- On the M2, all three matmul variants are slower than prefill-01: A by
+  1.6x on gate_up, B by 3.2x, C by 3.9x. B and C hold 64 accumulator floats
+  per thread, against 32 for prefill-01 and A.
+- The phone runs of A, B and C test separately: half the workgroup-memory
+  loads per multiply-add (A, B), and fewer weight reads (C: 3 instead of 5
+  at 36 rows; A: 9).
