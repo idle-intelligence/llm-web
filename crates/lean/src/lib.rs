@@ -3,6 +3,7 @@
 //! `model.rs` (forward pass), `gguf.rs` (parsing), `engine.rs`/`pool.rs`
 //! (wgpu plumbing, ported from `t0-web/crates/t0-fast`).
 
+pub mod chat;
 pub mod chat_template;
 pub mod config;
 pub mod cpu;
