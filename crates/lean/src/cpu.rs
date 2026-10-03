@@ -287,6 +287,32 @@ fn linear_threads(x: &[f32], rows: usize, in_dim: usize, w: &CpuWeight, b: &[f32
     debug_assert_eq!(w_out, out_dim);
     debug_assert_eq!(w_in, in_dim);
 
+    // Inside a decode step's team (`cpu_team::with_team`): blocks of
+    // TEAM_ITEM output columns as team items, no rayon call.
+    if rows == 1 {
+        const TEAM_ITEM: usize = 32;
+        struct OutPtr(*mut f32);
+        // SAFETY: items write disjoint column ranges of `out`.
+        unsafe impl Sync for OutPtr {}
+        impl OutPtr {
+            fn get(&self) -> *mut f32 {
+                self.0
+            }
+        }
+        let mut out = vec![0f32; out_dim];
+        let ptr = OutPtr(out.as_mut_ptr());
+        let item = |i: usize| {
+            let c0 = i * TEAM_ITEM;
+            for (c, bc) in b.iter().enumerate().take(((i + 1) * TEAM_ITEM).min(out_dim)).skip(c0) {
+                // SAFETY: `c < out_dim`, and each `c` belongs to one item.
+                unsafe { *ptr.get().add(c) = w.dot_row(c, x) + bc };
+            }
+        };
+        if crate::cpu_team::team_for(out_dim.div_ceil(TEAM_ITEM), &item) {
+            return Some(out);
+        }
+    }
+
     let n_threads = rayon::current_num_threads();
     let total = rows * out_dim;
     if n_threads <= 1 || total < n_threads * MIN_WORK_PER_THREAD {
@@ -882,6 +908,9 @@ pub fn forward_prefill(model: &CpuModel, cache: &mut CpuKvCache, token_ids: &[u3
 /// Decode one token against the cache; returns full-vocab logits - CPU
 /// mirror of `model.rs::forward_decode_step`.
 pub fn forward_decode_step(model: &CpuModel, cache: &mut CpuKvCache, token_id: u32) -> Vec<f32> {
+    #[cfg(feature = "threads")]
+    return crate::cpu_team::with_team(|| forward_layers(model, cache, &[token_id]));
+    #[cfg(not(feature = "threads"))]
     forward_layers(model, cache, &[token_id])
 }
 
