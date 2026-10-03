@@ -1,8 +1,7 @@
 // Copied verbatim from trucs.ai lib/model-cache.js
 // (github.com/idle-intelligence/trucs.ai, branch llm-life-demo,
-// commit fd6274bc88a295e99d4a7fed8ab82f265c4054c8). Do not fork this file —
+// commit 920fbd93a774595dda2b15ae50cc1d0e06c34ef6). Do not fork this file —
 // pull a fresh copy from that branch instead of hand-editing it here.
-//
 // model-cache.js — shared model download + Cache API storage for any
 // trucs.ai demo that loads one or more model files, in a page or a Worker.
 // No dependencies, dependency-free ES module.
@@ -68,6 +67,43 @@ async function fetchBytes(url, onBytes) {
   let off = 0;
   for (const c of chunks) { bytes.set(c, off); off += c.length; }
   return bytes;
+}
+
+// Streams `url` straight into `cache`: one branch of a teed response body
+// goes to cache.put (the browser writes it to disk without JS ever holding
+// the whole file), the other branch is only counted for onBytes and its
+// chunks are discarded. Reads the bytes back from the cache once put
+// resolves, so peak JS memory holds one copy of the file instead of two
+// (a 430 MB model used to mean a 430 MB chunk buffer, a second 430 MB
+// concatenated copy, and a third copy inside cache.put's own Response —
+// over 1 GB peak on a phone). Throws if the body can't be teed or the put
+// fails; the caller falls back to plain fetchBytes.
+async function fetchToCache(url, cache, onBytes) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`GET ${url}: ${r.status}`);
+  const total = Number(r.headers.get('content-length')) || 0;
+  const [forCache, forCount] = r.body.tee();
+
+  const putPromise = cache.put(
+    url,
+    new Response(forCache, { headers: { 'Content-Type': 'application/octet-stream' } })
+  );
+
+  const countPromise = (async () => {
+    const reader = forCount.getReader();
+    let loaded = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      loaded += value.length;
+      onBytes(loaded, total);
+    }
+  })();
+
+  await Promise.all([putPromise, countPromise]);
+
+  const cached = await cache.match(url);
+  return new Uint8Array(await cached.arrayBuffer());
 }
 
 // Asked at most once per page/worker lifetime (navigator.storage.persist()
@@ -138,20 +174,24 @@ export async function getModel(urls, opts = {}) {
       continue;
     }
 
-    const bytes = await fetchBytes(urls[i], (l, t) => {
+    const onBytes = (l, t) => {
       loaded[i] = l;
       sizes[i] = t || sizes[i];
       report();
-    });
-    sizes[i] = bytes.length;
+    };
 
+    let bytes;
     if (cache) {
       try {
-        await cache.put(urls[i], new Response(bytes.buffer, { headers: { 'Content-Type': 'application/octet-stream' } }));
+        bytes = await fetchToCache(urls[i], cache, onBytes);
       } catch (err) {
         if (!storageFailure) storageFailure = err;
+        bytes = await fetchBytes(urls[i], onBytes);
       }
+    } else {
+      bytes = await fetchBytes(urls[i], onBytes);
     }
+    sizes[i] = bytes.length;
 
     onFile(i, bytes);
     results.push(bytes);
