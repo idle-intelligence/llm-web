@@ -132,12 +132,12 @@ async function load() {
   }
   if (!engine) throw new Error(`no backend available (${skipped.join("; ")})`);
 
-  status(`ready — ${backendLabel(backend)}`, true);
+  status(`ready, ${backendLabel(backend)}`, true);
 }
 
 async function chat(text) {
   if (!engine) {
-    self.postMessage({ type: "error", message: "engine not loaded — send {type:'load'} first" });
+    self.postMessage({ type: "error", message: "engine not loaded; send {type:'load'} first" });
     return;
   }
   try {
