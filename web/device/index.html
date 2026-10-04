@@ -4,8 +4,6 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>llm-web device check - idle intelligence</title>
-    <link rel="icon" href="../favicon.ico">
-    <link rel="apple-touch-icon" href="../apple-touch-icon.png">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500&display=swap" rel="stylesheet">
@@ -45,14 +43,6 @@
             color: var(--muted);
             letter-spacing: 0.02em;
             margin-bottom: 2px;
-            display: flex;
-            align-items: center;
-            gap: 6px;
-        }
-        .org img {
-            width: 16px;
-            height: 16px;
-            border-radius: 2px;
         }
         h1 {
             font-family: 'IBM Plex Mono', monospace;
@@ -254,7 +244,7 @@
 </head>
 <body>
     <header>
-        <p class="org"><img src="../apple-touch-icon.png" alt="II">idle intelligence</p>
+        <p class="org">idle intelligence</p>
         <h1>llm-web device check</h1>
         <p class="tagline">
             Detects what this browser can run the lean engine on, and runs a short generation to check it against a
@@ -267,7 +257,7 @@
     </header>
 
     <section>
-        <h2>status</h2>
+        <h2>STATUS</h2>
         <div class="status">
             <span class="status-dot loading" id="statusDot"></span>
             <span id="statusText">Checking this device...</span>
@@ -283,14 +273,14 @@
     </section>
 
     <section>
-        <h2>device <span class="sub">· what was detected</span></h2>
+        <h2>DEVICE <span class="sub">· what was detected</span></h2>
         <dl class="rows" id="deviceRows">
             <dt>backend</dt><dd id="rowBackend">—</dd>
         </dl>
     </section>
 
     <section>
-        <h2>models <span class="sub">· what this backend can run</span></h2>
+        <h2>MODELS <span class="sub">· what this backend can run</span></h2>
         <ul class="model-list" id="modelList">
             <li><span>SmolLM2-360M-Instruct (Q4_0, ~219 MB)</span><span class="yes">runs on any backend</span></li>
             <li><span>Qwen2.5-0.5B-Instruct (Q4_0, ~430 MB)</span><span class="yes">runs on any backend</span></li>
@@ -299,7 +289,7 @@
     </section>
 
     <section>
-        <h2>verification <span class="sub">· one generation, checked against transformers</span></h2>
+        <h2>VERIFICATION <span class="sub">· one generation, checked against transformers</span></h2>
         <dl class="rows" id="resultRows">
             <dt>match</dt><dd id="rowMatch">—</dd>
             <dt>prefill</dt><dd id="rowPrefill">—</dd>

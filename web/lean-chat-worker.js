@@ -141,6 +141,9 @@ async function chat(text) {
     return;
   }
   try {
+    // web/index.html sends one fresh prompt per Send, same as the wllama
+    // page it replaced (no visible Reset button, no carried-over context).
+    engine.chatReset();
     abortFlag = new AbortFlagCtor();
     await engine.chatGenerate(
       text,

@@ -4,8 +4,6 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>llm-web — idle intelligence</title>
-    <link rel="icon" href="favicon.ico">
-    <link rel="apple-touch-icon" href="apple-touch-icon.png">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500&display=swap" rel="stylesheet">
@@ -45,14 +43,6 @@
             color: var(--muted);
             letter-spacing: 0.02em;
             margin-bottom: 2px;
-            display: flex;
-            align-items: center;
-            gap: 6px;
-        }
-        .org img {
-            width: 16px;
-            height: 16px;
-            border-radius: 2px;
         }
         h1 {
             font-family: 'IBM Plex Mono', monospace;
@@ -257,7 +247,7 @@
 </head>
 <body>
     <header>
-        <p class="org"><img src="apple-touch-icon.png" alt="II">idle intelligence</p>
+        <p class="org">idle intelligence</p>
         <h1>llm-web</h1>
         <p class="tagline">
             <a href="https://huggingface.co/HuggingFaceTB/SmolLM2-360M-Instruct">SmolLM2-360M-Instruct</a>
@@ -269,7 +259,7 @@
     </header>
 
     <section>
-        <h2>status</h2>
+        <h2>STATUS</h2>
         <div class="status">
             <span class="status-dot" id="statusDot"></span>
             <span id="statusText">Initializing...</span>
@@ -284,35 +274,34 @@
     </section>
 
     <section>
-        <h2>input <span class="sub">· message</span></h2>
+        <h2>INPUT <span class="sub">· message</span></h2>
         <textarea id="textInput" placeholder="Ask me anything..."></textarea>
         <div class="controls">
             <button id="sendBtn" class="primary" disabled>Send</button>
             <button id="stopBtn" style="display:none">Stop</button>
-            <button id="resetBtn" style="display:none">Reset</button>
         </div>
         <p class="info">Everything runs on this device.</p>
     </section>
 
     <section>
-        <h2>output <span class="sub">· response</span></h2>
+        <h2>OUTPUT <span class="sub">· response</span></h2>
         <div id="output" class="empty"><span id="outputText">Response will appear here...</span><span id="streamingCursor" class="streaming-cursor" style="display:none"></span></div>
     </section>
 
     <section id="metricsCard">
-        <h2>performance</h2>
+        <h2>PERFORMANCE</h2>
         <div class="metrics-grid">
             <div class="metric">
                 <div class="metric-value" id="metricTokens">—</div>
-                <div class="metric-label">tokens</div>
+                <div class="metric-label">TOKENS</div>
             </div>
             <div class="metric">
                 <div class="metric-value" id="metricElapsed">—</div>
-                <div class="metric-label">elapsed (s)</div>
+                <div class="metric-label">ELAPSED (s)</div>
             </div>
             <div class="metric">
                 <div class="metric-value" id="metricSpeed">—</div>
-                <div class="metric-label">tok/s</div>
+                <div class="metric-label">TOK/S</div>
             </div>
         </div>
     </section>
@@ -333,7 +322,6 @@
         const downloadBtn = document.getElementById('downloadBtn');
         const sendBtn = document.getElementById('sendBtn');
         const stopBtn = document.getElementById('stopBtn');
-        const resetBtn = document.getElementById('resetBtn');
         const textInput = document.getElementById('textInput');
         const outputEl = document.getElementById('output');
         const outputText = document.getElementById('outputText');
@@ -345,6 +333,7 @@
 
         let worker = null;
         let generating = false;
+        let stopRequested = false;
         let tokenCount = 0;
         let startTime = 0;
 
@@ -372,7 +361,6 @@
                 if (msg.type === 'status') {
                     if (msg.ready) {
                         updateStatus('ready', msg.text);
-                        resetBtn.style.display = '';
                         sendBtn.disabled = false;
                         progressBar.classList.remove('visible');
                         progressInfo.textContent = '';
@@ -400,7 +388,8 @@
                     streamingCursor.style.display = 'none';
                     sendBtn.disabled = false;
                     stopBtn.style.display = 'none';
-                    updateStatus('ready', 'Ready');
+                    updateStatus('ready', stopRequested ? 'Stopped' : 'Ready');
+                    stopRequested = false;
                 } else if (msg.type === 'error') {
                     generating = false;
                     streamingCursor.style.display = 'none';
@@ -426,6 +415,7 @@
             const text = textInput.value.trim();
             if (!text || generating || !worker) return;
             generating = true;
+            stopRequested = false;
             tokenCount = 0;
             startTime = performance.now();
             sendBtn.disabled = true;
@@ -439,14 +429,8 @@
 
         sendBtn.addEventListener('click', send);
         stopBtn.addEventListener('click', () => {
+            stopRequested = true;
             if (worker) worker.postMessage({ type: 'stop' });
-        });
-        resetBtn.addEventListener('click', () => {
-            if (worker) worker.postMessage({ type: 'reset' });
-            outputEl.classList.add('empty');
-            outputText.textContent = 'Response will appear here...';
-            metricsCard.style.display = 'none';
-            updateStatus('ready', 'Conversation reset');
         });
         textInput.addEventListener('keydown', (e) => {
             if (e.key === 'Enter' && !e.shiftKey) {
