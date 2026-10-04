@@ -18,12 +18,12 @@ ENGINE_BUILD=dev scripts/build_lean_mt.sh    # crates/lean/pkg-mt: CPU threads (
 python3 scripts/serve_coi.py
 ```
 
-Then open [`web/hello/index.html`](web/hello/index.html), a complete, minimal example (loads a model, streams one reply):
+Then open `http://localhost:8000/crates/lean/www/chat.html` (the port `serve_coi.py` prints) for a working chat page. The core of the API:
 
 ```html
 <script type="module">
-const mod = await import('../../crates/lean/pkg/lean.js');
-await mod.default('../../crates/lean/pkg/lean_bg.wasm');
+const mod = await import('./pkg/lean.js');
+await mod.default('./pkg/lean_bg.wasm');
 mod.leanInit();
 const engine = navigator.gpu ? await mod.LeanEngine.create() : mod.LeanEngineCpu.create();
 engine.load(ggufBytes, tokenizerJson, tokenizerConfigJson, 2048);
