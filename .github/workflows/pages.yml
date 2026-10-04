@@ -74,7 +74,7 @@ jobs:
           sed -i "s/const ENGINE_BUILD = \"[^\"]*\";/const ENGINE_BUILD = \"$TAG\";/" \
             _site/web/device/index.html
 
-          COUNT="$(grep -rEo 'ENGINE_BUILD = "[0-9a-f]{12}"' _site/web/lean-chat-worker.js _site/web/device/device_worker.js _site/web/device/index.html | wc -l)"
+          COUNT="$(grep -rEo 'ENGINE_BUILD = "[0-9a-f]{40}"' _site/web/lean-chat-worker.js _site/web/device/device_worker.js _site/web/device/index.html | wc -l)"
           if [ "$COUNT" -ne 3 ]; then
             echo "error: expected 3 ENGINE_BUILD assignments rewritten to $TAG, found $COUNT" >&2
             exit 1
