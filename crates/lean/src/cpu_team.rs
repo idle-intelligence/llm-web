@@ -14,7 +14,10 @@
 //! items; all threads, the leader included, claim items with a CAS on one
 //! 64-bit word (job epoch in the high half, next item in the low half, so a
 //! late thread can never claim an item of a newer job), and the leader
-//! spins until all `n` are done. No thread sleeps until `f` returns. Each
+//! spins until all `n` are done. A follower that finds no new job for
+//! `SPIN_LIMIT` polls parks on a condvar (the leader notifies only when one
+//! is parked), so a long serial stretch, or more pool threads than free
+//! cores, does not leave threads burning a core that the leader needs. Each
 //! item is computed by exactly the code the serial path runs, so results
 //! are bit-identical; only the thread that computes an item changes.
 //!
@@ -23,7 +26,11 @@
 
 use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex};
+
+/// Polls of the epoch word before a follower parks (no `yield_now` on
+/// wasm32: each poll is one atomic load).
+const SPIN_LIMIT: u32 = 1 << 18;
 
 type Body<'a> = &'a (dyn Fn(usize) + Sync);
 
@@ -38,6 +45,10 @@ struct Team {
     /// successful claim, while the leader is still waiting on that job.
     body: AtomicUsize,
     exit: AtomicBool,
+    /// Followers parked (or about to park) on `wake`.
+    sleepers: AtomicU32,
+    park: Mutex<()>,
+    wake: Condvar,
 }
 
 thread_local! {
@@ -71,14 +82,40 @@ impl Team {
 
     fn follow(&self) {
         let mut seen = 0u32;
-        while !self.exit.load(Ordering::Acquire) {
-            let e = self.epoch.load(Ordering::Acquire);
-            if e == seen {
+        let mut idle = 0u32;
+        while !self.exit.load(Ordering::SeqCst) {
+            let e = self.epoch.load(Ordering::SeqCst);
+            if e != seen {
+                seen = e;
+                idle = 0;
+                self.work(e);
+                continue;
+            }
+            idle += 1;
+            if idle < SPIN_LIMIT {
                 std::hint::spin_loop();
                 continue;
             }
-            seen = e;
-            self.work(e);
+            // Park. `sleepers` is raised before the epoch and exit flag are
+            // read again under the lock, and the leader reads `sleepers`
+            // after publishing, so either this thread sees the new value or
+            // the leader sees a sleeper and notifies under the same lock.
+            let mut guard = self.park.lock().unwrap();
+            self.sleepers.fetch_add(1, Ordering::SeqCst);
+            while self.epoch.load(Ordering::SeqCst) == seen && !self.exit.load(Ordering::SeqCst) {
+                guard = self.wake.wait(guard).unwrap();
+            }
+            self.sleepers.fetch_sub(1, Ordering::SeqCst);
+            drop(guard);
+            idle = 0;
+        }
+    }
+
+    /// Wakes parked followers after a new epoch or the exit flag.
+    fn notify(&self) {
+        if self.sleepers.load(Ordering::SeqCst) > 0 {
+            let _guard = self.park.lock().unwrap();
+            self.wake.notify_all();
         }
     }
 
@@ -89,7 +126,8 @@ impl Team {
         self.n.store(n, Ordering::Relaxed);
         self.done.store(0, Ordering::Relaxed);
         self.claim.store(u64::from(e) << 32, Ordering::Release);
-        self.epoch.store(e, Ordering::Release);
+        self.epoch.store(e, Ordering::SeqCst);
+        self.notify();
         self.work(e);
         while self.done.load(Ordering::Acquire) < n {
             std::hint::spin_loop();
@@ -104,7 +142,17 @@ pub fn with_team<R: Send>(f: impl FnOnce() -> R + Send) -> R {
     if rayon::current_num_threads() <= 1 || !TEAM.with(Cell::get).is_null() {
         return f();
     }
-    let team = Team { claim: AtomicU64::new(0), epoch: AtomicU32::new(0), n: AtomicUsize::new(0), done: AtomicUsize::new(0), body: AtomicUsize::new(0), exit: AtomicBool::new(false) };
+    let team = Team {
+        claim: AtomicU64::new(0),
+        epoch: AtomicU32::new(0),
+        n: AtomicUsize::new(0),
+        done: AtomicUsize::new(0),
+        body: AtomicUsize::new(0),
+        exit: AtomicBool::new(false),
+        sleepers: AtomicU32::new(0),
+        park: Mutex::new(()),
+        wake: Condvar::new(),
+    };
     let f = Mutex::new(Some(f));
     let result = Mutex::new(None);
     rayon::broadcast(|ctx| {
@@ -113,7 +161,8 @@ pub fn with_team<R: Send>(f: impl FnOnce() -> R + Send) -> R {
             TEAM.with(|t| t.set(&team));
             let r = f();
             TEAM.with(|t| t.set(std::ptr::null()));
-            team.exit.store(true, Ordering::Release);
+            team.exit.store(true, Ordering::SeqCst);
+            team.notify();
             *result.lock().unwrap() = Some(r);
         } else {
             team.follow();
