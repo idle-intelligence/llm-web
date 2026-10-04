@@ -762,6 +762,11 @@ impl GpuModel {
     pub fn load_from_reader<R: std::io::Read + std::io::Seek>(engine: &Engine, reader: R, fast_kernels: bool) -> Result<Self> {
         let mut reader = GgufReader::open(reader)?;
         let config = config_from_gguf(&reader)?;
+        anyhow::ensure!(
+            matches!(config.head_dim, 64 | 128),
+            "unsupported head_dim {} (the GPU attention kernels are compiled for 64 and 128)",
+            config.head_dim
+        );
 
         let embed_info = reader.tensor_info("token_embd.weight").context("missing token_embd.weight")?.clone();
         let embed_shape = embed_info.shape();
