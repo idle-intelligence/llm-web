@@ -9,6 +9,7 @@ crates/lean/www/model_qwen3/
 crates/lean/www/model_qwen3_1_7b/
 crates/lean/www/model_qwen25_3b/
 crates/lean/www/model_smollm2_360m/
+crates/lean/www/model_smollm2_1_7b/
 # scripts/build_lean_mt.sh's wasm-bindgen output (crates/lean/pkg/ is
 # ignored the same way, via wasm-pack's own auto-written pkg/.gitignore -
 # wasm-bindgen doesn't write one, so pkg-mt/ needs it here instead).

@@ -9,7 +9,7 @@
 //
 // Every wasm/js loading URL below carries `?v=ENGINE_BUILD`, bumped in the
 // same commit as any wasm/model rebuild - see docs/runs/2026-09-28-lean-web.md.
-const ENGINE_BUILD = "2026-10-04-night-07";
+const ENGINE_BUILD = "2026-10-04-chat-01";
 
 const HF_GGUF = "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_0.gguf";
 const HF_TOKENIZER = "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct/resolve/main/tokenizer.json";
