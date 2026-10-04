@@ -245,7 +245,11 @@ At 7c9080b (night-04 code), one test binary per locked run:
 | lib tests | default / threads | ok, 17 / 21 | 0.2 s |
 | clippy -D warnings, native all targets (default, threads) and wasm32 `web` | | clean | |
 
-The same list passed at 0debe36 (4-row kernels everywhere).
+The same list passed at 0debe36 (4-row kernels everywhere). After
+7c9080b only the CPU threads code changed; at ec9f580 (night-07):
+fixture_parity_llama_360m_cpu (threads) ok 4.9 s, cpu_lora_parity
+(threads) ok 104.3 s, lib tests (threads) ok, 22 including the new team
+test, clippy -D warnings with threads clean.
 
 ## Firefox CPU threads: diagnosis
 
