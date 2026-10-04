@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>llm-web device check — idle intelligence</title>
+    <title>llm-web device check - idle intelligence</title>
     <link rel="icon" href="../favicon.ico">
     <link rel="apple-touch-icon" href="../apple-touch-icon.png">
     <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -222,7 +222,7 @@
 <body>
     <header>
         <p class="org"><img src="../apple-touch-icon.png" alt="II">idle intelligence</p>
-        <h1>llm-web — device check</h1>
+        <h1>llm-web device check</h1>
         <p class="tagline">
             Detects what this browser can run the lean engine on, and runs a short generation to check it against a
             <a href="https://huggingface.co/HuggingFaceTB/SmolLM2-360M-Instruct">SmolLM2-360M-Instruct</a> (Q4_0) reference from HF transformers.
@@ -337,7 +337,7 @@
         }
 
         function showResult(r) {
-            document.getElementById('rowBackend').textContent = `${backendLabel(r.backend)} — chosen by capability, not by measurement`;
+            document.getElementById('rowBackend').textContent = `${backendLabel(r.backend)}, chosen by capability, not by measurement`;
 
             const reasons = [];
             if (r.backend !== 'webgpu') reasons.push(`WebGPU: ${r.caps.adapter}`);
