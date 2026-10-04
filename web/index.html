@@ -4,6 +4,8 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>llm-web — idle intelligence</title>
+    <link rel="icon" href="favicon.ico">
+    <link rel="apple-touch-icon" href="apple-touch-icon.png">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500&display=swap" rel="stylesheet">
@@ -43,6 +45,14 @@
             color: var(--muted);
             letter-spacing: 0.02em;
             margin-bottom: 2px;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .org img {
+            width: 16px;
+            height: 16px;
+            border-radius: 2px;
         }
         h1 {
             font-family: 'IBM Plex Mono', monospace;
@@ -80,6 +90,25 @@
         section h2 .sub {
             font-weight: 400;
         }
+
+        .model-selector {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 16px 20px;
+            align-items: center;
+        }
+        .model-selector label {
+            font-family: 'IBM Plex Mono', monospace;
+            font-size: 13px;
+            color: var(--text);
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            gap: 4px;
+        }
+        .model-selector label:has(input:disabled) { color: var(--faint); cursor: not-allowed; }
+        .model-selector input[type="radio"] { cursor: pointer; }
+        .model-selector input[type="radio"]:disabled { cursor: not-allowed; }
 
         .status {
             display: flex;
@@ -148,6 +177,7 @@
             display: flex;
             align-items: center;
             gap: 8px;
+            flex-wrap: wrap;
         }
         button {
             font-family: 'IBM Plex Mono', monospace;
@@ -183,18 +213,28 @@
             margin-top: 12px;
         }
 
-        #output {
-            padding: 16px;
-            min-height: 120px;
-            border: 1px solid var(--border);
+        #conversation {
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+        }
+        #conversation.empty {
+            color: var(--faint);
+            font-style: italic;
+        }
+        .turn-label {
+            display: block;
+            font-family: 'IBM Plex Mono', monospace;
+            font-size: 11px;
+            color: var(--faint);
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+            margin-bottom: 4px;
+        }
+        .turn-text {
             white-space: pre-wrap;
             line-height: 1.6;
             font-size: 15px;
-            color: var(--text);
-        }
-        #output.empty {
-            color: var(--faint);
-            font-style: italic;
         }
         .streaming-cursor {
             display: inline-block;
@@ -210,25 +250,9 @@
             50% { opacity: 0; }
         }
 
-        #metricsCard { display: none; }
-        .metrics-grid {
-            display: grid;
-            grid-template-columns: repeat(3, 1fr);
-            gap: 12px;
-        }
-        .metric { text-align: center; }
-        .metric-value {
+        #statsLine {
             font-family: 'IBM Plex Mono', monospace;
-            font-size: 16px;
-            font-weight: 600;
-        }
-        .metric-label {
-            font-family: 'IBM Plex Mono', monospace;
-            font-size: 11px;
-            color: var(--faint);
-            text-transform: uppercase;
-            letter-spacing: 0.04em;
-            margin-top: 2px;
+            font-size: 12px;
         }
 
         footer {
@@ -247,16 +271,40 @@
 </head>
 <body>
     <header>
-        <p class="org">idle intelligence</p>
+        <p class="org"><img src="apple-touch-icon.png" alt="II">idle intelligence</p>
         <h1>llm-web</h1>
         <p class="tagline">
-            <a href="https://huggingface.co/HuggingFaceTB/SmolLM2-360M-Instruct">SmolLM2-360M-Instruct</a>
-            (Q4_0, ~219 MB) running client-side via WebAssembly, on WebGPU when available
+            A chat interface for the lean engine, a Rust language-model engine running client-side via
+            WebAssembly, on WebGPU, CPU threads or a single CPU thread depending on what this browser offers.
         </p>
         <p class="repo">
             <a href="https://github.com/idle-intelligence/llm-web">github.com/idle-intelligence/llm-web</a>
+            · <a href="device/index.html">device check</a>
         </p>
     </header>
+
+    <section>
+        <h2>settings <span class="sub">· model</span></h2>
+        <div class="model-selector" id="modelSelector">
+            <label><input type="radio" name="model" value="smollm2-360m" checked> SmolLM2-360M-Instruct Q4_0 (219 MB)</label>
+            <label><input type="radio" name="model" value="qwen25-0.5b"> Qwen2.5-0.5B-Instruct Q4_0 (430 MB)</label>
+            <label><input type="radio" name="model" value="qwen3-0.6b"> Qwen3-0.6B Q8_0 (640 MB)</label>
+            <label><input type="radio" name="model" value="qwen3-1.7b"> Qwen3-1.7B Q8_0 (1.8 GB)</label>
+            <label id="smollm1_7bLabel"><input type="radio" name="model" value="smollm2-1.7b" disabled> SmolLM2-1.7B-Instruct Q4_0 (994 MB)</label>
+        </div>
+        <p class="info" id="modelNote"></p>
+    </section>
+
+    <section>
+        <h2>settings <span class="sub">· backend</span></h2>
+        <div class="model-selector" id="backendSelector">
+            <label><input type="radio" name="backend" value="auto" checked> Auto</label>
+            <label id="webgpuLabel"><input type="radio" name="backend" value="webgpu"> WebGPU</label>
+            <label id="threadsLabel"><input type="radio" name="backend" value="threads"> CPU threads</label>
+            <label><input type="radio" name="backend" value="single"> Single CPU thread</label>
+        </div>
+        <p class="info" id="backendNote"></p>
+    </section>
 
     <section>
         <h2>STATUS</h2>
@@ -269,7 +317,7 @@
         </div>
         <p id="progressInfo"></p>
         <div style="margin-top:12px">
-            <button id="downloadBtn" class="primary" style="display:none">Download Model (~219 MB)</button>
+            <button id="downloadBtn" class="primary" style="display:none">Download model</button>
         </div>
     </section>
 
@@ -279,31 +327,15 @@
         <div class="controls">
             <button id="sendBtn" class="primary" disabled>Send</button>
             <button id="stopBtn" style="display:none">Stop</button>
+            <button id="newChatBtn">New chat</button>
         </div>
         <p class="info">Everything runs on this device.</p>
     </section>
 
     <section>
-        <h2>OUTPUT <span class="sub">· response</span></h2>
-        <div id="output" class="empty"><span id="outputText">Response will appear here...</span><span id="streamingCursor" class="streaming-cursor" style="display:none"></span></div>
-    </section>
-
-    <section id="metricsCard">
-        <h2>PERFORMANCE</h2>
-        <div class="metrics-grid">
-            <div class="metric">
-                <div class="metric-value" id="metricTokens">—</div>
-                <div class="metric-label">TOKENS</div>
-            </div>
-            <div class="metric">
-                <div class="metric-value" id="metricElapsed">—</div>
-                <div class="metric-label">ELAPSED (s)</div>
-            </div>
-            <div class="metric">
-                <div class="metric-value" id="metricSpeed">—</div>
-                <div class="metric-label">TOK/S</div>
-            </div>
-        </div>
+        <h2>OUTPUT <span class="sub">· conversation</span></h2>
+        <div id="conversation" class="empty"><span id="emptyNote">Replies will appear here...</span></div>
+        <p class="info" id="statsLine" style="display:none"></p>
     </section>
 
     <footer>
@@ -311,8 +343,60 @@
     </footer>
 
     <script type="module">
-        const MODEL_CACHE = 'lean-smollm2-360m-q4_0-v1';
-        const GGUF_URL = 'https://huggingface.co/bartowski/SmolLM2-360M-Instruct-GGUF/resolve/main/SmolLM2-360M-Instruct-Q4_0.gguf';
+        const ENGINE_BUILD = "2026-10-04-demos-03";
+
+        const MODELS = {
+            "smollm2-360m": {
+                label: "SmolLM2-360M-Instruct Q4_0",
+                sizeMB: 219,
+                gguf: "https://huggingface.co/bartowski/SmolLM2-360M-Instruct-GGUF/resolve/main/SmolLM2-360M-Instruct-Q4_0.gguf",
+                tokenizer: "https://huggingface.co/HuggingFaceTB/SmolLM2-360M-Instruct/resolve/main/tokenizer.json",
+                tokenizerCfg: "https://huggingface.co/HuggingFaceTB/SmolLM2-360M-Instruct/resolve/main/tokenizer_config.json",
+                cache: "lean-smollm2-360m-q4_0-v1",
+                maxCtx: 2048,
+                requiresWebGpu: false,
+            },
+            "qwen25-0.5b": {
+                label: "Qwen2.5-0.5B-Instruct Q4_0",
+                sizeMB: 430,
+                gguf: "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_0.gguf",
+                tokenizer: "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct/resolve/main/tokenizer.json",
+                tokenizerCfg: "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct/resolve/main/tokenizer_config.json",
+                cache: "lean-qwen25-0.5b-q4_0-v1",
+                maxCtx: 2048,
+                requiresWebGpu: false,
+            },
+            "qwen3-0.6b": {
+                label: "Qwen3-0.6B Q8_0",
+                sizeMB: 640,
+                gguf: "https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q8_0.gguf",
+                tokenizer: "https://huggingface.co/Qwen/Qwen3-0.6B/resolve/main/tokenizer.json",
+                tokenizerCfg: "https://huggingface.co/Qwen/Qwen3-0.6B/resolve/main/tokenizer_config.json",
+                cache: "lean-qwen3-0.6b-q8_0-v1",
+                maxCtx: 2048,
+                requiresWebGpu: false,
+            },
+            "qwen3-1.7b": {
+                label: "Qwen3-1.7B Q8_0",
+                sizeMB: 1800,
+                gguf: "https://huggingface.co/Qwen/Qwen3-1.7B-GGUF/resolve/main/Qwen3-1.7B-Q8_0.gguf",
+                tokenizer: "https://huggingface.co/Qwen/Qwen3-1.7B/resolve/main/tokenizer.json",
+                tokenizerCfg: "https://huggingface.co/Qwen/Qwen3-1.7B/resolve/main/tokenizer_config.json",
+                cache: "lean-qwen3-1.7b-q8_0-v1",
+                maxCtx: 2048,
+                requiresWebGpu: false,
+            },
+            "smollm2-1.7b": {
+                label: "SmolLM2-1.7B-Instruct Q4_0",
+                sizeMB: 994,
+                gguf: "https://huggingface.co/bartowski/SmolLM2-1.7B-Instruct-GGUF/resolve/main/SmolLM2-1.7B-Instruct-Q4_0.gguf",
+                tokenizer: "https://huggingface.co/HuggingFaceTB/SmolLM2-1.7B-Instruct/resolve/main/tokenizer.json",
+                tokenizerCfg: "https://huggingface.co/HuggingFaceTB/SmolLM2-1.7B-Instruct/resolve/main/tokenizer_config.json",
+                cache: "lean-smollm2-1.7b-q4_0-v1",
+                maxCtx: 2048,
+                requiresWebGpu: true,
+            },
+        };
 
         const statusDot = document.getElementById('statusDot');
         const statusText = document.getElementById('statusText');
@@ -322,14 +406,16 @@
         const downloadBtn = document.getElementById('downloadBtn');
         const sendBtn = document.getElementById('sendBtn');
         const stopBtn = document.getElementById('stopBtn');
+        const newChatBtn = document.getElementById('newChatBtn');
         const textInput = document.getElementById('textInput');
-        const outputEl = document.getElementById('output');
-        const outputText = document.getElementById('outputText');
-        const streamingCursor = document.getElementById('streamingCursor');
-        const metricsCard = document.getElementById('metricsCard');
-        const metricTokens = document.getElementById('metricTokens');
-        const metricElapsed = document.getElementById('metricElapsed');
-        const metricSpeed = document.getElementById('metricSpeed');
+        const conversationEl = document.getElementById('conversation');
+        const emptyNote = document.getElementById('emptyNote');
+        const statsLine = document.getElementById('statsLine');
+        const modelNote = document.getElementById('modelNote');
+        const backendNote = document.getElementById('backendNote');
+        const smollm1_7bLabel = document.getElementById('smollm1_7bLabel');
+        const webgpuLabel = document.getElementById('webgpuLabel');
+        const threadsLabel = document.getElementById('threadsLabel');
 
         let worker = null;
         let generating = false;
@@ -338,6 +424,10 @@
         let loadingFromCache = false;
         let tokenCount = 0;
         let startTime = 0;
+        let currentModelId = 'smollm2-360m';
+        let currentBackendChoice = 'auto';
+        let activeBackend = null; // backend the worker actually loaded on
+        let currentTurn = null; // { body, cursor }
 
         function updateStatus(state, text) {
             statusDot.className = 'status-dot ' + state;
@@ -349,15 +439,106 @@
             return mb >= 1 ? `${mb.toFixed(1)} MB` : `${(bytes / 1024).toFixed(0)} KB`;
         }
 
-        async function isModelCached() {
+        function backendLabel(b) {
+            if (b === 'webgpu') return 'WebGPU';
+            if (b === 'threads') return 'CPU threads';
+            if (b === 'single') return 'CPU single-thread';
+            return '—';
+        }
+
+        async function detectCaps() {
+            const caps = {
+                hardwareConcurrency: navigator.hardwareConcurrency || 1,
+                crossOriginIsolated: self.crossOriginIsolated === true,
+                sharedArrayBuffer: typeof SharedArrayBuffer !== 'undefined',
+                hasAdapter: false,
+            };
+            if (navigator.gpu) {
+                try {
+                    const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+                    caps.hasAdapter = !!adapter;
+                } catch {
+                    caps.hasAdapter = false;
+                }
+            }
+            caps.threadsCapable = caps.crossOriginIsolated && caps.sharedArrayBuffer && caps.hardwareConcurrency > 1;
+            return caps;
+        }
+
+        function applyCaps(caps) {
+            const reasons = [];
+            if (!caps.hasAdapter) {
+                webgpuLabel.querySelector('input').disabled = true;
+                smollm1_7bLabel.querySelector('input').disabled = true;
+                reasons.push('WebGPU: no adapter');
+            } else {
+                smollm1_7bLabel.querySelector('input').disabled = false;
+            }
+            if (!caps.threadsCapable) {
+                threadsLabel.querySelector('input').disabled = true;
+                reasons.push(
+                    !caps.crossOriginIsolated
+                        ? 'CPU threads: not cross-origin isolated'
+                        : 'CPU threads: one hardware thread'
+                );
+            }
+            backendNote.textContent = reasons.length
+                ? `Unavailable here: ${reasons.join('; ')}.`
+                : 'WebGPU, CPU threads and a single CPU thread are all available here.';
+            modelNote.textContent = caps.hasAdapter
+                ? ''
+                : 'SmolLM2-1.7B-Instruct needs WebGPU; this browser has no adapter.';
+        }
+
+        async function isModelCached(model) {
             try {
-                const cache = await caches.open(MODEL_CACHE);
-                return !!(await cache.match(GGUF_URL));
+                const cache = await caches.open(model.cache);
+                return !!(await cache.match(model.gguf));
             } catch { return false; }
         }
 
+        function clearConversation() {
+            conversationEl.textContent = '';
+            conversationEl.classList.add('empty');
+            conversationEl.appendChild(emptyNote);
+            statsLine.style.display = 'none';
+            currentTurn = null;
+        }
+
+        function appendTurn(role, text) {
+            conversationEl.classList.remove('empty');
+            const div = document.createElement('div');
+            div.className = 'turn';
+            const label = document.createElement('span');
+            label.className = 'turn-label';
+            label.textContent = role === 'user' ? 'you' : 'lean';
+            const body = document.createElement('div');
+            body.className = 'turn-text';
+            body.textContent = text;
+            div.append(label, body);
+            conversationEl.appendChild(div);
+            return body;
+        }
+
+        function startAssistantTurn() {
+            const body = appendTurn('assistant', '');
+            const cursor = document.createElement('span');
+            cursor.className = 'streaming-cursor';
+            body.appendChild(cursor);
+            return { body, cursor };
+        }
+
+        function stopWorker() {
+            if (worker) {
+                worker.terminate();
+                worker = null;
+            }
+            modelReady = false;
+            activeBackend = null;
+        }
+
         function startWorker() {
-            worker = new Worker('./lean-chat-worker.js', { type: 'module' });
+            worker = new Worker(`./lean-chat-worker.js?v=${ENGINE_BUILD}`, { type: 'module' });
             worker.onmessage = (e) => {
                 const msg = e.data;
                 if (msg.type === 'progress') {
@@ -368,30 +549,32 @@
                     progressInfo.textContent = `${verb}: ${formatBytes(msg.loaded)} / ${formatBytes(msg.total)} (${pct}%)`;
                 } else if (msg.type === 'ready') {
                     modelReady = true;
+                    activeBackend = msg.backend;
                     progressBar.classList.remove('visible');
                     progressInfo.textContent = '';
                     downloadBtn.style.display = 'none';
-                    updateStatus('ready', 'Ready');
+                    updateStatus('ready', `Ready, ${backendLabel(activeBackend)}`);
                     sendBtn.disabled = false;
                 } else if (msg.type === 'token') {
-                    if (!generating) return;
+                    if (!generating || !currentTurn) return;
                     tokenCount++;
-                    outputText.textContent += msg.text;
-                    const elapsed = (performance.now() - startTime) / 1000;
-                    metricsCard.style.display = 'block';
-                    metricTokens.textContent = tokenCount;
-                    metricElapsed.textContent = elapsed.toFixed(1);
-                    metricSpeed.textContent = (tokenCount / elapsed).toFixed(1);
+                    currentTurn.body.insertBefore(document.createTextNode(msg.text), currentTurn.cursor);
                 } else if (msg.type === 'done') {
                     generating = false;
-                    streamingCursor.style.display = 'none';
+                    if (currentTurn) currentTurn.cursor.remove();
                     sendBtn.disabled = false;
                     stopBtn.style.display = 'none';
                     updateStatus('ready', stopRequested ? 'Stopped' : 'Ready');
+                    const elapsed = (performance.now() - startTime) / 1000;
+                    statsLine.style.display = '';
+                    statsLine.textContent =
+                        `${tokenCount} tokens · ${(tokenCount / elapsed).toFixed(1)} tok/s · ${backendLabel(activeBackend)} · ${MODELS[currentModelId].label}`;
+                    currentTurn = null;
                     stopRequested = false;
                 } else if (msg.type === 'error') {
                     generating = false;
-                    streamingCursor.style.display = 'none';
+                    if (currentTurn) currentTurn.cursor.remove();
+                    currentTurn = null;
                     updateStatus('error', (modelReady ? 'Error: ' : 'Failed: ') + msg.message);
                     sendBtn.disabled = false;
                     downloadBtn.disabled = false;
@@ -407,26 +590,67 @@
         }
 
         async function load() {
+            const model = MODELS[currentModelId];
             downloadBtn.disabled = true;
-            loadingFromCache = await isModelCached();
+            loadingFromCache = await isModelCached(model);
             updateStatus('loading', loadingFromCache ? 'Loading model from cache...' : 'Downloading model...');
             progressBar.classList.add('visible');
-            if (!worker) startWorker();
-            worker.postMessage({ type: 'load' });
+            stopWorker();
+            startWorker();
+            worker.postMessage({ type: 'load', model, backend: currentBackendChoice });
         }
+
+        async function switchSettings() {
+            if (generating) return;
+            sendBtn.disabled = true;
+            clearConversation();
+            downloadBtn.textContent = `Download model (${MODELS[currentModelId].sizeMB} MB)`;
+            const cached = await isModelCached(MODELS[currentModelId]);
+            if (cached) {
+                load();
+            } else {
+                stopWorker();
+                updateStatus('', `Model not downloaded (${MODELS[currentModelId].sizeMB} MB)`);
+                downloadBtn.style.display = '';
+                downloadBtn.disabled = false;
+            }
+        }
+
+        document.querySelectorAll('input[name="model"]').forEach((radio) => {
+            radio.addEventListener('change', (e) => {
+                if (generating) {
+                    e.target.checked = false;
+                    document.querySelector(`input[name="model"][value="${currentModelId}"]`).checked = true;
+                    return;
+                }
+                currentModelId = e.target.value;
+                switchSettings();
+            });
+        });
+        document.querySelectorAll('input[name="backend"]').forEach((radio) => {
+            radio.addEventListener('change', (e) => {
+                if (generating) {
+                    e.target.checked = false;
+                    document.querySelector(`input[name="backend"][value="${currentBackendChoice}"]`).checked = true;
+                    return;
+                }
+                currentBackendChoice = e.target.value;
+                switchSettings();
+            });
+        });
 
         function send() {
             const text = textInput.value.trim();
-            if (!text || generating || !worker) return;
+            if (!text || generating || !worker || !modelReady) return;
+            appendTurn('user', text);
+            currentTurn = startAssistantTurn();
             generating = true;
             stopRequested = false;
             tokenCount = 0;
             startTime = performance.now();
             sendBtn.disabled = true;
             stopBtn.style.display = '';
-            outputEl.classList.remove('empty');
-            outputText.textContent = '';
-            streamingCursor.style.display = 'inline-block';
+            textInput.value = '';
             updateStatus('generating', 'Generating...');
             worker.postMessage({ type: 'chat', text });
         }
@@ -436,6 +660,11 @@
             stopRequested = true;
             if (worker) worker.postMessage({ type: 'stop' });
         });
+        newChatBtn.addEventListener('click', () => {
+            if (generating) return;
+            if (worker) worker.postMessage({ type: 'reset' });
+            clearConversation();
+        });
         textInput.addEventListener('keydown', (e) => {
             if (e.key === 'Enter' && !e.shiftKey) {
                 e.preventDefault();
@@ -444,13 +673,16 @@
         });
 
         // Init flow
-        const cached = await isModelCached();
+        const caps = await detectCaps();
+        applyCaps(caps);
+        downloadBtn.textContent = `Download model (${MODELS[currentModelId].sizeMB} MB)`;
+        const cached = await isModelCached(MODELS[currentModelId]);
+        downloadBtn.addEventListener('click', load);
         if (cached) {
             load();
         } else {
-            updateStatus('', 'Model not downloaded (~219 MB)');
+            updateStatus('', `Model not downloaded (${MODELS[currentModelId].sizeMB} MB)`);
             downloadBtn.style.display = '';
-            downloadBtn.addEventListener('click', load);
         }
     </script>
 </body>
