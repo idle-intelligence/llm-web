@@ -250,9 +250,32 @@
             50% { opacity: 0; }
         }
 
-        #statsLine {
+        #metricsCard { display: none; }
+        .metrics-grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 12px;
+        }
+        .metric { text-align: center; }
+        .metric-value {
+            font-family: 'IBM Plex Mono', monospace;
+            font-size: 16px;
+            font-weight: 600;
+        }
+        .metric-label {
+            font-family: 'IBM Plex Mono', monospace;
+            font-size: 11px;
+            color: var(--faint);
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+            margin-top: 2px;
+        }
+        #metricBackendModel {
             font-family: 'IBM Plex Mono', monospace;
             font-size: 12px;
+            color: var(--faint);
+            text-align: center;
+            margin-top: 12px;
         }
 
         footer {
@@ -279,7 +302,6 @@
         </p>
         <p class="repo">
             <a href="https://github.com/idle-intelligence/llm-web">github.com/idle-intelligence/llm-web</a>
-            · <a href="device/index.html">device check</a>
         </p>
     </header>
 
@@ -335,10 +357,29 @@
     <section>
         <h2>OUTPUT <span class="sub">· conversation</span></h2>
         <div id="conversation" class="empty"><span id="emptyNote">Replies will appear here...</span></div>
-        <p class="info" id="statsLine" style="display:none"></p>
+    </section>
+
+    <section id="metricsCard">
+        <h2>PERFORMANCE</h2>
+        <div class="metrics-grid">
+            <div class="metric">
+                <div class="metric-value" id="metricTokens">—</div>
+                <div class="metric-label">TOKENS</div>
+            </div>
+            <div class="metric">
+                <div class="metric-value" id="metricElapsed">—</div>
+                <div class="metric-label">ELAPSED (s)</div>
+            </div>
+            <div class="metric">
+                <div class="metric-value" id="metricSpeed">—</div>
+                <div class="metric-label">TOK/S</div>
+            </div>
+        </div>
+        <p id="metricBackendModel"></p>
     </section>
 
     <footer>
+        <a href="device/index.html">device check</a> ·
         <a href="https://idleintelligence.org">idleintelligence.org</a>
     </footer>
 
@@ -410,7 +451,11 @@
         const textInput = document.getElementById('textInput');
         const conversationEl = document.getElementById('conversation');
         const emptyNote = document.getElementById('emptyNote');
-        const statsLine = document.getElementById('statsLine');
+        const metricsCard = document.getElementById('metricsCard');
+        const metricTokens = document.getElementById('metricTokens');
+        const metricElapsed = document.getElementById('metricElapsed');
+        const metricSpeed = document.getElementById('metricSpeed');
+        const metricBackendModel = document.getElementById('metricBackendModel');
         const modelNote = document.getElementById('modelNote');
         const backendNote = document.getElementById('backendNote');
         const smollm1_7bLabel = document.getElementById('smollm1_7bLabel');
@@ -501,12 +546,13 @@
             conversationEl.textContent = '';
             conversationEl.classList.add('empty');
             conversationEl.appendChild(emptyNote);
-            statsLine.style.display = 'none';
+            metricsCard.style.display = 'none';
             currentTurn = null;
         }
 
         function appendTurn(role, text) {
             conversationEl.classList.remove('empty');
+            if (emptyNote.parentNode) emptyNote.remove();
             const div = document.createElement('div');
             div.className = 'turn';
             const label = document.createElement('span');
@@ -566,9 +612,11 @@
                     stopBtn.style.display = 'none';
                     updateStatus('ready', stopRequested ? 'Stopped' : 'Ready');
                     const elapsed = (performance.now() - startTime) / 1000;
-                    statsLine.style.display = '';
-                    statsLine.textContent =
-                        `${tokenCount} tokens · ${(tokenCount / elapsed).toFixed(1)} tok/s · ${backendLabel(activeBackend)} · ${MODELS[currentModelId].label}`;
+                    metricsCard.style.display = 'block';
+                    metricTokens.textContent = tokenCount;
+                    metricElapsed.textContent = elapsed.toFixed(1);
+                    metricSpeed.textContent = (tokenCount / elapsed).toFixed(1);
+                    metricBackendModel.textContent = `${backendLabel(activeBackend)} · ${MODELS[currentModelId].label}`;
                     currentTurn = null;
                     stopRequested = false;
                 } else if (msg.type === 'error') {
