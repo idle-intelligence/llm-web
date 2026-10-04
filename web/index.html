@@ -334,6 +334,8 @@
         let worker = null;
         let generating = false;
         let stopRequested = false;
+        let modelReady = false;
+        let loadingFromCache = false;
         let tokenCount = 0;
         let startTime = 0;
 
@@ -358,22 +360,19 @@
             worker = new Worker('./lean-chat-worker.js', { type: 'module' });
             worker.onmessage = (e) => {
                 const msg = e.data;
-                if (msg.type === 'status') {
-                    if (msg.ready) {
-                        updateStatus('ready', msg.text);
-                        sendBtn.disabled = false;
-                        progressBar.classList.remove('visible');
-                        progressInfo.textContent = '';
-                        downloadBtn.style.display = 'none';
-                    } else {
-                        updateStatus('loading', msg.text);
-                        if (msg.progress) {
-                            progressBar.classList.add('visible');
-                            const pct = msg.progress.total > 0 ? (msg.progress.loaded / msg.progress.total) * 100 : 0;
-                            progressFill.style.width = pct + '%';
-                            progressInfo.textContent = `${formatBytes(msg.progress.loaded)} / ${formatBytes(msg.progress.total)}`;
-                        }
-                    }
+                if (msg.type === 'progress') {
+                    progressBar.classList.add('visible');
+                    const pct = msg.total > 0 ? ((msg.loaded / msg.total) * 100).toFixed(0) : '0';
+                    progressFill.style.width = pct + '%';
+                    const verb = loadingFromCache ? 'Loading' : 'Downloading';
+                    progressInfo.textContent = `${verb}: ${formatBytes(msg.loaded)} / ${formatBytes(msg.total)} (${pct}%)`;
+                } else if (msg.type === 'ready') {
+                    modelReady = true;
+                    progressBar.classList.remove('visible');
+                    progressInfo.textContent = '';
+                    downloadBtn.style.display = 'none';
+                    updateStatus('ready', 'Ready');
+                    sendBtn.disabled = false;
                 } else if (msg.type === 'token') {
                     if (!generating) return;
                     tokenCount++;
@@ -393,20 +392,25 @@
                 } else if (msg.type === 'error') {
                     generating = false;
                     streamingCursor.style.display = 'none';
-                    updateStatus('error', 'Error: ' + msg.message);
+                    updateStatus('error', (modelReady ? 'Error: ' : 'Failed: ') + msg.message);
                     sendBtn.disabled = false;
+                    downloadBtn.disabled = false;
                     stopBtn.style.display = 'none';
                     console.error(msg.message);
                 }
             };
             worker.onerror = (e) => {
-                updateStatus('error', 'Worker error: ' + e.message);
+                updateStatus('error', (modelReady ? 'Error: ' : 'Failed: ') + e.message);
+                downloadBtn.disabled = false;
                 console.error('[llm-web] worker error:', e);
             };
         }
 
-        function load() {
+        async function load() {
             downloadBtn.disabled = true;
+            loadingFromCache = await isModelCached();
+            updateStatus('loading', loadingFromCache ? 'Loading model from cache...' : 'Downloading model...');
+            progressBar.classList.add('visible');
             if (!worker) startWorker();
             worker.postMessage({ type: 'load' });
         }
@@ -442,7 +446,6 @@
         // Init flow
         const cached = await isModelCached();
         if (cached) {
-            updateStatus('loading', 'Loading model from cache...');
             load();
         } else {
             updateStatus('', 'Model not downloaded (~219 MB)');

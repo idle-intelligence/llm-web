@@ -49,7 +49,8 @@ async function run() {
     `./device_common.js?v=${ENGINE_BUILD}`
   );
 
-  status(`engine build ${ENGINE_BUILD}, checking this device...`);
+  console.log(`[device_worker] engine build ${ENGINE_BUILD}`);
+  status(`checking this device...`);
   const caps = await capabilities();
   const order = [
     caps.hasAdapter ? "webgpu" : null,

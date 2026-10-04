@@ -1,10 +1,17 @@
 // Module Worker behind web/index.html's chat UI. Speaks a small protocol:
 //
 //   page -> worker:  {type:'load'} | {type:'chat', text} | {type:'stop'} | {type:'reset'}
-//   worker -> page:  {type:'status', text, ready, progress?}
+//   worker -> page:  {type:'progress', loaded, total}
+//                     {type:'ready'}
 //                     {type:'token', text}
 //                     {type:'done'}
 //                     {type:'error', message}
+//
+// The page owns every status string the visitor sees (origin/main's exact
+// words: "Downloading model...", "Loading model from cache...", "Ready",
+// "Generating...", "Stopped") - this worker never sends prose, only the
+// bytes/total a progress bar needs and a plain ready/done/error signal.
+// Backend choice and the engine build tag are console.log only.
 //
 // Backend is picked by capability only (never a benchmark), same policy as
 // crates/lean/www/backends_worker.js: WebGPU if an adapter is granted, else
@@ -43,9 +50,6 @@ const TOKENIZER_CFG_URL = "https://huggingface.co/HuggingFaceTB/SmolLM2-360M-Ins
 const MAX_CTX = 2048;
 const MODEL_CACHE = "lean-smollm2-360m-q4_0-v1";
 
-function status(text, ready, progress) {
-  self.postMessage({ type: "status", text, ready: !!ready, progress });
-}
 
 async function capabilities() {
   const caps = {
@@ -98,17 +102,16 @@ function backendLabel(b) {
 }
 
 async function load() {
-  status(`engine build ${ENGINE_BUILD}, checking capabilities...`);
+  console.log(`[lean-chat-worker] engine build ${ENGINE_BUILD}, checking capabilities...`);
   const caps = await capabilities();
   const candidates = [caps.hasAdapter && "webgpu", caps.threadsCapable && "threads", "single"].filter(Boolean);
 
-  status("fetching model (~219 MB, cached after first load)...");
   const { getModel } = await import("./lib/model-cache.js");
   const [ggufBytes, tokenizerBytes, tokenizerCfgBytes] = await getModel(
     [GGUF_URL, TOKENIZER_URL, TOKENIZER_CFG_URL],
     {
       cache: MODEL_CACHE,
-      onProgress: (loaded, total) => status("downloading model...", false, { loaded, total }),
+      onProgress: (loaded, total) => self.postMessage({ type: "progress", loaded, total }),
     }
   );
   const tokenizerJson = new TextDecoder().decode(tokenizerBytes);
@@ -117,9 +120,9 @@ async function load() {
   const skipped = [];
   for (const c of candidates) {
     try {
-      status(`starting ${c} backend...`);
+      console.log(`[lean-chat-worker] starting ${c} backend...`);
       const r = await createEngine(c);
-      status(`loading weights on ${c} backend...`);
+      console.log(`[lean-chat-worker] loading weights on ${c} backend...`);
       r.engine.load(ggufBytes, tokenizerJson, tokenizerCfgJson, MAX_CTX);
       engine = r.engine;
       AbortFlagCtor = r.AbortFlag;
@@ -132,7 +135,8 @@ async function load() {
   }
   if (!engine) throw new Error(`no backend available (${skipped.join("; ")})`);
 
-  status(`ready, ${backendLabel(backend)}`, true);
+  console.log(`[lean-chat-worker] ready, ${backendLabel(backend)}, engine build ${ENGINE_BUILD}`);
+  self.postMessage({ type: "ready" });
 }
 
 async function chat(text) {
