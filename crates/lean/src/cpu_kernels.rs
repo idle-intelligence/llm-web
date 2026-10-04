@@ -477,8 +477,14 @@ impl F4 {
     #[inline(always)]
     pub fn sum(self) -> f32 {
         #[cfg(all(target_arch = "aarch64", not(feature = "force_scalar")))]
+        // SAFETY: `float32x4_t` is 16 bytes holding four f32 lanes in lane
+        // order, the same size and layout as `[f32; 4]`, and every bit
+        // pattern is a valid f32.
         let l: [f32; 4] = unsafe { std::mem::transmute(self.0) };
         #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+        // SAFETY: `v128` is 16 bytes, and read as f32x4 its lanes are four
+        // f32 in lane order, the same size and layout as `[f32; 4]`; every
+        // bit pattern is a valid f32.
         let l: [f32; 4] = unsafe { std::mem::transmute(self.0) };
         #[cfg(not(any(all(target_arch = "aarch64", not(feature = "force_scalar")), all(target_arch = "wasm32", target_feature = "simd128"))))]
         let l = self.0;
