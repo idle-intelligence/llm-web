@@ -18,7 +18,7 @@ ENGINE_BUILD=dev scripts/build_lean_mt.sh    # crates/lean/pkg-mt: CPU threads (
 python3 scripts/serve_coi.py
 ```
 
-Then open `http://localhost:8000/crates/lean/www/chat.html` (the port `serve_coi.py` prints) for a working chat page. The core of the API:
+Then open `http://localhost:8030/crates/lean/www/chat.html` for a working chat page. The core of the API:
 
 ```html
 <script type="module">
