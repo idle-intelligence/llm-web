@@ -4,6 +4,8 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>llm-web device check - idle intelligence</title>
+    <link rel="icon" href="../favicon.ico">
+    <link rel="apple-touch-icon" href="../apple-touch-icon.png">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500&display=swap" rel="stylesheet">
@@ -43,6 +45,14 @@
             color: var(--muted);
             letter-spacing: 0.02em;
             margin-bottom: 2px;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .org img {
+            width: 16px;
+            height: 16px;
+            border-radius: 2px;
         }
         h1 {
             font-family: 'IBM Plex Mono', monospace;
@@ -154,6 +164,12 @@
             background: var(--muted);
             border-color: var(--muted);
         }
+        .controls {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
         .info {
             font-size: 13px;
             color: var(--faint);
@@ -174,40 +190,28 @@
         }
         dl.rows dd { overflow-wrap: anywhere; }
 
-        .model-list { list-style: none; font-size: 14px; }
-        .model-list li {
-            padding: 6px 0;
+        table#resultsTable {
+            border-collapse: collapse;
+            width: 100%;
+            font-size: 13px;
+        }
+        table#resultsTable th, table#resultsTable td {
             border-bottom: 1px solid var(--border);
-            display: flex;
-            justify-content: space-between;
-            gap: 12px;
+            padding: 6px 8px 6px 0;
+            text-align: left;
+            vertical-align: top;
         }
-        .model-list li:last-child { border-bottom: none; }
-        .model-list .yes { color: var(--green); }
-        .model-list .no { color: var(--faint); }
-
-        #metricsCard { display: none; }
-        .metrics-grid {
-            display: grid;
-            grid-template-columns: repeat(3, 1fr);
-            gap: 12px;
-        }
-        .metric { text-align: center; }
-        .metric-value {
-            font-family: 'IBM Plex Mono', monospace;
-            font-size: 16px;
-            font-weight: 600;
-        }
-        .metric-label {
+        table#resultsTable th {
             font-family: 'IBM Plex Mono', monospace;
             font-size: 11px;
             color: var(--faint);
             text-transform: uppercase;
             letter-spacing: 0.04em;
-            margin-top: 2px;
         }
+        .yes { color: var(--green); }
+        .no { color: var(--red); }
 
-        details { font-size: 13px; }
+        details { font-size: 13px; margin-top: 12px; }
         details summary {
             cursor: pointer;
             font-family: 'IBM Plex Mono', monospace;
@@ -244,10 +248,11 @@
 </head>
 <body>
     <header>
-        <p class="org">idle intelligence</p>
+        <p class="org"><img src="../apple-touch-icon.png" alt="II">idle intelligence</p>
         <h1>llm-web device check</h1>
         <p class="tagline">
-            Detects what this browser can run the lean engine on, and runs a short generation to check it against a
+            Detects what this browser can run the lean engine on, then runs a short generation on each available
+            backend and checks it against a
             <a href="https://huggingface.co/HuggingFaceTB/SmolLM2-360M-Instruct">SmolLM2-360M-Instruct</a> (Q4_0) reference from HF transformers.
         </p>
         <p class="repo">
@@ -267,8 +272,11 @@
         </div>
         <p id="progressInfo"></p>
         <p class="info" id="downloadNote"></p>
-        <div style="margin-top:12px">
-            <button id="runBtn" class="primary" disabled>Run the check</button>
+        <div class="controls" style="margin-top:12px">
+            <button id="runWebgpuBtn" disabled>WebGPU</button>
+            <button id="runThreadsBtn" disabled>CPU threads</button>
+            <button id="runSingleBtn" disabled>Single CPU thread</button>
+            <button id="runAllBtn" class="primary" disabled>Run all</button>
         </div>
     </section>
 
@@ -280,25 +288,16 @@
     </section>
 
     <section>
-        <h2>MODELS <span class="sub">· what this backend can run</span></h2>
-        <ul class="model-list" id="modelList">
-            <li><span>SmolLM2-360M-Instruct (Q4_0, ~219 MB)</span><span class="yes">runs on any backend</span></li>
-            <li><span>Qwen2.5-0.5B-Instruct (Q4_0, ~430 MB)</span><span class="yes">runs on any backend</span></li>
-            <li><span>SmolLM2-1.7B-Instruct (Q4_0, ~1.1 GB)</span><span id="row1_7b" class="no">needs WebGPU</span></li>
-        </ul>
-    </section>
-
-    <section>
-        <h2>VERIFICATION <span class="sub">· one generation, checked against transformers</span></h2>
-        <dl class="rows" id="resultRows">
-            <dt>match</dt><dd id="rowMatch">—</dd>
-            <dt>prefill</dt><dd id="rowPrefill">—</dd>
-            <dt>speed</dt><dd id="rowSpeed">—</dd>
-            <dt>reply</dt><dd id="rowText">—</dd>
-        </dl>
+        <h2>RESULTS <span class="sub">· one generation per backend, checked against transformers</span></h2>
+        <table id="resultsTable">
+            <thead>
+                <tr><th>backend</th><th>token-exact</th><th>prefill</th><th>ms/token</th><th>tok/s</th></tr>
+            </thead>
+            <tbody id="resultsBody"></tbody>
+        </table>
         <div style="margin-top:16px">
             <details id="timingDetails" style="display:none">
-                <summary>timing detail</summary>
+                <summary>timing detail, last run</summary>
                 <table id="timingTable"></table>
             </details>
         </div>
@@ -309,7 +308,7 @@
     </footer>
 
     <script type="module">
-        const ENGINE_BUILD = "2026-10-04-demos-02";
+        const ENGINE_BUILD = "2026-10-04-demos-04";
         const { MODEL } = await import(`./device_common.js?v=${ENGINE_BUILD}`);
 
         const statusDot = document.getElementById('statusDot');
@@ -318,18 +317,20 @@
         const progressFill = document.getElementById('progressFill');
         const progressInfo = document.getElementById('progressInfo');
         const downloadNote = document.getElementById('downloadNote');
-        const runBtn = document.getElementById('runBtn');
+        const runWebgpuBtn = document.getElementById('runWebgpuBtn');
+        const runThreadsBtn = document.getElementById('runThreadsBtn');
+        const runSingleBtn = document.getElementById('runSingleBtn');
+        const runAllBtn = document.getElementById('runAllBtn');
         const deviceRows = document.getElementById('deviceRows');
-        const row1_7b = document.getElementById('row1_7b');
-        const rowMatch = document.getElementById('rowMatch');
-        const rowPrefill = document.getElementById('rowPrefill');
-        const rowSpeed = document.getElementById('rowSpeed');
-        const rowText = document.getElementById('rowText');
+        const resultsBody = document.getElementById('resultsBody');
         const timingDetails = document.getElementById('timingDetails');
         const timingTable = document.getElementById('timingTable');
 
+        const BACKEND_BTNS = { webgpu: runWebgpuBtn, threads: runThreadsBtn, single: runSingleBtn };
+        const rows = {}; // backend -> <tr>
+
         downloadNote.textContent =
-            `Running the check downloads ${MODEL.name} (about ${MODEL.sizeMB} MB, kept in the browser for next time) and runs it on this device.`;
+            `Running a check downloads ${MODEL.name} (about ${MODEL.sizeMB} MB, kept in the browser for next time) once, then runs it on the backend you pick.`;
 
         function updateStatus(state, text) {
             statusDot.className = 'status-dot ' + state;
@@ -369,38 +370,39 @@
             return x === undefined || x === null || Number.isNaN(x) ? 'n/a' : `${x.toFixed(1)} ms`;
         }
 
-        function renderDeviceInfo(backend, caps, canRun1_7b) {
+        function renderDeviceInfo(caps, available) {
             deviceRows.textContent = '';
-            addRow('backend', `${backendLabel(backend)}, chosen by capability, not by measurement`);
-
-            const reasons = [];
-            if (backend !== 'webgpu') reasons.push(`WebGPU: ${caps.adapter}`);
-            if (backend !== 'threads' && backend !== 'webgpu') {
-                reasons.push(
-                    `CPU threads: needs a cross-origin isolated page with SharedArrayBuffer and more than one hardware thread ` +
-                    `(crossOriginIsolated ${caps.crossOriginIsolated}, SharedArrayBuffer ${caps.sharedArrayBuffer}, hardwareConcurrency ${caps.hardwareConcurrency})`
-                );
-            }
-            for (const reason of reasons) addRow('why not', reason);
             addRow('WebGPU adapter', caps.adapter);
             addRow('hardware threads', String(caps.hardwareConcurrency));
             addRow('cross-origin isolated', String(caps.crossOriginIsolated));
+            addRow('available backends', available.length ? available.map(backendLabel).join(', ') : 'none');
+        }
 
-            row1_7b.textContent = canRun1_7b ? 'runs on this backend' : 'needs WebGPU';
-            row1_7b.className = canRun1_7b ? 'yes' : 'no';
+        function resultRow(backend) {
+            if (rows[backend]) return rows[backend];
+            const tr = document.createElement('tr');
+            const cells = [backendLabel(backend), '—', '—', '—', '—'];
+            for (const c of cells) {
+                const td = document.createElement('td');
+                td.textContent = c;
+                tr.appendChild(td);
+            }
+            resultsBody.appendChild(tr);
+            rows[backend] = tr;
+            return tr;
         }
 
         function showResult(r) {
-            renderDeviceInfo(r.backend, r.caps, r.canRun1_7b);
-
-            rowMatch.textContent = r.matchesReference
-                ? `yes, token-exact against the transformers reference (hash ${r.hash.slice(0, 16)})`
-                : `no match (hash ${r.hash.slice(0, 16)}, expected a different hash)`;
-            rowPrefill.textContent = `${r.prefillMs.toFixed(1)} ms for ${r.promptLen} tokens`;
-            rowSpeed.textContent = `${r.decodeMsPerTok.toFixed(1)} ms/token, ${r.tokPerSec.toFixed(1)} tok/s`;
-            rowText.textContent = r.text;
+            const tr = resultRow(r.backend);
+            const cells = tr.children;
+            cells[1].textContent = r.matchesReference ? 'yes' : 'no';
+            cells[1].className = r.matchesReference ? 'yes' : 'no';
+            cells[2].textContent = `${r.prefillMs.toFixed(1)} ms`;
+            cells[3].textContent = r.decodeMsPerTok.toFixed(1);
+            cells[4].textContent = r.tokPerSec.toFixed(1);
 
             timingTable.textContent = '';
+            timingRow('backend', backendLabel(r.backend));
             timingRow('wasm init', ms(r.timing.wasmInitMs));
             if (r.timing.threadPoolMs !== undefined) timingRow('thread pool init', ms(r.timing.threadPoolMs));
             timingRow('weights + tokenizer load', ms(r.timing.loadMs));
@@ -409,17 +411,21 @@
             timingRow('decode median (min / max)', `${ms(r.timing.decodeMedianMs)} (${ms(r.timing.decodeMinMs)} / ${ms(r.timing.decodeMaxMs)})`);
             timingRow('engine build', r.engineBuild);
             timingDetails.style.display = '';
-
-            updateStatus('ready', `done: ${backendLabel(r.backend)}, ${r.decodeMsPerTok.toFixed(1)} ms/token`);
         }
 
         const worker = new Worker(`./device_worker.js?v=${ENGINE_BUILD}`, { type: 'module' });
+        let available = [];
         worker.onmessage = (e) => {
             const m = e.data;
             if (m.type === 'detected') {
-                renderDeviceInfo(m.backend, m.caps, m.canRun1_7b);
-                updateStatus('ready', `ready: this device can run lean on ${backendLabel(m.backend)}`);
-                runBtn.disabled = false;
+                available = m.available;
+                renderDeviceInfo(m.caps, available);
+                for (const b of ['webgpu', 'threads', 'single']) {
+                    BACKEND_BTNS[b].disabled = !available.includes(b);
+                    if (!available.includes(b)) BACKEND_BTNS[b].title = m.reasons[b] || '';
+                }
+                runAllBtn.disabled = available.length === 0;
+                updateStatus('ready', `ready: this device can run lean on ${available.map(backendLabel).join(', ')}`);
             } else if (m.type === 'status') {
                 updateStatus('loading', m.text);
             } else if (m.type === 'progress') {
@@ -427,26 +433,45 @@
                 const pct = m.total > 0 ? (m.loaded / m.total) * 100 : 0;
                 progressFill.style.width = pct + '%';
                 progressInfo.textContent = `${formatBytes(m.loaded)} / ${formatBytes(m.total)}`;
-            } else if (m.type === 'done') {
+            } else if (m.type === 'result') {
                 progressBar.classList.remove('visible');
                 progressInfo.textContent = '';
                 showResult(m.result);
-                runBtn.disabled = false;
+            } else if (m.type === 'runDone') {
+                setRunButtonsDisabled(false);
+                updateStatus('ready', 'done');
             } else if (m.type === 'error') {
+                setRunButtonsDisabled(false);
                 updateStatus('error', 'Error: ' + m.message);
                 console.error(m.message);
-                runBtn.disabled = false;
             }
         };
         worker.onerror = (e) => {
+            setRunButtonsDisabled(false);
             updateStatus('error', 'Worker error: ' + e.message);
             console.error('[llm-web device] worker error:', e);
-            runBtn.disabled = false;
         };
 
-        runBtn.addEventListener('click', () => {
-            runBtn.disabled = true;
-            worker.postMessage({ type: 'run' });
+        function setRunButtonsDisabled(disabled) {
+            for (const b of ['webgpu', 'threads', 'single']) {
+                BACKEND_BTNS[b].disabled = disabled || !available.includes(b);
+            }
+            runAllBtn.disabled = disabled || available.length === 0;
+        }
+
+        function runOne(backend) {
+            setRunButtonsDisabled(true);
+            updateStatus('generating', `running ${backendLabel(backend)}...`);
+            worker.postMessage({ type: 'run', backend });
+        }
+
+        runWebgpuBtn.addEventListener('click', () => runOne('webgpu'));
+        runThreadsBtn.addEventListener('click', () => runOne('threads'));
+        runSingleBtn.addEventListener('click', () => runOne('single'));
+        runAllBtn.addEventListener('click', () => {
+            setRunButtonsDisabled(true);
+            updateStatus('generating', 'running all available backends...');
+            worker.postMessage({ type: 'run', backend: 'all' });
         });
 
         worker.postMessage({ type: 'detect' });
