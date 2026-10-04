@@ -1,0 +1,52 @@
+### qwen25-0.5b webgpu
+ready {"type":"ready","backend":"webgpu","model":"qwen25-0.5b","engineBuild":"2026-10-04-release-01","adapter":"apple / metal-3 (storage buffers/stage 10, max binding 4294967292, shader-f16 true)","info":"{\"loaded\":true,\"numLayers\":24,\"hiddenSize\":896,\"vocabSize\":151936,\"maxStorageBufferBindingSize\":4294967292}","wasmM
+{"turn":"What is the capital of France?","type":"done","tokens":48,"ms":374,"mem":324927488,"ok":true,"reply":"The capital of France is Paris. It is the largest city in Europe and the largest city in the world by population. Paris is a city with a rich history and culture, and it is also a major economic and political center of 
+{"turn":"Name two famous museums there, one sentence each.","type":"done","tokens":19,"ms":244,"mem":324927488,"ok":true,"reply":"The two famous museums in Paris are the Louvre and the Musée d'Orsay."}
+{"turn":"Écris une phrase en français sur la Seine, avec un emoji.","type":"done","tokens":16,"ms":263,"mem":324927488,"ok":true,"reply":"\"Le Seine est un écrãé en français avec un emoji.\""}
+abort {"type":"done","tokens":8,"streamedEqualsReply":true,"reply":"Once upon a time, in a far"}
+after-abort {"type":"done","tokens":7,"ok":true,"reply":"The dragon was learning to cook."}
+errors []
+ALL_OK true
+### qwen25-0.5b threads
+ready {"type":"ready","backend":"threads","model":"qwen25-0.5b","engineBuild":"2026-10-04-release-01","adapter":"navigator.gpu present, no adapter","info":"{\"loaded\":true,\"numLayers\":24,\"hiddenSize\":896,\"vocabSize\":151936}","wasmMemoryBytes":569901056}
+{"turn":"What is the capital of France?","type":"done","tokens":48,"ms":1443,"mem":613679104,"ok":true,"reply":"The capital of France is Paris. It is the largest city in Europe and the largest city in the world by population. Paris is a city with a rich history and culture, and it is also a major economic and political center of
+{"turn":"Name two famous museums there, one sentence each.","type":"done","tokens":19,"ms":664,"mem":613679104,"ok":true,"reply":"The two famous museums in Paris are the Louvre and the Musée d'Orsay."}
+{"turn":"Écris une phrase en français sur la Seine, avec un emoji.","type":"done","tokens":16,"ms":683,"mem":613679104,"ok":true,"reply":"\"Le Seine est un écrãé en français avec un emoji.\""}
+abort {"type":"done","tokens":7,"streamedEqualsReply":true,"reply":"Once upon a time, in a"}
+after-abort {"type":"done","tokens":5,"ok":true,"reply":"The dragon was cooking."}
+errors []
+ALL_OK true
+### smollm2-360m webgpu
+ready {"type":"ready","backend":"webgpu","model":"smollm2-360m","engineBuild":"2026-10-04-release-01","adapter":"apple / metal-3 (storage buffers/stage 10, max binding 4294967292, shader-f16 true)","info":"{\"loaded\":true,\"numLayers\":32,\"hiddenSize\":960,\"vocabSize\":49152,\"maxStorageBufferBindingSize\":4294967292}","wasmM
+{"turn":"What is the capital of France?","type":"done","tokens":7,"ms":146,"mem":113508352,"ok":true,"reply":"The capital of France is Paris."}
+{"turn":"Name two famous museums there, one sentence each.","type":"done","tokens":28,"ms":285,"mem":113508352,"ok":true,"reply":"The Louvre Museum is famous for its Mona Lisa. The Musée d'Orsay is famous for its Impressionist art."}
+{"turn":"Écris une phrase en français sur la Seine, avec un emoji.","type":"done","tokens":27,"ms":352,"mem":113508352,"ok":true,"reply":"Bien sûr, un jour de la Seine, avec un emoji de la Vue de la Terre."}
+errors []
+ALL_OK true
+### smollm2-360m threads
+ready {"type":"ready","backend":"threads","model":"smollm2-360m","engineBuild":"2026-10-04-release-01","adapter":"navigator.gpu present, no adapter","info":"{\"loaded\":true,\"numLayers\":32,\"hiddenSize\":960,\"vocabSize\":49152}","wasmMemoryBytes":521273344}
+{"turn":"What is the capital of France?","type":"done","tokens":7,"ms":490,"mem":528613376,"ok":true,"reply":"The capital of France is Paris."}
+{"turn":"Name two famous museums there, one sentence each.","type":"done","tokens":28,"ms":793,"mem":528613376,"ok":true,"reply":"The Louvre Museum is famous for its Mona Lisa. The Musée d'Orsay is famous for its Impressionist art."}
+{"turn":"Écris une phrase en français sur la Seine, avec un emoji.","type":"done","tokens":27,"ms":878,"mem":528613376,"ok":true,"reply":"Bien sûr, un jour de la Seine, avec un emoji de la Vue de la Terre."}
+errors []
+ALL_OK true
+### smollm2-1.7b threads
+ready {"type":"ready","backend":"threads","model":"smollm2-1.7b","engineBuild":"2026-10-04-release-01","adapter":"navigator.gpu present, no adapter","info":"{\"loaded\":true,\"numLayers\":24,\"hiddenSize\":2048,\"vocabSize\":49152}","wasmMemoryBytes":2091450368}
+{"turn":"What is the capital of France?","type":"done","tokens":7,"ms":1823,"mem":2106130432,"ok":true,"reply":"The capital of France is Paris."}
+{"turn":"Name two famous museums there, one sentence each.","type":"done","tokens":42,"ms":4032,"mem":2106130432,"ok":true,"reply":"The Louvre Museum, known for its vast collection of art and historical artifacts, and the Musée d'Orsay, famous for its impressive collection of Impressionist and Post-Impressionist art."}
+{"turn":"Écris une phrase en français sur la Seine, avec un emoji.","type":"done","tokens":22,"ms":2966,"mem":2106130432,"ok":true,"reply":"\"La Seine est une beauté inoubliable, et son emoji est le 🌊.\""}
+errors []
+ALL_OK true
+### smollm2-1.7b webgpu
+ready {"type":"ready","backend":"webgpu","model":"smollm2-1.7b","engineBuild":"2026-10-04-release-01","adapter":"apple / metal-3 (storage buffers/stage 10, max binding 4294967292, shader-f16 true)","info":"{\"loaded\":true,\"numLayers\":24,\"hiddenSize\":2048,\"vocabSize\":49152,\"maxStorageBufferBindingSize\":4294967292}","wasm
+{"turn":"What is the capital of France?","type":"done","tokens":7,"ms":474,"mem":174718976,"ok":true,"reply":"The capital of France is Paris."}
+{"turn":"Name two famous museums there, one sentence each.","type":"done","tokens":42,"ms":1333,"mem":174718976,"ok":true,"reply":"The Louvre Museum, known for its vast collection of art and historical artifacts, and the Musée d'Orsay, famous for its impressive collection of Impressionist and Post-Impressionist art."}
+{"turn":"Écris une phrase en français sur la Seine, avec un emoji.","type":"done","tokens":22,"ms":1148,"mem":174718976,"ok":true,"reply":"\"La Seine est une beauté inoubliable, et son emoji est le 🌊.\""}
+errors []
+ALL_OK true
+ready {"type":"ready","backend":"threads","model":"smollm2-1.7b","engineBuild":"2026-10-04-release-01","adapter":"navigator.gpu present, no adapter","info":"{\"loaded\":true,\"numLayers\":24,\"hiddenSize\":2048,\"vocabSize\":49152}","wasmMemoryBytes"
+{"turn":"What is the capital of France?","type":"done","tokens":7,"ms":2062,"mem":2106130432,"ok":true,"reply":"The capital of France is Paris."}
+{"turn":"Name two famous museums there, one sentence each.","type":"done","tokens":42,"ms":4266,"mem":2106130432,"ok":true,"reply":"The Louvre Museum, known for its vast collection of art and historical artifacts, and the Musée d'Orsay, famous for it
+{"turn":"Écris une phrase en français sur la Seine, avec un emoji.","type":"done","tokens":22,"ms":3211,"mem":2106130432,"ok":true,"reply":"\"La Seine est une beauté inoubliable, et son emoji est le 🌊.\""}
+errors []
+ALL_OK true

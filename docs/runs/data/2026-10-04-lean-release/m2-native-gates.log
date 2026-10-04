@@ -1,0 +1,23 @@
+fixture_parity_llama_360m_cpu [default] 68s: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 13.38s
+kv_snapshot [default] 80s: test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 40.52s
+logit_mask [default] 48s: test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.98s
+pool_reuse [default] 48s: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.74s
+streaming_sampling [default] 52s: test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.35s
+chat_api [default] 63s: test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 17.31s
+fixture_parity_llama_360m_cpu [--features threads] 59s: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.86s
+chat_api [--features threads] 56s: test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.59s
+embed_head_sliced [default] 59s: test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.26s
+lora_parity [default] 42s: test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.26s
+fixture_parity [default] 103s: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 58.21s
+fixture_parity_qwen25_3b [default] 85s: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 39.90s
+fixture_parity_qwen3 [default] 100s: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 55.08s
+fixture_parity_qwen3_1_7b [default] 211s: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 166.10s
+fixture_parity_llama_360m [default] 59s: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 13.91s
+fixture_parity_llama_1_7b [default] 80s: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 35.42s
+cpu_lora_parity [--features threads] 174s: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 118.73s
+lib [default]: test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s
+lib [--features threads]: test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.28s
+cpu_lora_parity [default] 354s: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 300.40s
+clippy native [default]:     Finished `dev` profile [unoptimized + debuginfo] target(s) in 14.43s
+clippy native [--features threads]:     Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.39s
+clippy wasm32 web:     Finished `dev` profile [unoptimized + debuginfo] target(s) in 25.46s

@@ -1,0 +1,6 @@
+== firefox 8831 threads load { 2.97 2.90 2.93 } engine build | 2026-10-03-main-01 prefill ms | 439.9 decode ms/token | 37.4 (63 steps) token hash | a454748c60e23841 
+== firefox 8840 threads load { 2.91 2.89 2.92 } engine build | 2026-10-04-release-01 prefill ms | 418.8 decode ms/token | 24.3 (63 steps) token hash | a454748c60e23841 
+== firefox 8831 threads load { 2.55 2.81 2.89 } engine build | 2026-10-03-main-01 prefill ms | 440.1 decode ms/token | 36.9 (63 steps) token hash | a454748c60e23841 
+== firefox 8840 threads load { 2.51 2.80 2.89 } engine build | 2026-10-04-release-01 prefill ms | 418.7 decode ms/token | 23.9 (63 steps) token hash | a454748c60e23841 
+== firefox 8831 threads load { 2.72 2.84 2.90 } engine build | 2026-10-03-main-01 prefill ms | 439.5 decode ms/token | 36.9 (63 steps) token hash | a454748c60e23841 
+== firefox 8840 threads load { 2.69 2.83 2.90 } engine build | 2026-10-04-release-01 prefill ms | 416.0 decode ms/token | 24.4 (63 steps) token hash | a454748c60e23841 

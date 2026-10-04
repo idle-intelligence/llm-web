@@ -1,0 +1,21 @@
+0 %, 515 MiB
+fixture_parity rc=0 68s test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.35s
+fixture_parity_qwen25_3b rc=0 61s test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.36s
+fixture_parity_qwen3 rc=0 58s test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.07s
+fixture_parity_qwen3_1_7b rc=0 67s test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 15.86s
+fixture_parity_llama_360m rc=0 55s test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.01s
+fixture_parity_llama_1_7b rc=0 60s test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.25s
+kv_snapshot rc=0 54s test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.15s
+logit_mask rc=0 54s test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.52s
+pool_reuse rc=0 51s test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.33s
+streaming_sampling rc=0 57s test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.08s
+chat_api rc=0 111s test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 59.27s
+fixture_parity_llama_360m_cpu rc=0 84s test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 53.65s
+lora_parity rc=0 48s test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.07s
+embed_head_sliced rc=0 31s test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.12s
+fixture_parity_llama_360m_cpu_threads rc=0 67s test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.30s
+chat_api_threads rc=0 66s test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 13.86s
+cpu_lora_parity_threads rc=0 142s test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 114.07s
+lib [] test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.65s
+lib [--features threads] test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.71s
+=== GATES DONE ===

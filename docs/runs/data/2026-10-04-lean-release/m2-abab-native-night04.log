@@ -1,0 +1,12 @@
+== night04 load { 2.08 2.80 2.89 }
+decode ms/step median 8.77 (min 7.93 max 13.02), encode+submit median 1.14 decode pipelined ms/step median of 3 runs 8.83 
+== release load { 1.92 2.75 2.87 }
+decode ms/step median 8.42 (min 8.06 max 10.49), encode+submit median 0.79 decode pipelined ms/step median of 3 runs 8.96 
+== night04 load { 1.84 2.72 2.86 }
+decode ms/step median 9.30 (min 8.38 max 19.30), encode+submit median 1.51 decode pipelined ms/step median of 3 runs 8.65 
+== release load { 1.84 2.72 2.86 }
+decode ms/step median 9.47 (min 8.24 max 12.31), encode+submit median 1.77 decode pipelined ms/step median of 3 runs 9.04 
+== night04 load { 1.86 2.71 2.85 }
+decode ms/step median 8.39 (min 7.86 max 9.96), encode+submit median 0.76 decode pipelined ms/step median of 3 runs 8.79 
+== release load { 1.71 2.67 2.84 }
+decode ms/step median 8.67 (min 7.96 max 12.78), encode+submit median 0.99 decode pipelined ms/step median of 3 runs 9.15 

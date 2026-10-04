@@ -1,0 +1,66 @@
+=== cpu_per_cell_a_norules [lean/threads]
+running 1 test
+test cpu_per_cell_a_norules ... [gate] cpu per-cell a-norules-300  64 cells per forward  512 cases, answers vs HF+PEFT: 0 differ, max |logit diff| 3.242e-4
+[gate] cpu per-cell a-norules-300  one cell per forward   64 cases, answers vs HF+PEFT: 0 differ, max |logit diff| 1.583e-4
+[gate] cpu per-cell a-norules-300  one cell, no reuse     64 cases, answers vs HF+PEFT: 0 differ, max |logit diff| 1.583e-4
+[gate] cpu per-cell a-norules-300  512/512 correct
+ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 91.82s
+--- 92s
+=== cpu_per_cell_base_rules [lean/threads]
+running 1 test
+test cpu_per_cell_base_rules ... [gate] cpu per-cell base-rules     64 cells per forward  512 cases, answers vs HF+PEFT: 0 differ, max |logit diff| 8.965e-5
+[gate] cpu per-cell base-rules     one cell per forward   64 cases, answers vs HF+PEFT: 0 differ, max |logit diff| 6.104e-5
+[gate] cpu per-cell base-rules     one cell, no reuse     64 cases, answers vs HF+PEFT: 0 differ, max |logit diff| 6.104e-5
+[gate] cpu per-cell base-rules     215/512 correct
+ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 142.45s
+--- 143s
+=== cpu_whole_grid [lean/threads]
+running 1 test
+test cpu_whole_grid ... [gate] cpu whole grid base-16x16                   157/256 correct, answers vs HF+PEFT: 0 differ, max |logit diff| 6.866e-5
+[gate] cpu whole grid lora-b-16-s3-300-16x16       256/256 correct, answers vs HF+PEFT: 0 differ, max |logit diff| 2.041e-4
+[gate] cpu whole grid base-16x16                   154/256 correct, answers vs HF+PEFT: 0 differ, max |logit diff| 5.913e-5
+[gate] cpu whole grid lora-b-16-s3-300-16x16       256/256 correct, answers vs HF+PEFT: 0 differ, max |logit diff| 2.155e-4
+[gate] cpu whole grid base-32x32                   677/1024 correct, answers vs HF+PEFT: 0 differ, max |logit diff| 7.820e-5
+[gate] cpu whole grid lora-b-32-32x32              1024/1024 correct, answers vs HF+PEFT: 0 differ, max |logit diff| 4.809e-4
+ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 24.96s
+--- 25s
+=== per_cell_base_fewshot [default]
+test per_cell_base_fewshot ... [gate] webgpu per-cell base-fewshot   64 cells per forward  512 cases, answers vs HF+PEFT: 0 differ, max |logit diff| 5.341e-5
+[gate] webgpu per-cell base-fewshot   one cell per forward   64 cases, answers vs HF+PEFT: 0 differ, max |logit diff| 3.624e-5
+[gate] webgpu per-cell base-fewshot   one cell, no reuse     64 cases, answers vs HF+PEFT: 0 differ, max |logit diff| 4.578e-5
+[gate] webgpu per-cell base-fewshot   175/512 correct
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 84.96s
+--- 86s
+=== per_cell_base_rules [default]
+test per_cell_base_rules ... [gate] webgpu per-cell base-rules     64 cells per forward  512 cases, answers vs HF+PEFT: 0 differ, max |logit diff| 6.866e-5
+[gate] webgpu per-cell base-rules     one cell per forward   64 cases, answers vs HF+PEFT: 0 differ, max |logit diff| 4.768e-5
+[gate] webgpu per-cell base-rules     one cell, no reuse     64 cases, answers vs HF+PEFT: 0 differ, max |logit diff| 4.387e-5
+[gate] webgpu per-cell base-rules     215/512 correct
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 43.75s
+--- 43s
+=== per_cell_a_norules [default]
+test per_cell_a_norules ... [gate] webgpu per-cell a-norules-300  64 cells per forward  512 cases, answers vs HF+PEFT: 0 differ, max |logit diff| 2.060e-4
+[gate] webgpu per-cell a-norules-300  one cell per forward   64 cases, answers vs HF+PEFT: 0 differ, max |logit diff| 1.202e-4
+[gate] webgpu per-cell a-norules-300  one cell, no reuse     64 cases, answers vs HF+PEFT: 0 differ, max |logit diff| 1.202e-4
+[gate] webgpu per-cell a-norules-300  512/512 correct
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 39.31s
+--- 40s
+=== per_cell_a_rules [default]
+test per_cell_a_rules ... [gate] webgpu per-cell a-rules-300    64 cells per forward  512 cases, answers vs HF+PEFT: 0 differ, max |logit diff| 2.499e-4
+[gate] webgpu per-cell a-rules-300    one cell per forward   64 cases, answers vs HF+PEFT: 0 differ, max |logit diff| 1.431e-4
+[gate] webgpu per-cell a-rules-300    one cell, no reuse     64 cases, answers vs HF+PEFT: 0 differ, max |logit diff| 1.087e-4
+[gate] webgpu per-cell a-rules-300    509/512 correct
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 51.84s
+--- 52s
+=== whole_grid [default]
+test whole_grid ... [gate] webgpu whole grid base-16x16                   157/256 correct, answers vs HF+PEFT: 0 differ, max |logit diff| 6.104e-5
+[gate] webgpu whole grid lora-b-16-s3-300-16x16       256/256 correct, answers vs HF+PEFT: 0 differ, max |logit diff| 2.785e-4
+[gate] webgpu whole grid base-16x16                   154/256 correct, answers vs HF+PEFT: 0 differ, max |logit diff| 5.913e-5
+[gate] webgpu whole grid lora-b-16-s3-300-16x16       256/256 correct, answers vs HF+PEFT: 0 differ, max |logit diff| 2.699e-4
+[gate] webgpu whole grid base-32x32                   677/1024 correct, answers vs HF+PEFT: 0 differ, max |logit diff| 7.629e-5
+[gate] webgpu whole grid lora-b-32-32x32              1024/1024 correct, answers vs HF+PEFT: 0 differ, max |logit diff| 4.058e-4
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 7.71s
+--- 7s

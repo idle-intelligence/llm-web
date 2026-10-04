@@ -1,0 +1,10 @@
+== chromium 8831 threads load { 2.53 2.76 2.89 } engine build | 2026-10-03-main-01 prefill ms | 341.7 decode ms/token | 26.3 (63 steps) token hash | a454748c60e23841 
+== chromium 8840 threads load { 2.53 2.76 2.89 } engine build | 2026-10-04-release-01 prefill ms | 343.8 decode ms/token | 22.7 (63 steps) token hash | a454748c60e23841 
+== chromium 8831 threads load { 2.48 2.75 2.88 } engine build | 2026-10-03-main-01 prefill ms | 347.1 decode ms/token | 26.4 (63 steps) token hash | a454748c60e23841 
+== chromium 8840 threads load { 2.69 2.79 2.89 } engine build | 2026-10-04-release-01 prefill ms | 341.5 decode ms/token | 22.7 (63 steps) token hash | a454748c60e23841 
+== chromium 8831 threads load { 2.78 2.82 2.90 } engine build | 2026-10-03-main-01 prefill ms | 341.8 decode ms/token | 26.4 (63 steps) token hash | a454748c60e23841 
+== chromium 8840 threads load { 2.78 2.82 2.90 } engine build | 2026-10-04-release-01 prefill ms | 347.5 decode ms/token | 22.7 (63 steps) token hash | a454748c60e23841 
+== chromium 8831 threads load { 2.57 2.78 2.89 } engine build | 2026-10-03-main-01 prefill ms | 343.4 decode ms/token | 26.4 (63 steps) token hash | a454748c60e23841 
+== chromium 8840 threads load { 2.57 2.78 2.89 } engine build | 2026-10-04-release-01 prefill ms | 356.2 decode ms/token | 23.2 (63 steps) token hash | a454748c60e23841 
+== chromium 8831 threads load { 2.45 2.75 2.87 } engine build | 2026-10-03-main-01 prefill ms | 343.7 decode ms/token | 26.3 (63 steps) token hash | a454748c60e23841 
+== chromium 8840 threads load { 2.81 2.82 2.90 } engine build | 2026-10-04-release-01 prefill ms | 346.1 decode ms/token | 22.4 (63 steps) token hash | a454748c60e23841 

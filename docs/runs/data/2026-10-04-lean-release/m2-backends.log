@@ -1,0 +1,4 @@
+== chromium 8840 webgpu load { 2.21 2.73 2.90 } backend used | webgpu engine build | 2026-10-04-release-01 prefill ms | 85.1 decode ms/token | 6.1 (63 steps) token hash | a454748c60e23841 
+== chromium 8840 threads load { 2.21 2.73 2.90 } backend used | threads engine build | 2026-10-04-release-01 prefill ms | 350.1 decode ms/token | 24.0 (63 steps) token hash | a454748c60e23841 
+== chromium 8840 single load { 2.19 2.71 2.89 } backend used | single engine build | 2026-10-04-release-01 prefill ms | 1041.9 decode ms/token | 77.2 (63 steps) token hash | a454748c60e23841 
+== firefox 8840 threads load { 2.09 2.67 2.88 } backend used | threads engine build | 2026-10-04-release-01 prefill ms | 420.3 decode ms/token | 24.1 (63 steps) token hash | a454748c60e23841 
