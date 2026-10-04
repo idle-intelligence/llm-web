@@ -232,6 +232,30 @@ console output, which the log does not hold).
 - The llm-life gates give the same counts and max logit differences as
   lean-main's run on every row.
 
+## Final merge: lean-demos, after review
+
+Fast-forwarded onto `lean-demos`, then one commit fixing a pre-existing
+privacy issue found by the final grep.
+
+| commit | change |
+|---|---|
+| d0bc704 | wllama removed from the backends diag page |
+| 9253b66 | diag page reports why every backend failed instead of continuing with no engine |
+| a72e873 | model downloads length-checked against the stored expected size, through the shared model-cache.js |
+| f9698f6 | the lean www pages use the shared trucs.ai model-cache.js instead of a copy |
+| (lean-demos) | device demo page, lean-first README, GitHub Pages workflow, coi-serviceworker |
+| c0df8fe | llm-agent: `--gguf`/`--model-dir`/`--out-dir` or `LLM_AGENT_*` env vars, no home-relative default path baked into the binary |
+
+Checks run after the merge:
+
+- Phone, Chrome, WebGPU backend: 30.6 ms/token, token-exact against the
+  reference.
+- Phone, Firefox, threads backend: 85.2 ms/token, token-exact against the
+  reference.
+- Desktop: multi-turn chat, replies match turn for turn.
+- A Pages-like site built from a fresh clone: WebGPU and threads backends
+  both token-exact.
+
 ## What TC pushes
 
 `lean-release` (HEAD = this doc's commit). It contains lean-main,
