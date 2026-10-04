@@ -4,6 +4,8 @@ lean is a small LLM inference engine written in Rust against `wgpu`, with hand-w
 
 In a browser it runs on WebGPU or fallback on WASM SIMD CPU. It is the same model on every backend, and it is token-exact against HF transformers: the greedy tokens match the transformers reference on every backend.
 
+[Chat demo](https://idle-intelligence.github.io/llm-web/web/) and [device check](https://idle-intelligence.github.io/llm-web/web/device/); the root [README](../../README.md#quick-start) has the quick start (web page, native CLI, parity gates).
+
 ## Backends
 
 A page picks one of three backends, in this order:

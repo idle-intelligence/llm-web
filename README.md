@@ -1,141 +1,84 @@
 # llm-web
 
-Two Rust WebGPU inference engines for language models, running client-side in the browser, plus a wllama fallback demo.
+lean is a small LLM inference engine written in Rust against `wgpu`, with hand-written WGSL kernels for the GPU and SIMD kernels for the CPU. It reads a quantized GGUF file and a Hugging Face tokenizer, and it compiles from one source to a native library and to WebAssembly for the browser, with no ML framework. In a browser it runs on WebGPU or falls back to WASM SIMD CPU, picked by capability rather than measured; it is the same model on every backend, and it is token-exact against HF transformers.
 
-- `crates/llm-wasm/` is the original engine: a Burn+wgpu implementation of the Qwen2 architecture, with quantized GGUF weights, runtime LoRA adapters, schema-constrained decoding and a tool-calling agent loop.
-- `crates/lean/` is a second, newer engine: a hand-written raw-wgpu + WGSL forward pass (no Burn, no CubeCL), native and wasm from one source, that picks a backend (WebGPU, else the CPU forward pass on a pool of threads, else on a single thread, with NEON/SIMD128 kernels) by capability rather than by runtime measurement. See [`crates/lean/README.md`](crates/lean/README.md).
+[**Chat demo →**](https://idle-intelligence.github.io/llm-web/web/) · [**Device check →**](https://idle-intelligence.github.io/llm-web/web/device/)
 
-[**Try the demo →**](https://idle-intelligence.github.io/llm-web/web/)
+> **Disclaimer:** lean is an original implementation written from public model configs and GGUF metadata, not a port of llama.cpp or wllama. Models are fetched at run time from their authors' Hugging Face repos under their own licenses; no weights are redistributed here. This project is not affiliated with the Qwen or SmolLM2 teams.
 
-> **Disclaimer:** both engines are original implementations written from public model configs and GGUF metadata, not ports of wllama or llama.cpp. Models are fetched at run time from their authors' Hugging Face repos under their own licenses; no weights are redistributed here. This project is not affiliated with the Qwen team.
+## Quick start
 
-## llm-wasm (Burn+wgpu engine)
+### In a web page
 
-### Status
-
-- The Burn+wgpu engine runs the full Qwen2 forward pass (GQA attention, QKV bias, RoPE, RMSNorm, SwiGLU, tied embeddings) natively and compiles to `wasm32-unknown-unknown` with WebGPU, verified by a native CLI (`llm-agent`) and a browser demo page under `web/agent/`.
-- Runs Qwen2.5-0.5B-Instruct (Q4_0) with runtime LoRA adapters in the browser. This is the engine behind the LLM methods of [llm-life](https://github.com/idle-intelligence/llm-life), where fine-tuned adapters turn the model into a Game of Life update rule.
-- Schema-constrained decoding forces tool calls onto valid JSON matching the tool schema, measured as a large accuracy gain over unconstrained decoding on a 43-utterance Sonos tool-calling eval against a model no longer used in this repo — see `docs/archive/` for the archived numbers.
-- An MCP-shaped agent loop (`agent.rs`/`web.rs`) drives multi-step tool calls, retries malformed output, and feeds tool errors back to the model.
-- Prefix KV cache images let a session restore GPU KV state to the longest matching prompt prefix instead of re-prefilling from scratch.
-- The public demo above runs the wllama fallback path (SmolLM2-360M-Instruct), which is deployed to GitHub Pages. The Burn+wgpu engine demo (`web/agent/`) is a local dev page: it loads the GGUF/tokenizer from a local model server and is not currently deployed publicly.
-
-### Models
-
-| Model | Size | Params | Quant | License |
-|-------|------|--------|-------|---------|
-| [Qwen2.5-0.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct) | ~430 MB (Q4_0 GGUF) | 0.5B | Q4_0 | Apache 2.0 |
-| [Qwen2.5-3B-Instruct](https://huggingface.co/Qwen/Qwen2.5-3B-Instruct) (Qwen2 architecture, tool calling) | ~1.8 GB (Q4_0 GGUF) | 3B | Q4_0 (Q6_K token embedding) | Apache 2.0 |
-| [SmolLM2-360M-Instruct](https://huggingface.co/HuggingFaceTB/SmolLM2-360M-Instruct) | ~271 MB | 360M | Q4_K_M | Apache 2.0 |
-
-### Structure
-
-```
-crates/llm-wasm/   # The engine: GGUF loader, Qwen2 model, WGSL kernels, tokenizer/template/agent, WASM bindings
-eval/              # Sonos MCP tool-calling eval harness and results
-fixtures/          # Reference tensors, rendered prompts, canned tool results
-scripts/headless/  # Playwright-driven harness to load and benchmark a page in headless Chromium
-web/agent/         # Local dev demo for the Burn+wgpu engine (Qwen2.5-3B-Instruct, tool calling)
-pkg/wllama/        # Vendored @wllama/wllama ESM build + WASM binaries
-web/index.html     # Public demo page, wllama fallback: download model, chat, streaming output
-```
-
-### Build
+Build the web packages and serve the repository with cross-origin isolation headers (needed for the CPU threads backend):
 
 ```bash
-# Native (default features: wgpu + native)
-cargo build
-cargo test
-
-# WASM (web feature; native/CLI excluded)
-cargo build --target wasm32-unknown-unknown --no-default-features --features web -p llm-wasm
-
-# wasm-pack, for the browser demo's pkg/
-wasm-pack build crates/llm-wasm --target web --no-default-features --features web
-```
-
-### Run locally
-
-Public wllama demo:
-
-```bash
-npx serve -l 9000 --no-clipboard
-# Open http://localhost:9000/web/
-```
-
-Engine agent demo (needs a local GGUF + tokenizer server, e.g. `scripts/serve_models.py`, and the COOP/COEP-enabled page server):
-
-```bash
-python3 web/agent/serve.py
-# Open http://localhost:8002/ (or the port serve.py prints) and point it at your model server
-```
-
-Native CLI (run/eval/bench against a local GGUF file):
-
-```bash
-cargo run --release --bin llm-agent -- run --gguf <path-to-gguf> --tokens <path-to-tokens.json> --tokenizer <path-to-tokenizer.json>
-```
-
-## lean (raw wgpu engine)
-
-`crates/lean/` is a second engine in this repo: a forward pass written directly against `wgpu` and hand-written WGSL, with no Burn and no CubeCL. It compiles from one source to native and to `wasm32-unknown-unknown`, and it picks a backend by capability rather than by runtime measurement or per-device tuning: WebGPU when available, otherwise the CPU forward pass on a pool of threads (wasm-bindgen-rayon, which needs a cross-origin isolated page), otherwise the CPU forward pass on a single thread, with NEON (aarch64) or SIMD128 (wasm32) dot-product kernels. Its own README, [`crates/lean/README.md`](crates/lean/README.md), covers the backends, the JavaScript API, the build and the parity gates.
-
-### Supported architectures and quant types
-
-Architectures (`src/config.rs`): Qwen2, Qwen3, and Llama (including SmolLM2, which uses the Llama architecture). GGUF tensor dtypes (`src/gguf.rs`): F32, F16, Q4_0, Q8_0, and Q6_K (Q4_1-encoded tensors are read and dequantized to F32). Which dtypes a given tensor uses depends on how the GGUF was quantized; llama.cpp's "Q4_0" quant profile commonly keeps `token_embd.weight`/`output.weight` at Q6_K or Q8_0.
-
-### Build
-
-```bash
-# Native
-cargo build -p lean
-cargo test -p lean
-
-# WASM (web feature; native CLI bins excluded)
-cargo build -p lean --target wasm32-unknown-unknown --no-default-features --features web
-
-# Web builds for the www/ pages: pkg/ (WebGPU and single CPU thread) and pkg-mt/ (CPU threads)
-ENGINE_BUILD=<tag> scripts/build_lean.sh
-ENGINE_BUILD=<tag> scripts/build_lean_mt.sh
-```
-
-### Run locally
-
-Native CLI (fixture-parity check or free-form prompt against a local GGUF + tokenizer):
-
-```bash
-LEAN_GGUF=<path-to-gguf> LEAN_TOKENIZER_DIR=<dir-with-tokenizer.json> cargo run -p lean --release --bin lean-cli
-# or: cargo run -p lean --release --bin lean-cli -- --prompt "..." --tokens 64
-```
-
-Browser pages: `crates/lean/www/backends.html` runs a fixed generation on a chosen backend (`?backend=auto|webgpu|threads|single`, `?diag=1` for diagnostics), `chat.html` is a multi-turn chat test page, and the rest are development harnesses; `crates/lean/README.md` describes them. Serve the repository with the cross-origin isolation headers the CPU threads backend needs and open a page:
-
-```bash
+ENGINE_BUILD=dev scripts/build_lean.sh       # crates/lean/pkg: WebGPU + single-thread CPU
+ENGINE_BUILD=dev scripts/build_lean_mt.sh    # crates/lean/pkg-mt: CPU threads (needs a nightly toolchain, see the script)
 python3 scripts/serve_coi.py
-# Open http://localhost:8030/crates/lean/www/backends.html
 ```
 
-### Tests
+Then open [`web/hello/index.html`](web/hello/index.html), a complete, minimal example (loads a model, streams one reply):
 
-`cargo test -p lean` always runs the synthetic (non-GPU) tests: `chat_template.rs`, `lora.rs`'s parser tests, `quant.rs`'s dequant-repack tests, and `q6k_reference_dequant.rs`. The GPU-backed parity tests are `#[ignore]`d because they need real model files not committed to this repo; run them explicitly with the matching env vars set, for example:
+```html
+<script type="module">
+const mod = await import('../../crates/lean/pkg/lean.js');
+await mod.default('../../crates/lean/pkg/lean_bg.wasm');
+mod.leanInit();
+const engine = navigator.gpu ? await mod.LeanEngine.create() : mod.LeanEngineCpu.create();
+engine.load(ggufBytes, tokenizerJson, tokenizerConfigJson, 2048);
+await engine.chatGenerate(prompt, 64, 0.7, 40, 0.9, 1.1, 0, new Uint32Array(0),
+  (_id, text) => { /* append text */ }, new mod.AbortFlag().cloneFlag());
+</script>
+```
+
+### Native
 
 ```bash
-LEAN_GGUF=<path> LEAN_TOKENIZER_DIR=<dir> cargo test -p lean --test fixture_parity -- --ignored
-LEAN_GGUF=<path> LEAN_TOKENIZER_DIR=<dir> cargo test -p lean --test kv_snapshot -- --ignored
-LEAN_GGUF=<path> LEAN_TOKENIZER_DIR=<dir> cargo test -p lean --test logit_mask -- --ignored
+cargo build -p lean --release --bin lean-cli
+LEAN_GGUF=<path-to-gguf> LEAN_TOKENIZER_DIR=<dir-with-tokenizer.json> \
+  cargo run -p lean --release --bin lean-cli -- --prompt "..." --tokens 64
 ```
 
-Each of `fixture_parity_qwen3.rs`, `fixture_parity_qwen3_1_7b.rs`, `fixture_parity_qwen25_3b.rs`, `fixture_parity_llama_360m.rs`, and `fixture_parity_llama_1_7b.rs` reads its own model-specific env vars (e.g. `LEAN_GGUF_QWEN3`/`LEAN_TOKENIZER_DIR_QWEN3`); see each test file's `env::var` calls for the exact names.
+### Verify (parity gates)
 
-### Performance
+Greedy tokens matching the transformers reference, on every backend:
 
-Benchmark and profiling runs (native and browser, prefill/decode timing, kernel-level breakdowns) are logged under `docs/runs/` (for example `docs/runs/2026-09-29-lean-vs-llamacpp-profile.md` for a comparison against llama.cpp on the same GGUF). Those docs are the source of truth for any performance number; this README doesn't restate them.
+```bash
+LEAN_GGUF=<gguf> LEAN_TOKENIZER_DIR=<dir> cargo test -p lean --release --test fixture_parity -- --ignored
+LEAN_GGUF_LLAMA_360M_Q4_0=<gguf> LEAN_GGUF_LLAMA_360M_Q8_0=<gguf> LEAN_TOKENIZER_DIR_LLAMA_360M=<dir> \
+  cargo test -p lean --release --features threads --test fixture_parity_llama_360m_cpu -- --ignored
+```
+
+See [`crates/lean/README.md`](crates/lean/README.md) for the backends, the full JavaScript API, every parity test and its environment variables, and the `www/` development pages (`backends.html`, `chat.html`).
+
+## Models
+
+| Model | Params | Quant | License |
+|-------|--------|-------|---------|
+| [SmolLM2-360M-Instruct](https://huggingface.co/HuggingFaceTB/SmolLM2-360M-Instruct) | 360M | Q4_0 | Apache 2.0 |
+| [Qwen2.5-0.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct) | 0.5B | Q4_0 | Apache 2.0 |
+| [SmolLM2-1.7B-Instruct](https://huggingface.co/HuggingFaceTB/SmolLM2-1.7B-Instruct) | 1.7B | Q4_0 | Apache 2.0 |
+| [Qwen2.5-3B-Instruct](https://huggingface.co/Qwen/Qwen2.5-3B-Instruct) | 3B | Q4_0 (Q6_K embedding) | Apache 2.0 |
+
+See [`crates/lean/README.md`](crates/lean/README.md#supported-models) for the full architecture and tensor-type list.
+
+## llm-wasm (earlier engine)
+
+`crates/llm-wasm/` is an earlier Burn+wgpu implementation of the Qwen2 architecture (GQA attention, RoPE, SwiGLU), with quantized GGUF weights, runtime LoRA adapters, schema-constrained decoding and an MCP-shaped tool-calling agent loop (`agent.rs`/`web.rs`). It runs Qwen2.5-0.5B-Instruct (Q4_0) with runtime LoRA adapters in the browser, and is the engine behind the LLM methods of [llm-life](https://github.com/idle-intelligence/llm-life). Prefix KV cache images let a session restore GPU KV state to the longest matching prompt prefix instead of re-prefilling from scratch. Its demo page (`web/agent/`) is a local dev harness, loading the GGUF/tokenizer from a local model server; it is not deployed publicly. See the crate's own doc comments and `docs/archive/` for the archived tool-calling accuracy numbers.
+
+```bash
+cargo build --target wasm32-unknown-unknown --no-default-features --features web -p llm-wasm
+wasm-pack build crates/llm-wasm --target web --no-default-features --features web
+python3 web/agent/serve.py
+```
 
 ## Credits
 
-- [wllama](https://github.com/nicebyte/wllama) (MIT) and [llama.cpp](https://github.com/ggml-org/llama.cpp) (MIT), the vendored browser-inference path under `pkg/wllama/` and `web/index.html`.
-- [Qwen/Qwen2.5-0.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct) and [Qwen/Qwen2.5-3B-Instruct](https://huggingface.co/Qwen/Qwen2.5-3B-Instruct) (both Apache 2.0), the models run on the engine so far; weights are not distributed here.
-- [HuggingFaceTB/SmolLM2-360M-Instruct](https://huggingface.co/HuggingFaceTB/SmolLM2-360M-Instruct) (Apache 2.0), the model served by the public wllama demo.
+- [Qwen/Qwen2.5-0.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct), [Qwen/Qwen2.5-3B-Instruct](https://huggingface.co/Qwen/Qwen2.5-3B-Instruct) (Apache 2.0).
+- [HuggingFaceTB/SmolLM2-360M-Instruct](https://huggingface.co/HuggingFaceTB/SmolLM2-360M-Instruct), [HuggingFaceTB/SmolLM2-1.7B-Instruct](https://huggingface.co/HuggingFaceTB/SmolLM2-1.7B-Instruct) (Apache 2.0).
+- [coi-serviceworker](https://github.com/gzuidhof/coi-serviceworker) (MIT), vendored at `web/vendor/coi-serviceworker.js` so the CPU threads backend works on GitHub Pages.
+- Weights for all of the above are not distributed here; both demo pages fetch them from Hugging Face at run time.
 
 ## License
 
