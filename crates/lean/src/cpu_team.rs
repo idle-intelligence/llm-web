@@ -14,8 +14,9 @@
 //! an epoch counter. Inside `f`, `team_for(n, body)` (used by both the
 //! one-row and the multi-row `linear` in cpu.rs) publishes a job of `n`
 //! items; all threads, the leader included, claim items with a CAS on one
-//! 64-bit word (job epoch in the high half, next item in the low half, so a
-//! late thread can never claim an item of a newer job), and the leader
+//! 64-bit word holding the job's epoch, its item count and the next item,
+//! so a thread still looking at an older job can never claim an item of a
+//! newer one or read one job's count with another's index, and the leader
 //! spins until all `n` are done. A follower that finds no new job for
 //! `SPIN_LIMIT` polls parks on a condvar (the leader notifies only when one
 //! is parked), so a long serial stretch, or more pool threads than free
@@ -34,13 +35,16 @@ use std::sync::{Condvar, Mutex};
 /// wasm32: each poll is one atomic load).
 const SPIN_LIMIT: u32 = 1 << 18;
 
+/// Item count and item index fields of the claim word (24 bits each).
+const ITEM_MASK: u64 = (1 << 24) - 1;
+
 type Body<'a> = &'a (dyn Fn(usize) + Sync);
 
 struct Team {
-    /// `(epoch << 32) | next unclaimed item` of the current job.
+    /// The current job: epoch (low 16 bits) << 48 | item count << 24 |
+    /// next unclaimed item, all read and advanced together.
     claim: AtomicU64,
     epoch: AtomicU32,
-    n: AtomicUsize,
     done: AtomicUsize,
     /// Address of the leader's `Body` for the current job (a thin pointer
     /// to the fat reference on the leader's stack). Read only after a
@@ -62,11 +66,11 @@ impl Team {
     fn work(&self, epoch: u32) {
         loop {
             let v = self.claim.load(Ordering::Acquire);
-            if (v >> 32) as u32 != epoch {
+            if (v >> 48) as u16 != epoch as u16 {
                 return;
             }
-            let i = (v & 0xffff_ffff) as usize;
-            if i >= self.n.load(Ordering::Relaxed) {
+            let (n, i) = ((v >> 24) & ITEM_MASK, v & ITEM_MASK);
+            if i >= n {
                 return;
             }
             if self.claim.compare_exchange_weak(v, v + 1, Ordering::AcqRel, Ordering::Acquire).is_err() {
@@ -77,7 +81,7 @@ impl Team {
             // `Body` (whose address it published before the claim word) is
             // alive.
             let body: Body = unsafe { *(self.body.load(Ordering::Relaxed) as *const Body) };
-            body(i);
+            body(i as usize);
             self.done.fetch_add(1, Ordering::Release);
         }
     }
@@ -122,12 +126,12 @@ impl Team {
     }
 
     fn run(&self, n: usize, body: Body) {
+        assert!(n as u64 <= ITEM_MASK, "team job of {n} items exceeds the claim word");
         let e = self.epoch.load(Ordering::Relaxed) + 1;
         let body_ref: Body = body;
         self.body.store(&body_ref as *const Body as usize, Ordering::Relaxed);
-        self.n.store(n, Ordering::Relaxed);
         self.done.store(0, Ordering::Relaxed);
-        self.claim.store(u64::from(e) << 32, Ordering::Release);
+        self.claim.store((u64::from(e as u16) << 48) | ((n as u64) << 24), Ordering::Release);
         self.epoch.store(e, Ordering::SeqCst);
         self.notify();
         self.work(e);
@@ -147,7 +151,6 @@ pub fn with_team<R: Send>(f: impl FnOnce() -> R + Send) -> R {
     let team = Team {
         claim: AtomicU64::new(0),
         epoch: AtomicU32::new(0),
-        n: AtomicUsize::new(0),
         done: AtomicUsize::new(0),
         body: AtomicUsize::new(0),
         exit: AtomicBool::new(false),
@@ -187,4 +190,36 @@ pub fn team_for(n: usize, body: &(dyn Fn(usize) + Sync)) -> bool {
         unsafe { &*team }.run(n, body);
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Many back-to-back jobs of varying sizes, with serial gaps long
+    /// enough for followers to park: every item of every job runs exactly
+    /// once, and `team_for` returns only when its job is done.
+    #[test]
+    fn every_item_runs_once_per_job() {
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(8).build().unwrap();
+        let counts: Vec<AtomicUsize> = (0..512).map(|_| AtomicUsize::new(0)).collect();
+        pool.install(|| {
+            with_team(|| {
+                for job in 0..3000usize {
+                    let n = 1 + (job * 7919) % 500;
+                    for c in &counts[..n] {
+                        c.store(0, Ordering::Relaxed);
+                    }
+                    assert!(team_for(n, &|i| {
+                        counts[i].fetch_add(1, Ordering::Relaxed);
+                    }));
+                    assert!(counts[..n].iter().all(|c| c.load(Ordering::Relaxed) == 1), "job {job}");
+                    if job % 500 == 0 {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                }
+            })
+        });
+        assert!(!team_for(1, &|_| {}), "no team outside with_team");
+    }
 }
