@@ -1,7 +1,6 @@
-// Shared by backends_worker.js (lean backends, in a Worker) and
-// wllama_backend.js (the llama.cpp reference, on the page): the model table,
-// best-effort model caching, the token hash, capability checks and the
-// WebGPU bandwidth probe used by ?diag=1.
+// Shared by backends_worker.js (lean backends, in a Worker): the model
+// table, best-effort model caching, the token hash, capability checks and
+// the WebGPU bandwidth probe used by ?diag=1.
 
 // Prompt ids are the fixture's "short" case ("What is the capital of
 // France?", chat-templated), so every backend sees the same ids without

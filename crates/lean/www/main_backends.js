@@ -1,16 +1,15 @@
 // Backend measurement page: runs one fixed greedy generation (the chosen
 // model's fixture "short" prompt, 64 tokens) on the backend the visitor
-// picks (?backend=auto|webgpu|threads|single|wllama, ?model=qwen25-0.5b|
+// picks (?backend=auto|webgpu|threads|single, ?model=qwen25-0.5b|
 // smollm2-360m) and shows the backend used, what the page can see of the
 // device, prefill ms, decode ms/token and a hash of the 64 generated ids.
 // Token-exact backends give the transformers reference hash.
 //
 // The lean backends run in backends_worker.js (a module Worker), so the
-// threads backend's rayon pool never blocks the main thread; wllama, the
-// llama.cpp reference, runs from wllama_backend.js (it has its own
-// workers). Served cross-origin isolated (scripts/serve_coi.py) so the
-// threaded builds are available. ?diag=1 adds a second table of
-// diagnostics under the results; the default output is unchanged.
+// threads backend's rayon pool never blocks the main thread. Served
+// cross-origin isolated (scripts/serve_coi.py) so the threaded builds are
+// available. ?diag=1 adds a second table of diagnostics under the results;
+// the default output is unchanged.
 //
 // Every wasm/js loading URL carries `?v=ENGINE_BUILD`, bumped in the same
 // commit as any wasm rebuild (backends.html's own script tag included).
@@ -19,7 +18,7 @@ import { MODELS, DEFAULT_MODEL } from "./backends_common.js?v=2026-10-04-release
 const ENGINE_BUILD = "2026-10-04-release-02";
 
 const params = new URLSearchParams(location.search);
-const backend = ["auto", "webgpu", "threads", "single", "wllama"].includes(params.get("backend")) ? params.get("backend") : "auto";
+const backend = ["auto", "webgpu", "threads", "single"].includes(params.get("backend")) ? params.get("backend") : "auto";
 const model = MODELS[params.get("model")] ? params.get("model") : DEFAULT_MODEL;
 const local = params.get("local") !== "0";
 const diag = params.get("diag") === "1";
@@ -59,7 +58,6 @@ function show(r) {
   row(resultsEl, "hardwareConcurrency", String(r.caps.hardwareConcurrency));
   row(resultsEl, "crossOriginIsolated", String(r.caps.crossOriginIsolated));
   row(resultsEl, "webgpu adapter", r.caps.adapter);
-  if (r.wllama) row(resultsEl, "wllama threads", `${r.wllama.nThreads} (${r.wllama.multithread ? "multi-thread" : "single-thread"} build)`);
   row(resultsEl, "prompt tokens", String(r.promptLen));
   row(resultsEl, "prefill ms", r.prefillMs.toFixed(1));
   row(resultsEl, "decode ms/token", `${r.decodeMsPerTok.toFixed(1)} (${r.ids.length - 1} steps)`);
@@ -80,19 +78,12 @@ function fail(text, e) {
   window.__leanBackends = { error: text };
 }
 
-if (backend === "wllama") {
-  import(`./wllama_backend.js?v=${ENGINE_BUILD}`)
-    .then((m) => m.runWllama({ local, diag, model }, status))
-    .then(show)
-    .catch((e) => fail(e && e.message ? e.message : String(e), e));
-} else {
-  const worker = new Worker(`./backends_worker.js?v=${ENGINE_BUILD}`, { type: "module" });
-  worker.onmessage = (e) => {
-    const m = e.data;
-    if (m.type === "status") status(m.text);
-    else if (m.type === "done") show(m.result);
-    else if (m.type === "error") fail(m.text);
-  };
-  worker.onerror = (e) => fail(e.message || "worker failed to start", e);
-  worker.postMessage({ backend, local, diag, model });
-}
+const worker = new Worker(`./backends_worker.js?v=${ENGINE_BUILD}`, { type: "module" });
+worker.onmessage = (e) => {
+  const m = e.data;
+  if (m.type === "status") status(m.text);
+  else if (m.type === "done") show(m.result);
+  else if (m.type === "error") fail(m.text);
+};
+worker.onerror = (e) => fail(e.message || "worker failed to start", e);
+worker.postMessage({ backend, local, diag, model });
