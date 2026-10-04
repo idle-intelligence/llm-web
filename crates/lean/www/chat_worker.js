@@ -8,8 +8,8 @@
 // {type: "stop"}, {type: "reset"}. Out: {type: "status"|"ready"|"piece"|
 // "done"|"error", ...}. The text shown is the `text` argument of
 // `on_token(id, text)`; the callback never calls back into the engine.
-import { capabilities, fetchBytes, fetchText } from "./backends_common.js?v=2026-10-04-chat-01";
-const ENGINE_BUILD = "2026-10-04-chat-01";
+import { capabilities, fetchBytes, fetchText } from "./backends_common.js?v=2026-10-04-release-01";
+const ENGINE_BUILD = "2026-10-04-release-01";
 
 const MODELS = {
   "qwen25-0.5b": { dir: "./model/", gguf: "qwen2.5-0.5b-instruct-q4_0.gguf" },
@@ -20,6 +20,7 @@ const MAX_CTX = 2048;
 
 let engine = null;
 let mod = null;
+let wasm = null; // the module's exports, for wasmMemoryBytes
 let abortFlag = null;
 
 function status(text) {
@@ -30,7 +31,7 @@ async function createEngine(backend, caps) {
   if (backend === "webgpu") {
     if (!caps.hasAdapter) throw new Error(`no WebGPU adapter (${caps.adapter})`);
     mod = await import(`../pkg/lean.js?v=${ENGINE_BUILD}`);
-    await mod.default({ module_or_path: `../pkg/lean_bg.wasm?v=${ENGINE_BUILD}` });
+    wasm = await mod.default({ module_or_path: `../pkg/lean_bg.wasm?v=${ENGINE_BUILD}` });
     mod.leanInit();
     return await mod.LeanEngine.create();
   }
@@ -42,13 +43,13 @@ async function createEngine(backend, caps) {
       );
     }
     mod = await import(`../pkg-mt/lean.js?v=${ENGINE_BUILD}`);
-    await mod.default({ module_or_path: `../pkg-mt/lean_bg.wasm?v=${ENGINE_BUILD}` });
+    wasm = await mod.default({ module_or_path: `../pkg-mt/lean_bg.wasm?v=${ENGINE_BUILD}` });
     await mod.initThreadPool(caps.hardwareConcurrency);
     mod.leanInit();
     return mod.LeanEngineCpu.create();
   }
   mod = await import(`../pkg/lean.js?v=${ENGINE_BUILD}`);
-  await mod.default({ module_or_path: `../pkg/lean_bg.wasm?v=${ENGINE_BUILD}` });
+  wasm = await mod.default({ module_or_path: `../pkg/lean_bg.wasm?v=${ENGINE_BUILD}` });
   mod.leanInit();
   return mod.LeanEngineCpu.create();
 }
@@ -66,7 +67,7 @@ async function load(forced, model) {
     fetchText(m.dir + "tokenizer_config.json"),
   ]);
   engine.load(gguf, tokenizerJson, tokenizerCfgJson, MAX_CTX);
-  self.postMessage({ type: "ready", backend, model, engineBuild: ENGINE_BUILD, adapter: caps.adapter, info: engine.info() });
+  self.postMessage({ type: "ready", backend, model, engineBuild: ENGINE_BUILD, adapter: caps.adapter, info: engine.info(), wasmMemoryBytes: wasm.memory.buffer.byteLength });
 }
 
 async function send(text, p) {
@@ -80,7 +81,7 @@ async function send(text, p) {
       streamed += piece;
       if (piece) self.postMessage({ type: "piece", text: piece });
     }, abortFlag.cloneFlag());
-    self.postMessage({ type: "done", reply, streamed, tokens, ms: performance.now() - t0 });
+    self.postMessage({ type: "done", reply, streamed, tokens, ms: performance.now() - t0, wasmMemoryBytes: wasm.memory.buffer.byteLength });
   } catch (e) {
     self.postMessage({ type: "error", message: e && e.message ? e.message : String(e) });
   }
