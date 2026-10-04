@@ -14,7 +14,7 @@
 // Both LeanEngine (GPU) and LeanEngineCpu (threads/single) expose the same
 // multi-turn chatGenerate/chatReset/AbortFlag surface as of
 // crates/lean/src/chat.rs + src/web.rs (merged from lean-chat-api,
-// ENGINE_BUILD 2026-10-04-pages-on-lean-02) - every backend gets real
+// ENGINE_BUILD 2026-10-04-demos-01) - every backend gets real
 // conversation memory, sampling and a working Stop button. on_token's
 // second argument (`text`) is the already-decoded delta for this token;
 // this worker streams that directly and never calls decodeIds per token
@@ -30,7 +30,7 @@
 const EARLY = [];
 self.onmessage = (e) => EARLY.push(e);
 
-const ENGINE_BUILD = "2026-10-04-pages-on-lean-02";
+const ENGINE_BUILD = "2026-10-04-demos-01";
 
 // Same model the chat.html test harness validates against
 // (crates/lean/www/backends_common.js's "smollm2-360m" entry, referenceHash
@@ -73,20 +73,20 @@ let abortFlag = null;
 
 async function createEngine(which) {
   if (which === "webgpu") {
-    const mod = await import(`../crates/lean/pkg/lean.js?v=${ENGINE_BUILD}`);
-    await mod.default(`../crates/lean/pkg/lean_bg.wasm?v=${ENGINE_BUILD}`);
+    const mod = await import(`./lean/pkg/lean.js?v=${ENGINE_BUILD}`);
+    await mod.default(`./lean/pkg/lean_bg.wasm?v=${ENGINE_BUILD}`);
     mod.leanInit();
     return { engine: await mod.LeanEngine.create(), AbortFlag: mod.AbortFlag };
   }
   if (which === "threads") {
-    const mod = await import(`../crates/lean/pkg-mt/lean.js?v=${ENGINE_BUILD}`);
-    await mod.default(`../crates/lean/pkg-mt/lean_bg.wasm?v=${ENGINE_BUILD}`);
+    const mod = await import(`./lean/pkg-mt/lean.js?v=${ENGINE_BUILD}`);
+    await mod.default(`./lean/pkg-mt/lean_bg.wasm?v=${ENGINE_BUILD}`);
     await mod.initThreadPool(navigator.hardwareConcurrency);
     mod.leanInit();
     return { engine: mod.LeanEngineCpu.create(), AbortFlag: mod.AbortFlag };
   }
-  const mod = await import(`../crates/lean/pkg/lean.js?v=${ENGINE_BUILD}`);
-  await mod.default(`../crates/lean/pkg/lean_bg.wasm?v=${ENGINE_BUILD}`);
+  const mod = await import(`./lean/pkg/lean.js?v=${ENGINE_BUILD}`);
+  await mod.default(`./lean/pkg/lean_bg.wasm?v=${ENGINE_BUILD}`);
   mod.leanInit();
   return { engine: mod.LeanEngineCpu.create(), AbortFlag: mod.AbortFlag };
 }

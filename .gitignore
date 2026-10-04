@@ -14,3 +14,9 @@ crates/lean/www/model_smollm2_1_7b/
 # ignored the same way, via wasm-pack's own auto-written pkg/.gitignore -
 # wasm-bindgen doesn't write one, so pkg-mt/ needs it here instead).
 crates/lean/pkg-mt/
+
+# Pages demo assets: lean's web build output, copied into web/lean/ for
+# local serving and by .github/workflows/pages.yml for the published site.
+# Not committed to main -- the workflow builds it from crates/lean/pkg* on
+# every deploy, same as crates/lean/pkg-mt/ above.
+web/lean/
