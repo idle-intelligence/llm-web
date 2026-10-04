@@ -1,16 +1,21 @@
 // Module Worker behind web/device/index.html. Speaks a small protocol:
 //
-//   page -> worker:  {type:'run'}
+//   page -> worker:  {type:'detect'}
+//                     {type:'run'}
 //   worker -> page:  {type:'status', text}
+//                     {type:'detected', caps, backend, canRun1_7b}
 //                     {type:'progress', loaded, total}
 //                     {type:'done', result}
 //                     {type:'error', message}
+//
+// 'detect' only runs capability checks: no model download, no engine start.
+// 'run' does that plus the full download/load/generate/verify flow.
 //
 // Picks a backend by capability only, same policy as
 // crates/lean/www/backends_worker.js and web/lean-chat-worker.js: WebGPU if
 // an adapter is granted, else CPU threads if the page is cross-origin
 // isolated with SharedArrayBuffer and more than one hardware thread, else
-// single-thread CPU (WASM SIMD128). It then runs one short generation on
+// single-thread CPU (WASM SIMD128). 'run' then runs one short generation on
 // that backend and checks the output against the transformers reference
 // hash (same fixture backends.html?diag=1 checks).
 //
@@ -20,12 +25,23 @@
 const EARLY = [];
 self.onmessage = (e) => EARLY.push(e);
 
-const ENGINE_BUILD = "2026-10-04-demos-01";
+const ENGINE_BUILD = "2026-10-04-demos-02";
 const N_GEN = 64;
 const MAX_CTX = 256;
 
 function status(text) {
   self.postMessage({ type: "status", text });
+}
+
+function backendFor(caps) {
+  return caps.hasAdapter ? "webgpu" : caps.threadsCapable ? "threads" : "single";
+}
+
+async function detect() {
+  const { capabilities } = await import(`./device_common.js?v=${ENGINE_BUILD}`);
+  const caps = await capabilities();
+  const backend = backendFor(caps);
+  self.postMessage({ type: "detected", caps, backend, canRun1_7b: backend === "webgpu" });
 }
 
 async function run() {
@@ -141,5 +157,10 @@ async function run() {
   });
 }
 
-self.onmessage = () => run().catch((e) => self.postMessage({ type: "error", message: e && e.message ? e.message : String(e) }));
-for (const e of EARLY) run().catch((err) => self.postMessage({ type: "error", message: err && err.message ? err.message : String(err) }));
+function dispatch(e) {
+  const fn = e.data && e.data.type === "detect" ? detect : run;
+  fn().catch((err) => self.postMessage({ type: "error", message: err && err.message ? err.message : String(err) }));
+}
+
+self.onmessage = dispatch;
+for (const e of EARLY) dispatch(e);

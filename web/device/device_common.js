@@ -5,6 +5,8 @@
 // qwen25-0.5b fixture are left out, this page runs one model).
 export const MODEL = {
   label: "SmolLM2-360M-Instruct Q4_0",
+  name: "SmolLM2-360M-Instruct",
+  sizeMB: 219,
   gguf: "https://huggingface.co/bartowski/SmolLM2-360M-Instruct-GGUF/resolve/main/SmolLM2-360M-Instruct-Q4_0.gguf",
   tokenizer: "https://huggingface.co/HuggingFaceTB/SmolLM2-360M-Instruct/resolve/main/tokenizer.json",
   tokenizerCfg: "https://huggingface.co/HuggingFaceTB/SmolLM2-360M-Instruct/resolve/main/tokenizer_config.json",

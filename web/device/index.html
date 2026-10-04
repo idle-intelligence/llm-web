@@ -136,6 +136,39 @@
             color: var(--faint);
             margin-top: 4px;
         }
+        button {
+            font-family: 'IBM Plex Mono', monospace;
+            font-size: 13px;
+            font-weight: 500;
+            padding: 8px 16px;
+            cursor: pointer;
+            border: 1px solid var(--border);
+            background: transparent;
+            color: var(--text);
+            border-radius: 0;
+            transition: border-color 0.15s;
+        }
+        button:hover:not(:disabled) {
+            border-color: var(--text);
+        }
+        button:disabled {
+            opacity: 0.3;
+            cursor: not-allowed;
+        }
+        button.primary {
+            background: var(--text);
+            color: var(--bg);
+            border-color: var(--text);
+        }
+        button.primary:hover:not(:disabled) {
+            background: var(--muted);
+            border-color: var(--muted);
+        }
+        .info {
+            font-size: 13px;
+            color: var(--faint);
+            margin-top: 12px;
+        }
 
         dl.rows {
             display: grid;
@@ -243,6 +276,10 @@
             <div class="progress-bar" id="progressFill"></div>
         </div>
         <p id="progressInfo"></p>
+        <p class="info" id="downloadNote"></p>
+        <div style="margin-top:12px">
+            <button id="runBtn" class="primary" disabled>run the check</button>
+        </div>
     </section>
 
     <section>
@@ -282,13 +319,16 @@
     </footer>
 
     <script type="module">
-        const ENGINE_BUILD = "2026-10-04-demos-01";
+        const ENGINE_BUILD = "2026-10-04-demos-02";
+        const { MODEL } = await import(`./device_common.js?v=${ENGINE_BUILD}`);
 
         const statusDot = document.getElementById('statusDot');
         const statusText = document.getElementById('statusText');
         const progressBar = document.getElementById('progressBar');
         const progressFill = document.getElementById('progressFill');
         const progressInfo = document.getElementById('progressInfo');
+        const downloadNote = document.getElementById('downloadNote');
+        const runBtn = document.getElementById('runBtn');
         const deviceRows = document.getElementById('deviceRows');
         const row1_7b = document.getElementById('row1_7b');
         const rowMatch = document.getElementById('rowMatch');
@@ -297,6 +337,9 @@
         const rowText = document.getElementById('rowText');
         const timingDetails = document.getElementById('timingDetails');
         const timingTable = document.getElementById('timingTable');
+
+        downloadNote.textContent =
+            `Running the check downloads ${MODEL.name} (about ${MODEL.sizeMB} MB, kept in the browser for next time) and runs it on this device.`;
 
         function updateStatus(state, text) {
             statusDot.className = 'status-dot ' + state;
@@ -336,24 +379,29 @@
             return x === undefined || x === null || Number.isNaN(x) ? 'n/a' : `${x.toFixed(1)} ms`;
         }
 
-        function showResult(r) {
-            document.getElementById('rowBackend').textContent = `${backendLabel(r.backend)}, chosen by capability, not by measurement`;
+        function renderDeviceInfo(backend, caps, canRun1_7b) {
+            deviceRows.textContent = '';
+            addRow('backend', `${backendLabel(backend)}, chosen by capability, not by measurement`);
 
             const reasons = [];
-            if (r.backend !== 'webgpu') reasons.push(`WebGPU: ${r.caps.adapter}`);
-            if (r.backend !== 'threads' && r.backend !== 'webgpu') {
+            if (backend !== 'webgpu') reasons.push(`WebGPU: ${caps.adapter}`);
+            if (backend !== 'threads' && backend !== 'webgpu') {
                 reasons.push(
                     `CPU threads: needs a cross-origin isolated page with SharedArrayBuffer and more than one hardware thread ` +
-                    `(crossOriginIsolated ${r.caps.crossOriginIsolated}, SharedArrayBuffer ${r.caps.sharedArrayBuffer}, hardwareConcurrency ${r.caps.hardwareConcurrency})`
+                    `(crossOriginIsolated ${caps.crossOriginIsolated}, SharedArrayBuffer ${caps.sharedArrayBuffer}, hardwareConcurrency ${caps.hardwareConcurrency})`
                 );
             }
             for (const reason of reasons) addRow('why not', reason);
-            addRow('WebGPU adapter', r.caps.adapter);
-            addRow('hardware threads', String(r.caps.hardwareConcurrency));
-            addRow('cross-origin isolated', String(r.caps.crossOriginIsolated));
+            addRow('WebGPU adapter', caps.adapter);
+            addRow('hardware threads', String(caps.hardwareConcurrency));
+            addRow('cross-origin isolated', String(caps.crossOriginIsolated));
 
-            row1_7b.textContent = r.canRun1_7b ? 'runs on this backend' : 'needs WebGPU';
-            row1_7b.className = r.canRun1_7b ? 'yes' : 'no';
+            row1_7b.textContent = canRun1_7b ? 'runs on this backend' : 'needs WebGPU';
+            row1_7b.className = canRun1_7b ? 'yes' : 'no';
+        }
+
+        function showResult(r) {
+            renderDeviceInfo(r.backend, r.caps, r.canRun1_7b);
 
             rowMatch.textContent = r.matchesReference
                 ? `yes, token-exact against the transformers reference (hash ${r.hash.slice(0, 16)})`
@@ -378,7 +426,11 @@
         const worker = new Worker(`./device_worker.js?v=${ENGINE_BUILD}`, { type: 'module' });
         worker.onmessage = (e) => {
             const m = e.data;
-            if (m.type === 'status') {
+            if (m.type === 'detected') {
+                renderDeviceInfo(m.backend, m.caps, m.canRun1_7b);
+                updateStatus('ready', `ready: this device can run lean on ${backendLabel(m.backend)}`);
+                runBtn.disabled = false;
+            } else if (m.type === 'status') {
                 updateStatus('loading', m.text);
             } else if (m.type === 'progress') {
                 progressBar.classList.add('visible');
@@ -389,16 +441,25 @@
                 progressBar.classList.remove('visible');
                 progressInfo.textContent = '';
                 showResult(m.result);
+                runBtn.disabled = false;
             } else if (m.type === 'error') {
                 updateStatus('error', 'Error: ' + m.message);
                 console.error(m.message);
+                runBtn.disabled = false;
             }
         };
         worker.onerror = (e) => {
             updateStatus('error', 'Worker error: ' + e.message);
             console.error('[llm-web device] worker error:', e);
+            runBtn.disabled = false;
         };
-        worker.postMessage({ type: 'run' });
+
+        runBtn.addEventListener('click', () => {
+            runBtn.disabled = true;
+            worker.postMessage({ type: 'run' });
+        });
+
+        worker.postMessage({ type: 'detect' });
     </script>
 </body>
 </html>
