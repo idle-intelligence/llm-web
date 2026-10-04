@@ -61,23 +61,48 @@ export function modelUrls(model, local) {
 // cache.put's own Response (on a 430 MB GGUF this was over 1 GB peak,
 // enough to hang a phone). If teeing or the put fails, falls back to a
 // plain fetch + arrayBuffer (the old behaviour).
+// Cached entries carry the length the server announced; an entry whose body is
+// shorter (an interrupted download) is deleted and fetched again, never used.
+const MODEL_CACHE = "lean-backends-model-v2";
+const LENGTH_HEADER = "X-Lean-Expected-Length";
+
+async function cachedIfComplete(cache, url) {
+  const hit = await cache.match(url);
+  if (!hit) return null;
+  const expected = Number(hit.headers.get(LENGTH_HEADER) || 0);
+  const bytes = new Uint8Array(await hit.arrayBuffer());
+  if (expected && bytes.length !== expected) {
+    console.warn(`[lean-backends] cached ${url} is ${bytes.length} of ${expected} bytes, fetching again`);
+    await cache.delete(url);
+    return null;
+  }
+  return bytes;
+}
+
 export async function fetchBytes(url) {
   let cache = null;
   try {
-    cache = await caches.open("lean-backends-model-v1");
-    const hit = await cache.match(url);
-    if (hit) return new Uint8Array(await hit.arrayBuffer());
+    for (const name of await caches.keys()) {
+      if (name.startsWith("lean-backends-model-") && name !== MODEL_CACHE) await caches.delete(name);
+    }
+    cache = await caches.open(MODEL_CACHE);
+    const hit = await cachedIfComplete(cache, url);
+    if (hit) return hit;
   } catch (e) {
     console.warn(`[lean-backends] cache unavailable: ${e && e.message ? e.message : e}`);
     cache = null;
   }
 
-  if (cache) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`fetch ${url}: HTTP ${r.status}`);
+  const expected = Number(r.headers.get("Content-Length") || 0);
+  const headers = { "Content-Type": "application/octet-stream" };
+  if (expected) headers[LENGTH_HEADER] = String(expected);
+
+  if (cache && r.body) {
     try {
-      const r = await fetch(url);
-      if (!r.ok) throw new Error(`fetch ${url}: HTTP ${r.status}`);
       const [forCache, forDiscard] = r.body.tee();
-      const putPromise = cache.put(url, new Response(forCache, { headers: { "Content-Type": "application/octet-stream" } }));
+      const putPromise = cache.put(url, new Response(forCache, { headers }));
       const drainPromise = (async () => {
         const reader = forDiscard.getReader();
         for (;;) {
@@ -86,22 +111,25 @@ export async function fetchBytes(url) {
         }
       })();
       await Promise.all([putPromise, drainPromise]);
-      const cached = await cache.match(url);
-      return new Uint8Array(await cached.arrayBuffer());
+      const bytes = await cachedIfComplete(cache, url);
+      if (bytes) return bytes;
+      throw new Error(`download of ${url} was cut short`);
     } catch (e) {
-      console.warn(`[lean-backends] streaming cache put failed, falling back: ${e && e.message ? e.message : e}`);
+      console.warn(`[lean-backends] streaming cache put failed, fetching without the cache: ${e && e.message ? e.message : e}`);
+      try { await cache.delete(url); } catch (_) {}
     }
+    const r2 = await fetch(url);
+    if (!r2.ok) throw new Error(`fetch ${url}: HTTP ${r2.status}`);
+    return checkedBytes(url, r2);
   }
+  return checkedBytes(url, r);
+}
 
-  const r = await fetch(url);
-  if (!r.ok) throw new Error(`fetch ${url}: HTTP ${r.status}`);
+async function checkedBytes(url, r) {
+  const expected = Number(r.headers.get("Content-Length") || 0);
   const bytes = new Uint8Array(await r.arrayBuffer());
-  if (cache) {
-    try {
-      await cache.put(url, new Response(bytes, { headers: { "Content-Type": "application/octet-stream" } }));
-    } catch (e) {
-      console.warn(`[lean-backends] cache put failed, continuing without it: ${e && e.message ? e.message : e}`);
-    }
+  if (expected && bytes.length !== expected) {
+    throw new Error(`download of ${url} was cut short: ${bytes.length} of ${expected} bytes; check the connection and reload`);
   }
   return bytes;
 }

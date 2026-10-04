@@ -9,7 +9,7 @@
 //
 // Every wasm/js loading URL carries `?v=ENGINE_BUILD`, bumped in the same
 // commit as any wasm/model rebuild - see docs/runs/2026-09-28-lean-web.md.
-const ENGINE_BUILD = "2026-10-04-release-03";
+const ENGINE_BUILD = "2026-10-04-release-04";
 
 const params = new URLSearchParams(location.search);
 const backend = params.get("backend") || null;
