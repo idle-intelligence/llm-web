@@ -3,7 +3,7 @@
 Two Rust WebGPU inference engines for language models, running client-side in the browser, plus a wllama fallback demo.
 
 - `crates/llm-wasm/` is the original engine: a Burn+wgpu implementation of the Qwen2 architecture, with quantized GGUF weights, runtime LoRA adapters, schema-constrained decoding and a tool-calling agent loop.
-- `crates/lean/` is a second, newer engine: a hand-written raw-wgpu + WGSL forward pass (no Burn, no CubeCL), native and wasm from one source, that picks a rung (WebGPU, or a single-threaded CPU fallback with NEON/simd128 kernels) by capability rather than by runtime measurement.
+- `crates/lean/` is a second, newer engine: a hand-written raw-wgpu + WGSL forward pass (no Burn, no CubeCL), native and wasm from one source, that picks a backend (WebGPU, else the CPU forward pass on a pool of threads, else on a single thread, with NEON/SIMD128 kernels) by capability rather than by runtime measurement. See [`crates/lean/README.md`](crates/lean/README.md).
 
 [**Try the demo →**](https://idle-intelligence.github.io/llm-web/web/)
 
@@ -78,7 +78,7 @@ cargo run --release --bin llm-agent -- run --gguf <path-to-gguf> --tokens <path-
 
 ## lean (raw wgpu engine)
 
-`crates/lean/` is a second engine in this repo: a forward pass written directly against `wgpu` and hand-written WGSL, with no Burn and no CubeCL. It compiles from one source to native and to `wasm32-unknown-unknown`, and it picks a rung by capability rather than by runtime measurement or per-device tuning: WebGPU when available, otherwise a single-threaded CPU forward pass (`cpu.rs`) with NEON (aarch64) or simd128 (wasm32) dot-product kernels, otherwise a plain scalar fallback.
+`crates/lean/` is a second engine in this repo: a forward pass written directly against `wgpu` and hand-written WGSL, with no Burn and no CubeCL. It compiles from one source to native and to `wasm32-unknown-unknown`, and it picks a backend by capability rather than by runtime measurement or per-device tuning: WebGPU when available, otherwise the CPU forward pass on a pool of threads (wasm-bindgen-rayon, which needs a cross-origin isolated page), otherwise the CPU forward pass on a single thread, with NEON (aarch64) or SIMD128 (wasm32) dot-product kernels. Its own README, [`crates/lean/README.md`](crates/lean/README.md), covers the backends, the JavaScript API, the build and the parity gates.
 
 ### Supported architectures and quant types
 
@@ -94,8 +94,9 @@ cargo test -p lean
 # WASM (web feature; native CLI bins excluded)
 cargo build -p lean --target wasm32-unknown-unknown --no-default-features --features web
 
-# wasm-pack, for the www/ demo pages
-wasm-pack build crates/lean --target web --no-default-features --features web
+# Web builds for the www/ pages: pkg/ (WebGPU and single CPU thread) and pkg-mt/ (CPU threads)
+ENGINE_BUILD=<tag> scripts/build_lean.sh
+ENGINE_BUILD=<tag> scripts/build_lean_mt.sh
 ```
 
 ### Run locally
@@ -107,11 +108,11 @@ LEAN_GGUF=<path-to-gguf> LEAN_TOKENIZER_DIR=<dir-with-tokenizer.json> cargo run 
 # or: cargo run -p lean --release --bin lean-cli -- --prompt "..." --tokens 64
 ```
 
-www demo pages (`crates/lean/www/index.html` and friends: `cpu.html`, `qwen3.html`, `qwen25_3b.html`, `decode_timing.html`, `mem_profile*.html`) load a `wasm-pack`-built `pkg/` plus a locally hosted GGUF and tokenizer with `?local=1`. Serve the crate directory over HTTP and open the page:
+Browser pages: `crates/lean/www/backends.html` runs a fixed generation on a chosen backend (`?backend=auto|webgpu|threads|single`, `?diag=1` for diagnostics), `chat.html` is a multi-turn chat test page, and the rest are development harnesses; `crates/lean/README.md` describes them. Serve the repository with the cross-origin isolation headers the CPU threads backend needs and open a page:
 
 ```bash
-cd crates/lean && python3 -m http.server 8000
-# Open http://localhost:8000/www/index.html?local=1
+python3 scripts/serve_coi.py
+# Open http://localhost:8030/crates/lean/www/backends.html
 ```
 
 ### Tests
