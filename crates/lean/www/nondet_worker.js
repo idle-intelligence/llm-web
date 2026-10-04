@@ -13,8 +13,8 @@
 //      the bytes uploaded.
 // Any hash that differs between trials of the same input is
 // non-determinism inside the engine; the report gives the first one.
-import { MODELS, MAX_CTX, modelUrls, fetchBytes, fetchText } from "./backends_common.js?v=2026-10-04-release-02";
-const ENGINE_BUILD = "2026-10-04-release-02";
+import { MODELS, MAX_CTX, modelUrls, fetchBytes, fetchText } from "./backends_common.js?v=2026-10-04-release-03";
+const ENGINE_BUILD = "2026-10-04-release-03";
 
 // transformers greedy ids for the "short" prompt (the ids behind
 // MODELS[...].referenceHash, crates/lean/reference/gen_backends_hash.py).

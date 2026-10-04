@@ -8,8 +8,8 @@
 // {type: "stop"}, {type: "reset"}. Out: {type: "status"|"ready"|"piece"|
 // "done"|"error", ...}. The text shown is the `text` argument of
 // `on_token(id, text)`; the callback never calls back into the engine.
-import { capabilities, fetchBytes, fetchText } from "./backends_common.js?v=2026-10-04-release-02";
-const ENGINE_BUILD = "2026-10-04-release-02";
+import { capabilities, fetchBytes, fetchText } from "./backends_common.js?v=2026-10-04-release-03";
+const ENGINE_BUILD = "2026-10-04-release-03";
 
 const MODELS = {
   "qwen25-0.5b": { dir: "./model/", gguf: "qwen2.5-0.5b-instruct-q4_0.gguf" },

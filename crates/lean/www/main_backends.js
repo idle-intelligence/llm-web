@@ -13,9 +13,9 @@
 //
 // Every wasm/js loading URL carries `?v=ENGINE_BUILD`, bumped in the same
 // commit as any wasm rebuild (backends.html's own script tag included).
-import { MODELS, DEFAULT_MODEL } from "./backends_common.js?v=2026-10-04-release-02";
+import { MODELS, DEFAULT_MODEL } from "./backends_common.js?v=2026-10-04-release-03";
 
-const ENGINE_BUILD = "2026-10-04-release-02";
+const ENGINE_BUILD = "2026-10-04-release-03";
 
 const params = new URLSearchParams(location.search);
 const backend = ["auto", "webgpu", "threads", "single"].includes(params.get("backend")) ? params.get("backend") : "auto";
