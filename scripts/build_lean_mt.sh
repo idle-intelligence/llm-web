@@ -29,7 +29,29 @@
 #   3. then call LeanEngineCpu as usual
 # and must be served cross-origin isolated (COOP/COEP) - see
 # scripts/serve_coi.py - for SharedArrayBuffer + atomics to work at all.
+#
+# Usage: ENGINE_BUILD=<tag> scripts/build_lean_mt.sh
+# ENGINE_BUILD is the same `?v=` tag the pages put on their loading URLs;
+# the patched worker helper imports `lean.js?v=<tag>` with it, so a worker
+# never runs a cached glue file from an older build. MAX_MEMORY (bytes)
+# overrides the shared memory's maximum, see below.
 set -euo pipefail
+
+: "${ENGINE_BUILD:?set ENGINE_BUILD to the ?v= tag the pages load this build with}"
+
+# Shared wasm memory needs a declared maximum. 1 GiB was too small for
+# SmolLM2-1.7B Q4_0: the CPU backend keeps its 0.93 GiB of quantized weights
+# resident and allocates a float32 KV cache of 384 KiB per position (0.75 GiB
+# at max_ctx 2048), and the load trapped with `unreachable`. Loaded at
+# max_ctx 2048 with 8 pool threads, the memory reached 1.96 GiB (2106130432
+# bytes) after a 3-turn chat; 2 GiB would leave 40 MiB. 2.5 GiB leaves about
+# 0.54 GiB for longer contexts and more pool threads, and stays well under
+# wasm32's 4 GiB, since a shared memory's maximum may be reserved up front.
+MAX_MEMORY="${MAX_MEMORY:-2684354560}"
+
+# Compiled-in source paths (panic locations, std and registry crates) would
+# carry the home directory; map it to a neutral prefix.
+REMAP="--remap-path-prefix=$HOME=/home"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
@@ -38,10 +60,10 @@ OUT_DIR="crates/lean/pkg-mt"
 
 echo "==> Building lean (wasm-mt feature, nightly build-std)"
 RUSTFLAGS="-C target-feature=+atomics,+bulk-memory,+mutable-globals,+simd128 \
--C link-arg=--shared-memory -C link-arg=--max-memory=1073741824 \
+-C link-arg=--shared-memory -C link-arg=--max-memory=$MAX_MEMORY \
 -C link-arg=--import-memory \
 -C link-arg=--export=__wasm_init_tls -C link-arg=--export=__tls_size \
--C link-arg=--export=__tls_align -C link-arg=--export=__tls_base" \
+-C link-arg=--export=__tls_align -C link-arg=--export=__tls_base $REMAP" \
   cargo +nightly build -p lean --lib \
     --target wasm32-unknown-unknown \
     --release \
@@ -63,12 +85,30 @@ wasm-bindgen --target web --out-dir "$OUT_DIR" --out-name lean "$WASM_IN"
 # `import('../../..')` to reach the main module, which doesn't resolve for
 # a plain browser `import()` of a bare directory (`--target web`, no
 # bundler) - same fix t0-web's build-mt.sh applies, adapted to this crate's
-# output name (`lean.js`, not `t0_wasm.js`).
+# output name (`lean.js`, not `t0_wasm.js`). Every URL in the chain
+# (lean.js -> workerHelpers.js -> the worker's own script -> lean.js)
+# carries `?v=$ENGINE_BUILD`, so the workers load the same lean.js module
+# the page loaded and nothing is served from an older build's cache.
 HELPER=$(find "$OUT_DIR/snippets" -name workerHelpers.js 2>/dev/null | head -1)
-if [ -n "$HELPER" ]; then
-    sed -i.bak "s#await import('\.\./\.\./\.\.')#await import('../../../lean.js')#" "$HELPER"
-    rm -f "$HELPER.bak"
-    echo "==> Patched $HELPER for --target web bare-directory import"
+if [ -z "$HELPER" ]; then
+    echo "error: workerHelpers.js not found under $OUT_DIR/snippets" >&2
+    exit 1
+fi
+sed -i.bak \
+    -e "s#await import('\.\./\.\./\.\.')#await import('../../../lean.js?v=$ENGINE_BUILD')#" \
+    -e "s#new URL('\./workerHelpers\.js', import\.meta\.url)#new URL('./workerHelpers.js?v=$ENGINE_BUILD', import.meta.url)#" \
+    "$HELPER"
+sed -i.bak "s#\(from '\./snippets/[^']*/workerHelpers\.js\)'#\1?v=$ENGINE_BUILD'#" "$OUT_DIR/lean.js"
+rm -f "$HELPER.bak" "$OUT_DIR/lean.js.bak"
+for want in "lean.js?v=$ENGINE_BUILD" "workerHelpers.js?v=$ENGINE_BUILD"; do
+    grep -qF "$want" "$HELPER" || { echo "error: $HELPER lacks $want" >&2; exit 1; }
+done
+grep -qF "workerHelpers.js?v=$ENGINE_BUILD'" "$OUT_DIR/lean.js" || { echo "error: lean.js does not import workerHelpers.js?v=$ENGINE_BUILD" >&2; exit 1; }
+echo "==> Patched $HELPER and lean.js: imports carry ?v=$ENGINE_BUILD"
+
+if strings "$OUT_DIR/lean_bg.wasm" | grep -q "$HOME"; then
+    echo "error: $OUT_DIR/lean_bg.wasm still contains the home directory" >&2
+    exit 1
 fi
 
 echo "==> Wrote $OUT_DIR"
