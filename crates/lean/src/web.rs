@@ -96,11 +96,15 @@ impl Seek for JsBytesReader {
 /// identical dispatch sequence to before this feature existed). wasm-bindgen
 /// doesn't need `Option<Vec<u32>>` plumbing this way, and JS call sites read
 /// naturally as `engine.decodeStepArgmax(id, [])`.
-fn mask_buf(engine: &Engine, mask_bits: &[u32]) -> Option<wgpu::Buffer> {
+/// A non-empty mask shorter than `vocab_size / 32` words is rejected, as
+/// `LeanEngineCpu::chatGenerate` does.
+fn mask_buf(engine: &Engine, vocab_size: usize, mask_bits: &[u32]) -> Result<Option<wgpu::Buffer>, JsError> {
     if mask_bits.is_empty() {
-        None
+        Ok(None)
+    } else if mask_bits.len() * 32 < vocab_size {
+        Err(JsError::new("mask_bits is shorter than vocab_size / 32"))
     } else {
-        Some(engine.buf_u32(mask_bits, "mask"))
+        Ok(Some(engine.buf_u32(mask_bits, "mask")))
     }
 }
 
@@ -516,6 +520,7 @@ impl LeanEngine {
         let cache = self.cache.as_mut().ok_or_else(|| JsError::new("load() must be called first"))?;
         let cos_buf = self.cos_buf.as_ref().ok_or_else(|| JsError::new("load() must be called first"))?;
         let sin_buf = self.sin_buf.as_ref().ok_or_else(|| JsError::new("load() must be called first"))?;
+        let mask = mask_buf(&self.engine, model.config.vocab_size, &mask_bits)?;
 
         cache.kv_len = 0;
         self.chat.invalidate_cache();
@@ -530,7 +535,6 @@ impl LeanEngine {
         let sink = TokenSink::new(on_token, tokenizer);
         let should_stop = || abort.as_ref().is_some_and(AbortFlag::is_aborted) || sink.borrow().stopped();
 
-        let mask = mask_buf(&self.engine, &mask_bits);
         let params = sampling_params(temperature, top_k, top_p, repetition_penalty, seed);
         let mut history = token_ids.clone();
         let logits = forward_prefill(&self.engine, model, cache, &token_ids, cos_buf, sin_buf, mask.as_ref()).await;
@@ -652,12 +656,12 @@ impl LeanEngine {
         let cache = self.cache.as_mut().ok_or_else(|| JsError::new("load() must be called first"))?;
         let cos_buf = self.cos_buf.as_ref().ok_or_else(|| JsError::new("load() must be called first"))?;
         let sin_buf = self.sin_buf.as_ref().ok_or_else(|| JsError::new("load() must be called first"))?;
+        let mask = mask_buf(&self.engine, model.config.vocab_size, &mask_bits)?;
         if token_ids.len() as u32 > cache.max_ctx {
             return Err(JsError::new("token_ids exceeds max_ctx"));
         }
         cache.kv_len = 0;
         self.chat.invalidate_cache();
-        let mask = mask_buf(&self.engine, &mask_bits);
         Ok(forward_prefill(&self.engine, model, cache, &token_ids, cos_buf, sin_buf, mask.as_ref()).await)
     }
 
@@ -715,6 +719,7 @@ impl LeanEngine {
         let cache = self.cache.as_mut().ok_or_else(|| JsError::new("load() must be called first"))?;
         let cos_buf = self.cos_buf.as_ref().ok_or_else(|| JsError::new("load() must be called first"))?;
         let sin_buf = self.sin_buf.as_ref().ok_or_else(|| JsError::new("load() must be called first"))?;
+        let mask = mask_buf(&self.engine, model.config.vocab_size, &mask_bits)?;
         if token_ids.is_empty() {
             return Err(JsError::new("appendTokens needs at least one token"));
         }
@@ -722,7 +727,6 @@ impl LeanEngine {
             return Err(JsError::new("appendTokens would exceed max_ctx"));
         }
         self.chat.invalidate_cache();
-        let mask = mask_buf(&self.engine, &mask_bits);
         Ok(forward_prefill_suffix(&self.engine, model, cache, &token_ids, cos_buf, sin_buf, mask.as_ref()).await)
     }
 
@@ -739,11 +743,11 @@ impl LeanEngine {
         let cache = self.cache.as_mut().ok_or_else(|| JsError::new("load() must be called first"))?;
         let cos_buf = self.cos_buf.as_ref().ok_or_else(|| JsError::new("load() must be called first"))?;
         let sin_buf = self.sin_buf.as_ref().ok_or_else(|| JsError::new("load() must be called first"))?;
+        let mask = mask_buf(&self.engine, model.config.vocab_size, &mask_bits)?;
         if cache.kv_len >= cache.max_ctx {
             return Err(JsError::new("decodeStepArgmax would exceed max_ctx"));
         }
         self.chat.invalidate_cache();
-        let mask = mask_buf(&self.engine, &mask_bits);
         Ok(forward_decode_step_argmax(&self.engine, model, cache, token_id, cos_buf, sin_buf, mask.as_ref()).await)
     }
 
@@ -856,10 +860,10 @@ impl LeanEngine {
         let cache = self.cache.as_mut().ok_or_else(|| JsError::new("load() must be called first"))?;
         let cos_buf = self.cos_buf.as_ref().ok_or_else(|| JsError::new("load() must be called first"))?;
         let sin_buf = self.sin_buf.as_ref().ok_or_else(|| JsError::new("load() must be called first"))?;
+        let mask = mask_buf(&self.engine, model.config.vocab_size, &mask_bits)?;
 
         let sink = TokenSink::new(on_token, tokenizer);
         let should_stop = || abort.as_ref().is_some_and(AbortFlag::is_aborted) || sink.borrow().stopped();
-        let mask = mask_buf(&self.engine, &mask_bits);
         let params = sampling_params(temperature, top_k, top_p, repetition_penalty, seed);
         let (_, reply) = gpu_chat_turn(
             &self.engine,
