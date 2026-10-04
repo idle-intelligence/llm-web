@@ -27,11 +27,13 @@ phone (Chrome, Adreno 6xx), Qwen2.5-0.5B-Instruct Q4_0, 36-token prompt,
 | b5a4ee1 | `linear_q4_decode` / `linear_q8_decode` rewritten with 4 output rows per lane: a lane loads a block's 32 x values once and dots them against 4 rows' blocks (x loads per weight byte 8x to 2x for Q4_0, 4x to 1x for Q8_0). Q8_0 gets the gate/up kernel with silu(gate) * up in its epilogue (`linear_q8_decode_swiglu`), as Q4_0 already had |
 | 2945369 | pipelined greedy decode (`model::decode_greedy_pipelined`): each step's embedding reads its token id from the previous step's argmax buffer, copied on the encoder, so step t+1 is encoded and submitted before step t's id is read back. Same tokens, stop rule and final `kv_len` as the step loop. Used by `generate`, the greedy path of `decode_loop` (`generateStream`, `chatGenerate`) and a new `decodeGreedy(tokenId, steps)`. New test `streaming_sampling::pipelined_greedy_matches_step_loop` |
 | b68d112 | backends page: WebGPU decodes with `decodeGreedy`; with `diag=1` it then repeats the same tokens step by step for the per-step split and checks the ids are the same. ENGINE_BUILD 2026-10-04-night-01 |
-| 5356f0b | CPU threads backend: one parallel region per decode step (`cpu_team.rs`). Pool thread 0 runs the step, the other pool threads spin and claim 32-column blocks of each matvec through one epoch-tagged CAS word, instead of one rayon `par_iter` per matvec (about 170 per token) with the pool parking in between. Same `dot_row` per output, bit-identical to the serial path. Prefill keeps rayon |
+| 5356f0b | CPU threads backend: one parallel region per decode step (`cpu_team.rs`). Pool thread 0 runs the step, the other pool threads spin and claim 32-column blocks of each matvec through one epoch-tagged CAS word, instead of one rayon `par_iter` per matvec (about 170 per token) with the pool parking in between. Same `dot_row` per output, bit-identical to the serial path. Prefill kept rayon until night-06 |
 | 0debe36 | ENGINE_BUILD 2026-10-04-night-02 (pkg-mt rebuilt) |
 | 48cec77 | merge of lean-main (streaming `cache.put`); ENGINE_BUILD 2026-10-04-night-03 |
 | 7c9080b, c918cde | the 4-row kernels only for outputs of 4096 rows or more (`DECODE_R4_MIN_ROWS`: MLP gate/up and the head); narrower outputs (qkv, o_proj, down) go back to the one-row kernels. ENGINE_BUILD 2026-10-04-night-04 |
 | bad5c04, 19028aa | CPU team followers park on a condvar after 2^18 idle polls instead of spinning without bound; the leader notifies only when one is parked. ENGINE_BUILD 2026-10-04-night-05 (pkg-mt rebuilt, pkg unchanged) |
+| 0924a0c, fdcbc0e | prefill runs in a CPU team too (multi-row `linear` column blocks as team items). ENGINE_BUILD 2026-10-04-night-06 |
+| ec9f580, f6d5b9f | CPU team: job epoch, item count and next item in one claim word (see the hang note below); lib test `cpu_team::tests::every_item_runs_once_per_job`. ENGINE_BUILD 2026-10-04-night-07 |
 
 ## Parameters
 
@@ -64,6 +66,8 @@ phone (Chrome, Adreno 6xx), Qwen2.5-0.5B-Instruct Q4_0, 36-token prompt,
 | 2026-10-04-night-03-oldmv (experiment: night-03 with lean-main's decode matvecs) | 986c531c0b089ba0 | c3aabd1b57483432 | 0 |
 | 2026-10-04-night-04 | 03b244d406cbbd88 | 6cacd768eea5230d | 0 |
 | 2026-10-04-night-05 | 03b244d406cbbd88 | 226bea4f757108d8 | 0 |
+| 2026-10-04-night-06 | 03b244d406cbbd88 | ade0d01f7ba3a2da | 0 |
+| 2026-10-04-night-07 | 03b244d406cbbd88 | da9930968a230132 | 0 |
 
 ## Results
 
@@ -145,6 +149,35 @@ All a454748c60e23841. Functional runs of night-05 on the M2 (one each,
 load 2.8-2.9): webgpu 6.1 ms/token, Chrome threads 22.8, Firefox threads
 23.8, Firefox auto (picked threads) 23.9, all a454748c60e23841. 3080
 night-05 webgpu (one load): 3.07 ms/token, a454748c60e23841.
+
+### CPU team for prefill (night-05 against the night-06 code), M2, ABAB x3 (load 1.6-3.0)
+
+| browser | night-05 prefill ms | prefill in a team ms | night-05 decode | team decode |
+|---|---|---|---|---|
+| Firefox 155 | 436.7, 444.4, 445.2 | 427.7, 420.2, 417.8 | 23.5, 24.6, 23.8 | 24.4, 24.6, 24.0 |
+| Chrome for Testing | 346.6, 346.9, 348.3 | 343.5, 345.0, 345.1 | 22.8, 22.8, 22.8 | 22.5, 23.3, 22.7 |
+
+### night-07 (final), CPU backends
+
+| machine, browser | runs | prefill ms | decode ms/token | token hash |
+|---|---|---|---|---|
+| M2, Chrome for Testing, threads (load 2.6-2.8) | 6 | 341.9-348.4 | 22.7-23.5 | a454748c60e23841 (6/6) |
+| M2, Firefox 155, threads (load 2.6-2.8) | 6 | 416.7-423.7 | 24.2-25.8 | a454748c60e23841 (6/6) |
+| M2, Chrome for Testing, single | 1 | 1042.6 | 77.0 | a454748c60e23841 |
+| M2, Chrome for Testing, webgpu | 1 | 91.8 | 6.2 | a454748c60e23841 |
+| RTX 3080 machine, Chromium, threads | 3 | 398.5-428.2 | 23.06-23.63 | a454748c60e23841 (3/3) |
+| RTX 3080 machine, Chromium, webgpu | 1 | 130.9 | 3.08 | a454748c60e23841 |
+
+Hang note: one headless Chrome threads run of night-06 on the M2 timed
+out (900 s, no result); the next 12 Chrome threads runs of night-06 and
+all 15 threads runs of night-07 completed. Reading `cpu_team.rs` turned up
+a race in night-02 to night-06: the item count was a separate atomic, so a
+thread still on an older job could read the newer job's count with the
+older job's index, claim an item the older job never had and call the
+older job's body through a pointer into a returned stack frame. A trap in
+a pool thread leaves the leader waiting forever. night-07 reads the count
+from the same word as the index. That this race caused the hang is not
+verified; the native stress test passes with and without the fix.
 
 ### M2 native, ABAB x5 (load 1.5-1.6)
 
@@ -271,8 +304,10 @@ The same list passed at 0debe36 (4-row kernels everywhere).
   to 23.1 ms/token: 24 pool threads on 12 cores with SMT, where spinning
   siblings take issue slots from the threads doing the work. On the M2 (8
   threads) it changed nothing measurable.
-- The CPU team made prefill slower when tried there (M2 Chrome 342 to
-  401 ms), so prefill keeps rayon.
+- A spin-only team made prefill slower (M2 Chrome 342 to 401 ms). With
+  parking followers it is slightly faster (Firefox 436.7-445.2 to
+  417.8-427.7 ms, Chrome about the same), and prefill runs in the team
+  from night-06.
 - Prefill matmuls were not changed: the checkpoint-2 small-M variants A,
   B and C are still served from lean-prefill's servers and still need
   phone numbers before another variant is worth writing.
@@ -284,7 +319,7 @@ All on the M2, COOP/COEP (`scripts/serve_coi.py`), Qwen2.5-0.5B Q4_0, add
 
 | port | build | what it tests |
 |---|---|---|
-| 8833 | 2026-10-04-night-05 | the branch: pipelined decode, 4-row kernels for gate/up and the head, CPU team (spin, then park) |
+| 8833 | 2026-10-04-night-07 | the branch: pipelined decode, 4-row kernels for gate/up and the head, CPU team for decode and prefill |
 | 8834 | 2026-10-04-night-03-oldmv | same, one-row decode kernels everywhere (isolates the 4-row kernels) |
 | 8835 | 2026-10-04-night-03 | same, 4-row kernels everywhere |
 | 8831 | 2026-10-03-main-01 | lean-main, for a same-session baseline |
