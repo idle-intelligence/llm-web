@@ -31,6 +31,7 @@ phone (Chrome, Adreno 6xx), Qwen2.5-0.5B-Instruct Q4_0, 36-token prompt,
 | 0debe36 | ENGINE_BUILD 2026-10-04-night-02 (pkg-mt rebuilt) |
 | 48cec77 | merge of lean-main (streaming `cache.put`); ENGINE_BUILD 2026-10-04-night-03 |
 | 7c9080b, c918cde | the 4-row kernels only for outputs of 4096 rows or more (`DECODE_R4_MIN_ROWS`: MLP gate/up and the head); narrower outputs (qkv, o_proj, down) go back to the one-row kernels. ENGINE_BUILD 2026-10-04-night-04 |
+| bad5c04, 19028aa | CPU team followers park on a condvar after 2^18 idle polls instead of spinning without bound; the leader notifies only when one is parked. ENGINE_BUILD 2026-10-04-night-05 (pkg-mt rebuilt, pkg unchanged) |
 
 ## Parameters
 
@@ -62,6 +63,7 @@ phone (Chrome, Adreno 6xx), Qwen2.5-0.5B-Instruct Q4_0, 36-token prompt,
 | 2026-10-04-night-02, -03 | 9226e2b2be03d7b1 | c3aabd1b57483432 | 0 |
 | 2026-10-04-night-03-oldmv (experiment: night-03 with lean-main's decode matvecs) | 986c531c0b089ba0 | c3aabd1b57483432 | 0 |
 | 2026-10-04-night-04 | 03b244d406cbbd88 | 6cacd768eea5230d | 0 |
+| 2026-10-04-night-05 | 03b244d406cbbd88 | 226bea4f757108d8 | 0 |
 
 ## Results
 
@@ -130,6 +132,19 @@ Single-thread backend (base, one run each): Chrome 77.3 ms/token, prefill
 A team for prefill too (not on the branch): Chrome prefill 401.1 / 402.9
 ms and Firefox 506.7 / 497.5 ms against 342.0 / 342.8 and 440.4 / 478.8
 for the base in the same rounds.
+
+### CPU threads backend, night-04 (spin only) against night-05 (spin, then park)
+
+| machine, browser | night-04 decode ms/token | night-05 decode ms/token |
+|---|---|---|
+| M2, Firefox 155 (ABAB x3, load 2.4-3.0) | 27.0, 25.1, 24.7 | 25.5, 25.4, 25.1 |
+| M2, Chrome for Testing (same rounds) | 23.3, 23.1, 23.3 | 22.8, 22.5, 22.7 |
+| RTX 3080 machine, Chromium (24 threads) | 27.6 (one run) | 23.16, 23.14 |
+
+All a454748c60e23841. Functional runs of night-05 on the M2 (one each,
+load 2.8-2.9): webgpu 6.1 ms/token, Chrome threads 22.8, Firefox threads
+23.8, Firefox auto (picked threads) 23.9, all a454748c60e23841. 3080
+night-05 webgpu (one load): 3.07 ms/token, a454748c60e23841.
 
 ### M2 native, ABAB x5 (load 1.5-1.6)
 
@@ -252,6 +267,10 @@ The same list passed at 0debe36 (4-row kernels everywhere).
   an 18.9 GB/s probe, and Q4_0 (8x) ran slower than Q8_0 (4x).
 - Pipelining hides the CPU encode (8.1 ms on the phone) behind the GPU
   work as long as encode is shorter than the GPU span (40.5 ms).
+- On the 3080 machine the parking followers took threads decode from 27.6
+  to 23.1 ms/token: 24 pool threads on 12 cores with SMT, where spinning
+  siblings take issue slots from the threads doing the work. On the M2 (8
+  threads) it changed nothing measurable.
 - The CPU team made prefill slower when tried there (M2 Chrome 342 to
   401 ms), so prefill keeps rayon.
 - Prefill matmuls were not changed: the checkpoint-2 small-M variants A,
@@ -265,7 +284,7 @@ All on the M2, COOP/COEP (`scripts/serve_coi.py`), Qwen2.5-0.5B Q4_0, add
 
 | port | build | what it tests |
 |---|---|---|
-| 8833 | 2026-10-04-night-04 | the branch: pipelined decode, 4-row kernels for gate/up and the head, CPU team |
+| 8833 | 2026-10-04-night-05 | the branch: pipelined decode, 4-row kernels for gate/up and the head, CPU team (spin, then park) |
 | 8834 | 2026-10-04-night-03-oldmv | same, one-row decode kernels everywhere (isolates the 4-row kernels) |
 | 8835 | 2026-10-04-night-03 | same, 4-row kernels everywhere |
 | 8831 | 2026-10-03-main-01 | lean-main, for a same-session baseline |
