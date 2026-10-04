@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<!-- Minimal lean quick start. Build crates/lean/pkg first (scripts/build_lean.sh)
+     and serve the repo root (python3 scripts/serve_coi.py), then open this page. -->
+<html><body><pre id="out">loading model...</pre><script type="module">
+const mod = await import('../../crates/lean/pkg/lean.js');
+await mod.default('../../crates/lean/pkg/lean_bg.wasm');
+mod.leanInit();
+
+const gguf = await (await fetch('https://huggingface.co/bartowski/SmolLM2-360M-Instruct-GGUF/resolve/main/SmolLM2-360M-Instruct-Q4_0.gguf')).arrayBuffer();
+const tokenizer = await (await fetch('https://huggingface.co/HuggingFaceTB/SmolLM2-360M-Instruct/resolve/main/tokenizer.json')).text();
+const tokenizerCfg = await (await fetch('https://huggingface.co/HuggingFaceTB/SmolLM2-360M-Instruct/resolve/main/tokenizer_config.json')).text();
+
+const engine = navigator.gpu ? await mod.LeanEngine.create() : mod.LeanEngineCpu.create();
+engine.load(new Uint8Array(gguf), tokenizer, tokenizerCfg, 2048);
+
+const out = document.getElementById('out');
+out.textContent = '';
+await engine.chatGenerate('Say hello in one short sentence.', 64, 0.7, 40, 0.9, 1.1, 0, new Uint32Array(0),
+  (_id, text) => { out.textContent += text; }, new mod.AbortFlag().cloneFlag());
+</script></body></html>
