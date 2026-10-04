@@ -908,13 +908,14 @@ impl Generator for NativeGenerator {
     }
 }
 
-const DEFAULT_GGUF_SUFFIX: &str =
-    "Code/idle-intelligence/models/gguf/qwen2.5-3b-instruct/qwen2.5-3b-instruct-q4_0.gguf";
-const DEFAULT_MODEL_DIR_SUFFIX: &str = "Code/idle-intelligence/models/hf/Qwen2.5-3B-Instruct";
-
-fn home_relative(suffix: &str) -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_default();
-    PathBuf::from(format!("{home}/{suffix}"))
+fn require_path(provided: Option<PathBuf>, env_var: &str, flag: &str) -> anyhow::Result<PathBuf> {
+    if let Some(p) = provided {
+        return Ok(p);
+    }
+    match std::env::var(env_var) {
+        Ok(v) if !v.is_empty() => Ok(PathBuf::from(v)),
+        _ => anyhow::bail!("pass {flag} or set {env_var}"),
+    }
 }
 
 fn git_commit_hash() -> String {
@@ -992,9 +993,9 @@ fn kv_export(
     out_dir: Option<PathBuf>,
     tool_order: &str,
 ) -> anyhow::Result<()> {
-    let gguf_path = gguf.unwrap_or_else(|| home_relative(DEFAULT_GGUF_SUFFIX));
-    let model_dir = model_dir.unwrap_or_else(|| home_relative(DEFAULT_MODEL_DIR_SUFFIX));
-    let out_dir = out_dir.unwrap_or_else(|| home_relative("Code/idle-intelligence/models/kv"));
+    let gguf_path = require_path(gguf, "LLM_AGENT_GGUF", "--gguf")?;
+    let model_dir = require_path(model_dir, "LLM_AGENT_MODEL_DIR", "--model-dir")?;
+    let out_dir = require_path(out_dir, "LLM_AGENT_OUT_DIR", "--out-dir")?;
     std::fs::create_dir_all(&out_dir).map_err(|e| anyhow::anyhow!("creating --out-dir {out_dir:?}: {e}"))?;
 
     let dtype = match dtype_arg {
@@ -1120,8 +1121,8 @@ fn run_eval(
     label: &str,
     constrained: bool,
 ) -> anyhow::Result<()> {
-    let gguf_path = gguf.unwrap_or_else(|| home_relative(DEFAULT_GGUF_SUFFIX));
-    let model_dir = model_dir.unwrap_or_else(|| home_relative(DEFAULT_MODEL_DIR_SUFFIX));
+    let gguf_path = require_path(gguf, "LLM_AGENT_GGUF", "--gguf")?;
+    let model_dir = require_path(model_dir, "LLM_AGENT_MODEL_DIR", "--model-dir")?;
 
     let tool_set = match tools_arg {
         "all" => ToolSet::All,
