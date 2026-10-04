@@ -1,0 +1,116 @@
+name: pages
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: wasm32-unknown-unknown
+          components: rust-src
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+
+      - name: Install wasm-bindgen-cli (version pinned to Cargo.lock's wasm-bindgen)
+        run: |
+          set -euo pipefail
+          VER="$(grep -A1 '^name = "wasm-bindgen"$' Cargo.lock | grep '^version' | head -1 | cut -d'"' -f2)"
+          echo "wasm-bindgen-cli $VER"
+          cargo install wasm-bindgen-cli --version "$VER" --locked
+
+      - name: Test lean (non-GPU tests only; parity gates need model files not in this repo)
+        run: cargo test -p lean --release
+
+      - name: Clippy
+        run: cargo clippy -p lean --all-targets -- -D warnings
+
+      - name: Build lean (web, WebGPU + single-thread CPU) -> crates/lean/pkg
+        run: ENGINE_BUILD="${{ github.sha }}" scripts/build_lean.sh
+
+      - name: Build lean (web, CPU threads) -> crates/lean/pkg-mt
+        run: ENGINE_BUILD="${{ github.sha }}" scripts/build_lean_mt.sh
+
+      - name: Assemble site
+        run: |
+          set -euo pipefail
+          rm -rf _site
+          mkdir -p _site/web
+          cp -R web/. _site/web/
+          rm -rf _site/web/lean/pkg _site/web/lean/pkg-mt
+          mkdir -p _site/web/lean
+          cp -R crates/lean/pkg _site/web/lean/pkg
+          cp -R crates/lean/pkg-mt _site/web/lean/pkg-mt
+
+      - name: Rewrite the ?v= build tag to this commit's sha
+        run: |
+          set -euo pipefail
+          TAG="${{ github.sha }}"
+          echo "build tag: $TAG"
+          sed -i "s/const ENGINE_BUILD = \"[^\"]*\"/const ENGINE_BUILD = \"$TAG\"/" \
+            _site/web/lean-chat-worker.js _site/web/device/device_worker.js
+          sed -i "s/const ENGINE_BUILD = \"[^\"]*\";/const ENGINE_BUILD = \"$TAG\";/" \
+            _site/web/device/index.html
+
+          COUNT="$(grep -rEo 'ENGINE_BUILD = "[0-9a-f]{12}"' _site/web/lean-chat-worker.js _site/web/device/device_worker.js _site/web/device/index.html | wc -l)"
+          if [ "$COUNT" -ne 3 ]; then
+            echo "error: expected 3 ENGINE_BUILD assignments rewritten to $TAG, found $COUNT" >&2
+            exit 1
+          fi
+
+      - name: Check built wasm has no local build paths
+        run: |
+          set -euo pipefail
+          FAILED=0
+          for f in _site/web/lean/pkg/lean_bg.wasm _site/web/lean/pkg-mt/lean_bg.wasm; do
+            for pat in '/Users/' '/home/runner/.cargo' '/home/runner/work'; do
+              COUNT="$(grep -c -a "$pat" "$f" || true)"
+              if [ "$COUNT" -gt 0 ]; then
+                echo "error: found '$pat' $COUNT time(s) in $f" >&2
+                FAILED=1
+              fi
+            done
+          done
+          if [ "$FAILED" -ne 0 ]; then
+            exit 1
+          fi
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
