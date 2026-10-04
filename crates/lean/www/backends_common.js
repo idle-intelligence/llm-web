@@ -49,88 +49,22 @@ export function modelUrls(model, local) {
     : { gguf: m.hfGguf, tokenizer: m.hfTokenizer, tokenizerCfg: m.hfTokenizerCfg };
 }
 
-// The Cache API is best-effort: it can be missing or throw (headless
-// browsers, private windows, low quota), and a caching failure must never
-// stop a run, so every step falls back to the network bytes.
-//
-// On a miss, the response body is teed: one branch streams straight into
-// cache.put (the browser writes to disk without JS buffering the whole
-// file) while the other is drained and discarded. The bytes handed back
-// come from one read of the cache entry, so peak JS memory holds one copy
-// of the file instead of a chunk buffer plus a second copy inside
-// cache.put's own Response (on a 430 MB GGUF this was over 1 GB peak,
-// enough to hang a phone). If teeing or the put fails, falls back to a
-// plain fetch + arrayBuffer (the old behaviour).
-// Cached entries carry the length the server announced; an entry whose body is
-// shorter (an interrupted download) is deleted and fetched again, never used.
-const MODEL_CACHE = "lean-backends-model-v2";
-const LENGTH_HEADER = "X-Lean-Expected-Length";
+// Model download + Cache API storage is the shared trucs.ai module (see
+// provenance header in ./model-cache.js); this keeps lean's own copy of the
+// streaming-cache/length-check logic from drifting from the one other
+// pages use. getModel() takes a list of files, so a single GGUF is a
+// one-element list; fetchBytes() keeps its old single-url, no-progress
+// signature since none of lean's ~10 pages that import it ever used a
+// progress callback.
+import { getModel } from "./model-cache.js?v=2026-10-04-release-05";
 
-async function cachedIfComplete(cache, url) {
-  const hit = await cache.match(url);
-  if (!hit) return null;
-  const expected = Number(hit.headers.get(LENGTH_HEADER) || 0);
-  const bytes = new Uint8Array(await hit.arrayBuffer());
-  if (expected && bytes.length !== expected) {
-    console.warn(`[lean-backends] cached ${url} is ${bytes.length} of ${expected} bytes, fetching again`);
-    await cache.delete(url);
-    return null;
-  }
-  return bytes;
-}
+const MODEL_CACHE = "lean-backends-model-v2";
 
 export async function fetchBytes(url) {
-  let cache = null;
-  try {
-    for (const name of await caches.keys()) {
-      if (name.startsWith("lean-backends-model-") && name !== MODEL_CACHE) await caches.delete(name);
-    }
-    cache = await caches.open(MODEL_CACHE);
-    const hit = await cachedIfComplete(cache, url);
-    if (hit) return hit;
-  } catch (e) {
-    console.warn(`[lean-backends] cache unavailable: ${e && e.message ? e.message : e}`);
-    cache = null;
-  }
-
-  const r = await fetch(url);
-  if (!r.ok) throw new Error(`fetch ${url}: HTTP ${r.status}`);
-  const expected = Number(r.headers.get("Content-Length") || 0);
-  const headers = { "Content-Type": "application/octet-stream" };
-  if (expected) headers[LENGTH_HEADER] = String(expected);
-
-  if (cache && r.body) {
-    try {
-      const [forCache, forDiscard] = r.body.tee();
-      const putPromise = cache.put(url, new Response(forCache, { headers }));
-      const drainPromise = (async () => {
-        const reader = forDiscard.getReader();
-        for (;;) {
-          const { done } = await reader.read();
-          if (done) break;
-        }
-      })();
-      await Promise.all([putPromise, drainPromise]);
-      const bytes = await cachedIfComplete(cache, url);
-      if (bytes) return bytes;
-      throw new Error(`download of ${url} was cut short`);
-    } catch (e) {
-      console.warn(`[lean-backends] streaming cache put failed, fetching without the cache: ${e && e.message ? e.message : e}`);
-      try { await cache.delete(url); } catch (_) {}
-    }
-    const r2 = await fetch(url);
-    if (!r2.ok) throw new Error(`fetch ${url}: HTTP ${r2.status}`);
-    return checkedBytes(url, r2);
-  }
-  return checkedBytes(url, r);
-}
-
-async function checkedBytes(url, r) {
-  const expected = Number(r.headers.get("Content-Length") || 0);
-  const bytes = new Uint8Array(await r.arrayBuffer());
-  if (expected && bytes.length !== expected) {
-    throw new Error(`download of ${url} was cut short: ${bytes.length} of ${expected} bytes; check the connection and reload`);
-  }
+  const [bytes] = await getModel([url], {
+    cache: MODEL_CACHE,
+    onStatus: (m) => console.warn(`[lean-backends] ${m}`),
+  });
   return bytes;
 }
 
