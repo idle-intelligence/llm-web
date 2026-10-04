@@ -1,4 +1,5 @@
-//! One parallel region per decode step for the CPU threads backend.
+//! One parallel region per decode step (and per prefill) for the CPU
+//! threads backend.
 //!
 //! A decode step makes about 170 small matvecs (7 per layer plus the head).
 //! Run as separate rayon `par_iter` calls, each one hands work to a pool
@@ -10,7 +11,8 @@
 //!
 //! `with_team(f)` instead enters the pool once (`rayon::broadcast`): pool
 //! thread 0 runs `f` (the whole step) and every other pool thread spins on
-//! an epoch counter. Inside `f`, `team_for(n, body)` publishes a job of `n`
+//! an epoch counter. Inside `f`, `team_for(n, body)` (used by both the
+//! one-row and the multi-row `linear` in cpu.rs) publishes a job of `n`
 //! items; all threads, the leader included, claim items with a CAS on one
 //! 64-bit word (job epoch in the high half, next item in the low half, so a
 //! late thread can never claim an item of a newer job), and the leader

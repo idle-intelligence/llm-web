@@ -207,8 +207,29 @@ fn linear_multi_row(x: &[f32], rows: usize, in_dim: usize, w: &CpuWeight, b: &[f
     };
     #[cfg(feature = "threads")]
     {
-        use rayon::prelude::*;
-        out_t.par_chunks_mut(COLS_PER_TASK * rows).enumerate().for_each(block);
+        // Inside a team (`cpu_team::with_team`): the same column blocks as
+        // team items.
+        struct OutPtr(*mut f32);
+        // SAFETY: items write disjoint column blocks of `out_t`.
+        unsafe impl Sync for OutPtr {}
+        impl OutPtr {
+            fn get(&self) -> *mut f32 {
+                self.0
+            }
+        }
+        let (len, task) = (out_t.len(), COLS_PER_TASK * rows);
+        let ptr = OutPtr(out_t.as_mut_ptr());
+        let item = |i: usize| {
+            let start = i * task;
+            // SAFETY: block `i` is `[start, min(start + task, len))`, in
+            // bounds and disjoint from every other block.
+            let chunk = unsafe { std::slice::from_raw_parts_mut(ptr.get().add(start), task.min(len - start)) };
+            block((i, chunk));
+        };
+        if !crate::cpu_team::team_for(len.div_ceil(task), &item) {
+            use rayon::prelude::*;
+            out_t.par_chunks_mut(task).enumerate().for_each(block);
+        }
     }
     #[cfg(not(feature = "threads"))]
     out_t.chunks_mut(COLS_PER_TASK * rows).enumerate().for_each(block);
@@ -901,6 +922,9 @@ fn argmax(logits: &[f32]) -> u32 {
 pub fn forward_prefill(model: &CpuModel, cache: &mut CpuKvCache, token_ids: &[u32]) -> Vec<f32> {
     let vocab = model.config.vocab_size;
     let rows = token_ids.len();
+    #[cfg(feature = "threads")]
+    let all_logits = crate::cpu_team::with_team(|| forward_layers(model, cache, token_ids));
+    #[cfg(not(feature = "threads"))]
     let all_logits = forward_layers(model, cache, token_ids);
     all_logits[(rows - 1) * vocab..].to_vec()
 }
