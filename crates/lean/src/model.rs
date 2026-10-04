@@ -64,10 +64,21 @@ const SMALL_M_MAX_ROWS: u32 = 64;
 const SMALL_M_ROWS: u32 = 8;
 const SMALL_M_COLS: u32 = 64;
 
-/// Output rows per workgroup of the decode matvecs `linear_q4_decode.wgsl` and
-/// `linear_q8_decode.wgsl` (8 row groups of 4 rows); their GATE_UP variant
-/// writes half as many gated outputs.
-const DECODE_ROWS_PER_WG: u32 = 32;
+/// Decode matvecs with at least this many output rows (in one binding
+/// chunk) use the 4-rows-per-lane kernels (`linear_q4_decode_r4.wgsl`,
+/// `linear_q8_decode_r4.wgsl`): each x load feeds 4 weight rows, which
+/// matters most on a GPU whose storage-buffer loads are far from the ALUs.
+/// Narrower outputs keep one row per lane (`linear_q4_decode.wgsl`), where
+/// the 4-row kernel leaves too few workgroups: on an RTX 3080 it took
+/// down (896 rows) from 0.6 to 1.1 ms per token. A row-count rule, the
+/// same on every device.
+const DECODE_R4_MIN_ROWS: u32 = 4096;
+
+/// Output rows per workgroup of the 4-row decode kernels (8 row groups of
+/// 4 rows; their GATE_UP variants write half as many gated outputs) and of
+/// the one-row decode kernels (16 rows of 8 lanes).
+const DECODE_R4_ROWS_PER_WG: u32 = 32;
+const DECODE_ROWS_PER_WG: u32 = 16;
 
 /// WebGPU's `max_compute_workgroups_per_dimension`: 65535 on every backend
 /// (spec-mandated minimum-and-typical value, not a per-device tuned
@@ -1071,8 +1082,9 @@ fn linear(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &
                 if fast && rows == 1 {
                     // Decode: coalesced matvec, same kernel shape as
                     // linear_q4_decode below, adapted to Q8_0 blocks.
-                    let bg = pool.bind_group(&format!("{ckey}.decode"), &engine.linear_q8_decode, &entries);
-                    engine.dispatch(pass, &engine.linear_q8_decode, &bg, (chunk.rows.div_ceil(DECODE_ROWS_PER_WG), 1, 1), &ckey);
+                    let (pipeline, rows_per_wg) = if chunk.rows >= DECODE_R4_MIN_ROWS { (&engine.linear_q8_decode_r4, DECODE_R4_ROWS_PER_WG) } else { (&engine.linear_q8_decode, DECODE_ROWS_PER_WG) };
+                    let bg = pool.bind_group(&format!("{ckey}.decode"), pipeline, &entries);
+                    engine.dispatch(pass, pipeline, &bg, (chunk.rows.div_ceil(rows_per_wg), 1, 1), &ckey);
                 } else if fast && rows < SMALL_M_MAX_ROWS {
                     // Short prefill: same small-M kernel and row rule as
                     // Q4_0 (linear_q4_small_m.wgsl with its Q8 override).
@@ -1140,8 +1152,9 @@ fn linear(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &
                     engine.dispatch(pass, &engine.linear_q4, &bg, (chunk.rows.div_ceil(16), rows.div_ceil(16), 1), &ckey);
                 } else if rows == 1 {
                     // Decode: coalesced matvec (llm-wasm's shader_q4_matvec_coalesced.wgsl port).
-                    let bg = pool.bind_group(&format!("{ckey}.decode"), &engine.linear_q4_decode, &entries);
-                    engine.dispatch(pass, &engine.linear_q4_decode, &bg, (chunk.rows.div_ceil(DECODE_ROWS_PER_WG), 1, 1), &ckey);
+                    let (pipeline, rows_per_wg) = if chunk.rows >= DECODE_R4_MIN_ROWS { (&engine.linear_q4_decode_r4, DECODE_R4_ROWS_PER_WG) } else { (&engine.linear_q4_decode, DECODE_ROWS_PER_WG) };
+                    let bg = pool.bind_group(&format!("{ckey}.decode"), pipeline, &entries);
+                    engine.dispatch(pass, pipeline, &bg, (chunk.rows.div_ceil(rows_per_wg), 1, 1), &ckey);
                 } else if rows < SMALL_M_MAX_ROWS {
                     // Short prefill: weight words read and dequantised once
                     // per group of 8 query rows (see linear_q4_small_m.wgsl).
@@ -1160,14 +1173,18 @@ fn linear(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &
 }
 
 /// Decode's fused gate/up matvec with silu(gate) * up in the same dispatch
-/// (`linear_q4_decode_swiglu` / `linear_q8_decode_swiglu`), returning the
-/// `inter`-long gated activations. `None` when the weight is not one Q4_0 or Q8_0 binding (or fast
+/// (`linear_q4_decode_swiglu`, or the 4-row `*_swiglu_r4` kernels when
+/// `2 * inter >= DECODE_R4_MIN_ROWS`), returning the `inter`-long gated
+/// activations. `None` when the weight is not one Q4_0 binding or one wide
+/// Q8_0 binding (or fast
 /// kernels are off): the caller then runs `linear` + `silu_mul_fused`.
 #[allow(clippy::too_many_arguments)]
 fn gate_up_swiglu_decode(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &str, x: &wgpu::Buffer, in_dim: u32, w: &MatMulWeight, b: &wgpu::Buffer, inter: u32, fast: bool) -> Option<wgpu::Buffer> {
-    let (chunks, blocks_per_row, out_dim, pipeline) = match w {
-        MatMulWeight::Q4_0 { chunks, blocks_per_row, out_dim } => (chunks, blocks_per_row, out_dim, &engine.linear_q4_decode_swiglu),
-        MatMulWeight::Q8_0 { chunks, blocks_per_row, out_dim } => (chunks, blocks_per_row, out_dim, &engine.linear_q8_decode_swiglu),
+    let wide = 2 * inter >= DECODE_R4_MIN_ROWS;
+    let (chunks, blocks_per_row, out_dim, pipeline, outs_per_wg) = match w {
+        MatMulWeight::Q4_0 { chunks, blocks_per_row, out_dim } if wide => (chunks, blocks_per_row, out_dim, &engine.linear_q4_decode_swiglu_r4, DECODE_R4_ROWS_PER_WG / 2),
+        MatMulWeight::Q4_0 { chunks, blocks_per_row, out_dim } => (chunks, blocks_per_row, out_dim, &engine.linear_q4_decode_swiglu, DECODE_ROWS_PER_WG / 2),
+        MatMulWeight::Q8_0 { chunks, blocks_per_row, out_dim } if wide => (chunks, blocks_per_row, out_dim, &engine.linear_q8_decode_swiglu_r4, DECODE_R4_ROWS_PER_WG / 2),
         _ => return None,
     };
     if !fast || chunks.len() != 1 || *out_dim != 2 * inter {
@@ -1189,7 +1206,7 @@ fn gate_up_swiglu_decode(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputeP
             BindGroupEntry { binding: 5, resource: dims.as_entire_binding() },
         ],
     );
-    engine.dispatch(pass, pipeline, &bg, (inter.div_ceil(DECODE_ROWS_PER_WG / 2), 1, 1), key);
+    engine.dispatch(pass, pipeline, &bg, (inter.div_ceil(outs_per_wg), 1, 1), key);
     Some(out)
 }
 
