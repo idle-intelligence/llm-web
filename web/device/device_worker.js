@@ -22,7 +22,7 @@
 const EARLY = [];
 self.onmessage = (e) => EARLY.push(e);
 
-const ENGINE_BUILD = "2026-10-05-demos-05";
+const ENGINE_BUILD = "2026-10-05-demos-06";
 const N_GEN = 64;
 const MAX_CTX = 256;
 
@@ -64,29 +64,15 @@ async function runBackend(backend) {
   let t0 = performance.now();
   let engine, gpu;
   if (backend === "webgpu") {
-    const mod = await import(`../lean/pkg/lean.js?v=${ENGINE_BUILD}`);
-    await mod.default(`../lean/pkg/lean_bg.wasm?v=${ENGINE_BUILD}`);
-    timing.wasmInitMs = performance.now() - t0;
-    mod.leanInit();
+    const mod = await loadSingle(timing);
     engine = await mod.LeanEngine.create();
     gpu = true;
   } else if (backend === "threads") {
-    const { capabilities } = await import(`./device_common.js?v=${ENGINE_BUILD}`);
-    const caps = await capabilities();
-    const mod = await import(`../lean/pkg-mt/lean.js?v=${ENGINE_BUILD}`);
-    await mod.default(`../lean/pkg-mt/lean_bg.wasm?v=${ENGINE_BUILD}`);
-    timing.wasmInitMs = performance.now() - t0;
-    t0 = performance.now();
-    await mod.initThreadPool(caps.hardwareConcurrency);
-    timing.threadPoolMs = performance.now() - t0;
-    mod.leanInit();
+    const mod = await loadThreads(timing);
     engine = mod.LeanEngineCpu.create();
     gpu = false;
   } else {
-    const mod = await import(`../lean/pkg/lean.js?v=${ENGINE_BUILD}`);
-    await mod.default(`../lean/pkg/lean_bg.wasm?v=${ENGINE_BUILD}`);
-    timing.wasmInitMs = performance.now() - t0;
-    mod.leanInit();
+    const mod = await loadSingle(timing);
     engine = mod.LeanEngineCpu.create();
     gpu = false;
   }
@@ -140,7 +126,45 @@ async function runBackend(backend) {
       decodeMaxMs: stepMs.length ? Math.max(...stepMs) : null,
     },
   };
+  engine.free();
   self.postMessage({ type: "result", result });
+}
+
+// Each wasm build is initialised once per worker and reused: the CPU threads
+// build's thread pool can only be built once, so a second run must not
+// initialise it again.
+let singlePromise = null;
+let threadsPromise = null;
+function loadSingle(timing) {
+  if (!singlePromise) {
+    singlePromise = (async () => {
+      const t0 = performance.now();
+      const mod = await import(`../lean/pkg/lean.js?v=${ENGINE_BUILD}`);
+      await mod.default(`../lean/pkg/lean_bg.wasm?v=${ENGINE_BUILD}`);
+      mod.leanInit();
+      timing.wasmInitMs = performance.now() - t0;
+      return mod;
+    })();
+  }
+  return singlePromise;
+}
+function loadThreads(timing) {
+  if (!threadsPromise) {
+    threadsPromise = (async () => {
+      const { capabilities } = await import(`./device_common.js?v=${ENGINE_BUILD}`);
+      const caps = await capabilities();
+      let t0 = performance.now();
+      const mod = await import(`../lean/pkg-mt/lean.js?v=${ENGINE_BUILD}`);
+      await mod.default(`../lean/pkg-mt/lean_bg.wasm?v=${ENGINE_BUILD}`);
+      timing.wasmInitMs = performance.now() - t0;
+      t0 = performance.now();
+      await mod.initThreadPool(caps.hardwareConcurrency);
+      timing.threadPoolMs = performance.now() - t0;
+      mod.leanInit();
+      return mod;
+    })();
+  }
+  return threadsPromise;
 }
 
 async function run(requested) {
