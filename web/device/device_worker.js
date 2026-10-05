@@ -22,7 +22,7 @@
 const EARLY = [];
 self.onmessage = (e) => EARLY.push(e);
 
-const ENGINE_BUILD = "2026-10-04-demos-04";
+const ENGINE_BUILD = "2026-10-05-demos-05";
 const N_GEN = 64;
 const MAX_CTX = 256;
 
@@ -102,13 +102,21 @@ async function runBackend(backend) {
   const prefillMs = performance.now() - t0;
   const ids = [argmaxJs(logits)];
   const stepMs = [];
-  for (let i = 1; i < N_GEN; i++) {
+  let decodeMsPerTok;
+  if (gpu) {
+    // WebGPU: pipelined greedy decode, as lean ships it (each step is
+    // submitted before the previous token is read back).
     const ts = performance.now();
-    const id = gpu ? await engine.decodeStepArgmax(ids[i - 1], []) : engine.decodeStepArgmax(ids[i - 1]);
-    stepMs.push(performance.now() - ts);
-    ids.push(id);
+    ids.push(...(await engine.decodeGreedy(ids[0], N_GEN - 1)));
+    decodeMsPerTok = (performance.now() - ts) / (N_GEN - 1);
+  } else {
+    for (let i = 1; i < N_GEN; i++) {
+      const ts = performance.now();
+      ids.push(engine.decodeStepArgmax(ids[i - 1]));
+      stepMs.push(performance.now() - ts);
+    }
+    decodeMsPerTok = stepMs.reduce((a, b) => a + b, 0) / stepMs.length;
   }
-  const decodeMsPerTok = stepMs.reduce((a, b) => a + b, 0) / stepMs.length;
   const hash = await sha256Hex(ids);
 
   const result = {
@@ -126,10 +134,10 @@ async function runBackend(backend) {
       threadPoolMs: timing.threadPoolMs,
       loadMs: timing.loadMs,
       prefillMs,
-      decodeFirstMs: stepMs[0],
-      decodeMedianMs: median(stepMs),
-      decodeMinMs: Math.min(...stepMs),
-      decodeMaxMs: Math.max(...stepMs),
+      decodeFirstMs: stepMs.length ? stepMs[0] : null,
+      decodeMedianMs: stepMs.length ? median(stepMs) : null,
+      decodeMinMs: stepMs.length ? Math.min(...stepMs) : null,
+      decodeMaxMs: stepMs.length ? Math.max(...stepMs) : null,
     },
   };
   self.postMessage({ type: "result", result });
