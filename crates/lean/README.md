@@ -14,7 +14,7 @@ A page picks one of three backends, in this order:
 2. **CPU threads.** The CPU forward pass with each matrix product split across a pool of Web Workers (wasm-bindgen-rayon). It needs `SharedArrayBuffer`, so the page must be served cross-origin isolated (the `Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedder-Policy: require-corp` headers), and it needs more than one hardware thread.
 3. **Single CPU thread.** The same CPU forward pass on one thread, with SIMD128 dot-product kernels. It runs wherever WebAssembly does.
 
-The choice is made by capability, never by measuring the device: WebGPU when `navigator.gpu.requestAdapter()` returns an adapter, otherwise CPU threads when `crossOriginIsolated` is true, `SharedArrayBuffer` exists and `navigator.hardwareConcurrency` is above 1, otherwise a single CPU thread. `www/backends_common.js` (`capabilities()`) and `www/chat_worker.js` (`load()`) implement this. The kernels are the same on every device; there is no autotuning and no per-device code.
+The choice is made by capability, never by measuring the device: WebGPU when `navigator.gpu.requestAdapter()` returns an adapter, otherwise CPU threads when `crossOriginIsolated` is true, `SharedArrayBuffer` exists and `navigator.hardwareConcurrency` is above 1, otherwise a single CPU thread. The kernels are the same on every device; there is no autotuning and no per-device code.
 
 Natively the same code runs through `wgpu` (tested on Metal and Vulkan), and the CPU path uses NEON on aarch64 and scalar code elsewhere, on one thread or, with the `threads` feature, on a rayon pool.
 
@@ -57,7 +57,7 @@ Both load with `engine.load(ggufBytes, tokenizerJson, tokenizerConfigJson, maxCt
 - **LoRA.** LoRA adapters are in the Rust API (`apply_lora` / `clear_lora` on the GPU model and on the CPU model); they are not exposed to JavaScript yet.
 - **Tokens.** `tokenize`, `encodeRaw`, `decodeIds`, `tokenCount`, `kvLen`, `info`.
 
-A minimal worker, from `www/chat_worker.js`:
+A minimal worker:
 
 ```js
 const mod = await import(`../pkg/lean.js?v=${ENGINE_BUILD}`);
@@ -116,16 +116,6 @@ LEAN_GGUF_LLAMA_360M_Q4_0=<gguf> LEAN_GGUF_LLAMA_360M_Q8_0=<gguf> LEAN_TOKENIZER
 ```
 
 `cargo test -p lean` without `--ignored` runs the tests that need no model file (dequantization, chat template, LoRA parsing). Release gate logs are under `docs/runs/`.
-
-## Pages in `www/`
-
-Serve the repository with `python3 scripts/serve_coi.py` (port 8030 by default), which sets the cross-origin isolation headers the CPU threads backend needs, and open a page under `crates/lean/www/`.
-
-- `backends.html` runs one fixed greedy generation on a chosen backend and shows the backend used, what the page can see of the device, prefill time, decode time per token and a hash of the generated tokens. The hash equals the transformers reference hash on every backend. `?backend=auto|webgpu|threads|single` picks the backend, `?model=qwen25-0.5b|smollm2-360m` the model, `?local=0` fetches the model from Hugging Face instead of `www/model*/`, and `?diag=1` adds a table of diagnostics (load and init times, cold and warm prefill, GPU timestamps where the device supports them).
-- `chat.html` is a multi-turn chat page for testing the chat API on any backend, with streaming and stop (`?backend=`, `?model=qwen25-0.5b|smollm2-360m|smollm2-1.7b`, `?max=`).
-- The other pages (`index.html`, `cpu.html`, `cpu_mt.html`, `cpu_qwen3.html`, `qwen3.html`, `qwen3_1_7b.html`, `qwen25_3b.html`, `decode_timing.html`, `mem_profile*.html`, `nondet.html`) are development harnesses: browser parity checks, timing and memory profiles, and a determinism probe. They print JSON and are not meant for visitors.
-
-Local model files go in `www/model/`, `www/model_smollm2_360m/` and so on (a GGUF plus `tokenizer.json` and `tokenizer_config.json`); they are not in the repository.
 
 ## License
 

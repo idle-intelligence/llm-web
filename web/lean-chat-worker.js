@@ -12,7 +12,7 @@
 // 'threads' or 'single'; 'auto' picks by capability (WebGPU if an adapter
 // is granted, else CPU threads if cross-origin isolated with
 // SharedArrayBuffer and more than one hardware thread, else single-thread
-// CPU), same policy as crates/lean/www/backends_worker.js. Any other value
+// CPU). Any other value
 // tries only that backend and fails if it can't start — the page only
 // offers backends the capability check found available, so this should
 // not happen from normal use.

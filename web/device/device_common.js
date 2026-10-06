@@ -1,8 +1,6 @@
 // Shared by device_worker.js: capability checks, the one model this page
-// verifies against, and the token hash. Adapted from
-// crates/lean/www/backends_common.js (the same functions, same reference
-// hash for SmolLM2-360M-Instruct Q4_0; the bandwidth probe and the
-// qwen25-0.5b fixture are left out, this page runs one model).
+// verifies against, and the token hash (the same reference hash for
+// SmolLM2-360M-Instruct Q4_0 the lean engine's own parity gates use).
 export const MODEL = {
   label: "SmolLM2-360M-Instruct Q4_0",
   name: "SmolLM2-360M-Instruct",

@@ -12,8 +12,7 @@
 // 'detect' only runs capability checks: no model download, no engine
 // start. 'run' downloads the model once (cached after that) and then runs
 // one short generation per requested backend, verified against the
-// transformers reference hash (same fixture crates/lean/www's
-// backends.html?diag=1 checks). 'run' with backend:'all' runs every
+// transformers reference hash. 'run' with backend:'all' runs every
 // available backend in turn, posting a 'result' after each.
 //
 // This file has no top-level `import` or `await`: a module worker with a

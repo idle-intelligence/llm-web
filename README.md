@@ -18,7 +18,7 @@ ENGINE_BUILD=dev scripts/build_lean_mt.sh    # crates/lean/pkg-mt: CPU threads (
 python3 scripts/serve_coi.py
 ```
 
-Then open `http://localhost:8030/crates/lean/www/chat.html` for a working chat page. The core of the API:
+The core of the API:
 
 ```html
 <script type="module">
@@ -50,7 +50,7 @@ LEAN_GGUF_LLAMA_360M_Q4_0=<gguf> LEAN_GGUF_LLAMA_360M_Q8_0=<gguf> LEAN_TOKENIZER
   cargo test -p lean --release --features threads --test fixture_parity_llama_360m_cpu -- --ignored
 ```
 
-See [`crates/lean/README.md`](crates/lean/README.md) for the backends, the full JavaScript API, every parity test and its environment variables, and the `www/` development pages (`backends.html`, `chat.html`).
+See [`crates/lean/README.md`](crates/lean/README.md) for the backends, the full JavaScript API, and every parity test and its environment variables.
 
 ## Models
 

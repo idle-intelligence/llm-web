@@ -388,7 +388,7 @@ impl LeanEngine {
     /// files' contents as strings. `max_ctx` bounds the KV cache (prompt +
     /// max_new_tokens must fit). The caller should drop its own reference to
     /// `gguf_bytes`'s backing `ArrayBuffer` right after this call returns so
-    /// the JS heap can reclaim it too (see `www/main.js`'s call site).
+    /// the JS heap can reclaim it too.
     #[wasm_bindgen(js_name = load)]
     pub fn load(&mut self, gguf_bytes: js_sys::Uint8Array, tokenizer_json: String, tokenizer_config_json: String, max_ctx: u32) -> Result<(), JsError> {
         let t_start = now_ms();
@@ -547,8 +547,8 @@ impl LeanEngine {
     /// Renders + tokenizes `prompt` the same way `generate()` does and
     /// returns the resulting token count, with no GPU work - lets a harness
     /// log a synthetic timing-only prompt's actual length (e.g. the
-    /// ~1000-token prefill case in `www/main.js`) without duplicating the
-    /// chat-template/tokenizer path in JS.
+    /// ~1000-token prefill case in a browser harness) without duplicating
+    /// the chat-template/tokenizer path in JS.
     #[wasm_bindgen(js_name = tokenCount)]
     pub fn token_count(&self, prompt: String) -> Result<u32, JsError> {
         let tokenizer = self.tokenizer.as_ref().ok_or_else(|| JsError::new("load() must be called first"))?;
