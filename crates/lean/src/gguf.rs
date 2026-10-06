@@ -364,7 +364,7 @@ impl<R: Read + Seek> GgufReader<R> {
 /// convention, same as `t0-fast`'s `quant.rs` and `llm-wasm`'s WGSL kernels.
 pub fn dequantize_q4_0(bytes: &[u8], n_elements: usize) -> Vec<f32> {
     let mut out = vec![0f32; n_elements];
-    for (bi, block) in bytes.chunks_exact(18).enumerate() {
+    for (bi, block) in bytes.as_chunks::<18>().0.iter().enumerate() {
         let scale = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
         for j in 0..16 {
             let byte = block[2 + j];
@@ -389,7 +389,7 @@ pub fn dequantize_q4_0(bytes: &[u8], n_elements: usize) -> Vec<f32> {
 /// worth it.
 pub fn dequantize_q4_1(bytes: &[u8], n_elements: usize) -> Vec<f32> {
     let mut out = vec![0f32; n_elements];
-    for (bi, block) in bytes.chunks_exact(20).enumerate() {
+    for (bi, block) in bytes.as_chunks::<20>().0.iter().enumerate() {
         let scale = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
         let min = f16_to_f32(u16::from_le_bytes([block[2], block[3]]));
         for j in 0..16 {
@@ -408,7 +408,7 @@ pub fn dequantize_q4_1(bytes: &[u8], n_elements: usize) -> Vec<f32> {
 /// signed i8 values, `value = qs[j] * scale`.
 pub fn dequantize_q8_0(bytes: &[u8], n_elements: usize) -> Vec<f32> {
     let mut out = vec![0f32; n_elements];
-    for (bi, block) in bytes.chunks_exact(34).enumerate() {
+    for (bi, block) in bytes.as_chunks::<34>().0.iter().enumerate() {
         let scale = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
         for j in 0..32 {
             out[bi * 32 + j] = (block[2 + j] as i8) as f32 * scale;
@@ -432,7 +432,7 @@ pub fn dequantize_q8_0(bytes: &[u8], n_elements: usize) -> Vec<f32> {
 pub fn dequantize_q6_k(bytes: &[u8], n_elements: usize) -> Vec<f32> {
     const QK_K: usize = 256;
     let mut out = vec![0f32; n_elements];
-    for (bi, block) in bytes.chunks_exact(210).enumerate() {
+    for (bi, block) in bytes.as_chunks::<210>().0.iter().enumerate() {
         let ql_all = &block[0..128];
         let qh_all = &block[128..192];
         let sc_all = &block[192..208];

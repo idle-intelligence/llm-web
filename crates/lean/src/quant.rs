@@ -66,7 +66,7 @@ fn split_q8_blocks(bytes: &[u8], n_elements: usize) -> (Vec<u32>, Vec<f32>) {
     let n_blocks = n_elements / QK;
     let mut qs = vec![0u32; n_elements / 4];
     let mut scales = vec![0f32; n_blocks];
-    for (bi, block) in bytes.chunks_exact(34).enumerate() {
+    for (bi, block) in bytes.as_chunks::<34>().0.iter().enumerate() {
         scales[bi] = half::f16::from_le_bytes([block[0], block[1]]).to_f32();
         for j in 0..QK {
             let byte = block[2 + j] as u32;
@@ -82,7 +82,7 @@ fn split_q4_blocks(bytes: &[u8], n_elements: usize) -> (Vec<u32>, Vec<f32>) {
     let n_blocks = n_elements / QK;
     let mut qs = vec![0u32; n_blocks * 4]; // 16 bytes/block = 4 u32/block
     let mut scales = vec![0f32; n_blocks];
-    for (bi, block) in bytes.chunks_exact(18).enumerate() {
+    for (bi, block) in bytes.as_chunks::<18>().0.iter().enumerate() {
         scales[bi] = half::f16::from_le_bytes([block[0], block[1]]).to_f32();
         for byte_i in 0..QK / 2 {
             let byte = block[2 + byte_i] as u32;
@@ -144,7 +144,7 @@ fn split_q6k_blocks(bytes: &[u8], n_elements: usize) -> (Vec<u32>, Vec<u32>, Vec
     let mut qh = vec![0u32; n_blocks * 16];
     let mut scales = vec![0u32; n_blocks * 4];
     let mut d = vec![0f32; n_blocks];
-    for (bi, block) in bytes.chunks_exact(Q6K_BLOCK_BYTES).enumerate() {
+    for (bi, block) in bytes.as_chunks::<Q6K_BLOCK_BYTES>().0.iter().enumerate() {
         let ql_bytes = &block[0..128];
         let qh_bytes = &block[128..192];
         let sc_bytes = &block[192..208];
@@ -348,7 +348,7 @@ mod tests {
         // check the GPU-layout repack decodes to the same values as
         // `gguf::dequantize_q4_0`.
         let mut bytes = vec![0u8; 36];
-        for (bi, block) in bytes.chunks_exact_mut(18).enumerate() {
+        for (bi, block) in bytes.as_chunks_mut::<18>().0.iter_mut().enumerate() {
             let scale = half::f16::from_f32(0.1 + bi as f32 * 0.05);
             block[0..2].copy_from_slice(&scale.to_le_bytes());
             for (i, b) in block[2..18].iter_mut().enumerate() {
@@ -383,7 +383,7 @@ mod tests {
         // `gguf::dequantize_q6_k`.
         use crate::gguf::dequantize_q6_k;
         let mut bytes = vec![0u8; 420];
-        for (bi, block) in bytes.chunks_exact_mut(210).enumerate() {
+        for (bi, block) in bytes.as_chunks_mut::<210>().0.iter_mut().enumerate() {
             for (i, b) in block[0..192].iter_mut().enumerate() {
                 *b = ((i * 13 + bi * 37) % 256) as u8;
             }

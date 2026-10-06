@@ -46,7 +46,7 @@ fn f16_to_f32(bits: u16) -> f32 {
 #[allow(dead_code)] // always used by tests; used as the fallback impl on non-aarch64/non-simd128 targets
 fn dot_q6_k_scalar(bytes: &[u8], x: &[f32]) -> f32 {
     let mut acc = 0f32;
-    for (bi, block) in bytes.chunks_exact(210).enumerate() {
+    for (bi, block) in bytes.as_chunks::<210>().0.iter().enumerate() {
         let ql_all = &block[0..128];
         let qh_all = &block[128..192];
         let sc_all = &block[192..208];
@@ -108,7 +108,7 @@ fn unpack_q6k_half(ql: &[u8], qh: &[u8]) -> ([i8; 32], [i8; 32], [i8; 32], [i8; 
 #[allow(dead_code)] // always used by tests; used as the fallback impl on non-aarch64/non-simd128 targets
 fn dot_q4_0_scalar(bytes: &[u8], x: &[f32]) -> f32 {
     let mut acc = 0f32;
-    for (bi, block) in bytes.chunks_exact(18).enumerate() {
+    for (bi, block) in bytes.as_chunks::<18>().0.iter().enumerate() {
         let scale = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
         let base = bi * QK;
         let mut s = 0f32;
@@ -129,7 +129,7 @@ fn dot_q4_0_scalar(bytes: &[u8], x: &[f32]) -> f32 {
 #[allow(dead_code)] // always used by tests; used as the fallback impl on non-aarch64/non-simd128 targets
 fn dot_q8_0_scalar(bytes: &[u8], x: &[f32]) -> f32 {
     let mut acc = 0f32;
-    for (bi, block) in bytes.chunks_exact(34).enumerate() {
+    for (bi, block) in bytes.as_chunks::<34>().0.iter().enumerate() {
         let scale = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
         let base = bi * QK;
         let mut s = 0f32;
@@ -198,7 +198,7 @@ mod neon {
 
     pub(super) fn dot_q4_0(bytes: &[u8], x: &[f32]) -> f32 {
         let mut acc = 0f32;
-        for (bi, block) in bytes.chunks_exact(18).enumerate() {
+        for (bi, block) in bytes.as_chunks::<18>().0.iter().enumerate() {
             let scale = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
             let base = bi * QK;
             let s = unsafe { dot_q4_0_block(block, &x[base..base + QK]) };
@@ -248,7 +248,7 @@ mod neon {
 
     pub(super) fn dot_q8_0(bytes: &[u8], x: &[f32]) -> f32 {
         let mut acc = 0f32;
-        for (bi, block) in bytes.chunks_exact(34).enumerate() {
+        for (bi, block) in bytes.as_chunks::<34>().0.iter().enumerate() {
             let scale = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
             let base = bi * QK;
             let s = unsafe { dot_q8_0_block(&block[2..34], &x[base..base + QK]) };
@@ -265,7 +265,7 @@ mod neon {
     /// unpack itself stays scalar.
     pub(super) fn dot_q6_k(bytes: &[u8], x: &[f32]) -> f32 {
         let mut acc = 0f32;
-        for (bi, block) in bytes.chunks_exact(210).enumerate() {
+        for (bi, block) in bytes.as_chunks::<210>().0.iter().enumerate() {
             let ql_all = &block[0..128];
             let qh_all = &block[128..192];
             let sc_all = &block[192..208];

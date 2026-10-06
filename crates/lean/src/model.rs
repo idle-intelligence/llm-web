@@ -554,7 +554,7 @@ impl KvSnapshot {
 }
 
 fn read_f32_le(bytes: &[u8]) -> Vec<f32> {
-    bytes.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect()
+    bytes.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect()
 }
 
 /// Reads a KV buffer's full `[kv_heads, max_ctx, head_dim]` contents back

@@ -85,7 +85,7 @@ impl CpuWeight {
             CpuWeight::F32 { data, in_dim, .. } => out.copy_from_slice(&data[row * in_dim..(row + 1) * in_dim]),
             CpuWeight::Q4_0 { bytes, blocks_per_row, .. } => {
                 let n = blocks_per_row * 18;
-                for (block, o) in bytes[row * n..(row + 1) * n].chunks_exact(18).zip(out.chunks_exact_mut(32)) {
+                for (block, o) in bytes[row * n..(row + 1) * n].as_chunks::<18>().0.iter().zip(out.as_chunks_mut::<32>().0.iter_mut()) {
                     let scale = half::f16::from_le_bytes([block[0], block[1]]).to_f32();
                     for j in 0..16 {
                         let byte = block[2 + j];
@@ -96,7 +96,7 @@ impl CpuWeight {
             }
             CpuWeight::Q8_0 { bytes, blocks_per_row, .. } => {
                 let n = blocks_per_row * 34;
-                for (block, o) in bytes[row * n..(row + 1) * n].chunks_exact(34).zip(out.chunks_exact_mut(32)) {
+                for (block, o) in bytes[row * n..(row + 1) * n].as_chunks::<34>().0.iter().zip(out.as_chunks_mut::<32>().0.iter_mut()) {
                     let scale = half::f16::from_le_bytes([block[0], block[1]]).to_f32();
                     for j in 0..32 {
                         o[j] = (block[2 + j] as i8) as f32 * scale;
@@ -119,7 +119,7 @@ impl CpuWeight {
 #[inline]
 fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
     let mut acc = F4::zero();
-    for (ca, cb) in a.chunks_exact(4).zip(b.chunks_exact(4)) {
+    for (ca, cb) in a.as_chunks::<4>().0.iter().zip(b.as_chunks::<4>().0.iter()) {
         acc = acc.add_mul(F4::load(cb), F4::load(ca));
     }
     acc.sum()
