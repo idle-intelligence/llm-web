@@ -63,6 +63,8 @@ jobs:
           mkdir -p _site/web/lean
           cp -R crates/lean/pkg _site/web/lean/pkg
           cp -R crates/lean/pkg-mt _site/web/lean/pkg-mt
+          mkdir -p _site/pkg
+          cp -R pkg/wllama _site/pkg/wllama
 
       - name: Rewrite the ?v= build tag to this commit's sha
         run: |
