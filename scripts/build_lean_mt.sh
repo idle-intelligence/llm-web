@@ -15,8 +15,11 @@
 # where cargo treats it as a rustc flag and errors).
 #
 # Requires:
-#   - nightly toolchain with rust-src: `rustup toolchain install nightly
-#     --component rust-src`
+#   - a nightly toolchain with rust-src: `rustup toolchain install nightly
+#     --component rust-src`. Pinned in CI to nightly-2026-10-05 (the pages
+#     workflow installs it and passes its name through LEAN_NIGHTLY); set
+#     LEAN_NIGHTLY to override which nightly `cargo +<toolchain>` below
+#     uses, otherwise it defaults to the unpinned `nightly`.
 #   - wasm-bindgen-cli matching the wasm-bindgen version in Cargo.lock
 #     exactly (`cargo install wasm-bindgen-cli --version <that version>
 #     --locked`)
@@ -64,7 +67,7 @@ RUSTFLAGS="-C target-feature=+atomics,+bulk-memory,+mutable-globals,+simd128 \
 -C link-arg=--import-memory \
 -C link-arg=--export=__wasm_init_tls -C link-arg=--export=__tls_size \
 -C link-arg=--export=__tls_align -C link-arg=--export=__tls_base $REMAP" \
-  cargo +nightly build -p lean --lib \
+  cargo +"${LEAN_NIGHTLY:-nightly}" build -p lean --lib \
     --target wasm32-unknown-unknown \
     --release \
     --no-default-features --features wasm-mt \

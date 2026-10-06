@@ -20,14 +20,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
-          targets: wasm32-unknown-unknown
-
-      - uses: dtolnay/rust-toolchain@nightly
-        with:
+          toolchain: nightly-2026-10-05
           targets: wasm32-unknown-unknown
           components: rust-src
+
+      - uses: dtolnay/rust-toolchain@1.99.0
+        with:
+          targets: wasm32-unknown-unknown
+          components: clippy
 
       - uses: Swatinem/rust-cache@v2
 
@@ -51,6 +53,8 @@ jobs:
         run: ENGINE_BUILD="${{ github.sha }}" scripts/build_lean.sh
 
       - name: Build lean (web, CPU threads) -> crates/lean/pkg-mt
+        env:
+          LEAN_NIGHTLY: nightly-2026-10-05
         run: ENGINE_BUILD="${{ github.sha }}" scripts/build_lean_mt.sh
 
       - name: Assemble site
