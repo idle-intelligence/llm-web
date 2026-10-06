@@ -134,7 +134,7 @@ impl Pool {
     /// non-debug caller.
     pub fn debug_top_buffers(&self, n: usize) -> Vec<(String, u64)> {
         let mut v: Vec<(String, u64)> = self.buffers.borrow().iter().map(|(k, b)| (k.clone(), b.size())).collect();
-        v.sort_by(|a, b| b.1.cmp(&a.1));
+        v.sort_by_key(|b| std::cmp::Reverse(b.1));
         v.truncate(n);
         v
     }
