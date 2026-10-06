@@ -14,7 +14,7 @@ storage + uniform-`Dims` binding layout.
 
 - Commit tested: this session's own commit on branch `lean-rmsnorm`,
   committed files only (`git archive HEAD`), built and run on the same
-  Linux desktop (RTX 3080, Vulkan backend via wgpu) used by
+  RTX 3080 desktop (Vulkan backend via wgpu) used by
   `docs/runs/2026-09-29-lean-box-check.md` and the profiling doc above.
 - Models/fixtures: same four as the box-check doc (Qwen2.5-0.5B-Instruct
   Q4_0, the official Qwen2.5-3B-Instruct Q4_0 with Q6_K `output.weight`,

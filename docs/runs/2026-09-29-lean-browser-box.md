@@ -1,9 +1,9 @@
-# lean in the browser on the RTX 3080/Vulkan box (Chrome/Dawn vs native wgpu-core)
+# lean in the browser on the RTX 3080/Vulkan machine (Chrome/Dawn vs native wgpu-core)
 
-Machine: a Linux desktop (Manjaro, RTX 3080 10GB, driver 610.57.04,
-Vulkan 1.4). Chromium 152.0.7977.75 (system package, already installed - no
+Machine: RTX 3080 (10GB), driver 610.57.04,
+Vulkan 1.4. Chromium 152.0.7977.75 (system package, already installed - no
 sudo used, no packages installed at the OS level). Work done entirely under
-a fresh directory (`llm-web-browser/`) inside a sandbox directory on the box;
+a fresh directory (`llm-web-browser/`);
 no other worker's checkout was touched. Source: the `lean-kernels` branch
 tip (commit `57fa22d`, includes all sessions in
 `docs/runs/2026-09-29-lean-kernels.md` - Q6_K decode matvec, add+rmsnorm
@@ -11,11 +11,11 @@ fusion, F32 decode matvec, uniform-write skip, head_dim-conditioned
 SPLIT_CHUNK - plus the load-time memory fixes from
 `docs/runs/2026-09-28-lean-decode-breakdown.md` Sessions 2-3, `scratch_key`/
 lm-head-slice/`JsBytesReader`, all confirmed present in the built source).
-Transferred from the Mac worktree to the box via `git bundle` (the branch is
-local-only, never pushed) since the box's own checkouts under
-`lean/llm-web-kernels-final` etc. belong to other workers and were left
-untouched. `wasm-pack build crates/lean --target web --out-dir pkg
---no-default-features --features web` was run **on the box itself**
+Transferred from the Mac worktree to the RTX 3080 machine via `git bundle`
+(the branch is local-only, never pushed) since the machine's own checkouts
+under `lean/llm-web-kernels-final` etc. belong to other workers and were
+left untouched. `wasm-pack build crates/lean --target web --out-dir pkg
+--no-default-features --features web` was run **on the machine itself**
 (wasm-pack/cargo/rustc/`wasm32-unknown-unknown` were already installed there
 from earlier work) - no Mac build-lock contention. `ENGINE_BUILD` bumped to
 `2026-09-29-box-01` in `main.js`/`main_decode_timing.js` in the same commit
@@ -24,7 +24,7 @@ the just-built file before every run in this doc.
 
 ## 1. Getting a WebGPU adapter on the NVIDIA GPU
 
-**Headless Chromium cannot reach the Vulkan/NVIDIA adapter on this box and
+**Headless Chromium cannot reach the Vulkan/NVIDIA adapter on this machine and
 silently falls back to SwiftShader (software).** Tried, in order:
 `--headless=new` and the old default headless mode (`chrome-headless-shell`),
 both via Playwright's bundled Chromium and the system `/usr/bin/chromium`,
@@ -52,8 +52,8 @@ a missing driver/library. Not investigated further than root-causing the
 error code - out of scope for "get an adapter", which the headed fallback
 below does.
 
-**Fix: headed Chromium on the box's own Xwayland display.** The box already
-runs a desktop session (GNOME/mutter on Wayland, with Xwayland providing
+**Fix: headed Chromium on the machine's own Xwayland display.** The machine
+already runs a desktop session (GNOME/mutter on Wayland, with Xwayland providing
 `:0`/`:1`). Using that display's `XAUTHORITY` cookie
 (`/run/user/<uid>/.mutter-Xwaylandauth.<token>`, found via
 `ls /run/user/<uid>/ | grep -i xwayland`) and `DISPLAY=:0`, launching
@@ -80,8 +80,8 @@ out of this task's scope). Limits: `maxStorageBufferBindingSize =
 **Reproducible command** (adapter probe only, no model):
 ```
 XAUTHORITY=/run/user/<uid>/.mutter-Xwaylandauth.<token> DISPLAY=:0 \
-  flock <workdir>/lean/box.lock -c '<venv>/bin/python3 gpu_probe.py \
-  --executable-path /usr/bin/chromium --headless-mode headed'
+  <venv>/bin/python3 gpu_probe.py \
+  --executable-path /usr/bin/chromium --headless-mode headed
 ```
 (`gpu_probe.py`: Playwright launch with `headless=False` and args
 `--enable-unsafe-webgpu --enable-features=Vulkan,WebGPU --use-angle=vulkan
@@ -90,7 +90,7 @@ XAUTHORITY=/run/user/<uid>/.mutter-Xwaylandauth.<token> DISPLAY=:0 \
 `requestDevice()`, printed as JSON.)
 
 This opens a real (offscreen-composited, but real) browser window on the
-box's own display for the run's duration - acceptable per this task's own
+machine's own display for the run's duration - acceptable per this task's own
 "headed is the fallback" instruction, but worth flagging: anyone
 physically at that desktop session would see Chromium windows flash open
 and close during a sweep.
@@ -114,9 +114,8 @@ no NaN/garbled output; greedy continuations read as coherent English/French
 text in every case.
 
 ```
-flock <workdir>/lean/box.lock -c \
-  'XAUTHORITY=<...> DISPLAY=:0 <venv>/bin/python3 run_lean_page.py \
-   "http://localhost:8899/www/index.html?local=1" --limit-gb 20 --timeout 180'
+XAUTHORITY=<...> DISPLAY=:0 <venv>/bin/python3 run_lean_page.py \
+   "http://localhost:8899/www/index.html?local=1" --limit-gb 20 --timeout 180
 ```
 
 ## 3. Decode timing, browser (Chrome/Dawn/Vulkan/NVIDIA) vs native (wgpu-core/Vulkan/NVIDIA)
@@ -124,7 +123,7 @@ flock <workdir>/lean/box.lock -c \
 `www/decode_timing.html?model=<key>&case=<short|long>&steps=16`, 3 fresh
 Chromium page loads per model/case (each a fresh process - `cold` = that
 page's first decode step, `warm` = median of the remaining 15), one GPU job
-at a time (`flock box.lock`), headed on the box's Xwayland display as in
+at a time, headed on the machine's Xwayland display as in
 section 1. `smollm2_360m`'s own fixture has no `long_tools_single` case
 (confirmed in `docs/runs/2026-09-29-lean-kernels.md`), so its "long" case is
 its own 86-token `long` fixture case (`main_decode_timing.js` was given a
@@ -137,8 +136,8 @@ whose max token id (151645) is out of `smollm2_360m`'s vocab range and would
 crash it (same failure mode the kernels doc's native CLI hit on this model
 without its own `--fixture`).
 
-Native numbers below are this box's own final figures from
-`docs/runs/2026-09-29-lean-kernels.md` (same box, same branch tip, native
+Native numbers below are this machine's own final figures from
+`docs/runs/2026-09-29-lean-kernels.md` (same machine, same branch tip, native
 `lean-cli --kernel fast`, GPU-locked, median of 5-8, `short`-case gap table
 end of session 3, and the head_dim-conditioned-SPLIT_CHUNK table for
 long-context cases).
@@ -170,14 +169,13 @@ findings, not investigated further here.
 
 **Reproducible command** (per model/case/run):
 ```
-flock <workdir>/lean/box.lock -c \
-  'XAUTHORITY=<...> DISPLAY=:0 <venv>/bin/python3 run_lean_page.py \
+XAUTHORITY=<...> DISPLAY=:0 <venv>/bin/python3 run_lean_page.py \
    "http://localhost:8899/www/decode_timing.html?model=<05b|3b|qwen3_1_7b|smollm2_360m>&case=<short|long>&steps=16" \
-   --limit-gb <see section 4> --timeout 300'
+   --limit-gb <see section 4> --timeout 300
 ```
 models served from `crates/lean/www/model*/` directories, each a set of
 symlinks into `<workdir>/lean/models/{gguf,hf}/...` (no files copied,
-no HF re-download - all four models were already cached on the box from
+no HF re-download - all four models were already cached on the machine from
 earlier native work).
 
 ## 4. Memory guard: 8GB is a headless number, not a headed one
@@ -241,20 +239,19 @@ creation succeeds either way on this adapter), but the feature must still
 be requested explicitly for `createQuerySet({ type: "timestamp" })` and
 `timestampWrites` to be permitted on the pass (confirmed by requesting it
 in this test). **This means the in-browser kernel profiler the lead wants
-next can use real per-pass GPU timestamps on this box's Chrome/Dawn/Vulkan
+next can use real per-pass GPU timestamps on this machine's Chrome/Dawn/Vulkan
 adapter, headed** - it has not been tried headless (section 1: headless
 never reaches this adapter here) or inside the actual `lean` engine's own
 passes (this test used a standalone trivial kernel, not `Engine::dispatch`).
 
 **Reproducible command:**
 ```
-flock <workdir>/lean/box.lock -c \
-  'XAUTHORITY=<...> DISPLAY=:0 <venv>/bin/python3 run_ts_test.py'
+XAUTHORITY=<...> DISPLAY=:0 <venv>/bin/python3 run_ts_test.py
 ```
 (`run_ts_test.py` navigates to a static test page,
 `www/ts_query_test.html`, and reads `window.__tsResult`.)
 
-## Files touched (box side, not committed - lives in the sandbox directory)
+## Files touched (not committed)
 
 `<workdir>/llm-web-browser/` (fresh dir): `repo/` (git bundle clone of
 `lean-kernels`, wasm built in place), `venv/` (Python + Playwright, bundled
@@ -266,9 +263,9 @@ bumped to `2026-09-29-box-01`; `main_decode_timing.js` also gained a
 per-model `fixture`/`longCaseName` override for `qwen3_1_7b`/`smollm2_360m`
 (see section 3). `repo/crates/lean/www/ts_query_test.html`: new, standalone
 timestamp-query functional test (section 5). `repo/crates/lean/www/model*/`:
-symlinks only, into the box's already-cached model files - no new
+symlinks only, into the machine's already-cached model files - no new
 downloads. All cleaned up after this session: systemd units
 (`agent-lean-http`, `agent-lean-sweep`, `agent-lean-sweep2`) stopped and
 unloaded, no Chromium or `http.server` process left running
 (`ps aux` checked clean), GPU memory back to idle (461MB, matches this
-box's idle baseline before this session started).
+machine's idle baseline before this session started).

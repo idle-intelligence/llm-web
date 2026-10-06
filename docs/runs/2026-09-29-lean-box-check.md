@@ -3,8 +3,8 @@
 Follow-on to `docs/runs/2026-09-28-lean-decode-breakdown.md` (Session 4,
 argmax fold + QKV fusion). That session's changes were only verified for
 correctness and timed on the Apple M2 (Metal). This run repeats both the
-full gate suite and the decode timing sweep on a different client - a Linux
-desktop with an RTX 3080 (10GB), Vulkan backend via wgpu - to check the
+full gate suite and the decode timing sweep on a different client - an RTX
+3080 desktop (10GB), Vulkan backend via wgpu - to check the
 changes hold outside the M2.
 
 ## Parameters

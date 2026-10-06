@@ -791,7 +791,7 @@ session.
 ## Session 6: rmsnorm fix, Mac + browser side (2026-09-29)
 
 The rmsnorm one-workgroup-per-row fix (`docs/runs/2026-09-29-lean-rmsnorm.md`)
-was gated and timed only on the Linux/RTX 3080/Vulkan box. This session
+was gated and timed only on the RTX 3080/Vulkan machine. This session
 covers the Mac (Metal via wgpu) and the browser (headless Chromium/WebGPU),
 on the same commit (branch `lean-perf`, which merges the rmsnorm fix).
 
@@ -935,7 +935,7 @@ reports `allMatch: true` against the freshly built and served
 
 `lean-kernels` (Q6_K decode matvec, fused add+rmsnorm, decode-shaped F32
 matvec - `docs/runs/2026-09-29-lean-kernels.md`) was gated and timed only on
-the Linux/RTX 3080/Vulkan box. This session covers the Mac (Metal via wgpu)
+the RTX 3080/Vulkan machine. This session covers the Mac (Metal via wgpu)
 and the browser (headless Chromium/WebGPU), on the merge commit (branch
 `lean-perf`, base `lean-kernels` merged in). Same method as Session 6:
 quiet-machine gate before every timed run (1-minute load average < 3, no

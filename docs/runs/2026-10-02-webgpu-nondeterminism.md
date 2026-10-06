@@ -7,15 +7,15 @@ page load, named as in the tables below).
 
 `www/backends.html?backend=webgpu`, Qwen2.5-0.5B-Instruct Q4_0, fixture
 "short" prompt (36 ids), 64 greedy tokens, ENGINE_BUILD
-`2026-10-02-backends-03`: two runs in Chromium on the Linux test machine (RTX
-3080, Vulkan) gave two different hashes, neither equal to the transformers
+`2026-10-02-backends-03`: two runs in Chromium on the RTX 3080 test machine
+(Vulkan) gave two different hashes, neither equal to the transformers
 hash `a454748c60e23841`. The threads and single backends on the same machine,
 Chrome on the M2 laptop (Metal) and native lean on the 3080 (wgpu, Vulkan)
 were exact.
 
 ## Setup
 
-- Linux test machine: RTX 3080, Chromium 152.0.7977.75, headed on the
+- RTX 3080 test machine: Chromium 152.0.7977.75, headed on the
   desktop's X display, flags `--enable-unsafe-webgpu
   --enable-features=Vulkan,WebGPU --use-angle=vulkan --use-vulkan=native
   --enable-dawn-features=allow_unsafe_apis --ignore-gpu-blocklist`, a fresh

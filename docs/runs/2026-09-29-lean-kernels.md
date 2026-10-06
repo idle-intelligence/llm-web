@@ -2,7 +2,7 @@
 
 Follow-on to `docs/runs/2026-09-29-lean-vs-llamacpp-profile.md` (per-kernel
 profile) and `docs/runs/2026-09-29-lean-rmsnorm.md` (rmsnorm fix, merged into
-this branch's base commit). Same box (Linux desktop, RTX 3080 10GB, Vulkan
+this branch's base commit). Same machine (RTX 3080 10GB, Vulkan
 backend via wgpu) as both prior sessions. Branch `lean-kernels`, created from
 `lean-perf` at commit `c7866b6` (rmsnorm fix already merged in).
 
@@ -23,7 +23,7 @@ backend via wgpu) as both prior sessions. Branch `lean-kernels`, created from
   `fixture_parity_qwen3`, `fixture_parity_qwen3_1_7b`, `fixture_parity_llama_360m`,
   `fixture_parity_llama_1_7b`, `kv_snapshot` (both cases), `logit_mask` (run
   separately with `--test logit_mask`, all 3 cases) - all pass on every
-  commit below, native release build, GPU-locked (`flock box.lock`),
+  commit below, native release build, GPU-locked,
   `--ignored --test-threads=1`.
 - Timing: `lean-cli` median of 5 (Qwen3-1.7B's noisiest case re-run at 8) per
   model/case, ABAB interleaving (before/after alternated within the same
@@ -254,7 +254,7 @@ across both sessions the gap to llama.cpp has closed from ~10-12x to
   promising lever than kernel-body micro-optimization for these specific
   matvecs, consistent with Change 3's approach.
 - **Qwen3-1.7B's `short` case has high run-to-run variance on this box**
-  independent of any code change - the box's own before/before spread
+  independent of any code change - the machine's own before/before spread
   across the two 5-rep sweeps in this doc was 5.62-19.15% (e.g. 8.52 to
   13.52 ms/tok within one 8-rep sample). A 5-rep median can land on either
   side of a small (<5%) true effect purely from this noise; this session's
@@ -572,7 +572,7 @@ per-round, not just on the median):
 **Kept** - every `head_dim=64` long-context case clears the >3% bar
 (3.7-15.6%), with the biggest wins on the cases with the most split-K
 overhead to amortize (SmolLM2-360M `long`, Qwen2.5-0.5B's `long_tools_*`).
-Every `head_dim=128` case is flat within this box's own measured noise
+Every `head_dim=128` case is flat within this machine's own measured noise
 floor (session 2 logged 5.62-19.15% round-to-round spread on Qwen3-1.7B
 `short` alone) - the largest regression anywhere is Qwen2.5-3B `short` at
 -0.9%, well inside that noise band, and per-round direction (not just the
@@ -734,7 +734,7 @@ breakdown above correctly identified `encode` as ~16% of step time and one
 fewer dispatch/layer as a real, verified reduction in that count, but the
 actual per-dispatch CPU cost this fusion removes (bind-group build +
 uniform-buffer write + one `dispatch_workgroups` call for a kernel this
-small) is on the order of 100-300 us/step - inside this box's own
+small) is on the order of 100-300 us/step - inside this machine's own
 documented noise floor for the `short` case (session 2's Observations:
 5.6-19.2% round-to-round spread on Qwen3-1.7B `short` alone), not above
 it. Not committed; `engine.rs`, `model.rs`, and the new

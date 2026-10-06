@@ -66,9 +66,8 @@ with `lean-chat-api` at b4d1f09 merged in.
 - M2 browsers: Playwright's Chrome for Testing (headless,
   `--use-angle=metal`, adapter apple / metal-3) and Firefox 155 (headless,
   CPU backends only).
-- Linux desktop with an RTX 3080: Chromium on Xwayland (Vulkan, adapter
-  nvidia / ampere), 24 hardware threads, one page load at a time under the
-  box lock.
+- RTX 3080 desktop: Chromium on Xwayland (Vulkan, adapter
+  nvidia / ampere), 24 hardware threads, one page load at a time.
 - Page: `crates/lean/www/backends.html` (Qwen2.5-0.5B-Instruct Q4_0,
   36-token prompt, 64 greedy tokens, no `diag`), and `www/chat.html`
   (3-turn greedy conversation from the chat API run, max 48 tokens per
@@ -185,7 +184,7 @@ Against lean-perf-night's night-04 binary, ABAB x3 (load 1.71-2.08):
 pipelined 8.79 (8.65 / 8.83) for night-04 and 9.04 (8.96 / 9.15) for
 release; step loop 8.77, 9.30, 8.39 against 8.42, 9.47, 8.67.
 
-### RTX 3080, native gates (`--release`, `--ignored`, under the box lock)
+### RTX 3080, native gates (`--release`, `--ignored`)
 
 Every test in the M2 native table above except clippy and the
 single-thread cpu_lora_parity passed: fixture_parity (all six),
@@ -256,7 +255,7 @@ Checks run after the merge:
 - A Pages-like site built from a fresh clone: WebGPU and threads backends
   both token-exact.
 
-## What TC pushes
+## Push steps
 
 `lean-release` (HEAD = this doc's commit). It contains lean-main,
 lean-perf-night and lean-chat-api; pushing it makes those three branches

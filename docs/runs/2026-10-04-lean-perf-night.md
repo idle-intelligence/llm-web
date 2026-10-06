@@ -43,9 +43,9 @@ phone (Chrome, Adreno 6xx), Qwen2.5-0.5B-Instruct Q4_0, 36-token prompt,
 - M2 browser: Playwright's Chrome for Testing (headless, `--use-angle=metal`,
   adapter apple / metal-3) and Playwright's Firefox 155 (headless; no
   WebGPU, CPU backends only). `navigator.hardwareConcurrency` is 8 in both.
-- Linux desktop with an RTX 3080: Chromium headed on Xwayland (Vulkan,
-  adapter nvidia / ampere), 24 hardware threads, the box's page runner,
-  one page load at a time under the box lock. GPU idle before the runs
+- RTX 3080 desktop: Chromium headed on Xwayland (Vulkan,
+  adapter nvidia / ampere), 24 hardware threads, one page load at a time.
+  GPU idle before the runs
   (0 %, 515 MiB).
 - Page: `crates/lean/www/backends.html`, Qwen2.5-0.5B-Instruct Q4_0,
   36-token prompt, 64 greedy tokens (63 decode steps). Base = lean-main
@@ -269,7 +269,7 @@ test, clippy -D warnings with threads clean.
   blocks on a latch until the call ends.
 - With one region per step (5356f0b) Firefox went from 37.8 to 25.5
   ms/token and Chrome from 26.4 to 23.1 on the M2; on the 3080 machine
-  (24 threads, Linux Chromium) from 72.6 to 27.1 ms/token. The per-call
+  (24 threads, Chromium) from 72.6 to 27.1 ms/token. The per-call
   wake cost is larger in Firefox than in Chrome, and grows with the thread
   count.
 - On the phone, Firefox threads (282.4 ms/token) were about as slow as
@@ -316,7 +316,7 @@ test, clippy -D warnings with threads clean.
   B and C are still served from lean-prefill's servers and still need
   phone numbers before another variant is worth writing.
 
-## Phone test URLs (for TC)
+## Phone test URLs
 
 All on the M2, COOP/COEP (`scripts/serve_coi.py`), Qwen2.5-0.5B Q4_0, add
 `&diag=1` for the split. Compare within one session.

@@ -114,7 +114,7 @@ it ran faster than the base.
 
 ### Phone (Adreno 6xx, Android Chrome, 36 tokens)
 
-Run by TC, values as reported back. All runs gave token hash
+Run by hand, values as reported back. All runs gave token hash
 a454748c60e23841.
 
 | build | prefill | prefill warm | gpu span | gate_up | down | qkv | o_proj | attn | lm_head | decode ms/token | probe read GB/s |

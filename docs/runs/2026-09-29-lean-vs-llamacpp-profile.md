@@ -1,8 +1,8 @@
 # lean vs llama.cpp: where decode time goes, RTX 3080/Vulkan
 
 Follow-on to `docs/runs/2026-09-29-lean-box-check.md` (same commit,
-`376144ace9448f1ffe73098afbaa068ee3b3992e`, same client: a Linux desktop
-with an RTX 3080 (10GB), Vulkan backend, box-check's own decode ms/tok
+`376144ace9448f1ffe73098afbaa068ee3b3992e`, same client: an RTX 3080
+(10GB), Vulkan backend, box-check's own decode ms/tok
 numbers are the "current, unprofiled" reference used below). This run adds
 an opt-in per-kernel GPU timing path to `lean`, measures llama.cpp's Vulkan
 backend on the same two GGUF files as a reference, and traces the ~10x gap
