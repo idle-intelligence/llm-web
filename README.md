@@ -1,6 +1,6 @@
 # llm-web
 
-lean is a small LLM inference engine written in Rust against `wgpu`, with hand-written WGSL kernels for the GPU and SIMD kernels for the CPU. It reads a quantized GGUF file and a Hugging Face tokenizer, and it compiles from one source to a native library and to WebAssembly for the browser, with no ML framework. In a browser it runs on WebGPU or falls back to WASM SIMD CPU, picked by capability rather than measured; it is the same model on every backend, and it is token-exact against HF transformers.
+lean is a small LLM inference engine written in Rust against `wgpu`, with hand-written WGSL kernels for the GPU and SIMD kernels for the CPU. It reads a quantized GGUF file and a Hugging Face tokenizer, and it compiles from one source to a native library and to WebAssembly for the browser, with no ML framework. In a browser it runs on WebGPU, then on CPU threads, then on a single CPU thread (WASM SIMD), picked by capability rather than measured; it is the same model on every backend, and it is token-exact against HF transformers.
 
 [**Chat demo →**](https://idle-intelligence.github.io/llm-web/web/) · [**Device check →**](https://idle-intelligence.github.io/llm-web/web/device/)
 
@@ -77,7 +77,7 @@ python3 web/agent/serve.py
 
 - [Qwen/Qwen2.5-0.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct), [Qwen/Qwen2.5-3B-Instruct](https://huggingface.co/Qwen/Qwen2.5-3B-Instruct) (Apache 2.0).
 - [HuggingFaceTB/SmolLM2-360M-Instruct](https://huggingface.co/HuggingFaceTB/SmolLM2-360M-Instruct), [HuggingFaceTB/SmolLM2-1.7B-Instruct](https://huggingface.co/HuggingFaceTB/SmolLM2-1.7B-Instruct) (Apache 2.0).
-- [coi-serviceworker](https://github.com/gzuidhof/coi-serviceworker) (MIT), vendored at `web/vendor/coi-serviceworker.js` so the CPU threads backend works on GitHub Pages.
+- [coi-serviceworker](https://github.com/gzuidhof/coi-serviceworker) (MIT), vendored at `web/coi-serviceworker.js` so the CPU threads backend works on GitHub Pages.
 - Weights for all of the above are not distributed here; both demo pages fetch them from Hugging Face at run time.
 
 ## License
