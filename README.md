@@ -10,12 +10,14 @@ lean is a small LLM inference engine written in Rust against `wgpu`, with hand-w
 
 ### In a web page
 
-Build the web packages, assemble them into `_site/`, and serve it with cross-origin isolation headers (needed for the CPU threads backend):
+Build the web packages and assemble them into `_site/`:
 
 ```bash
-ENGINE_BUILD=dev scripts/build.sh    # writes crates/lean/pkg, crates/lean/pkg-mt, and _site/
-python3 scripts/serve.py             # serves _site/ on http://localhost:8030
+ENGINE_BUILD=dev scripts/build.sh    # writes crates/lean/pkg and _site/
+python3 scripts/serve.py             # serves _site/ on http://localhost:8030, with cross-origin isolation headers
 ```
+
+The CPU threads backend is opt-in and needs a nightly toolchain: `BUILD_THREADS=1 scripts/build.sh` also writes `crates/lean/pkg-mt`.
 
 Then open `http://localhost:8030/web/index.html` for the chat demo, or `http://localhost:8030/web/device/` for the device check. The core of the API:
 

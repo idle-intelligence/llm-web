@@ -20,12 +20,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: nightly-2026-09-20
-          targets: wasm32-unknown-unknown
-          components: rust-src
-
       - uses: dtolnay/rust-toolchain@1.99.0
         with:
           targets: wasm32-unknown-unknown
@@ -50,8 +44,6 @@ jobs:
         run: cargo clippy -p lean --all-targets -- -D warnings
 
       - name: Build lean and assemble the site
-        env:
-          LEAN_NIGHTLY: nightly-2026-09-20
         run: ENGINE_BUILD="${{ github.sha }}" scripts/build.sh
 
       - uses: actions/upload-pages-artifact@v3

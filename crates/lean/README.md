@@ -81,12 +81,11 @@ For CPU threads the page loads `../pkg-mt/lean.js` instead and calls `await mod.
 cargo build -p lean --release
 cargo build -p lean --release --features threads   # CPU path on a rayon pool
 
-# Web: writes crates/lean/pkg (WebGPU + single CPU thread), crates/lean/pkg-mt
-# (CPU threads), and assembles _site/
+# Web: writes crates/lean/pkg (WebGPU + single CPU thread) and assembles _site/
 ENGINE_BUILD=<tag> scripts/build.sh
 ```
 
-`ENGINE_BUILD` is the `?v=` tag that every page puts on its wasm and JS URLs. A rebuild comes with a new tag on every loading URL, otherwise browsers keep running the cached module. `scripts/build.sh` maps the home directory out of the compiled-in source paths and fails if a local path is left in either wasm. It needs `wasm-pack`, a nightly toolchain with `rust-src`, and the `wasm-bindgen-cli` version that matches `Cargo.lock`; see the comment at its top.
+`ENGINE_BUILD` is the `?v=` tag that every page puts on its wasm and JS URLs. A rebuild comes with a new tag on every loading URL, otherwise browsers keep running the cached module. `scripts/build.sh` maps the home directory out of the compiled-in source paths and fails if a local path is left in either wasm. It needs `wasm-pack` and the `wasm-bindgen-cli` version that matches `Cargo.lock`; see the comment at its top. `BUILD_THREADS=1 scripts/build.sh` also writes `crates/lean/pkg-mt` (CPU threads), and needs a nightly toolchain with `rust-src`.
 
 ## Parity gates
 

@@ -487,6 +487,19 @@
             return '—';
         }
 
+        // pkg-mt is an opt-in build (scripts/build.sh BUILD_THREADS=1); GitHub
+        // Pages never has it. HEAD-check rather than assume, so a threads-
+        // capable browser gets "not built" instead of a 404 when it fetches
+        // lean.js.
+        async function mtBuilt() {
+            try {
+                const r = await fetch('./lean/pkg-mt/lean_bg.wasm', { method: 'HEAD' });
+                return r.ok;
+            } catch {
+                return false;
+            }
+        }
+
         async function detectCaps() {
             const caps = {
                 hardwareConcurrency: navigator.hardwareConcurrency || 1,
@@ -502,7 +515,8 @@
                     caps.hasAdapter = false;
                 }
             }
-            caps.threadsCapable = caps.crossOriginIsolated && caps.sharedArrayBuffer && caps.hardwareConcurrency > 1;
+            caps.mtBuilt = await mtBuilt();
+            caps.threadsCapable = caps.mtBuilt && caps.crossOriginIsolated && caps.sharedArrayBuffer && caps.hardwareConcurrency > 1;
             return caps;
         }
 
@@ -518,7 +532,9 @@
             if (!caps.threadsCapable) {
                 threadsLabel.querySelector('input').disabled = true;
                 reasons.push(
-                    !caps.crossOriginIsolated
+                    !caps.mtBuilt
+                        ? 'CPU threads: not built'
+                        : !caps.crossOriginIsolated
                         ? 'CPU threads: not cross-origin isolated'
                         : 'CPU threads: one hardware thread'
                 );

@@ -47,6 +47,18 @@ export async function sha256Hex(ids) {
   return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
+// pkg-mt is an opt-in build (scripts/build.sh BUILD_THREADS=1); GitHub
+// Pages never has it. HEAD-check rather than assume, so a threads-capable
+// browser gets "not built" instead of a 404 when it fetches lean.js.
+async function mtBuilt() {
+  try {
+    const r = await fetch(new URL("../lean/pkg-mt/lean_bg.wasm", import.meta.url), { method: "HEAD" });
+    return r.ok;
+  } catch {
+    return false;
+  }
+}
+
 export async function capabilities() {
   const caps = {
     hardwareConcurrency: navigator.hardwareConcurrency || 1,
@@ -55,6 +67,7 @@ export async function capabilities() {
     adapter: "none",
     hasAdapter: false,
   };
+  caps.mtBuilt = await mtBuilt();
   if (navigator.gpu) {
     try {
       const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
@@ -71,7 +84,7 @@ export async function capabilities() {
   } else {
     caps.adapter = "no navigator.gpu (WebGPU not available in this browser)";
   }
-  caps.threadsCapable = caps.crossOriginIsolated && caps.sharedArrayBuffer && caps.hardwareConcurrency > 1;
+  caps.threadsCapable = caps.mtBuilt && caps.crossOriginIsolated && caps.sharedArrayBuffer && caps.hardwareConcurrency > 1;
   return caps;
 }
 
@@ -89,12 +102,13 @@ export function availableBackends(caps) {
   if (caps.threadsCapable) {
     available.push("threads");
   } else {
-    reasons.threads =
-      !caps.crossOriginIsolated
-        ? "not cross-origin isolated"
-        : !caps.sharedArrayBuffer
-        ? "no SharedArrayBuffer"
-        : "one hardware thread";
+    reasons.threads = !caps.mtBuilt
+      ? "not built"
+      : !caps.crossOriginIsolated
+      ? "not cross-origin isolated"
+      : !caps.sharedArrayBuffer
+      ? "no SharedArrayBuffer"
+      : "one hardware thread";
   }
   available.push("single");
   return { available, reasons };

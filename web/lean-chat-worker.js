@@ -40,6 +40,18 @@ self.onmessage = (e) => EARLY.push(e);
 
 const ENGINE_BUILD = "2026-10-04-demos-03";
 
+// pkg-mt is an opt-in build (scripts/build.sh BUILD_THREADS=1); GitHub
+// Pages never has it. HEAD-check rather than assume, so a threads-capable
+// browser gets "not built" instead of a 404 when it fetches lean.js.
+async function mtBuilt() {
+  try {
+    const r = await fetch(`./lean/pkg-mt/lean_bg.wasm?v=${ENGINE_BUILD}`, { method: "HEAD" });
+    return r.ok;
+  } catch {
+    return false;
+  }
+}
+
 async function capabilities() {
   const caps = {
     hardwareConcurrency: navigator.hardwareConcurrency || 1,
@@ -55,7 +67,8 @@ async function capabilities() {
       caps.hasAdapter = false;
     }
   }
-  caps.threadsCapable = caps.crossOriginIsolated && caps.sharedArrayBuffer && caps.hardwareConcurrency > 1;
+  caps.mtBuilt = await mtBuilt();
+  caps.threadsCapable = caps.mtBuilt && caps.crossOriginIsolated && caps.sharedArrayBuffer && caps.hardwareConcurrency > 1;
   return caps;
 }
 
