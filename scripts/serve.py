@@ -9,8 +9,11 @@ script is for local testing only (the gate this crate's threads work needs
 to pass before shipping the loader's rung-selection logic), matching t0-web's
 own local-only `coi_server.py` approach (idle-intelligence/t0-web PR #8).
 
+Serves `_site` by default - run `scripts/build.sh` first - so the pages see
+the same assembled tree GitHub Pages deploys.
+
 Usage:
-    python3 scripts/serve_coi.py [--dir DIR] [--port PORT]
+    python3 scripts/serve.py [--dir DIR] [--port PORT]
 """
 import argparse
 import http.server
@@ -36,7 +39,7 @@ class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dir", default=".")
+    parser.add_argument("--dir", default="_site")
     parser.add_argument("--port", type=int, default=8030)
     parser.add_argument("--bind", default="127.0.0.1")
     args = parser.parse_args()

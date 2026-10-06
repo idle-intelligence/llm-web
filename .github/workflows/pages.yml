@@ -22,7 +22,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-10-05
+          toolchain: nightly-2026-09-20
           targets: wasm32-unknown-unknown
           components: rust-src
 
@@ -49,60 +49,10 @@ jobs:
       - name: Clippy
         run: cargo clippy -p lean --all-targets -- -D warnings
 
-      - name: Build lean (web, WebGPU + single-thread CPU) -> crates/lean/pkg
-        run: ENGINE_BUILD="${{ github.sha }}" scripts/build_lean.sh
-
-      - name: Build lean (web, CPU threads) -> crates/lean/pkg-mt
+      - name: Build lean and assemble the site
         env:
-          LEAN_NIGHTLY: nightly-2026-10-05
-        run: ENGINE_BUILD="${{ github.sha }}" scripts/build_lean_mt.sh
-
-      - name: Assemble site
-        run: |
-          set -euo pipefail
-          rm -rf _site
-          mkdir -p _site/web/device _site/web/lib
-          cp web/index.html web/lean-chat-worker.js web/apple-touch-icon.png web/favicon.ico _site/web/
-          cp web/lib/model-cache.js _site/web/lib/
-          cp -R web/device/. _site/web/device/
-          mkdir -p _site/web/lean
-          cp -R crates/lean/pkg _site/web/lean/pkg
-          cp -R crates/lean/pkg-mt _site/web/lean/pkg-mt
-          mkdir -p _site/pkg
-          cp -R pkg/wllama _site/pkg/wllama
-
-      - name: Rewrite the ?v= build tag to this commit's sha
-        run: |
-          set -euo pipefail
-          TAG="${{ github.sha }}"
-          echo "build tag: $TAG"
-          sed -i "s/const ENGINE_BUILD = \"[^\"]*\"/const ENGINE_BUILD = \"$TAG\"/" \
-            _site/web/lean-chat-worker.js _site/web/device/device_worker.js
-          sed -i "s/const ENGINE_BUILD = \"[^\"]*\";/const ENGINE_BUILD = \"$TAG\";/" \
-            _site/web/device/index.html
-
-          COUNT="$(grep -rEo 'ENGINE_BUILD = "[0-9a-f]{40}"' _site/web/lean-chat-worker.js _site/web/device/device_worker.js _site/web/device/index.html | wc -l)"
-          if [ "$COUNT" -ne 3 ]; then
-            echo "error: expected 3 ENGINE_BUILD assignments rewritten to $TAG, found $COUNT" >&2
-            exit 1
-          fi
-
-      - name: Check built wasm has no local build paths
-        run: |
-          set -euo pipefail
-          FAILED=0
-          for f in _site/web/lean/pkg/lean_bg.wasm _site/web/lean/pkg-mt/lean_bg.wasm; do
-            for pat in '/Users/' '/home/runner/.cargo' '/home/runner/work'; do
-              COUNT="$(grep -c -a "$pat" "$f" || true)"
-              if [ "$COUNT" -gt 0 ]; then
-                echo "error: found '$pat' $COUNT time(s) in $f" >&2
-                FAILED=1
-              fi
-            done
-          done
-          if [ "$FAILED" -ne 0 ]; then
-            exit 1
-          fi
+          LEAN_NIGHTLY: nightly-2026-09-20
+        run: ENGINE_BUILD="${{ github.sha }}" scripts/build.sh
 
       - uses: actions/upload-pages-artifact@v3
         with:

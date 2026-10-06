@@ -3,8 +3,7 @@ __pycache__/
 *.pyc
 target/
 eval/results/*.log
-scripts/headless/out/
-# scripts/build_lean_mt.sh's wasm-bindgen output (crates/lean/pkg/ is
+# scripts/build.sh's wasm-bindgen output (crates/lean/pkg/ is
 # ignored the same way, via wasm-pack's own auto-written pkg/.gitignore -
 # wasm-bindgen doesn't write one, so pkg-mt/ needs it here instead).
 crates/lean/pkg-mt/
