@@ -64,15 +64,6 @@ See [`crates/lean/README.md`](crates/lean/README.md) for the backends, the full 
 
 See [`crates/lean/README.md`](crates/lean/README.md#supported-models) for the full architecture and tensor-type list.
 
-## llm-wasm (earlier engine)
-
-`crates/llm-wasm/` is an earlier Burn+wgpu implementation of the Qwen2 architecture (GQA attention, RoPE, SwiGLU), with quantized GGUF weights, runtime LoRA adapters, schema-constrained decoding and an MCP-shaped tool-calling agent loop (`agent.rs`/`web.rs`). It runs Qwen2.5-0.5B-Instruct (Q4_0) with runtime LoRA adapters in the browser, and is the engine behind the LLM methods of [llm-life](https://github.com/idle-intelligence/llm-life). Prefix KV cache images let a session restore GPU KV state to the longest matching prompt prefix instead of re-prefilling from scratch. It has no deployed demo page. See the crate's own doc comments and `docs/archive/` for the archived tool-calling accuracy numbers.
-
-```bash
-cargo build --target wasm32-unknown-unknown --no-default-features --features web -p llm-wasm
-wasm-pack build crates/llm-wasm --target web --no-default-features --features web
-```
-
 ## Credits
 
 - [Qwen/Qwen2.5-0.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct), [Qwen/Qwen2.5-3B-Instruct](https://huggingface.co/Qwen/Qwen2.5-3B-Instruct) (Apache 2.0).
