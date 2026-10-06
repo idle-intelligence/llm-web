@@ -22,6 +22,9 @@ const EARLY = [];
 self.onmessage = (e) => EARLY.push(e);
 
 const ENGINE_BUILD = "2026-10-05-demos-06";
+// Rewritten to true by scripts/build.sh when BUILD_THREADS=1 built pkg-mt
+// into this deployment; GitHub Pages never sets it.
+const MT_BUILT = false;
 const N_GEN = 64;
 const MAX_CTX = 256;
 
@@ -31,7 +34,7 @@ function status(text) {
 
 async function detect() {
   const { capabilities, availableBackends } = await import(`./device_common.js?v=${ENGINE_BUILD}`);
-  const caps = await capabilities();
+  const caps = await capabilities(MT_BUILT);
   const { available, reasons } = availableBackends(caps);
   self.postMessage({ type: "detected", caps, available, reasons });
 }
@@ -151,7 +154,7 @@ function loadThreads(timing) {
   if (!threadsPromise) {
     threadsPromise = (async () => {
       const { capabilities } = await import(`./device_common.js?v=${ENGINE_BUILD}`);
-      const caps = await capabilities();
+      const caps = await capabilities(MT_BUILT);
       let t0 = performance.now();
       const mod = await import(`../lean/pkg-mt/lean.js?v=${ENGINE_BUILD}`);
       await mod.default(`../lean/pkg-mt/lean_bg.wasm?v=${ENGINE_BUILD}`);
@@ -169,7 +172,7 @@ function loadThreads(timing) {
 async function run(requested) {
   console.log(`[device_worker] engine build ${ENGINE_BUILD}, backend ${requested}`);
   const { capabilities, availableBackends } = await import(`./device_common.js?v=${ENGINE_BUILD}`);
-  const caps = await capabilities();
+  const caps = await capabilities(MT_BUILT);
   const { available } = availableBackends(caps);
 
   const order = requested === "all" ? available : [requested];

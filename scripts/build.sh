@@ -160,4 +160,22 @@ if [ "$COUNT" -ne 3 ]; then
     exit 1
 fi
 
+# --- Rewrite MT_BUILT to reflect whether pkg-mt is actually in this _site ---
+# Capability checks never fetch pkg-mt to find out if it exists - this
+# build-time constant (false in every source file) tells the page instead,
+# so a threads-capable browser without a threads build gets a "not built"
+# reason rather than a pkg-mt fetch that 404s.
+if [ -n "$MT_WASM" ]; then
+    echo "==> Rewriting MT_BUILT to true (BUILD_THREADS=1)"
+    sed -i.bak "s/const MT_BUILT = false;/const MT_BUILT = true;/" \
+      _site/web/lean-chat-worker.js _site/web/device/device_worker.js _site/web/index.html
+    rm -f _site/web/lean-chat-worker.js.bak _site/web/device/device_worker.js.bak _site/web/index.html.bak
+
+    MT_COUNT="$(grep -c 'const MT_BUILT = true;' _site/web/lean-chat-worker.js _site/web/device/device_worker.js _site/web/index.html | awk -F: '{s+=$2} END {print s}')"
+    if [ "$MT_COUNT" -ne 3 ]; then
+        echo "error: expected 3 MT_BUILT assignments rewritten to true, found $MT_COUNT" >&2
+        exit 1
+    fi
+fi
+
 echo "==> Wrote _site"

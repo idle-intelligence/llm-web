@@ -381,6 +381,9 @@
 
     <script type="module">
         const ENGINE_BUILD = "2026-10-04-demos-03";
+        // Rewritten to true by scripts/build.sh when BUILD_THREADS=1 built
+        // pkg-mt into this deployment; GitHub Pages never sets it.
+        const MT_BUILT = false;
 
         const MODELS = {
             "smollm2-360m": {
@@ -487,19 +490,6 @@
             return '—';
         }
 
-        // pkg-mt is an opt-in build (scripts/build.sh BUILD_THREADS=1); GitHub
-        // Pages never has it. HEAD-check rather than assume, so a threads-
-        // capable browser gets "not built" instead of a 404 when it fetches
-        // lean.js.
-        async function mtBuilt() {
-            try {
-                const r = await fetch('./lean/pkg-mt/lean_bg.wasm', { method: 'HEAD' });
-                return r.ok;
-            } catch {
-                return false;
-            }
-        }
-
         async function detectCaps() {
             const caps = {
                 hardwareConcurrency: navigator.hardwareConcurrency || 1,
@@ -515,8 +505,7 @@
                     caps.hasAdapter = false;
                 }
             }
-            caps.mtBuilt = await mtBuilt();
-            caps.threadsCapable = caps.mtBuilt && caps.crossOriginIsolated && caps.sharedArrayBuffer && caps.hardwareConcurrency > 1;
+            caps.threadsCapable = MT_BUILT && caps.crossOriginIsolated && caps.sharedArrayBuffer && caps.hardwareConcurrency > 1;
             return caps;
         }
 
@@ -532,7 +521,7 @@
             if (!caps.threadsCapable) {
                 threadsLabel.querySelector('input').disabled = true;
                 reasons.push(
-                    !caps.mtBuilt
+                    !MT_BUILT
                         ? 'CPU threads: not built'
                         : !caps.crossOriginIsolated
                         ? 'CPU threads: not cross-origin isolated'

@@ -47,27 +47,20 @@ export async function sha256Hex(ids) {
   return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-// pkg-mt is an opt-in build (scripts/build.sh BUILD_THREADS=1); GitHub
-// Pages never has it. HEAD-check rather than assume, so a threads-capable
-// browser gets "not built" instead of a 404 when it fetches lean.js.
-async function mtBuilt() {
-  try {
-    const r = await fetch(new URL("../lean/pkg-mt/lean_bg.wasm", import.meta.url), { method: "HEAD" });
-    return r.ok;
-  } catch {
-    return false;
-  }
-}
-
-export async function capabilities() {
+// mtBuilt: whether this deployment's build included pkg-mt (scripts/
+// build.sh BUILD_THREADS=1; GitHub Pages never does). Passed in by the
+// caller (device_worker.js's own build-time MT_BUILT constant) rather than
+// probed over the network, so a threads-capable browser that just lacks
+// the build gets "not built" instead of a pkg-mt fetch that 404s.
+export async function capabilities(mtBuilt) {
   const caps = {
     hardwareConcurrency: navigator.hardwareConcurrency || 1,
     crossOriginIsolated: self.crossOriginIsolated === true,
     sharedArrayBuffer: typeof SharedArrayBuffer !== "undefined",
     adapter: "none",
     hasAdapter: false,
+    mtBuilt: !!mtBuilt,
   };
-  caps.mtBuilt = await mtBuilt();
   if (navigator.gpu) {
     try {
       const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
