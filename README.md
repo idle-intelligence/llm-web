@@ -10,15 +10,14 @@ lean is a small LLM inference engine written in Rust against `wgpu`, with hand-w
 
 ### In a web page
 
-Build the web packages and serve the repository with cross-origin isolation headers (needed for the CPU threads backend):
+Build the web packages, assemble them into `_site/`, and serve it with cross-origin isolation headers (needed for the CPU threads backend):
 
 ```bash
-ENGINE_BUILD=dev scripts/build_lean.sh       # crates/lean/pkg: WebGPU + single-thread CPU
-ENGINE_BUILD=dev scripts/build_lean_mt.sh    # crates/lean/pkg-mt: CPU threads (needs a nightly toolchain, see the script)
-python3 scripts/serve_coi.py
+ENGINE_BUILD=dev scripts/build.sh    # writes crates/lean/pkg, crates/lean/pkg-mt, and _site/
+python3 scripts/serve.py             # serves _site/ on http://localhost:8030
 ```
 
-The core of the API:
+Then open `http://localhost:8030/web/index.html` for the chat demo, or `http://localhost:8030/web/device/` for the device check. The core of the API:
 
 ```html
 <script type="module">
@@ -65,12 +64,11 @@ See [`crates/lean/README.md`](crates/lean/README.md#supported-models) for the fu
 
 ## llm-wasm (earlier engine)
 
-`crates/llm-wasm/` is an earlier Burn+wgpu implementation of the Qwen2 architecture (GQA attention, RoPE, SwiGLU), with quantized GGUF weights, runtime LoRA adapters, schema-constrained decoding and an MCP-shaped tool-calling agent loop (`agent.rs`/`web.rs`). It runs Qwen2.5-0.5B-Instruct (Q4_0) with runtime LoRA adapters in the browser, and is the engine behind the LLM methods of [llm-life](https://github.com/idle-intelligence/llm-life). Prefix KV cache images let a session restore GPU KV state to the longest matching prompt prefix instead of re-prefilling from scratch. Its demo page (`web/agent/`) is a local dev harness, loading the GGUF/tokenizer from a local model server; it is not deployed publicly. See the crate's own doc comments and `docs/archive/` for the archived tool-calling accuracy numbers.
+`crates/llm-wasm/` is an earlier Burn+wgpu implementation of the Qwen2 architecture (GQA attention, RoPE, SwiGLU), with quantized GGUF weights, runtime LoRA adapters, schema-constrained decoding and an MCP-shaped tool-calling agent loop (`agent.rs`/`web.rs`). It runs Qwen2.5-0.5B-Instruct (Q4_0) with runtime LoRA adapters in the browser, and is the engine behind the LLM methods of [llm-life](https://github.com/idle-intelligence/llm-life). Prefix KV cache images let a session restore GPU KV state to the longest matching prompt prefix instead of re-prefilling from scratch. It has no deployed demo page. See the crate's own doc comments and `docs/archive/` for the archived tool-calling accuracy numbers.
 
 ```bash
 cargo build --target wasm32-unknown-unknown --no-default-features --features web -p llm-wasm
 wasm-pack build crates/llm-wasm --target web --no-default-features --features web
-python3 web/agent/serve.py
 ```
 
 ## Credits
