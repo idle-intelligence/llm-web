@@ -134,10 +134,11 @@ cp -R pkg/wllama _site/pkg/wllama
 
 # --- Rewrite the ?v= build tag to ENGINE_BUILD on every loading URL ---
 echo "==> Rewriting ENGINE_BUILD tag to $ENGINE_BUILD"
-sed -i "s/const ENGINE_BUILD = \"[^\"]*\"/const ENGINE_BUILD = \"$ENGINE_BUILD\"/" \
+sed -i.bak "s/const ENGINE_BUILD = \"[^\"]*\"/const ENGINE_BUILD = \"$ENGINE_BUILD\"/" \
   _site/web/lean-chat-worker.js _site/web/device/device_worker.js
-sed -i "s/const ENGINE_BUILD = \"[^\"]*\";/const ENGINE_BUILD = \"$ENGINE_BUILD\";/" \
+sed -i.bak "s/const ENGINE_BUILD = \"[^\"]*\";/const ENGINE_BUILD = \"$ENGINE_BUILD\";/" \
   _site/web/device/index.html
+rm -f _site/web/lean-chat-worker.js.bak _site/web/device/device_worker.js.bak _site/web/device/index.html.bak
 
 COUNT="$(grep -rEo 'ENGINE_BUILD = "[^"]*"' _site/web/lean-chat-worker.js _site/web/device/device_worker.js _site/web/device/index.html | grep -Fc "\"$ENGINE_BUILD\"")"
 if [ "$COUNT" -ne 3 ]; then
