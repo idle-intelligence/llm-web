@@ -136,7 +136,7 @@ echo "==> no local paths in built wasm"
 # --- Assemble the deployed site into _site/ ---
 echo "==> Assembling _site"
 rm -rf _site
-mkdir -p _site/web/device _site/web/lib _site/web/lean _site/pkg
+mkdir -p _site/web/device _site/web/lib _site/web/lean
 cp web/index.html web/lean-chat-worker.js web/apple-touch-icon.png web/favicon.ico _site/web/
 cp web/lib/model-cache.js _site/web/lib/
 cp -R web/device/. _site/web/device/
@@ -144,7 +144,6 @@ cp -R crates/lean/pkg _site/web/lean/pkg
 if [ -n "$MT_WASM" ]; then
     cp -R crates/lean/pkg-mt _site/web/lean/pkg-mt
 fi
-cp -R pkg/wllama _site/pkg/wllama
 
 # --- Rewrite the ?v= build tag to ENGINE_BUILD on every loading URL ---
 echo "==> Rewriting ENGINE_BUILD tag to $ENGINE_BUILD"
