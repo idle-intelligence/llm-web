@@ -2480,15 +2480,23 @@ mod grid1d_tests {
     use crate::engine::Engine;
     use crate::pool::Pool;
 
-    fn engine_and_pool() -> (Engine, Pool) {
-        let engine = Engine::new().expect("wgpu device for grid1d test");
+    // None when the machine has no wgpu adapter (e.g. CI runners without a
+    // GPU): the test is skipped there and runs wherever a GPU exists.
+    fn engine_and_pool() -> Option<(Engine, Pool)> {
+        let engine = match Engine::new() {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("skipped: no wgpu adapter ({e})");
+                return None;
+            }
+        };
         let pool = Pool::new(engine.device.clone(), engine.queue.clone());
-        (engine, pool)
+        Some((engine, pool))
     }
 
     #[test]
     fn add_inplace_beyond_max_workgroups_matches_cpu() {
-        let (engine, pool) = engine_and_pool();
+        let Some((engine, pool)) = engine_and_pool() else { return };
         let total: u32 = MAX_WORKGROUPS_PER_DIM * 256 + 4321; // forces grid1d's y > 1
         let a: Vec<f32> = (0..total).map(|i| (i as f32) * 0.5 - 100.0).collect();
         let b: Vec<f32> = (0..total).map(|i| ((i as f32) * 0.0173).sin()).collect();
@@ -2508,7 +2516,7 @@ mod grid1d_tests {
 
     #[test]
     fn silu_mul_fused_beyond_max_workgroups_matches_cpu() {
-        let (engine, pool) = engine_and_pool();
+        let Some((engine, pool)) = engine_and_pool() else { return };
         let hidden: u32 = 4096;
         // rows*hidden must exceed MAX_WORKGROUPS_PER_DIM*256 to force y > 1.
         let rows: u32 = (MAX_WORKGROUPS_PER_DIM * 256) / hidden + 2;
