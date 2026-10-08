@@ -9,7 +9,7 @@
 //! the decode steps (pass timestamps, needs `TIMESTAMP_QUERY`).
 
 use lean_core::engine::Engine;
-use lean_core::model::{build_rope_tables, decode_greedy_pipelined, forward_decode_step_argmax, forward_prefill, GpuModel, KvCache};
+use lean_core::model::{rope_tables, decode_greedy_pipelined, forward_decode_step_argmax, forward_prefill, GpuModel, KvCache};
 
 const PROMPT: [u32; 36] = [
     151644, 8948, 198, 2610, 525, 1207, 16948, 11, 3465, 553, 54364, 14817, 13, 1446, 525, 264, 10950, 17847, 13, 151645, 198, 151644, 872, 198, 3838, 374, 279, 6722, 315, 9625, 30, 151645, 198, 151644, 77091, 198,
@@ -44,7 +44,7 @@ fn main() -> anyhow::Result<()> {
     let model = GpuModel::load(&engine, &gguf, true)?;
     let max_len = *lens.iter().max().unwrap();
     let max_ctx = max_len + n_decode as u32 + 4;
-    let (cos, sin) = build_rope_tables(model.config.head_dim, model.config.rope_theta, max_ctx as usize);
+    let (cos, sin) = rope_tables(&model.config, max_ctx as usize);
     let cos_buf = engine.buf_f32(&cos, "rope_cos");
     let sin_buf = engine.buf_f32(&sin, "rope_sin");
     let mut cache = KvCache::new(&engine, &model.config, max_ctx);

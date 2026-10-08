@@ -17,7 +17,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use lean_core::model::{build_rope_tables, forward_chunk_spec, forward_decode_step_argmax, forward_prefill, forward_prefill_suffix, ForwardSpec, GpuModel, KvCache};
+use lean_core::model::{rope_tables, forward_chunk_spec, forward_decode_step_argmax, forward_prefill, forward_prefill_suffix, ForwardSpec, GpuModel, KvCache};
 use tokenizers::Tokenizer;
 
 #[derive(Parser)]
@@ -104,7 +104,7 @@ fn life_cells(cells: usize) -> Result<()> {
     let cell_len = cell_ids.len() as u32;
 
     let max_ctx = prefix_len + cell_len + 4;
-    let (cos, sin) = build_rope_tables(model.config.head_dim, model.config.rope_theta, max_ctx as usize);
+    let (cos, sin) = rope_tables(&model.config, max_ctx as usize);
     let cos_buf = engine.buf_f32(&cos, "rope_cos");
     let sin_buf = engine.buf_f32(&sin, "rope_sin");
 
@@ -168,7 +168,7 @@ fn sonos_turns(fixture_path: &str, turns: usize, max_new: usize) -> Result<()> {
     let command_len = command_ids.len() as u32;
 
     let max_ctx = prefix_len + command_len + max_new as u32 + 8;
-    let (cos, sin) = build_rope_tables(model.config.head_dim, model.config.rope_theta, max_ctx as usize);
+    let (cos, sin) = rope_tables(&model.config, max_ctx as usize);
     let cos_buf = engine.buf_f32(&cos, "rope_cos");
     let sin_buf = engine.buf_f32(&sin, "rope_sin");
 

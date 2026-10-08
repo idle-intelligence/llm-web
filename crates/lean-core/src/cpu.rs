@@ -23,7 +23,7 @@ use std::io::{Read, Seek};
 use crate::config::{config_from_gguf, Architecture, Qwen2Config};
 use crate::cpu_kernels::{dot_q4_0, dot_q6_k, dot_q8_0, F4};
 use crate::gguf::{dequantize_for, GgmlDtype, GgufReader};
-use crate::model::unpermute_rope_rows;
+use crate::model::{rope_inv_freq, unpermute_rope_rows};
 
 /// A CPU-resident matmul weight (`shape = [out_dim, in_dim]`), holding the
 /// GGUF's on-disk bytes for Q4_0/Q8_0 unchanged (row-major, block-contiguous,
@@ -382,14 +382,14 @@ fn silu_mul(gate: &[f32], up: &[f32]) -> Vec<f32> {
 /// each row's absolute position: `pos_base + row` for a causal
 /// continuation (`model.rs::rope`), caller-chosen for a `ForwardSpec` chunk
 /// (`model.rs::rope_positions`).
-fn rope_inplace(buf: &mut [f32], rows: usize, heads: usize, head_dim: usize, positions: &[u32], theta: f32) {
+fn rope_inplace(buf: &mut [f32], rows: usize, heads: usize, head_dim: usize, positions: &[u32], theta: f32, freq_factors: Option<&[f32]>) {
     let half = head_dim / 2;
     for (row, &pos) in positions.iter().enumerate().take(rows) {
         let pos = pos as f32;
         for head in 0..heads {
             let base = (row * heads + head) * head_dim;
             for j in 0..half {
-                let inv_freq = theta.powf(-2.0 * j as f32 / head_dim as f32);
+                let inv_freq = rope_inv_freq(head_dim, theta, freq_factors, j);
                 let angle = pos * inv_freq;
                 let (s, c) = angle.sin_cos();
                 let x0 = buf[base + j];
@@ -542,7 +542,7 @@ impl CpuModel {
     /// don't linger.
     pub fn load_from_reader<R: Read + Seek>(reader: R) -> Result<Self> {
         let mut reader = GgufReader::open(reader)?;
-        let config = config_from_gguf(&reader)?;
+        let config = config_from_gguf(&mut reader)?;
 
         let embed_info = reader.tensor_info("token_embd.weight").context("missing token_embd.weight")?.clone();
         let embed_shape = embed_info.shape();
@@ -823,8 +823,9 @@ fn layer_forward(
         k = rmsnorm(&k, scale, rows * cfg.num_kv_heads, cfg.head_dim, cfg.rms_norm_eps);
     }
 
-    rope_inplace(&mut q, rows, cfg.num_heads, cfg.head_dim, positions, cfg.rope_theta);
-    rope_inplace(&mut k, rows, cfg.num_kv_heads, cfg.head_dim, positions, cfg.rope_theta);
+    let freq_factors = cfg.rope_freq_factors.as_deref();
+    rope_inplace(&mut q, rows, cfg.num_heads, cfg.head_dim, positions, cfg.rope_theta, freq_factors);
+    rope_inplace(&mut k, rows, cfg.num_kv_heads, cfg.head_dim, positions, cfg.rope_theta, freq_factors);
 
     let max_ctx = k_cache.len() / (cfg.num_kv_heads * cfg.head_dim);
     CpuKvCache::scatter(k_cache, &k, rows, cfg.num_kv_heads, cfg.head_dim, kv_base, max_ctx);

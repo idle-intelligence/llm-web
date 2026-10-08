@@ -49,7 +49,7 @@
 use anyhow::{ensure, Context, Result};
 use std::io::{Read, Seek};
 
-use crate::gguf::GgufReader;
+use crate::gguf::{dequantize_f32, GgmlDtype, GgufReader};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Architecture {
@@ -79,6 +79,16 @@ pub struct Qwen2Config {
     pub intermediate_size: usize,
     pub vocab_size: usize,
     pub rope_theta: f32,
+    /// Per-frequency RoPE divisors from the GGUF's `rope_freqs.weight`
+    /// tensor (`[head_dim/2]` F32), `None` when the file has none. Llama 3.1/
+    /// 3.2's `rope_scaling.rope_type = "llama3"` reaches the GGUF only this
+    /// way: llama.cpp's converter evaluates the scaling rule once and stores
+    /// `inv_freq_unscaled / inv_freq_llama3` per frequency (1 for high
+    /// frequencies, `factor` for low ones, the smoothed ratio in between),
+    /// with no `rope.scaling.*` metadata. Applying `inv_freq[j] /
+    /// rope_freq_factors[j]` reproduces HF transformers'
+    /// `modeling_rope_utils._compute_llama3_parameters`.
+    pub rope_freq_factors: Option<Vec<f32>>,
     pub max_seq_len: usize,
     pub rms_norm_eps: f32,
     pub bos_token_id: u32,
@@ -98,7 +108,7 @@ pub struct Qwen2Config {
     pub tied_embeddings: bool,
 }
 
-pub(crate) fn config_from_gguf<R: Read + Seek>(reader: &GgufReader<R>) -> Result<Qwen2Config> {
+pub(crate) fn config_from_gguf<R: Read + Seek>(reader: &mut GgufReader<R>) -> Result<Qwen2Config> {
     let arch_str = reader.meta_string("general.architecture").unwrap_or("");
     let architecture = match arch_str {
         "qwen2" => Architecture::Qwen2,
@@ -159,6 +169,16 @@ pub(crate) fn config_from_gguf<R: Read + Seek>(reader: &GgufReader<R>) -> Result
 
     let tied_embeddings = reader.tensor_info("output.weight").is_none();
 
+    let rope_freq_factors = match reader.tensor_info("rope_freqs.weight").cloned() {
+        None => None,
+        Some(info) => {
+            ensure!(info.dtype() == GgmlDtype::F32, "rope_freqs.weight: expected F32, got {:?}", info.dtype());
+            ensure!(info.shape() == [head_dim / 2], "rope_freqs.weight: expected shape [{}], got {:?}", head_dim / 2, info.shape());
+            let bytes = reader.tensor_data("rope_freqs.weight")?;
+            Some(dequantize_f32(&bytes, head_dim / 2))
+        }
+    };
+
     Ok(Qwen2Config {
         architecture,
         num_layers,
@@ -169,6 +189,7 @@ pub(crate) fn config_from_gguf<R: Read + Seek>(reader: &GgufReader<R>) -> Result
         intermediate_size,
         vocab_size,
         rope_theta,
+        rope_freq_factors,
         max_seq_len,
         rms_norm_eps,
         bos_token_id,

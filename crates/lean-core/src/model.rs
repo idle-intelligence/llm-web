@@ -761,7 +761,7 @@ impl GpuModel {
     /// reader is needed here - see `gguf.rs`'s module doc comment on that).
     pub fn load_from_reader<R: std::io::Read + std::io::Seek>(engine: &Engine, reader: R, fast_kernels: bool) -> Result<Self> {
         let mut reader = GgufReader::open(reader)?;
-        let config = config_from_gguf(&reader)?;
+        let config = config_from_gguf(&mut reader)?;
         anyhow::ensure!(
             matches!(config.head_dim, 64 | 128),
             "unsupported head_dim {} (the GPU attention kernels are compiled for 64 and 128)",
@@ -962,10 +962,21 @@ impl GpuModel {
 /// RoPE cos/sin tables for absolute positions `[0, max_pos)`, `half =
 /// head_dim/2` columns each. `inv_freq[j] = theta^(-2j/head_dim)` - HF
 /// Qwen2RotaryEmbedding's convention (`gen_fixture.py`'s reference reads the
-/// same `qwen2.rope.freq_base` metadata key).
+/// same `qwen2.rope.freq_base` metadata key). Unscaled: for a model whose
+/// GGUF carries `rope_freqs.weight` (Llama 3.1/3.2) use [`rope_tables`].
 pub fn build_rope_tables(head_dim: usize, theta: f32, max_pos: usize) -> (Vec<f32>, Vec<f32>) {
+    build_rope_tables_scaled(head_dim, theta, None, max_pos)
+}
+
+/// The RoPE cos/sin tables `config`'s model needs: [`build_rope_tables`]
+/// with `config.rope_freq_factors` applied when the GGUF has them.
+pub fn rope_tables(config: &Qwen2Config, max_pos: usize) -> (Vec<f32>, Vec<f32>) {
+    build_rope_tables_scaled(config.head_dim, config.rope_theta, config.rope_freq_factors.as_deref(), max_pos)
+}
+
+fn build_rope_tables_scaled(head_dim: usize, theta: f32, freq_factors: Option<&[f32]>, max_pos: usize) -> (Vec<f32>, Vec<f32>) {
     let half = head_dim / 2;
-    let inv_freq: Vec<f32> = (0..half).map(|j| theta.powf(-2.0 * j as f32 / head_dim as f32)).collect();
+    let inv_freq: Vec<f32> = (0..half).map(|j| rope_inv_freq(head_dim, theta, freq_factors, j)).collect();
     let mut cos = vec![0f32; max_pos * half];
     let mut sin = vec![0f32; max_pos * half];
     for pos in 0..max_pos {
@@ -976,6 +987,18 @@ pub fn build_rope_tables(head_dim: usize, theta: f32, max_pos: usize) -> (Vec<f3
         }
     }
     (cos, sin)
+}
+
+/// Inverse frequency `j` of a `head_dim`-wide RoPE: `theta^(-2j/head_dim)`,
+/// divided by `freq_factors[j]` when the model has per-frequency factors
+/// (see `Qwen2Config::rope_freq_factors`). Shared by the GPU tables above
+/// and `cpu.rs`'s `rope_inplace` so both paths compute the same angles.
+pub(crate) fn rope_inv_freq(head_dim: usize, theta: f32, freq_factors: Option<&[f32]>, j: usize) -> f32 {
+    let inv_freq = theta.powf(-2.0 * j as f32 / head_dim as f32);
+    match freq_factors {
+        Some(f) => inv_freq / f[j],
+        None => inv_freq,
+    }
 }
 
 /// Maps a per-layer call-site key (`"layer5.mlp.gate_up"`,
@@ -2541,5 +2564,40 @@ mod grid1d_tests {
         check(0, hidden - 1);
         check(rows / 2, hidden / 2);
         check(rows - 1, hidden - 1);
+    }
+}
+
+#[cfg(test)]
+mod rope_tests {
+    use super::rope_inv_freq;
+
+    /// `rope_freqs.weight` as Llama-3.2-1B-Instruct's GGUF carries it
+    /// (head_dim 64, theta 500000; llama.cpp's converter output), against
+    /// HF transformers' `_compute_llama3_parameters` (factor 32,
+    /// low_freq_factor 1, high_freq_factor 4, original context 8192)
+    /// evaluated here in f64.
+    #[test]
+    fn rope_freq_factors_match_hf_llama3_rule() {
+        let factors: [f32; 32] = [
+            1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.651_329_3, 3.292_262_8, 9.666_731, 32.0, 32.0, 32.0, 32.0,
+            32.0, 32.0, 32.0, 32.0, 32.0, 32.0, 32.0, 32.0, 32.0, 32.0,
+        ];
+        let (head_dim, theta) = (64usize, 500_000f32);
+        let (factor, low, high, old_ctx) = (32f64, 1f64, 4f64, 8192f64);
+        for j in 0..head_dim / 2 {
+            let inv = 1.0 / (theta as f64).powf(2.0 * j as f64 / head_dim as f64);
+            let wavelen = 2.0 * std::f64::consts::PI / inv;
+            let hf = if wavelen < old_ctx / high {
+                inv
+            } else if wavelen > old_ctx / low {
+                inv / factor
+            } else {
+                let smooth = (old_ctx / wavelen - low) / (high - low);
+                (1.0 - smooth) * inv / factor + smooth * inv
+            };
+            let got = rope_inv_freq(head_dim, theta, Some(&factors), j) as f64;
+            assert!((got - hf).abs() <= 1e-6 * hf, "j={j}: lean {got} vs HF {hf}");
+            assert_eq!(rope_inv_freq(head_dim, theta, None, j), theta.powf(-2.0 * j as f32 / head_dim as f32));
+        }
     }
 }
