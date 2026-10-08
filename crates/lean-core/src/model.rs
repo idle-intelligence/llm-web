@@ -173,6 +173,11 @@ struct RopeDims {
     heads: u32,
     head_dim: u32,
     pos_base: u32,
+    /// See `grid1d`.
+    stride_x: u32,
+    _p0: u32,
+    _p1: u32,
+    _p2: u32,
 }
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -258,7 +263,8 @@ struct RopePosDims {
     rows: u32,
     heads: u32,
     head_dim: u32,
-    _p0: u32,
+    /// See `grid1d`.
+    stride_x: u32,
 }
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -1373,7 +1379,8 @@ fn rmsnorm<'a>(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, k
 fn rope<'a>(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &str, buf: impl Into<BufView<'a>>, cos: &wgpu::Buffer, sin: &wgpu::Buffer, rows: u32, heads: u32, head_dim: u32, pos_base: u32) {
     let buf = buf.into();
     let skey = scratch_key(key);
-    let dims = pool.uniform(&format!("{skey}.dims"), RopeDims { rows, heads, head_dim, pos_base });
+    let (gx, gy, stride_x) = grid1d(rows * heads * (head_dim / 2));
+    let dims = pool.uniform(&format!("{skey}.dims"), RopeDims { rows, heads, head_dim, pos_base, stride_x, _p0: 0, _p1: 0, _p2: 0 });
     let bg = pool.bind_group(
         key,
         &engine.rope,
@@ -1384,8 +1391,7 @@ fn rope<'a>(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key:
             BindGroupEntry { binding: 3, resource: dims.as_entire_binding() },
         ],
     );
-    let half = head_dim / 2;
-    engine.dispatch(pass, &engine.rope, &bg, ((rows * heads * half).div_ceil(64), 1, 1), key);
+    engine.dispatch(pass, &engine.rope, &bg, (gx, gy, 1), key);
 }
 
 /// Same RoPE as `rope()` but each row's absolute position comes from a
@@ -1426,7 +1432,8 @@ fn rope_kv_decode<'a>(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass
 fn rope_positions<'a>(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &str, buf: impl Into<BufView<'a>>, cos: &wgpu::Buffer, sin: &wgpu::Buffer, positions: &wgpu::Buffer, rows: u32, heads: u32, head_dim: u32) {
     let buf = buf.into();
     let skey = scratch_key(key);
-    let dims = pool.uniform(&format!("{skey}.dims"), RopePosDims { rows, heads, head_dim, _p0: 0 });
+    let (gx, gy, stride_x) = grid1d(rows * heads * (head_dim / 2));
+    let dims = pool.uniform(&format!("{skey}.dims"), RopePosDims { rows, heads, head_dim, stride_x });
     let bg = pool.bind_group(
         key,
         &engine.rope_positions,
@@ -1438,8 +1445,7 @@ fn rope_positions<'a>(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass
             BindGroupEntry { binding: 4, resource: dims.as_entire_binding() },
         ],
     );
-    let half = head_dim / 2;
-    engine.dispatch(pass, &engine.rope_positions, &bg, ((rows * heads * half).div_ceil(64), 1, 1), key);
+    engine.dispatch(pass, &engine.rope_positions, &bg, (gx, gy, 1), key);
 }
 
 /// Fused `add_inplace` (residual `a += delta`) + `rmsnorm` read of the

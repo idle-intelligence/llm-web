@@ -16,18 +16,20 @@
 // row read at `p * half + j`. Absolute position of buffer row r is
 // `pos_base + r` (prefill: pos_base=0, r is the sequence index; decode:
 // pos_base = kv_len, r is always 0 since decode processes one row).
-struct Dims { rows: u32, heads: u32, head_dim: u32, pos_base: u32 };
+// The grid is 2-D when rows*heads*half/256 exceeds the 65535 per-dimension
+// workgroup limit (long prefills): `stride_x` is `model.rs::grid1d`'s.
+struct Dims { rows: u32, heads: u32, head_dim: u32, pos_base: u32, stride_x: u32, _p0: u32, _p1: u32, _p2: u32 };
 
 @group(0) @binding(0) var<storage, read_write> buf: array<f32>;
 @group(0) @binding(1) var<storage, read> cos_t: array<f32>;
 @group(0) @binding(2) var<storage, read> sin_t: array<f32>;
 @group(0) @binding(3) var<uniform> dims: Dims;
 
-@compute @workgroup_size(64)
+@compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let half = dims.head_dim / 2u;
     let total = dims.rows * dims.heads * half;
-    let id = gid.x;
+    let id = gid.y * dims.stride_x + gid.x;
     if (id >= total) {
         return;
     }

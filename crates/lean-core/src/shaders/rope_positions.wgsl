@@ -9,7 +9,9 @@
 // buf: [rows, heads, head_dim] contiguous, row_stride = heads*head_dim.
 // cos_t/sin_t: [max_positions, half] with half = head_dim/2, position p's
 // row read at `p * half + j`. positions: [rows] absolute position per row.
-struct Dims { rows: u32, heads: u32, head_dim: u32, _p0: u32 };
+// The grid is 2-D when rows*heads*half/256 exceeds the 65535 per-dimension
+// workgroup limit (long chunks): `stride_x` is `model.rs::grid1d`'s.
+struct Dims { rows: u32, heads: u32, head_dim: u32, stride_x: u32 };
 
 @group(0) @binding(0) var<storage, read_write> buf: array<f32>;
 @group(0) @binding(1) var<storage, read> cos_t: array<f32>;
@@ -17,11 +19,11 @@ struct Dims { rows: u32, heads: u32, head_dim: u32, _p0: u32 };
 @group(0) @binding(3) var<storage, read> positions: array<u32>;
 @group(0) @binding(4) var<uniform> dims: Dims;
 
-@compute @workgroup_size(64)
+@compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let half = dims.head_dim / 2u;
     let total = dims.rows * dims.heads * half;
-    let id = gid.x;
+    let id = gid.y * dims.stride_x + gid.x;
     if (id >= total) {
         return;
     }
