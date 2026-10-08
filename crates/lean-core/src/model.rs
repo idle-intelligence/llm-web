@@ -152,7 +152,10 @@ struct RmsDims {
     rows: u32,
     dim: u32,
     eps: f32,
-    _p0: u32,
+    /// Workgroups along x; `rmsnorm.wgsl` reads its row as `wg.y *
+    /// stride_x + wg.x`. Unused (0) by `add_rmsnorm.wgsl`, which is
+    /// decode-only (one row).
+    stride_x: u32,
 }
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -1351,7 +1354,11 @@ fn rmsnorm<'a>(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, k
     let x = x.into();
     let skey = scratch_key(key);
     let out = pool.data(&format!("{skey}.out"), (rows * dim) as usize);
-    let dims = pool.uniform(&format!("{skey}.dims"), RmsDims { rows, dim, eps, _p0: 0 });
+    // One workgroup per row, folded into a second grid dimension past
+    // MAX_WORKGROUPS_PER_DIM rows (Qwen3's per-head q/k norms run
+    // rows * heads of them: 32 heads reach it from 2048 prompt tokens).
+    let gx = rows.clamp(1, MAX_WORKGROUPS_PER_DIM);
+    let dims = pool.uniform(&format!("{skey}.dims"), RmsDims { rows, dim, eps, stride_x: gx });
     let bg = pool.bind_group(
         key,
         &engine.rmsnorm,
@@ -1362,8 +1369,8 @@ fn rmsnorm<'a>(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, k
             BindGroupEntry { binding: 3, resource: dims.as_entire_binding() },
         ],
     );
-    // One workgroup per row (see shaders/rmsnorm.wgsl's header comment).
-    engine.dispatch(pass, &engine.rmsnorm, &bg, (rows, 1, 1), key);
+    // See shaders/rmsnorm.wgsl's header comment.
+    engine.dispatch(pass, &engine.rmsnorm, &bg, (gx, rows.div_ceil(gx), 1), key);
     out
 }
 
@@ -1451,7 +1458,7 @@ fn rope_positions<'a>(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass
 fn add_rmsnorm(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &str, a: &wgpu::Buffer, delta: &wgpu::Buffer, scale: &wgpu::Buffer, rows: u32, dim: u32, eps: f32) -> wgpu::Buffer {
     let skey = scratch_key(key);
     let out = pool.data(&format!("{skey}.out"), (rows * dim) as usize);
-    let dims = pool.uniform(&format!("{skey}.dims"), RmsDims { rows, dim, eps, _p0: 0 });
+    let dims = pool.uniform(&format!("{skey}.dims"), RmsDims { rows, dim, eps, stride_x: 0 });
     let bg = pool.bind_group(
         key,
         &engine.add_rmsnorm,
@@ -2562,6 +2569,32 @@ mod grid1d_tests {
         check(0, hidden - 1);
         check(rows / 2, hidden / 2);
         check(rows - 1, hidden - 1);
+    }
+
+    #[test]
+    fn rmsnorm_rows_past_max_workgroups() {
+        let Some((engine, pool)) = engine_and_pool() else { return };
+        let dim: u32 = 8;
+        let rows: u32 = MAX_WORKGROUPS_PER_DIM + 77;
+        let x: Vec<f32> = (0..rows * dim).map(|i| ((i as f32) * 0.37).sin() + 0.1).collect();
+        let scale: Vec<f32> = (0..dim).map(|j| 0.5 + j as f32 * 0.25).collect();
+        let x_buf = engine.buf_f32(&x, "grid1d_test.x");
+        let scale_buf = engine.buf_f32(&scale, "grid1d_test.scale");
+        let mut encoder = engine.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        let mut pass = engine.begin_pass(&mut encoder, "test");
+        let out = rmsnorm(&engine, &pool, &mut pass, "grid1d_test.rmsnorm", &x_buf, &scale_buf, rows, dim, 1e-6);
+        drop(pass);
+        engine.queue.submit(Some(encoder.finish()));
+        let got = pollster::block_on(engine.read_buffer(&out, (rows * dim) as usize));
+        for row in [0, MAX_WORKGROUPS_PER_DIM - 1, MAX_WORKGROUPS_PER_DIM, rows - 1] {
+            let r = &x[(row * dim) as usize..((row + 1) * dim) as usize];
+            let denom = (r.iter().map(|v| v * v).sum::<f32>() / dim as f32 + 1e-6).sqrt();
+            for j in 0..dim as usize {
+                let expected = r[j] / denom * scale[j];
+                let g = got[row as usize * dim as usize + j];
+                assert!((g - expected).abs() < 1e-5, "row {row} col {j}: got {g} expected {expected}");
+            }
+        }
     }
 }
 

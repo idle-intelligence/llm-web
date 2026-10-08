@@ -18,7 +18,9 @@
 // safely branch around the `workgroupBarrier()` calls below (that step in
 // llm-wasm's version works around Tint tainting *storage*-buffer loads as
 // non-uniform; it does not apply to `uniform` address space loads).
-struct Dims { rows: u32, dim: u32, eps: f32, _pad0: u32 };
+// `stride_x` = workgroups along x: past 65535 rows the grid folds into y
+// and a workgroup's row is wg.y * stride_x + wg.x (model.rs's `rmsnorm`).
+struct Dims { rows: u32, dim: u32, eps: f32, stride_x: u32 };
 
 @group(0) @binding(0) var<storage, read> x: array<f32>;
 @group(0) @binding(1) var<storage, read> scale: array<f32>;
@@ -31,7 +33,7 @@ var<workgroup> partial_sums: array<f32, WG_SIZE>;
 
 @compute @workgroup_size(256, 1, 1)
 fn main(@builtin(workgroup_id) wg_id: vec3<u32>, @builtin(local_invocation_id) local_id: vec3<u32>) {
-    let row = wg_id.x;
+    let row = wg_id.y * dims.stride_x + wg_id.x;
     let valid = row < dims.rows;
     let tid = local_id.x;
     let row_base = row * dims.dim;
