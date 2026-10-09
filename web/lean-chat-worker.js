@@ -178,8 +178,11 @@ async function chat(text) {
   try {
     abortFlag = new AbortFlagCtor();
     const reply = await generateWithTrim((text) => self.postMessage({ type: "token", text }));
+    // Prompt size of this turn, after any trimming (before the reply joins HISTORY).
+    let promptTokens = null;
+    try { promptTokens = engine.tokenCount(HISTORY); } catch (_) {}
     HISTORY.push({ role: "assistant", content: reply });
-    self.postMessage({ type: "done" });
+    self.postMessage({ type: "done", promptTokens });
   } catch (e) {
     HISTORY.pop(); // the user turn never got a reply - take it back out.
     self.postMessage({ type: "error", message: e && e.message ? e.message : String(e) });

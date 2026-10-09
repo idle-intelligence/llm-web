@@ -249,8 +249,11 @@
         #metricsCard { display: none; }
         .metrics-grid {
             display: grid;
-            grid-template-columns: repeat(3, 1fr);
+            grid-template-columns: repeat(4, 1fr);
             gap: 12px;
+        }
+        @media (max-width: 480px) {
+            .metrics-grid { grid-template-columns: repeat(2, 1fr); }
         }
         .metric { text-align: center; }
         .metric-value {
@@ -359,16 +362,20 @@
         <h2>PERFORMANCE</h2>
         <div class="metrics-grid">
             <div class="metric">
-                <div class="metric-value" id="metricTokens">—</div>
-                <div class="metric-label">TOKENS</div>
-            </div>
-            <div class="metric">
-                <div class="metric-value" id="metricElapsed">—</div>
-                <div class="metric-label">ELAPSED (s)</div>
+                <div class="metric-value" id="metricTtft">—</div>
+                <div class="metric-label">TTFT (ms)</div>
             </div>
             <div class="metric">
                 <div class="metric-value" id="metricSpeed">—</div>
-                <div class="metric-label">TOK/S</div>
+                <div class="metric-label">DECODE TOK/S</div>
+            </div>
+            <div class="metric">
+                <div class="metric-value" id="metricPrompt">—</div>
+                <div class="metric-label">PROMPT TOKENS</div>
+            </div>
+            <div class="metric">
+                <div class="metric-value" id="metricTokens">—</div>
+                <div class="metric-label">TOKENS</div>
             </div>
         </div>
         <p id="metricBackendModel"></p>
@@ -380,7 +387,7 @@
     </footer>
 
     <script type="module">
-        const ENGINE_BUILD = "2026-10-09-one-turn-02";
+        const ENGINE_BUILD = "2026-10-09-one-turn-03";
         // Rewritten to true by scripts/build.sh when BUILD_THREADS=1 built
         // pkg-mt into this deployment; GitHub Pages never sets it.
         const MT_BUILT = false;
@@ -452,7 +459,8 @@
         const emptyNote = document.getElementById('emptyNote');
         const metricsCard = document.getElementById('metricsCard');
         const metricTokens = document.getElementById('metricTokens');
-        const metricElapsed = document.getElementById('metricElapsed');
+        const metricTtft = document.getElementById('metricTtft');
+        const metricPrompt = document.getElementById('metricPrompt');
         const metricSpeed = document.getElementById('metricSpeed');
         const metricBackendModel = document.getElementById('metricBackendModel');
         const modelNote = document.getElementById('modelNote');
@@ -467,6 +475,7 @@
         let modelReady = false;
         let loadingFromCache = false;
         let tokenCount = 0;
+        let firstTokenTime = 0;
         let startTime = 0;
         let currentModelId = 'smollm2-360m';
         let currentBackendChoice = 'auto';
@@ -605,6 +614,7 @@
                 } else if (msg.type === 'token') {
                     if (!generating || !currentTurn) return;
                     tokenCount++;
+                    if (tokenCount === 1) firstTokenTime = performance.now();
                     currentTurn.body.insertBefore(document.createTextNode(msg.text), currentTurn.cursor);
                 } else if (msg.type === 'done') {
                     generating = false;
@@ -612,11 +622,15 @@
                     sendBtn.disabled = false;
                     stopBtn.style.display = 'none';
                     updateStatus('ready', stopRequested ? 'Stopped' : 'Ready');
-                    const elapsed = (performance.now() - startTime) / 1000;
+                    // TTFT covers the prompt (minus any reused prefix); decode speed
+                    // counts only the tokens after the first one.
+                    const doneTime = performance.now();
                     metricsCard.style.display = 'block';
                     metricTokens.textContent = tokenCount;
-                    metricElapsed.textContent = elapsed.toFixed(1);
-                    metricSpeed.textContent = (tokenCount / elapsed).toFixed(1);
+                    metricTtft.textContent = firstTokenTime ? (firstTokenTime - startTime).toFixed(0) : '—';
+                    metricSpeed.textContent = tokenCount > 1 && firstTokenTime
+                        ? ((tokenCount - 1) / ((doneTime - firstTokenTime) / 1000)).toFixed(1) : '—';
+                    metricPrompt.textContent = msg.promptTokens != null ? msg.promptTokens : '—';
                     metricBackendModel.textContent = `${backendLabel(activeBackend)} · ${MODELS[currentModelId].label}`;
                     currentTurn = null;
                     stopRequested = false;
@@ -696,6 +710,7 @@
             generating = true;
             stopRequested = false;
             tokenCount = 0;
+            firstTokenTime = 0;
             startTime = performance.now();
             sendBtn.disabled = true;
             stopBtn.style.display = '';
