@@ -361,7 +361,7 @@ mod simd128 {
 
     pub(super) fn dot_q4_0(bytes: &[u8], x: &[f32]) -> f32 {
         let mut acc = 0f32;
-        for (bi, block) in bytes.chunks_exact(18).enumerate() {
+        for (bi, block) in bytes.as_chunks::<18>().0.iter().enumerate() {
             let scale = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
             let base = bi * QK;
             acc += dot_q4_0_block(block, &x[base..base + QK]) * scale;
@@ -383,7 +383,7 @@ mod simd128 {
 
     pub(super) fn dot_q8_0(bytes: &[u8], x: &[f32]) -> f32 {
         let mut acc = 0f32;
-        for (bi, block) in bytes.chunks_exact(34).enumerate() {
+        for (bi, block) in bytes.as_chunks::<34>().0.iter().enumerate() {
             let scale = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
             let base = bi * QK;
             acc += dot_q8_0_block(&block[2..34], &x[base..base + QK]) * scale;
@@ -397,7 +397,7 @@ mod simd128 {
     /// each 16-value sub-range's widen-and-accumulate.
     pub(super) fn dot_q6_k(bytes: &[u8], x: &[f32]) -> f32 {
         let mut acc = 0f32;
-        for (bi, block) in bytes.chunks_exact(210).enumerate() {
+        for (bi, block) in bytes.as_chunks::<210>().0.iter().enumerate() {
             let ql_all = &block[0..128];
             let qh_all = &block[128..192];
             let sc_all = &block[192..208];
