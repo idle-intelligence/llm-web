@@ -14,14 +14,14 @@
 //! produces byte-identical output to no mask at all; (3) the added ms/step
 //! of uploading + applying a mask vs an unmasked decode step.
 
-use lean::chat_template::{read_chat_template, render_user_prompt};
 use lean::engine::Engine;
 use lean::model::{build_mask_bitset, build_rope_tables, forward_decode_step_argmax, forward_prefill, GpuModel, KvCache};
+use lean_chat::{read_chat_template, render, Message};
 use std::time::Instant;
 use tokenizers::Tokenizer;
 
 fn tokenize(tokenizer: &Tokenizer, chat_template: &str, prompt: &str) -> Vec<u32> {
-    let rendered = render_user_prompt(chat_template, prompt).unwrap();
+    let rendered = render(chat_template, &[Message::user(prompt)], None, true).unwrap();
     tokenizer.encode(rendered, false).unwrap().get_ids().to_vec()
 }
 

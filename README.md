@@ -34,7 +34,7 @@ const reply = await lean.generate(prompt, params, (text) => { /* append text */ 
 </script>
 ```
 
-The engine is text in, text out: `generate` runs one inference turn over the given text and returns the reply. It applies no chat template and keeps no conversation (see [`crates/lean/README.md`](crates/lean/README.md)); a page holds its own message history, renders it with the model's chat template, and sends the whole text each call.
+The engine is text in, text out: `generate` runs one inference turn over the given text and returns the reply. It applies no chat template and keeps no conversation (see [`crates/lean/README.md`](crates/lean/README.md)); a page holds its own message history, renders it with the model's chat template, and sends the whole text each call. `chatRender` comes from [`lean-chat`](crates/lean-chat/README.md), shipped in the same wasm package: it renders messages, and tools, exactly as transformers' `apply_chat_template` does, and `chatTrimOldestExchange` drops the oldest exchange when a conversation no longer fits.
 
 ### Native
 

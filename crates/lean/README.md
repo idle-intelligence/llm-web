@@ -48,7 +48,7 @@ The engine is `Lean`, with the same surface in Rust and in JavaScript:
 - **One inference turn.** `generate(text, params, on_token, abort)` tokenizes `text` exactly as given, decodes up to `params.max_new_tokens` tokens, streams each piece of reply text to `on_token` and returns the whole reply. `params` holds `max_new_tokens`, `temperature` (0 = greedy), `top_k`, `top_p`, `repetition_penalty`, `seed` and an optional logit mask (JS: `maxNewTokens`, `temperature`, `topK`, `topP`, `repetitionPenalty`, `seed`, `mask`). `abort` is an `AbortFlag` checked before each token: in JS, pass `flag.cloneFlag()` and call `flag.abort()` from a message handler.
 - **Token count.** `token_count(text)` (JS: `tokenCount(text)`) tokenizes without running the model.
 
-The engine applies no chat template and keeps no conversation: the caller renders its messages with the model's template and passes the text. Between calls the engine keeps the KV cache of its previous call and reuses the longest token prefix the new text shares with it, so a growing conversation only prefills its new suffix; the output is the same with or without that reuse. **One client per engine**: two clients sharing one engine evict each other's cached prefix (nothing breaks, each call just costs a full prefill), so give each client its own `Lean`.
+The engine applies no chat template and keeps no conversation: the caller renders its messages with the model's template and passes the text. The [`lean-chat`](../lean-chat/README.md) crate does that rendering, byte-exact with transformers, and its JavaScript functions (`chatRender`, `chatTrimOldestExchange`) are exported from the same wasm package. Between calls the engine keeps the KV cache of its previous call and reuses the longest token prefix the new text shares with it, so a growing conversation only prefills its new suffix; the output is the same with or without that reuse. **One client per engine**: two clients sharing one engine evict each other's cached prefix (nothing breaks, each call just costs a full prefill), so give each client its own `Lean`.
 
 If `text` plus `max_new_tokens` does not fit `max_ctx`, `generate` returns `LeanError::ContextOverflow { needed, available }` before touching anything, and the engine stays usable. In JS the promise rejects with an `Error` whose `name` is `"ContextOverflow"`, `code` is `"CONTEXT_OVERFLOW"`, and which carries numeric `needed` and `available`. What to drop before retrying is the caller's choice; `web/lean-chat-worker.js` and `examples/chat.rs` drop the oldest exchange.
 
@@ -91,7 +91,7 @@ ENGINE_BUILD=<tag> scripts/build.sh
 
 ## Parity gates
 
-The parity tests compare lean against fixtures written by HF transformers (`reference/gen_fixture*.py`, which load the same GGUF through transformers). Each `fixture_parity*` test checks that lean's tokenizer and chat template give the fixture's input ids, that the top-20 logits after prefill agree within 1e-3, and that the greedy continuation is identical. They need model files that are not in the repository, so they are `#[ignore]`d and run with `--ignored` and environment variables pointing at a GGUF and at a directory holding `tokenizer.json` and `tokenizer_config.json`:
+The parity tests compare lean against fixtures written by HF transformers (`reference/gen_fixture*.py`, which load the same GGUF through transformers). Each `fixture_parity*` test checks that the prompt rendered by lean-chat and tokenized by lean gives the fixture's input ids, that the top-20 logits after prefill agree within 1e-3, and that the greedy continuation is identical. They need model files that are not in the repository, so they are `#[ignore]`d and run with `--ignored` and environment variables pointing at a GGUF and at a directory holding `tokenizer.json` and `tokenizer_config.json`:
 
 | test | what it checks | environment |
 |---|---|---|
@@ -115,7 +115,7 @@ LEAN_GGUF_LLAMA_360M_Q4_0=<gguf> LEAN_GGUF_LLAMA_360M_Q8_0=<gguf> LEAN_TOKENIZER
   cargo test -p lean --release --features threads --test fixture_parity_llama_360m_cpu -- --ignored
 ```
 
-`cargo test -p lean` without `--ignored` runs the tests that need no model file (dequantization, chat template, LoRA parsing). Release gate logs are under `docs/runs/`.
+`cargo test -p lean` without `--ignored` runs the tests that need no model file (dequantization, LoRA parsing); `cargo test -p lean-chat` runs the chat-template exactness tests, which need no model file either. Release gate logs are under `docs/runs/`.
 
 ## License
 

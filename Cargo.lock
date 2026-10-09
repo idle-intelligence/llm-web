@@ -776,8 +776,7 @@ dependencies = [
  "getrandom",
  "half",
  "js-sys",
- "minijinja",
- "minijinja-contrib",
+ "lean-chat",
  "pollster",
  "rayon",
  "serde",
@@ -788,6 +787,19 @@ dependencies = [
  "wasm-bindgen-rayon",
  "web-sys",
  "wgpu",
+]
+
+[[package]]
+name = "lean-chat"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "js-sys",
+ "minijinja",
+ "minijinja-contrib",
+ "serde",
+ "serde_json",
+ "wasm-bindgen",
 ]
 
 [[package]]

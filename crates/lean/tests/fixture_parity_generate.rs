@@ -26,8 +26,8 @@
 //! cargo test -p lean --release --test fixture_parity_generate -- --ignored smollm2_360m
 //! ```
 
-use lean::chat_template::{read_chat_template, render_user_prompt};
 use lean::{Backend, GenParams, GgufSource, Lean, LoadOptions, TokenizerSource};
+use lean_chat::{read_chat_template, render, Message};
 use serde::Deserialize;
 use tokenizers::Tokenizer;
 
@@ -70,7 +70,7 @@ fn check_generate_matches_fixture(gguf: &str, tokenizer_dir: &str, fixture_path:
                 continue;
             }
             let prompt = case.prompt.as_deref().expect("case has neither prompt nor no_retokenize");
-            let text = render_user_prompt(&chat_template, prompt).expect("rendering the prompt");
+            let text = render(&chat_template, &[Message::user(prompt)], None, true).expect("rendering the prompt");
             assert_eq!(lean.token_count(&text).unwrap(), case.input_ids.len(), "[{}] token_count != fixture input_ids length", case.name);
 
             let expected = tokenizer.decode(&case.greedy_continuation, true).expect("decoding greedy_continuation");

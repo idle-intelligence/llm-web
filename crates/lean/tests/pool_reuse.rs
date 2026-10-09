@@ -11,9 +11,9 @@
 //! cargo test -p lean --release --test pool_reuse -- --ignored
 //! ```
 
-use lean::chat_template::{read_chat_template, render_user_prompt};
 use lean::engine::Engine;
 use lean::model::{argmax, build_rope_tables, forward_decode_step_argmax, forward_prefill, GpuModel, KvCache};
+use lean_chat::{read_chat_template, render, Message};
 use tokenizers::Tokenizer;
 
 const N_NEW: usize = 16;
@@ -45,7 +45,7 @@ fn reused_cache_matches_fresh_caches() {
     let engine = Engine::new().expect("wgpu engine init");
     let model = GpuModel::load(&engine, &gguf_path, true).expect("loading model");
 
-    let prompts: Vec<Vec<u32>> = PROMPTS.iter().map(|p| tokenizer.encode(render_user_prompt(&chat_template, p).unwrap(), false).unwrap().get_ids().to_vec()).collect();
+    let prompts: Vec<Vec<u32>> = PROMPTS.iter().map(|p| tokenizer.encode(render(&chat_template, &[Message::user(*p)], None, true).unwrap(), false).unwrap().get_ids().to_vec()).collect();
     let max_ctx = prompts.iter().map(|p| p.len()).max().unwrap() as u32 + N_NEW as u32 + 4;
     let (cos, sin) = build_rope_tables(model.config.head_dim, model.config.rope_theta, max_ctx as usize);
     let cos_buf = engine.buf_f32(&cos, "rope_cos");

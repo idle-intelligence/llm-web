@@ -13,7 +13,6 @@
 //! `engine.rs`/`pool.rs` wgpu plumbing, `cpu.rs` CPU forward pass) stay
 //! public for callers that work on token ids directly.
 
-pub mod chat_template;
 pub mod config;
 pub mod cpu;
 pub mod cpu_kernels;

@@ -26,12 +26,12 @@
 // onToken, abort)`): it applies no chat template and keeps no
 // conversation. This worker holds the conversation (`HISTORY`), renders
 // the whole of it through the model's chat template on every call
-// (`chatRender`), and passes that text to the engine, which reuses the KV
-// cache of the common prefix by itself. `onToken(text)` streams
-// already-decoded reply text. On a `ContextOverflow` error (`e.name ===
-// "ContextOverflow"`), this worker drops the oldest user/assistant pair
-// and retries — the same client-side trim `examples/chat.rs` uses
-// natively. The page's "New chat" button sends {type:'reset'}, which just
+// (`chatRender`, from lean-chat, in the same wasm package), and passes
+// that text to the engine, which reuses the KV cache of the common prefix
+// by itself. `onToken(text)` streams already-decoded reply text. On a
+// `ContextOverflow` error (`e.name === "ContextOverflow"`), this worker
+// drops the oldest exchange (`chatTrimOldestExchange`) and retries, the
+// same client-side trim `examples/chat.rs` uses natively. The page's "New chat" button sends {type:'reset'}, which just
 // clears `HISTORY`.
 //
 // This file intentionally has NO top-level `import` or `await`: a module
@@ -42,7 +42,7 @@
 const EARLY = [];
 self.onmessage = (e) => EARLY.push(e);
 
-const ENGINE_BUILD = "2026-10-10-lean-text-01";
+const ENGINE_BUILD = "2026-10-10-lean-chat-01";
 // Rewritten to true by scripts/build.sh when BUILD_THREADS=1 built pkg-mt
 // into this deployment; GitHub Pages never sets it.
 const MT_BUILT = false;
@@ -146,10 +146,10 @@ async function load(model, backendChoice) {
 
 const GEN_PARAMS = { maxNewTokens: 256, temperature: 0.7, topK: 40, topP: 0.9, repetitionPenalty: 1.1, seed: 0 };
 
-// Drops the oldest user/assistant pair (after any leading system message)
-// and retries - the same trim rule examples/chat.rs uses natively. Gives
-// up (rethrows) once there is nothing left to drop.
-// Returns the reply and the prompt it answered.
+// On a context overflow, drops the oldest exchange (chatTrimOldestExchange
+// keeps the system message and the current question) and retries - the
+// same rule examples/chat.rs uses natively. Gives up (rethrows) once there
+// is nothing left to drop. Returns the reply and the prompt it answered.
 async function generateWithTrim(onToken) {
   for (;;) {
     const prompt = lean.chatRender(chatTemplate, HISTORY, null, true);
@@ -157,10 +157,10 @@ async function generateWithTrim(onToken) {
       const reply = await engine.generate(prompt, GEN_PARAMS, onToken, abortFlag.cloneFlag());
       return { reply, prompt };
     } catch (e) {
-      const dropFrom = HISTORY[0] && HISTORY[0].role === "system" ? 1 : 0;
-      if (e && e.name === "ContextOverflow" && HISTORY.length > dropFrom + 2) {
+      const trimmed = e && e.name === "ContextOverflow" ? lean.chatTrimOldestExchange(HISTORY) : undefined;
+      if (trimmed) {
         console.log(`[lean-chat-worker] context overflow (needed=${e.needed} available=${e.available}); dropping the oldest turn`);
-        HISTORY.splice(dropFrom, 2);
+        HISTORY = trimmed;
         continue;
       }
       throw e;

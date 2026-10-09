@@ -1,8 +1,6 @@
 //! Native tests for the streaming/sampling/multi-turn primitives
-//! (`generate::decode_loop`, `sampling::{SamplingParams, sample}`,
-//! `chat_template::render_conversation`) - the plain-Rust core that
-//! `chat::gpu_generate`/`chat::cpu_generate` (what `web.rs` wraps for JS)
-//! build on. Same fixture/env
+//! (`generate::decode_loop`, `sampling::{SamplingParams, sample}`) - the
+//! plain-Rust core that `Lean::generate` builds on. Same fixture/env
 //! convention as `kv_snapshot.rs`/`logit_mask.rs`: needs the actual GGUF +
 //! tokenizer files on disk, never committed to this repo.
 //!
@@ -12,15 +10,15 @@
 //! cargo test -p lean --release -- --ignored streaming_sampling
 //! ```
 
-use lean::chat_template::{read_chat_template, render_conversation, render_user_prompt};
 use lean::engine::Engine;
 use lean::generate::decode_loop;
 use lean::model::{argmax, build_rope_tables, decode_greedy_pipelined, forward_decode_step_argmax, forward_prefill, forward_prefill_suffix, GpuModel, KvCache};
 use lean::sampling::SamplingParams;
+use lean_chat::{read_chat_template, render, Message};
 use tokenizers::Tokenizer;
 
 fn tokenize(tokenizer: &Tokenizer, chat_template: &str, prompt: &str) -> Vec<u32> {
-    let rendered = render_user_prompt(chat_template, prompt).unwrap();
+    let rendered = render(chat_template, &[Message::user(prompt)], None, true).unwrap();
     tokenizer.encode(rendered, false).unwrap().get_ids().to_vec()
 }
 
@@ -34,8 +32,7 @@ fn setup() -> (Engine, GpuModel, Tokenizer, String) {
     (engine, model, tokenizer, chat_template)
 }
 
-/// Runs the pre-existing whole-reply greedy path exactly as `LeanEngine::generate`
-/// does natively (prefill -> CPU argmax -> loop of `forward_decode_step_argmax`),
+/// Runs the plain step-by-step greedy path (prefill -> CPU argmax -> loop of `forward_decode_step_argmax`),
 /// for comparison against `decode_loop`'s greedy path.
 fn whole_reply_greedy(engine: &Engine, model: &GpuModel, cache: &mut KvCache, token_ids: &[u32], cos: &wgpu::Buffer, sin: &wgpu::Buffer, max_new_tokens: u32) -> Vec<u32> {
     let logits = pollster::block_on(forward_prefill(engine, model, cache, token_ids, cos, sin, None));
@@ -156,20 +153,20 @@ fn multi_turn_append_matches_full_reprefill() {
     // --- Append path: turn 1 (fresh prefill) -> greedy reply -> close turn
     // -> turn 2 appended onto the existing cache. ---
     let mut cache = KvCache::new(&engine, &model.config, max_ctx);
-    let ids1 = tokenizer.encode(render_conversation(&chat_template, &[("user", p1)], true).unwrap(), false).unwrap().get_ids().to_vec();
+    let ids1 = tokenizer.encode(render(&chat_template, &[Message::user(p1)], None, true).unwrap(), false).unwrap().get_ids().to_vec();
     let logits1 = pollster::block_on(forward_prefill(&engine, &model, &mut cache, &ids1, &cos_buf, &sin_buf, None));
     let mut history = ids1.clone();
     let params = SamplingParams::default();
     let gen1 = pollster::block_on(decode_loop(&engine, &model, &mut cache, logits1, &cos_buf, &sin_buf, None, 12, &params, &mut history, |_| {}, || false));
     let text1 = tokenizer.decode(&gen1, true).unwrap();
 
-    let closed1 = tokenizer.encode(render_conversation(&chat_template, &[("user", p1), ("assistant", &text1)], false).unwrap(), false).unwrap().get_ids().to_vec();
+    let closed1 = tokenizer.encode(render(&chat_template, &[Message::user(p1), Message::assistant(text1.as_str())], None, false).unwrap(), false).unwrap().get_ids().to_vec();
     assert!(closed1.len() as u32 > cache.kv_len, "closing text must add at least the eos/newline tokens back onto the cache");
     let closing_suffix = &closed1[cache.kv_len as usize..];
     let _ = pollster::block_on(forward_prefill_suffix(&engine, &model, &mut cache, closing_suffix, &cos_buf, &sin_buf, None));
 
     let full_ids2 = tokenizer
-        .encode(render_conversation(&chat_template, &[("user", p1), ("assistant", &text1), ("user", p2)], true).unwrap(), false)
+        .encode(render(&chat_template, &[Message::user(p1), Message::assistant(text1.as_str()), Message::user(p2)], None, true).unwrap(), false)
         .unwrap()
         .get_ids()
         .to_vec();

@@ -1,8 +1,9 @@
 //! A multi-turn terminal chat on lean's engine. The conversation lives
-//! here, not in the engine: every turn renders the whole history through
-//! the model's chat template and passes that text to `Lean::generate`. On
-//! `LeanError::ContextOverflow` it drops the oldest exchange (keeping any
-//! system message) and retries, the same policy the web demo applies.
+//! here, not in the engine: every turn renders the whole history with
+//! lean-chat (the model's own chat template) and passes that text to
+//! `Lean::generate`. On `LeanError::ContextOverflow` it drops the oldest
+//! exchange with `lean_chat::trim_oldest_exchange` (the system message
+//! stays) and retries, the same policy the web demo applies.
 //!
 //! ```sh
 //! LEAN_GGUF=/path/to/model.gguf \
@@ -13,24 +14,12 @@
 //! Reads one prompt per line from stdin, streams the reply to stdout, and
 //! repeats until EOF (Ctrl-D) or a line that is exactly `/exit`.
 
-use lean::chat_template::{read_chat_template, render_conversation};
 use lean::{Backend, GenParams, GgufSource, Lean, LeanError, LoadOptions, TokenizerSource};
+use lean_chat::{read_chat_template, render, trim_oldest_exchange, Message};
 use std::io::Write;
 
 fn arg(args: &[String], name: &str) -> Option<String> {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1).cloned())
-}
-
-/// Drops the oldest user/assistant pair (after any leading system message).
-/// Returns `false` once only the system message and the current prompt
-/// remain.
-fn trim_oldest_pair(messages: &mut Vec<(String, String)>) -> bool {
-    let drop_from = if messages.first().is_some_and(|m| m.0 == "system") { 1 } else { 0 };
-    if messages.len() < drop_from + 3 {
-        return false;
-    }
-    messages.drain(drop_from..drop_from + 2);
-    true
 }
 
 fn print_token(text: &str) {
@@ -58,9 +47,9 @@ fn main() -> anyhow::Result<()> {
     eprintln!("[backend: {}]", lean.backend());
     let params = GenParams { max_new_tokens, ..GenParams::default() };
 
-    let mut messages: Vec<(String, String)> = Vec::new();
+    let mut messages: Vec<Message> = Vec::new();
     if let Some(s) = system {
-        messages.push(("system".into(), s));
+        messages.push(Message::system(s));
     }
 
     for line in std::io::stdin().lines() {
@@ -68,19 +57,18 @@ fn main() -> anyhow::Result<()> {
         if line == "/exit" {
             break;
         }
-        messages.push(("user".into(), line));
+        messages.push(Message::user(line));
         loop {
-            let turns: Vec<(&str, &str)> = messages.iter().map(|(r, c)| (r.as_str(), c.as_str())).collect();
-            let prompt = render_conversation(&chat_template, &turns, true)?;
+            let prompt = render(&chat_template, &messages, None, true)?;
             match pollster::block_on(lean.generate(&prompt, &params, print_token, None)) {
                 Ok(reply) => {
                     println!();
-                    messages.push(("assistant".into(), reply));
+                    messages.push(Message::assistant(reply));
                     break;
                 }
                 Err(LeanError::ContextOverflow { needed, available }) => {
                     eprintln!("[context overflow: needed {needed}, available {available}; dropping the oldest turn]");
-                    if !trim_oldest_pair(&mut messages) {
+                    if !trim_oldest_exchange(&mut messages) {
                         eprintln!("[nothing left to drop; try a shorter prompt or a larger --max-ctx]");
                         messages.pop();
                         break;

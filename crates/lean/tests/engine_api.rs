@@ -32,8 +32,8 @@
 //! cargo test -p lean --release --features threads --test engine_api -- --ignored
 //! ```
 
-use lean::chat_template::{read_chat_template, render_conversation};
 use lean::{Backend, GenParams, GgufSource, Lean, LeanError, LoadOptions, TextStream, TokenizerSource};
+use lean_chat::{read_chat_template, Message};
 use tokenizers::Tokenizer;
 
 const TURNS: [&str; 3] = [
@@ -57,8 +57,11 @@ fn template(tokenizer_dir: &str) -> String {
     read_chat_template(&format!("{tokenizer_dir}/tokenizer_config.json")).expect("reading chat_template")
 }
 
-fn render(template: &str, turns: &[(&str, &str)]) -> String {
-    render_conversation(template, turns, true).expect("rendering")
+/// The prompt text for `turns` (role, content), ending with the opening of
+/// an assistant turn.
+fn prompt(template: &str, turns: &[(&str, &str)]) -> String {
+    let messages: Vec<Message> = turns.iter().map(|&(role, content)| Message::new(role, content)).collect();
+    lean_chat::render(template, &messages, None, true).expect("rendering")
 }
 
 fn params() -> GenParams {
@@ -80,10 +83,10 @@ fn conversation(gguf: &str, tokenizer_dir: &str, backend: Backend, reuse: bool) 
     let mut shared = reuse.then(|| load(gguf, tokenizer_dir, MAX_CTX, backend));
     let mut history: Vec<(String, String)> = Vec::new();
     let mut replies = Vec::new();
-    for prompt in TURNS {
-        history.push(("user".into(), prompt.into()));
+    for question in TURNS {
+        history.push(("user".into(), question.into()));
         let turns: Vec<(&str, &str)> = history.iter().map(|(r, c)| (r.as_str(), c.as_str())).collect();
-        let text = render(&template, &turns);
+        let text = prompt(&template, &turns);
         let t = std::time::Instant::now();
         let reply = match shared.as_mut() {
             Some(lean) => generate(lean, &text),
@@ -121,13 +124,13 @@ fn reuse_equivalence_cpu_qwen25_0_5b() {
 fn reuse_diverging_prefix(backend: Backend) {
     let (gguf, dir) = (env("LEAN_GGUF"), env("LEAN_TOKENIZER_DIR"));
     let template = template(&dir);
-    let first = render(&template, &[("user", TURNS[0])]);
+    let first = prompt(&template, &[("user", TURNS[0])]);
     let texts = [
         first.clone(),
         // Same template prefix, different user turn.
-        render(&template, &[("user", TURNS[1])]),
+        prompt(&template, &[("user", TURNS[1])]),
         // Diverges a few tokens in, at the system message.
-        render(&template, &[("system", "You answer in French."), ("user", TURNS[0])]),
+        prompt(&template, &[("system", "You answer in French."), ("user", TURNS[0])]),
         // Back to the first prompt, then the same prompt again (the cached
         // ids then cover the whole prompt).
         first.clone(),
@@ -186,10 +189,10 @@ fn context_overflow_then_recovers(backend: Backend) {
     let mut lean = load(&gguf, &dir, max_ctx, backend);
 
     // A short call first, so the engine holds a cached prefix.
-    let short = render(&template, &[("user", "Hi!")]);
+    let short = prompt(&template, &[("user", "Hi!")]);
     let before = pollster::block_on(lean.generate(&short, &params, |_| {}, None)).unwrap();
 
-    let long = render(&template, &[("user", "Tell me, in great detail, everything you know about the history, geography, culture and cuisine of France, Italy and Spain.")]);
+    let long = prompt(&template, &[("user", "Tell me, in great detail, everything you know about the history, geography, culture and cuisine of France, Italy and Spain.")]);
     let long_tokens = lean.token_count(&long).unwrap();
     match pollster::block_on(lean.generate(&long, &params, |_| panic!("an overflowing call must not stream"), None)) {
         Err(LeanError::ContextOverflow { needed, available }) => {
@@ -254,7 +257,7 @@ fn text_stream_smollm2() {
 fn smollm2_1_7b_q4_0_gpu_streams_text() {
     let dir = env("LEAN_TOKENIZER_DIR_LLAMA_1_7B");
     let mut lean = load(&env("LEAN_GGUF_LLAMA_1_7B_Q4_0"), &dir, 512, Backend::WebGpu);
-    let text = render(&template(&dir), &[("user", "Hello! Who are you?")]);
+    let text = prompt(&template(&dir), &[("user", "Hello! Who are you?")]);
     let params = GenParams { max_new_tokens: 32, ..GenParams::default() };
     let reply = pollster::block_on(lean.generate(&text, &params, |_| {}, None)).unwrap();
     println!("{reply:?}");

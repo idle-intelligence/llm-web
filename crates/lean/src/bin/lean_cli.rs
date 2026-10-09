@@ -4,7 +4,7 @@
 //! With no `--prompt`, runs every case in `--fixture`
 //! (`crates/lean/reference/fixture.json`, from `reference/gen_fixture.py`'s
 //! HF-transformers-on-the-same-GGUF output) through this crate's own
-//! tokenizer + chat-template path (`chat_template.rs` + the `tokenizers`
+//! tokenizer + chat-template path (lean-chat's `render` + the `tokenizers`
 //! crate) and checks the resulting token ids, prefill top-20 logits, and
 //! greedy continuation against each case.
 //!
@@ -20,8 +20,8 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
-use lean::chat_template::{read_chat_template, render_user_prompt};
 use lean::model::{build_mask_bitset, build_rope_tables, forward_decode_step, forward_decode_step_argmax, forward_prefill, forward_prefill_suffix, GpuModel, KvCache, KvSnapshot};
+use lean_chat::{read_chat_template, render, Message};
 use serde::Deserialize;
 use tokenizers::Tokenizer;
 
@@ -106,8 +106,8 @@ struct Case {
     /// `reference/gen_fixture.py`'s `LONG_TOKEN_CASES`, and
     /// `tests/fixture_parity.rs`'s `Case` doc comment): `input_ids` is
     /// already the fully tools-chat-templated prompt, and there is no
-    /// `prompt` field to retokenize from (this crate's `chat_template.rs`
-    /// has no tools support).
+    /// `prompt` field to retokenize from (the fixture keeps only the
+    /// token ids).
     #[serde(default)]
     no_retokenize: bool,
 }
@@ -141,7 +141,7 @@ fn argmax(logits: &[f32]) -> u32 {
 /// picks them out as single tokens — the same mechanism HF's Python
 /// tokenizer uses).
 fn tokenize_prompt(tokenizer: &Tokenizer, chat_template: &str, prompt: &str) -> Result<Vec<u32>> {
-    let rendered = render_user_prompt(chat_template, prompt)?;
+    let rendered = render(chat_template, &[Message::user(prompt)], None, true)?;
     let encoding = tokenizer.encode(rendered, false).map_err(|e| anyhow::anyhow!("tokenizer encode failed: {e}"))?;
     Ok(encoding.get_ids().to_vec())
 }

@@ -21,9 +21,9 @@
 //! (256/2048), added alongside the length-independent kernel rewrite - see
 //! docs/runs/2026-09-28-lean-long-context.md.
 
-use lean::chat_template::{read_chat_template, render_user_prompt};
 use lean::engine::Engine;
 use lean::model::{build_rope_tables, forward_decode_step, forward_prefill, GpuModel, KvCache};
+use lean_chat::{read_chat_template, render, Message};
 use serde::Deserialize;
 use tokenizers::Tokenizer;
 
@@ -44,7 +44,7 @@ struct Case {
     /// True for the long-context cases (see `reference/gen_fixture.py`'s
     /// `LONG_TOKEN_CASES`): `input_ids` come from the Sonos MCP agent's
     /// real, already-tools-chat-templated prompts, not from re-rendering
-    /// `prompt` through this crate's (tools-less) `chat_template.rs`.
+    /// a `prompt`; the fixture keeps only the token ids.
     #[serde(default)]
     no_retokenize: bool,
 }
@@ -82,15 +82,13 @@ fn fixture_parity_both_kernel_paths() {
         let model = GpuModel::load(&engine, &gguf_path, fast_kernels).expect("loading model");
         for case in &fixture.cases {
             // `no_retokenize` cases (the Sonos MCP agent's real long
-            // tool-calling inputs) are pre-tokenized with the full HF
-            // `apply_chat_template(..., tools=...)` path, which this
-            // crate's `chat_template.rs` deliberately doesn't implement
-            // (single-user-turn, no-tools scope only - see its header) -
-            // so there's no re-render to check for these; `input_ids` feeds
-            // prefill directly instead.
+            // tool-calling inputs) were tokenized by HF's
+            // `apply_chat_template(..., tools=...)` and the fixture keeps
+            // no messages to re-render, so `input_ids` feeds prefill
+            // directly.
             if !case.no_retokenize {
                 let prompt = case.prompt.as_deref().expect("case has neither prompt nor no_retokenize");
-                let rendered = render_user_prompt(&chat_template, prompt).unwrap();
+                let rendered = render(&chat_template, &[Message::user(prompt)], None, true).unwrap();
                 let our_ids: Vec<u32> = tokenizer.encode(rendered, false).unwrap().get_ids().to_vec();
                 assert_eq!(our_ids, case.input_ids, "[fast={fast_kernels} case={}] tokenization mismatch", case.name);
             }

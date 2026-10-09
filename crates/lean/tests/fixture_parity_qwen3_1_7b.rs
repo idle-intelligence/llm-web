@@ -12,9 +12,9 @@
 //! cargo test -p lean --release -- --ignored fixture_parity_qwen3_1_7b
 //! ```
 
-use lean::chat_template::{read_chat_template, render_user_prompt};
 use lean::engine::Engine;
 use lean::model::{build_rope_tables, forward_decode_step, forward_prefill, GpuModel, KvCache};
+use lean_chat::{read_chat_template, render, Message};
 use serde::Deserialize;
 use tokenizers::Tokenizer;
 
@@ -69,7 +69,7 @@ fn fixture_parity_qwen3_1_7b() {
     for case in &fixture.cases {
         if !case.no_retokenize {
             let prompt = case.prompt.as_deref().expect("case has neither prompt nor no_retokenize");
-            let rendered = render_user_prompt(&chat_template, prompt).unwrap();
+            let rendered = render(&chat_template, &[Message::user(prompt)], None, true).unwrap();
             let our_ids: Vec<u32> = tokenizer.encode(rendered, false).unwrap().get_ids().to_vec();
             assert_eq!(our_ids, case.input_ids, "[case={}] tokenization mismatch", case.name);
         }

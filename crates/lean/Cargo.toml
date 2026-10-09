@@ -18,12 +18,17 @@ wasm = ["wgpu/webgpu"]
 # --features web` skips the bins outright instead of failing to compile
 # them for wasm32. Included in `default` so a plain native `cargo build`/
 # `cargo clippy --all-targets` still builds both binaries.
-native-bin = ["dep:pollster", "dep:clap"]
-# Minimal wasm-bindgen surface (src/web.rs): load GGUF + tokenizer bytes from
-# JS, generate greedily. onig/esaxx_fast are not wasm32-safe; unstable_wasm
-# swaps out rayon for wasm32.
+# lean-cli renders fixture prompts with lean-chat; the library itself never
+# uses it.
+native-bin = ["dep:pollster", "dep:clap", "dep:lean-chat"]
+# wasm-bindgen surface (src/web.rs). The web package also carries lean-chat's
+# bindings (chatRender, chatTrimOldestExchange), so a page loads one wasm for
+# both; the engine code never calls lean-chat. onig/esaxx_fast are not
+# wasm32-safe; unstable_wasm swaps out rayon for wasm32.
 web = [
     "wasm",
+    "dep:lean-chat",
+    "lean-chat/web",
     "dep:wasm-bindgen",
     "dep:wasm-bindgen-futures",
     "dep:js-sys",
@@ -58,7 +63,7 @@ wgpu = { workspace = true }
 futures-channel = "0.3"
 serde = { workspace = true }
 serde_json = { workspace = true }
-minijinja = { workspace = true }
+lean-chat = { path = "../lean-chat", optional = true }
 
 wasm-bindgen = { workspace = true, optional = true }
 wasm-bindgen-futures = { workspace = true, optional = true }
@@ -66,8 +71,10 @@ js-sys = { workspace = true, optional = true }
 web-sys = { workspace = true, optional = true }
 console_error_panic_hook = { workspace = true, optional = true }
 getrandom = { workspace = true, optional = true }
-minijinja-contrib = { version = "2.24.0", features = ["pycompat"] }
 rayon = { version = "1", optional = true }
+
+[dev-dependencies]
+lean-chat = { path = "../lean-chat" }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 pollster = { version = "0.3", optional = true }

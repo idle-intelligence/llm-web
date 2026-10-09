@@ -24,9 +24,9 @@
 //! comment), so `fast_kernels` only changes the q/k/v/o/gate/up/down (Q4_0)
 //! kernels here, not the lm head.
 
-use lean::chat_template::{read_chat_template, render_user_prompt};
 use lean::engine::Engine;
 use lean::model::{build_rope_tables, forward_decode_step, forward_prefill, GpuModel, KvCache};
+use lean_chat::{read_chat_template, render, Message};
 use serde::Deserialize;
 use tokenizers::Tokenizer;
 
@@ -77,7 +77,7 @@ fn fixture_parity_qwen25_3b() {
     for fast_kernels in [false, true] {
         let model = GpuModel::load(&engine, &gguf_path, fast_kernels).expect("loading model");
         for case in &fixture.cases {
-            let rendered = render_user_prompt(&chat_template, &case.prompt).unwrap();
+            let rendered = render(&chat_template, &[Message::user(&case.prompt)], None, true).unwrap();
             let our_ids: Vec<u32> = tokenizer.encode(rendered, false).unwrap().get_ids().to_vec();
             assert_eq!(our_ids, case.input_ids, "[fast={fast_kernels} case={}] tokenization mismatch", case.name);
 

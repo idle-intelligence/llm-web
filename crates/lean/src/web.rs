@@ -23,7 +23,6 @@ use std::io::{Read, Seek, SeekFrom};
 
 use tokenizers::Tokenizer;
 
-use crate::chat_template::render_conversation;
 use crate::cpu::{forward_decode_step_argmax as cpu_decode_step_argmax, forward_prefill as cpu_forward_prefill, CpuKvCache, CpuModel};
 use crate::engine::{now_ms, Engine};
 use crate::error::LeanError;
@@ -98,7 +97,7 @@ impl Seek for JsBytesReader {
 /// doesn't need `Option<Vec<u32>>` plumbing this way, and JS call sites read
 /// naturally as `engine.decodeStepArgmax(id, [])`.
 /// A non-empty mask shorter than `vocab_size / 32` words is rejected, as
-/// `LeanEngineCpu::generate` does.
+/// `Lean::generate` does.
 fn mask_buf(engine: &Engine, vocab_size: usize, mask_bits: &[u32]) -> Result<Option<wgpu::Buffer>, JsError> {
     if mask_bits.is_empty() {
         Ok(None)
@@ -238,24 +237,8 @@ pub(crate) async fn yield_to_event_loop() {
     let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
 }
 
-/// Renders `messages` (`[{role, content}]`) through a chat template
-/// (`tokenizer_config.json`'s `chat_template` string), the text a chat page
-/// passes to `Lean.generate`. `tools` must be null or undefined.
-#[wasm_bindgen(js_name = chatRender)]
-pub fn chat_render(template: &str, messages: JsValue, tools: JsValue, add_generation_prompt: bool) -> Result<String, JsValue> {
-    if !tools.is_undefined() && !tools.is_null() {
-        return Err(JsValue::from(JsError::new("tools are not supported by this renderer")));
-    }
-    let arr: js_sys::Array = messages.dyn_into().map_err(|_| JsValue::from(JsError::new("messages must be an array")))?;
-    let mut turns = Vec::with_capacity(arr.length() as usize);
-    for m in arr.iter() {
-        let role = get_field(&m, "role").as_string().ok_or_else(|| JsValue::from(JsError::new("message missing 'role'")))?;
-        let content = get_field(&m, "content").as_string().ok_or_else(|| JsValue::from(JsError::new("message missing 'content'")))?;
-        turns.push((role, content));
-    }
-    let turns: Vec<(&str, &str)> = turns.iter().map(|(r, c)| (r.as_str(), c.as_str())).collect();
-    render_conversation(template, &turns, add_generation_prompt).map_err(|e| JsValue::from(JsError::new(&format!("{e:#}"))))
-}
+/// lean-chat's bindings, exported from this package too.
+pub use lean_chat::web::{chat_render, chat_trim_oldest_exchange};
 
 /// Whether `navigator.gpu` exists in this global scope: the capability
 /// check before asking wgpu for a WebGPU adapter.
