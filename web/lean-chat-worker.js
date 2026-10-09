@@ -157,6 +157,7 @@ async function generateWithTrim(onToken) {
     } catch (e) {
       const dropFrom = HISTORY[0] && HISTORY[0].role === "system" ? 1 : 0;
       if (e && e.name === "ContextOverflow" && HISTORY.length > dropFrom + 2) {
+        console.log(`[lean-chat-worker] context overflow (needed=${e.needed} available=${e.available}); dropping the oldest turn`);
         HISTORY.splice(dropFrom, 2);
         continue;
       }
