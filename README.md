@@ -28,10 +28,13 @@ await mod.default('./pkg/lean_bg.wasm');
 mod.leanInit();
 const engine = navigator.gpu ? await mod.LeanEngine.create() : mod.LeanEngineCpu.create();
 engine.load(ggufBytes, tokenizerJson, tokenizerConfigJson, 2048);
-await engine.chatGenerate(prompt, 64, 0.7, 40, 0.9, 1.1, 0, new Uint32Array(0),
-  (_id, text) => { /* append text */ }, new mod.AbortFlag().cloneFlag());
+const messages = [{ role: 'user', content: prompt }];
+const params = { maxNewTokens: 64, temperature: 0.7, topK: 40, topP: 0.9, repetitionPenalty: 1.1, seed: 0 };
+await engine.generate(messages, params, (text) => { /* append text */ }, new mod.AbortFlag().cloneFlag());
 </script>
 ```
+
+`generate` runs one inference turn over the given `messages` and returns the reply; it keeps no conversation of its own (see [`crates/lean/README.md`](crates/lean/README.md)) - a page holds its own message history and sends the whole thing each call.
 
 ### Native
 

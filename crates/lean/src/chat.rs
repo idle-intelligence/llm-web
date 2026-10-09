@@ -1,117 +1,178 @@
-//! Multi-turn chat shared by both browser engines (`web.rs`'s `LeanEngine`
-//! on WebGPU and `LeanEngineCpu` on CPU threads or one thread) and by the
-//! native tests, so the wasm surface is a thin wrapper over the code the
-//! tests exercise.
+//! One inference turn, shared by both browser engines (`web.rs`'s
+//! `LeanEngine` on WebGPU and `LeanEngineCpu` on CPU threads or one
+//! thread), the native CLI example (`examples/chat.rs`), and the native
+//! tests, so the wasm surface and the CLI are both thin wrappers over the
+//! code the tests exercise.
 //!
-//! - [`ChatSession`]: the conversation (`(role, content)` turns) and the
-//!   exact token ids resident in the KV cache. Each turn re-renders the whole
-//!   conversation through the model's own chat template, tokenizes it, and
-//!   reuses the longest common prefix with the cached ids; only the rest is
-//!   run through the model. The KV state after N turns is therefore the
-//!   state a from-scratch prefill of the rendered conversation would build,
-//!   including when the template rewrites an earlier turn or when the reply
-//!   text re-tokenizes differently from the generated ids.
-//! - [`TextStream`]: incremental detokenization. Decoding one id at a time
-//!   is wrong for byte-level BPE (a multi-byte character spans tokens) and
-//!   for SentencePiece-style decoders (a leading space is dropped at the
-//!   start of a decode); this decodes a sliding window of the accumulated
-//!   ids and emits only the new text, holding back a trailing incomplete
-//!   character. The concatenated deltas equal `decode(all ids)`.
-//! - [`gpu_chat_turn`] / [`cpu_chat_turn`]: one turn on each backend.
+//! Conversation state - which messages to send on the next call, when to
+//! drop old ones - is the caller's job, not this engine's: a call here
+//! takes the whole conversation (`messages`) every time and returns one
+//! reply. What this module keeps between calls is purely an optimization,
+//! invisible to the caller:
+//!
+//! - [`PrefixCache`]: the token ids this engine's KV cache currently holds,
+//!   left over from the previous call. The next call renders its own
+//!   `messages` through the chat template, tokenizes it, and reuses the
+//!   longest prefix the two id sequences agree on; only the remainder is
+//!   prefilled. If nothing matches (the caller dropped an early turn, or
+//!   this is the first call), the whole conversation is prefilled from
+//!   scratch - this is `forward_prefill`'s default behavior regardless of
+//!   the cache's prior contents, so no explicit reset is needed. The cache
+//!   serves one caller at a time: two callers sharing one engine evict
+//!   each other's prefix, since each call's reuse check only ever sees the
+//!   previous call's own result.
+//! - [`TextStream`]: incremental detokenization, unchanged in shape from
+//!   before this module dropped conversation history. Decoding one id at a
+//!   time is wrong for byte-level BPE (a multi-byte character spans
+//!   tokens) and for SentencePiece-style decoders (a leading space is
+//!   dropped at the start of a decode); this decodes a sliding window of
+//!   the accumulated ids and emits only the new text, holding back a
+//!   trailing incomplete character. The concatenated deltas equal
+//!   `decode(all ids)`.
+//! - [`gpu_generate`] / [`cpu_generate`]: one turn on each backend. Takes
+//!   `messages`, streams the reply as text (not token ids - see
+//!   `GenParams`'s doc comment on why the token-level primitives this
+//!   builds on, `forward_prefill`/`forward_prefill_suffix`/`decode_loop`,
+//!   are the right level for a caller that wants raw ids instead).
 
 use std::future::Future;
 
-use anyhow::{bail, Context, Result};
 use tokenizers::Tokenizer;
 
 use crate::chat_template::render_conversation;
 use crate::cpu::{forward_decode_step as cpu_forward_decode_step, forward_prefill as cpu_forward_prefill, CpuKvCache, CpuModel};
 use crate::engine::Engine;
+use crate::error::LeanError;
 use crate::generate::decode_loop;
 use crate::model::{argmax, forward_prefill, forward_prefill_suffix, GpuModel, KvCache};
 use crate::sampling::{sample, Rng64, SamplingParams};
 
+/// One turn's input: `role` + `content`. A client renders its own chat
+/// template context for any system prompt/history policy before building
+/// this slice; this crate only renders it through the model's
+/// `chat_template` string.
+#[derive(Debug, Clone)]
+pub struct Message {
+    pub role: String,
+    pub content: String,
+}
+
+impl Message {
+    pub fn new(role: impl Into<String>, content: impl Into<String>) -> Self {
+        Message { role: role.into(), content: content.into() }
+    }
+}
+
+/// Everything one `generate` call needs beyond `messages`: how many tokens
+/// to produce, and the sampling choices `sampling::SamplingParams` already
+/// carries (wrapped here rather than duplicated, so a caller builds one
+/// params type instead of two). `mask_bits` is this crate's mask-bitset
+/// convention (`model::build_mask_bitset`); `None` means unmasked - the
+/// token-level primitives (`forward_prefill`, `forward_decode_step_argmax`,
+/// `decode_loop`) take the same convention directly if a caller wants raw
+/// token ids instead of this message-level wrapper.
+#[derive(Debug, Clone)]
+pub struct GenParams {
+    pub max_new_tokens: u32,
+    pub temperature: f32,
+    pub top_k: u32,
+    pub top_p: f32,
+    pub repetition_penalty: f32,
+    pub seed: u64,
+    pub mask_bits: Option<Vec<u32>>,
+}
+
+impl Default for GenParams {
+    fn default() -> Self {
+        let s = SamplingParams::default();
+        GenParams { max_new_tokens: 256, temperature: s.temperature, top_k: s.top_k, top_p: s.top_p, repetition_penalty: s.repetition_penalty, seed: s.seed, mask_bits: None }
+    }
+}
+
+impl GenParams {
+    pub fn sampling(&self) -> SamplingParams {
+        SamplingParams { temperature: self.temperature, top_k: self.top_k, top_p: self.top_p, repetition_penalty: self.repetition_penalty, seed: self.seed }
+    }
+}
+
+/// The token ids this engine's KV cache currently holds, left over from
+/// whichever call (or low-level write) last touched the cache - see the
+/// module doc comment on single-client reuse.
 #[derive(Default)]
-pub struct ChatSession {
-    history: Vec<(String, String)>,
-    /// The token ids at KV positions `[0, cached_ids.len())`, as this session
-    /// wrote them. Cleared by [`ChatSession::invalidate_cache`] whenever
-    /// anything else writes the cache.
+pub struct PrefixCache {
     cached_ids: Vec<u32>,
 }
 
-/// What a turn has to run: the whole rendered conversation's ids, and how
-/// many leading ids are already in the KV cache (always fewer than
-/// `ids.len()`, so at least one id is prefilled and yields logits).
-pub struct TurnPlan {
-    pub ids: Vec<u32>,
-    pub reuse: usize,
-}
-
-impl ChatSession {
+impl PrefixCache {
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Forget the conversation and the cached ids (the caller resets the KV
-    /// length to 0).
-    pub fn reset(&mut self) {
-        self.history.clear();
+    /// Stop trusting the cached ids: the next call prefills its whole
+    /// rendered conversation from scratch. Call this whenever something
+    /// else writes the KV cache directly (a low-level `prefillTokens`/
+    /// `decodeStepArgmax`/`restoreKv` call, or any direct `cache.kv_len`
+    /// change) so the next `generate` doesn't trust a prefix that is no
+    /// longer actually resident.
+    pub fn invalidate(&mut self) {
         self.cached_ids.clear();
     }
 
-    /// Keep the conversation but stop trusting the KV cache: the next turn
-    /// prefills the whole rendered conversation again.
-    pub fn invalidate_cache(&mut self) {
-        self.cached_ids.clear();
-    }
-
-    pub fn history(&self) -> &[(String, String)] {
-        &self.history
-    }
-
-    fn render(&self, chat_template: &str, add_generation_prompt: bool) -> Result<String> {
-        let turns: Vec<(&str, &str)> = self.history.iter().map(|(r, c)| (r.as_str(), c.as_str())).collect();
-        render_conversation(chat_template, &turns, add_generation_prompt)
-    }
-
-    /// Appends `prompt` as a user turn and plans the prefill. `kv_len` is
-    /// the cache's current length: cached ids beyond it are not reused. On
-    /// error the user turn is taken back out.
-    pub fn begin_turn(&mut self, tokenizer: &Tokenizer, chat_template: &str, prompt: &str, kv_len: usize, max_new_tokens: usize, max_ctx: usize) -> Result<TurnPlan> {
-        self.history.push(("user".to_string(), prompt.to_string()));
-        let plan = self.plan(tokenizer, chat_template, kv_len, max_new_tokens, max_ctx);
-        if plan.is_err() {
-            self.history.pop();
-        }
-        plan
-    }
-
-    fn plan(&self, tokenizer: &Tokenizer, chat_template: &str, kv_len: usize, max_new_tokens: usize, max_ctx: usize) -> Result<TurnPlan> {
-        let rendered = self.render(chat_template, true).context("rendering the conversation")?;
-        let ids = tokenizer.encode(rendered, false).map_err(|e| anyhow::anyhow!("tokenizer encode failed: {e}"))?.get_ids().to_vec();
-        if ids.is_empty() {
-            bail!("the rendered conversation tokenizes to nothing");
-        }
-        if ids.len() + max_new_tokens > max_ctx {
-            bail!("conversation ({} tokens) + max_new_tokens ({max_new_tokens}) exceeds max_ctx ({max_ctx})", ids.len());
-        }
+    /// How many of `ids`' leading tokens are already resident at `kv_len`:
+    /// the longest common prefix of the previously cached ids and `ids`,
+    /// capped so at least one id is always left to prefill (a call always
+    /// produces at least one position's logits).
+    fn reuse(&self, ids: &[u32], kv_len: usize) -> usize {
         let usable = self.cached_ids.len().min(kv_len);
-        let lcp = self.cached_ids[..usable].iter().zip(&ids).take_while(|(a, b)| a == b).count();
-        let reuse = lcp.min(ids.len() - 1);
-        Ok(TurnPlan { ids, reuse })
+        let lcp = self.cached_ids[..usable].iter().zip(ids).take_while(|(a, b)| a == b).count();
+        lcp.min(ids.len().saturating_sub(1))
     }
 
-    /// Records the reply: the cache now holds the first `kv_len` ids of
-    /// `plan_ids` + `generated` (every generated id is fed back except one
-    /// whose step an abort skipped), and `reply` becomes the assistant turn.
-    pub fn end_turn(&mut self, plan_ids: Vec<u32>, generated: &[u32], kv_len: usize, reply: String) {
-        let mut cached = plan_ids;
+    /// Records what a call left resident: `ids`' first `kv_len` tokens,
+    /// plus `generated` appended, truncated to `kv_len` (an abort can skip
+    /// feeding the last generated id back into the cache).
+    fn commit(&mut self, ids: Vec<u32>, generated: &[u32], kv_len: usize) {
+        let mut cached = ids;
         cached.extend_from_slice(generated);
         cached.truncate(kv_len);
         self.cached_ids = cached;
-        self.history.push(("assistant".to_string(), reply));
     }
+}
+
+/// Renders `messages` through `chat_template` (`add_generation_prompt =
+/// true`) - the exact text a `generate` call would tokenize and run,
+/// without running it.
+pub fn render_prompt(chat_template: &str, messages: &[Message]) -> Result<String, LeanError> {
+    let turns: Vec<(&str, &str)> = messages.iter().map(|m| (m.role.as_str(), m.content.as_str())).collect();
+    render_conversation(chat_template, &turns, true).map_err(LeanError::from)
+}
+
+/// [`render_prompt`] + tokenize, with no forward-pass work - how many
+/// tokens a `generate` call over `messages` would need, so a caller can
+/// decide whether to trim before calling.
+pub fn token_count(tokenizer: &Tokenizer, chat_template: &str, messages: &[Message]) -> Result<usize, LeanError> {
+    let rendered = render_prompt(chat_template, messages)?;
+    let ids = tokenizer.encode(rendered, false).map_err(|e| LeanError::Other(anyhow::anyhow!("tokenizer encode failed: {e}")))?;
+    Ok(ids.get_ids().len())
+}
+
+/// Renders + tokenizes `messages` and checks the result plus
+/// `max_new_tokens` fits `max_ctx`, returning the typed overflow error
+/// ([`LeanError::ContextOverflow`]) rather than running anything if not -
+/// shared by [`gpu_generate`]/[`cpu_generate`]. Nothing is mutated before
+/// this returns, so an `Err` here leaves the engine's cache state exactly
+/// as it was.
+fn plan(tokenizer: &Tokenizer, chat_template: &str, messages: &[Message], max_new_tokens: u32, max_ctx: usize) -> Result<Vec<u32>, LeanError> {
+    let rendered = render_prompt(chat_template, messages)?;
+    let ids = tokenizer.encode(rendered, false).map_err(|e| LeanError::Other(anyhow::anyhow!("tokenizer encode failed: {e}")))?.get_ids().to_vec();
+    if ids.is_empty() {
+        return Err(LeanError::Other(anyhow::anyhow!("the rendered conversation tokenizes to nothing")));
+    }
+    let needed = ids.len() + max_new_tokens as usize;
+    if needed > max_ctx {
+        return Err(LeanError::ContextOverflow { needed, available: max_ctx });
+    }
+    Ok(ids)
 }
 
 /// See the module doc. `prev..cur` is the window decoded at the previous
@@ -130,14 +191,14 @@ impl TextStream {
         Self::default()
     }
 
-    fn decode(tokenizer: &Tokenizer, ids: &[u32]) -> Result<String> {
+    fn decode(tokenizer: &Tokenizer, ids: &[u32]) -> Result<String, LeanError> {
         if ids.is_empty() {
             return Ok(String::new());
         }
-        tokenizer.decode(ids, true).map_err(|e| anyhow::anyhow!("tokenizer decode failed: {e}"))
+        tokenizer.decode(ids, true).map_err(|e| LeanError::Other(anyhow::anyhow!("tokenizer decode failed: {e}")))
     }
 
-    fn delta(&self, tokenizer: &Tokenizer, flush: bool) -> Result<Option<String>> {
+    fn delta(&self, tokenizer: &Tokenizer, flush: bool) -> Result<Option<String>, LeanError> {
         let prev_text = Self::decode(tokenizer, &self.ids[self.prev..self.cur])?;
         let text = Self::decode(tokenizer, &self.ids[self.prev..])?;
         if text.len() > prev_text.len() && text.starts_with(&prev_text) && (flush || !text.ends_with('\u{FFFD}')) {
@@ -148,7 +209,7 @@ impl TextStream {
 
     /// Adds one generated id; returns the text it completes (often "", e.g.
     /// for a special token or the first half of a multi-byte character).
-    pub fn push(&mut self, tokenizer: &Tokenizer, id: u32) -> Result<String> {
+    pub fn push(&mut self, tokenizer: &Tokenizer, id: u32) -> Result<String, LeanError> {
         self.ids.push(id);
         match self.delta(tokenizer, false)? {
             Some(d) => {
@@ -162,7 +223,7 @@ impl TextStream {
 
     /// Text still held back at the end of generation (an incomplete
     /// character cut off by `max_new_tokens` or an abort); usually "".
-    pub fn finish(&mut self, tokenizer: &Tokenizer) -> Result<String> {
+    pub fn finish(&mut self, tokenizer: &Tokenizer) -> Result<String, LeanError> {
         let d = self.delta(tokenizer, true)?.unwrap_or_default();
         self.prev = self.cur;
         self.cur = self.ids.len();
@@ -223,64 +284,119 @@ pub async fn cpu_decode_loop<F: Future<Output = ()>>(
     generated
 }
 
-/// One chat turn on the GPU: plan, prefill what is not cached
-/// (`forward_prefill` from position 0, else `forward_prefill_suffix` after
-/// rewinding to the reused prefix), stream the reply, record it. Returns
-/// the generated ids and the reply text.
+/// One inference turn on the GPU: plan, prefill what is not cached
+/// (`forward_prefill` from scratch, else `forward_prefill_suffix` after
+/// rewinding to the reused prefix), stream the reply as text through
+/// `on_token`, record what the call left resident in `prefix`. Returns the
+/// reply text.
 #[allow(clippy::too_many_arguments)]
-pub async fn gpu_chat_turn(
+pub async fn gpu_generate(
     engine: &Engine,
     model: &GpuModel,
     cache: &mut KvCache,
     cos: &wgpu::Buffer,
     sin: &wgpu::Buffer,
-    session: &mut ChatSession,
+    prefix: &mut PrefixCache,
     tokenizer: &Tokenizer,
     chat_template: &str,
-    prompt: &str,
-    max_new_tokens: u32,
-    params: &SamplingParams,
+    messages: &[Message],
+    params: &GenParams,
     mask: Option<&wgpu::Buffer>,
-    on_token: impl FnMut(u32),
+    mut on_token: impl FnMut(&str),
     should_stop: impl FnMut() -> bool,
-) -> Result<(Vec<u32>, String)> {
-    let plan = session.begin_turn(tokenizer, chat_template, prompt, cache.kv_len as usize, max_new_tokens as usize, cache.max_ctx as usize)?;
-    let logits = if plan.reuse == 0 {
-        forward_prefill(engine, model, cache, &plan.ids, cos, sin, mask).await
+) -> Result<String, LeanError> {
+    let ids = plan(tokenizer, chat_template, messages, params.max_new_tokens, cache.max_ctx as usize)?;
+    let reuse = prefix.reuse(&ids, cache.kv_len as usize);
+    let logits = if reuse == 0 {
+        forward_prefill(engine, model, cache, &ids, cos, sin, mask).await
     } else {
-        cache.kv_len = plan.reuse as u32;
-        forward_prefill_suffix(engine, model, cache, &plan.ids[plan.reuse..], cos, sin, mask).await
+        cache.kv_len = reuse as u32;
+        forward_prefill_suffix(engine, model, cache, &ids[reuse..], cos, sin, mask).await
     };
-    let mut history = plan.ids.clone();
-    let generated = decode_loop(engine, model, cache, logits, cos, sin, mask, max_new_tokens, params, &mut history, on_token, should_stop).await;
+    let mut history = ids.clone();
+    let sampling = params.sampling();
+    let mut stream = TextStream::new();
+    let mut stream_err: Option<LeanError> = None;
+    let generated = decode_loop(
+        engine,
+        model,
+        cache,
+        logits,
+        cos,
+        sin,
+        mask,
+        params.max_new_tokens,
+        &sampling,
+        &mut history,
+        |id| match stream.push(tokenizer, id) {
+            Ok(delta) if !delta.is_empty() => on_token(&delta),
+            Ok(_) => {}
+            Err(e) => stream_err = Some(e),
+        },
+        should_stop,
+    )
+    .await;
+    if let Some(e) = stream_err {
+        return Err(e);
+    }
+    let tail = stream.finish(tokenizer)?;
+    if !tail.is_empty() {
+        on_token(&tail);
+    }
     let reply = TextStream::decode(tokenizer, &generated)?;
-    session.end_turn(plan.ids, &generated, cache.kv_len as usize, reply.clone());
-    Ok((generated, reply))
+    prefix.commit(ids, &generated, cache.kv_len as usize);
+    Ok(reply)
 }
 
-/// One chat turn on the CPU, same steps as [`gpu_chat_turn`]; the CPU
+/// One inference turn on the CPU, same steps as [`gpu_generate`]; the CPU
 /// prefill continues from the cache's resident prefix directly.
 #[allow(clippy::too_many_arguments)]
-pub async fn cpu_chat_turn<F: Future<Output = ()>>(
+pub async fn cpu_generate<F: Future<Output = ()>>(
     model: &CpuModel,
     cache: &mut CpuKvCache,
-    session: &mut ChatSession,
+    prefix: &mut PrefixCache,
     tokenizer: &Tokenizer,
     chat_template: &str,
-    prompt: &str,
-    max_new_tokens: u32,
-    params: &SamplingParams,
-    mask_bits: Option<&[u32]>,
-    on_token: impl FnMut(u32),
+    messages: &[Message],
+    params: &GenParams,
+    mut on_token: impl FnMut(&str),
     should_stop: impl FnMut() -> bool,
     yield_now: impl FnMut() -> F,
-) -> Result<(Vec<u32>, String)> {
-    let plan = session.begin_turn(tokenizer, chat_template, prompt, cache.kv_len, max_new_tokens as usize, cache.max_ctx())?;
-    cache.kv_len = plan.reuse;
-    let logits = cpu_forward_prefill(model, cache, &plan.ids[plan.reuse..]);
-    let mut history = plan.ids.clone();
-    let generated = cpu_decode_loop(model, cache, logits, mask_bits, max_new_tokens, params, &mut history, on_token, should_stop, yield_now).await;
+) -> Result<String, LeanError> {
+    let ids = plan(tokenizer, chat_template, messages, params.max_new_tokens, cache.max_ctx())?;
+    let reuse = prefix.reuse(&ids, cache.kv_len);
+    cache.kv_len = reuse;
+    let logits = cpu_forward_prefill(model, cache, &ids[reuse..]);
+    let mut history = ids.clone();
+    let sampling = params.sampling();
+    let mask_bits = params.mask_bits.as_deref();
+    let mut stream = TextStream::new();
+    let mut stream_err: Option<LeanError> = None;
+    let generated = cpu_decode_loop(
+        model,
+        cache,
+        logits,
+        mask_bits,
+        params.max_new_tokens,
+        &sampling,
+        &mut history,
+        |id| match stream.push(tokenizer, id) {
+            Ok(delta) if !delta.is_empty() => on_token(&delta),
+            Ok(_) => {}
+            Err(e) => stream_err = Some(e),
+        },
+        should_stop,
+        yield_now,
+    )
+    .await;
+    if let Some(e) = stream_err {
+        return Err(e);
+    }
+    let tail = stream.finish(tokenizer)?;
+    if !tail.is_empty() {
+        on_token(&tail);
+    }
     let reply = TextStream::decode(tokenizer, &generated)?;
-    session.end_turn(plan.ids, &generated, cache.kv_len, reply.clone());
-    Ok((generated, reply))
+    prefix.commit(ids, &generated, cache.kv_len);
+    Ok(reply)
 }

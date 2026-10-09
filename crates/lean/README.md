@@ -49,13 +49,19 @@ The wasm module exports two engines with the same method names wherever both imp
 
 Both load with `engine.load(ggufBytes, tokenizerJson, tokenizerConfigJson, maxCtx)` and run in a Web Worker, never on the main thread.
 
-- **Chat.** `await engine.chatGenerate(prompt, maxNewTokens, temperature, topK, topP, repetitionPenalty, seed, maskBits, onToken, abortFlag)` adds a user turn, streams the reply and keeps the KV cache for the next turn; only the new part of the conversation is prefilled. `engine.chatReset()` starts a new conversation. `onToken(id, text)` is called once per generated token; `text` is the piece of reply text that token completes, so concatenating every `text` gives the returned reply. If text is still held back when generation ends, one last call passes `id = -1`. The callback must not call back into the engine. A throw from the callback stops generation and rejects the call.
+lean runs **one inference turn per `generate` call** and keeps no conversation of its own: `messages` is the whole conversation, every call, and the caller decides what stays in it (when to trim, whether there's a system message). This serves a single client at a time - see the KV cache note below.
+
+- **One inference turn.** `await engine.generate(messages, params, onToken, abortFlag)`. `messages` is a plain array of `{role, content}`. `params` is a plain object: `maxNewTokens`, `temperature` (0 = greedy), `topK`, `topP`, `repetitionPenalty`, `seed`, and an optional `mask` (a bitset array, same convention as `buildMaskBitset`; omitted or empty means unmasked). `onToken(text)` is called with each piece of reply text as soon as it is produced - text only, no token ids cross this boundary. Returns the full reply text.
+
+  The engine keeps the KV cache from its last call and reuses whatever prefix the new `messages` still agree with, so a growing conversation only prefills its new suffix - this is invisible to the caller and serves one client at a time: two callers sharing one engine evict each other's cached prefix (nothing breaks, it just costs a full reprefill).
+
+  If `messages` plus `maxNewTokens` would not fit this engine's `maxCtx`, the call rejects with an `Error` whose `name` is `"ContextOverflow"` and which carries numeric `needed`/`available` properties; the engine's own state is untouched, so the next call works normally. A caller drops older messages and retries - see `web/lean-chat-worker.js`'s `generateWithTrim` or the native `examples/chat.rs` for the same policy.
 - **Stop.** `new AbortFlag()`; pass `flag.cloneFlag()` to the call and call `flag.abort()` from a message handler. The engine checks it before each token.
-- **One-shot generation** (`LeanEngine`): `generate(prompt, maxNewTokens, onToken)` is greedy; `generateStream(prompt, maxNewTokens, temperature, topK, topP, repetitionPenalty, seed, maskBits, onToken, abortFlag)` samples. `LeanEngineCpu.generate` is greedy and synchronous.
-- **Logit mask.** `engine.buildMaskBitset(allowedIds)` packs the allowed token ids into a bitset; pass it as `maskBits` (an empty array means no mask). `LeanEngine` also takes a mask on the low-level calls `prefillTokens`, `appendTokens` and `decodeStepArgmax`, so a grammar can change the allowed set at every step. A mask shorter than `vocabSize / 32` words is rejected.
+- **Render / token count, no forward pass.** `engine.renderPrompt(messages)` returns the text `generate` would tokenize; `engine.tokenCount(messages)` returns its token count - a caller uses these to decide whether to trim before calling `generate`.
+- **Logit mask.** `engine.buildMaskBitset(allowedIds)` packs the allowed token ids into a bitset; pass it as `params.mask` (omitted means no mask). `LeanEngine` also takes a mask on the low-level calls `prefillTokens`, `appendTokens` and `decodeStepArgmax`, so a grammar can change the allowed set at every step. A mask shorter than `vocabSize / 32` words is rejected.
 - **KV snapshot** (`LeanEngine`): `await engine.snapshotKv()` returns the KV cache prefix as bytes, `engine.restoreKv(bytes)` puts it back, and `appendTokens(ids, maskBits)` continues from it. A page can store the snapshot of a long fixed prefix and skip its prefill next time.
 - **LoRA.** LoRA adapters are in the Rust API (`apply_lora` / `clear_lora` on the GPU model and on the CPU model); they are not exposed to JavaScript yet.
-- **Tokens.** `tokenize`, `encodeRaw`, `decodeIds`, `tokenCount`, `kvLen`, `info`.
+- **Low-level, raw token ids.** `tokenize`, `encodeRaw`, `decodeIds`, `prefillTokens`, `appendTokens`, `decodeStepArgmax`, `decodeGreedy`, `kvLen`, `info` - unchanged by the one-turn `generate` API above; a consumer driving its own token-level loop (an agent, a grammar) keeps using these directly.
 
 A minimal worker:
 
@@ -67,8 +73,10 @@ const engine = await mod.LeanEngine.create(); // or mod.LeanEngineCpu.create()
 engine.load(gguf, tokenizerJson, tokenizerCfgJson, 2048);
 
 const abortFlag = new mod.AbortFlag();
-const reply = await engine.chatGenerate(text, 128, 0.7, 40, 0.9, 1.1, 1, new Uint32Array(0), (id, piece) => {
-  if (piece) self.postMessage({ type: "piece", text: piece });
+const messages = [{ role: "user", content: text }];
+const params = { maxNewTokens: 128, temperature: 0.7, topK: 40, topP: 0.9, repetitionPenalty: 1.1, seed: 1 };
+const reply = await engine.generate(messages, params, (piece) => {
+  self.postMessage({ type: "piece", text: piece });
 }, abortFlag.cloneFlag());
 ```
 

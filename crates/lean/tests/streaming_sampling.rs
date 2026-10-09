@@ -1,7 +1,8 @@
-//! Native tests for this session's streaming/sampling/multi-turn additions
+//! Native tests for the streaming/sampling/multi-turn primitives
 //! (`generate::decode_loop`, `sampling::{SamplingParams, sample}`,
 //! `chat_template::render_conversation`) - the plain-Rust core that
-//! `web.rs`'s `generateStream`/`chatGenerate` wrap for JS. Same fixture/env
+//! `chat::gpu_generate`/`chat::cpu_generate` (what `web.rs` wraps for JS)
+//! build on. Same fixture/env
 //! convention as `kv_snapshot.rs`/`logit_mask.rs`: needs the actual GGUF +
 //! tokenizer files on disk, never committed to this repo.
 //!

@@ -11,6 +11,7 @@ pub mod cpu_kernels;
 #[cfg(feature = "threads")]
 mod cpu_team;
 pub mod engine;
+pub mod error;
 pub mod generate;
 pub mod gguf;
 pub mod lora;
