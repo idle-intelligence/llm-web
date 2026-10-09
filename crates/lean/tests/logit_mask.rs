@@ -20,7 +20,7 @@ use lean_chat::{read_chat_template, render, Message};
 use std::time::Instant;
 use tokenizers::Tokenizer;
 
-fn tokenize(tokenizer: &Tokenizer, chat_template: &str, prompt: &str) -> Vec<u32> {
+fn tokenize(tokenizer: &Tokenizer, chat_template: &lean_chat::ChatTemplate, prompt: &str) -> Vec<u32> {
     let rendered = render(chat_template, &[Message::user(prompt)], None, true).unwrap();
     tokenizer.encode(rendered, false).unwrap().get_ids().to_vec()
 }

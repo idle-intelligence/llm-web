@@ -42,7 +42,7 @@
 const EARLY = [];
 self.onmessage = (e) => EARLY.push(e);
 
-const ENGINE_BUILD = "2026-10-10-lean-chat-01";
+const ENGINE_BUILD = "2026-10-10-lean-chat-02";
 // Rewritten to true by scripts/build.sh when BUILD_THREADS=1 built pkg-mt
 // into this deployment; GitHub Pages never sets it.
 const MT_BUILT = false;
@@ -121,7 +121,7 @@ async function load(model, backendChoice) {
     }
   );
   const tokenizerJson = new TextDecoder().decode(tokenizerBytes);
-  chatTemplate = JSON.parse(new TextDecoder().decode(tokenizerCfgBytes)).chat_template;
+  const tokenizerCfgJson = new TextDecoder().decode(tokenizerCfgBytes);
 
   const skipped = [];
   for (const c of candidates) {
@@ -130,6 +130,7 @@ async function load(model, backendChoice) {
       const mod = await loadModule(c);
       console.log(`[lean-chat-worker] loading weights on ${c} backend...`);
       engine = await mod.Lean.load({ gguf: ggufBytes, tokenizer: tokenizerJson, maxCtx: model.maxCtx, backend: c === "webgpu" ? "webgpu" : "cpu" });
+      chatTemplate = mod.ChatTemplate.fromTokenizerConfig(tokenizerCfgJson);
       lean = mod;
       backend = c;
       break;

@@ -140,7 +140,7 @@ fn argmax(logits: &[f32]) -> u32 {
 /// in the rendered string, and the tokenizer's added-vocabulary matching
 /// picks them out as single tokens — the same mechanism HF's Python
 /// tokenizer uses).
-fn tokenize_prompt(tokenizer: &Tokenizer, chat_template: &str, prompt: &str) -> Result<Vec<u32>> {
+fn tokenize_prompt(tokenizer: &Tokenizer, chat_template: &lean_chat::ChatTemplate, prompt: &str) -> Result<Vec<u32>> {
     let rendered = render(chat_template, &[Message::user(prompt)], None, true)?;
     let encoding = tokenizer.encode(rendered, false).map_err(|e| anyhow::anyhow!("tokenizer encode failed: {e}"))?;
     Ok(encoding.get_ids().to_vec())
@@ -229,7 +229,7 @@ fn run_generation_cpu(model: &lean::cpu::CpuModel, token_ids: &[u32], n_tokens: 
 /// engines take different model types (`CpuModel` vs `GpuModel`) with no
 /// shared trait yet - see this crate's CPU-fallback plan on that being a
 /// possible follow-up once both rungs are proven out.
-fn run_fixture_cpu(gguf_path: &str, tokenizer: &Tokenizer, chat_template: &str, fixture: &Fixture, n_tokens: usize, include_long: bool) -> Result<()> {
+fn run_fixture_cpu(gguf_path: &str, tokenizer: &Tokenizer, chat_template: &lean_chat::ChatTemplate, fixture: &Fixture, n_tokens: usize, include_long: bool) -> Result<()> {
     let load_start = Instant::now();
     let model = lean::cpu::CpuModel::load(gguf_path)?;
     eprintln!("loaded CPU model in {:?}", load_start.elapsed());
@@ -285,7 +285,7 @@ fn run_fixture_cpu(gguf_path: &str, tokenizer: &Tokenizer, chat_template: &str, 
 /// fresh cache -> prefill(suffix) -> greedy generate must reproduce
 /// prefill(prefix+suffix) -> greedy generate exactly, plus an export/import
 /// byte round trip. Uses `--prompt` split at its midpoint token.
-fn check_kv_snapshot(engine: &lean::engine::Engine, model: &GpuModel, tokenizer: &Tokenizer, chat_template: &str, prompt: &str, n_new: usize) -> Result<()> {
+fn check_kv_snapshot(engine: &lean::engine::Engine, model: &GpuModel, tokenizer: &Tokenizer, chat_template: &lean_chat::ChatTemplate, prompt: &str, n_new: usize) -> Result<()> {
     let all_ids = tokenize_prompt(tokenizer, chat_template, prompt)?;
     anyhow::ensure!(all_ids.len() >= 4, "prompt too short to split into a prefix/suffix ({} tokens)", all_ids.len());
     let split = all_ids.len() / 2;
@@ -338,7 +338,7 @@ fn check_kv_snapshot(engine: &lean::engine::Engine, model: &GpuModel, tokenizer:
 /// `--check mask`: a per-step singleton mask must force greedy decoding to
 /// reproduce a fixed target string; an all-allowed mask must match
 /// unmasked output.
-fn check_mask(engine: &lean::engine::Engine, model: &GpuModel, tokenizer: &Tokenizer, chat_template: &str, prompt: &str) -> Result<()> {
+fn check_mask(engine: &lean::engine::Engine, model: &GpuModel, tokenizer: &Tokenizer, chat_template: &lean_chat::ChatTemplate, prompt: &str) -> Result<()> {
     let vocab = model.config.vocab_size;
     let prompt_ids = tokenize_prompt(tokenizer, chat_template, prompt)?;
     let target = "{\"ok\":true}";

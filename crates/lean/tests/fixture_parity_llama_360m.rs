@@ -57,7 +57,7 @@ fn argmax(logits: &[f32]) -> u32 {
     best as u32
 }
 
-fn run_fixture(engine: &Engine, gguf_path: &str, fixture_json: &str, tokenizer: &Tokenizer, chat_template: &str) {
+fn run_fixture(engine: &Engine, gguf_path: &str, fixture_json: &str, tokenizer: &Tokenizer, chat_template: &lean_chat::ChatTemplate) {
     let fixture: Fixture = serde_json::from_str(fixture_json).expect("parsing fixture json");
     let model = GpuModel::load(engine, gguf_path, false).expect("loading model");
 

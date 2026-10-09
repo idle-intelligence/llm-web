@@ -27,7 +27,7 @@ const mod = await import('./pkg/lean.js');
 await mod.default('./pkg/lean_bg.wasm');
 mod.leanInit();
 const lean = await mod.Lean.load({ gguf: ggufBytes, tokenizer: tokenizerJson, maxCtx: 2048 });
-const template = JSON.parse(tokenizerConfigJson).chat_template;
+const template = mod.ChatTemplate.fromTokenizerConfig(tokenizerConfigJson);
 const prompt = mod.chatRender(template, [{ role: 'user', content: question }], null, true);
 const params = { maxNewTokens: 64, temperature: 0.7, topK: 40, topP: 0.9, repetitionPenalty: 1.1, seed: 0 };
 const reply = await lean.generate(prompt, params, (text) => { /* append text */ }, new mod.AbortFlag().cloneFlag());

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Writes lean-chat's exactness fixtures: for each model below, its chat
-template and, for a set of conversations, the prompt text transformers
+template, its bos_token and eos_token (transformers passes the special
+tokens into the template context) and, for a set of conversations, the prompt text transformers
 renders with
 
     tokenizer.apply_chat_template(messages, tools=tools,
@@ -27,6 +28,8 @@ MODELS = {
     "qwen2_5": ("Qwen/Qwen2.5-0.5B-Instruct", True),
     "qwen3": ("Qwen/Qwen3-0.6B", True),
     "smollm2": ("HuggingFaceTB/SmolLM2-360M-Instruct", False),
+    # A template that writes bos_token and eos_token into the text.
+    "mistral_v0_3": ("mistralai/Mistral-7B-Instruct-v0.3", True),
 }
 
 TOOLS = [
@@ -77,12 +80,14 @@ def assistant(text):
     return {"role": "assistant", "content": text}
 
 
+# Tool call ids are 9 alphanumeric characters, the form Mistral's template
+# requires; the other templates ignore them.
 def tool_calls(*calls):
-    return {"role": "assistant", "content": "", "tool_calls": [{"type": "function", "function": {"name": n, "arguments": a}} for n, a in calls]}
+    return {"role": "assistant", "content": "", "tool_calls": [{"id": i, "type": "function", "function": {"name": n, "arguments": a}} for i, n, a in calls]}
 
 
-def tool(text):
-    return {"role": "tool", "content": text}
+def tool(call_id, text):
+    return {"role": "tool", "tool_call_id": call_id, "content": text}
 
 
 # (name, messages, use tools, add_generation_prompt, needs a tool-capable template)
@@ -110,8 +115,8 @@ CASES = [
         [
             sys_msg("You control the house."),
             user("What's the weather in Zürich?"),
-            tool_calls(("get_weather", {"unit": "celsius", "city": "Zürich"})),
-            tool('{"temperature": 21, "condition": "sunny"}'),
+            tool_calls(("call00001", "get_weather", {"unit": "celsius", "city": "Zürich"})),
+            tool("call00001", '{"temperature": 21, "condition": "sunny"}'),
             assistant("It is 21 °C and sunny in Zürich."),
             user("Set the kitchen volume to 30."),
         ],
@@ -123,9 +128,9 @@ CASES = [
         "parallel_tool_calls",
         [
             user("Mute the kitchen and tell me the weather in Paris."),
-            tool_calls(("set_volume", {"room": "kitchen", "level": 0, "fade": 0.5, "mute": True}), ("get_weather", {"city": "Paris"})),
-            tool('{"ok": true}'),
-            tool('{"temperature": 18, "condition": "rain", "alerts": null}'),
+            tool_calls(("call00002", "set_volume", {"room": "kitchen", "level": 0, "fade": 0.5, "mute": True}), ("call00003", "get_weather", {"city": "Paris"})),
+            tool("call00002", '{"ok": true}'),
+            tool("call00003", '{"temperature": 18, "condition": "rain", "alerts": null}'),
         ],
         True,
         True,
@@ -135,8 +140,8 @@ CASES = [
         "string_arguments",
         [
             user("Weather in Paris?"),
-            tool_calls(("get_weather", '{"city": "Paris"}')),
-            tool("18 °C"),
+            tool_calls(("call00004", "get_weather", '{"city": "Paris"}')),
+            tool("call00004", "18 °C"),
             assistant("18 °C in Paris."),
             user("Thanks!"),
         ],
@@ -169,7 +174,14 @@ def main():
             tools = TOOLS if use_tools else None
             rendered = tok.apply_chat_template(messages, tools=tools, add_generation_prompt=add_generation_prompt, tokenize=False)
             cases.append({"name": case_name, "messages": messages, "tools": tools, "add_generation_prompt": add_generation_prompt, "rendered": rendered})
-        out = {"model": repo, "transformers": transformers.__version__, "template": tok.chat_template, "cases": cases}
+        out = {
+            "model": repo,
+            "transformers": transformers.__version__,
+            "template": tok.chat_template,
+            "bos_token": tok.bos_token,
+            "eos_token": tok.eos_token,
+            "cases": cases,
+        }
         path = os.path.join(OUT_DIR, f"{name}.json")
         with open(path, "w", encoding="utf-8") as f:
             json.dump(out, f, indent=1, ensure_ascii=False)

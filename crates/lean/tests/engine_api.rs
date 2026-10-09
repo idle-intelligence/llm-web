@@ -53,13 +53,13 @@ fn load(gguf: &str, tokenizer_dir: &str, max_ctx: u32, backend: Backend) -> Lean
     pollster::block_on(Lean::load(opts)).expect("loading lean")
 }
 
-fn template(tokenizer_dir: &str) -> String {
+fn template(tokenizer_dir: &str) -> lean_chat::ChatTemplate {
     read_chat_template(&format!("{tokenizer_dir}/tokenizer_config.json")).expect("reading chat_template")
 }
 
 /// The prompt text for `turns` (role, content), ending with the opening of
 /// an assistant turn.
-fn prompt(template: &str, turns: &[(&str, &str)]) -> String {
+fn prompt(template: &lean_chat::ChatTemplate, turns: &[(&str, &str)]) -> String {
     let messages: Vec<Message> = turns.iter().map(|&(role, content)| Message::new(role, content)).collect();
     lean_chat::render(template, &messages, None, true).expect("rendering")
 }

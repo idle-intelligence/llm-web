@@ -61,6 +61,7 @@ mod.leanInit();
 const lean = await mod.Lean.load({ gguf, tokenizer: tokenizerJson, maxCtx: 2048 });
 
 const abortFlag = new mod.AbortFlag();
+const chatTemplate = mod.ChatTemplate.fromTokenizerConfig(tokenizerConfigJson);
 const prompt = mod.chatRender(chatTemplate, [{ role: "user", content: text }], null, true);
 const params = { maxNewTokens: 128, temperature: 0.7, topK: 40, topP: 0.9, repetitionPenalty: 1.1, seed: 1 };
 const reply = await lean.generate(prompt, params, (piece) => {

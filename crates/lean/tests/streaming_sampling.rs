@@ -17,12 +17,12 @@ use lean::sampling::SamplingParams;
 use lean_chat::{read_chat_template, render, Message};
 use tokenizers::Tokenizer;
 
-fn tokenize(tokenizer: &Tokenizer, chat_template: &str, prompt: &str) -> Vec<u32> {
+fn tokenize(tokenizer: &Tokenizer, chat_template: &lean_chat::ChatTemplate, prompt: &str) -> Vec<u32> {
     let rendered = render(chat_template, &[Message::user(prompt)], None, true).unwrap();
     tokenizer.encode(rendered, false).unwrap().get_ids().to_vec()
 }
 
-fn setup() -> (Engine, GpuModel, Tokenizer, String) {
+fn setup() -> (Engine, GpuModel, Tokenizer, lean_chat::ChatTemplate) {
     let gguf_path = std::env::var("LEAN_GGUF").expect("set LEAN_GGUF to run this test");
     let tokenizer_dir = std::env::var("LEAN_TOKENIZER_DIR").expect("set LEAN_TOKENIZER_DIR to run this test");
     let tokenizer = Tokenizer::from_file(format!("{tokenizer_dir}/tokenizer.json")).expect("loading tokenizer.json");
