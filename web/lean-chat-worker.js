@@ -74,7 +74,10 @@ let abortFlag = null;
 // Conversation state: lean keeps no history of its own (see this file's
 // doc comment), so the worker owns it, same role as examples/chat.rs's
 // `history` on the native side.
-let HISTORY = [];
+// Every conversation opens with a short system message; context trimming
+// keeps it (see generateWithTrim).
+const SYSTEM_MESSAGE = { role: "system", content: "Answer briefly, in one or two sentences." };
+let HISTORY = [SYSTEM_MESSAGE];
 
 async function createEngine(which) {
   if (which === "webgpu") {
@@ -190,7 +193,7 @@ function stop() {
 }
 
 function reset() {
-  HISTORY = [];
+  HISTORY = [SYSTEM_MESSAGE];
 }
 
 const handlers = {
