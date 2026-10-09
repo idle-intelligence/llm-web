@@ -21,7 +21,7 @@
 const EARLY = [];
 self.onmessage = (e) => EARLY.push(e);
 
-const ENGINE_BUILD = "2026-10-05-demos-06";
+const ENGINE_BUILD = "2026-10-10-lean-text-01";
 // Rewritten to true by scripts/build.sh when BUILD_THREADS=1 built pkg-mt
 // into this deployment; GitHub Pages never sets it.
 const MT_BUILT = false;
@@ -48,18 +48,17 @@ async function ensureModel() {
   if (modelFiles) return modelFiles;
   const { MODEL, fetchBytes, fetchText } = await import(`./device_common.js?v=${ENGINE_BUILD}`);
   status(`fetching ${MODEL.label} (cached after first load)...`);
-  const [ggufBytes, tokenizerJson, tokenizerCfgJson] = await Promise.all([
+  const [ggufBytes, tokenizerJson] = await Promise.all([
     fetchBytes(MODEL.gguf, (loaded, total) => self.postMessage({ type: "progress", loaded, total })),
     fetchText(MODEL.tokenizer),
-    fetchText(MODEL.tokenizerCfg),
   ]);
-  modelFiles = { ggufBytes, tokenizerJson, tokenizerCfgJson, MODEL };
+  modelFiles = { ggufBytes, tokenizerJson, MODEL };
   return modelFiles;
 }
 
 async function runBackend(backend) {
   const { MODEL, argmaxJs, sha256Hex, median } = await import(`./device_common.js?v=${ENGINE_BUILD}`);
-  const { ggufBytes, tokenizerJson, tokenizerCfgJson } = await ensureModel();
+  const { ggufBytes, tokenizerJson } = await ensureModel();
 
   status(`starting ${backend} backend...`);
   const timing = {};
@@ -81,7 +80,7 @@ async function runBackend(backend) {
 
   status(`loading weights on ${backend} backend...`);
   t0 = performance.now();
-  engine.load(ggufBytes, tokenizerJson, tokenizerCfgJson, MAX_CTX);
+  engine.load(ggufBytes, tokenizerJson, MAX_CTX);
   timing.loadMs = performance.now() - t0;
 
   status(`running ${N_GEN} greedy tokens on the ${backend} backend...`);

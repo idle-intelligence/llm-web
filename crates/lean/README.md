@@ -26,7 +26,7 @@ Architectures, from `general.architecture` in the GGUF (`src/config.rs`):
 - `qwen3`: Qwen3 (tested: Qwen3-0.6B, Qwen3-1.7B).
 - `llama`: Llama-architecture models (tested: SmolLM2-360M-Instruct, SmolLM2-1.7B-Instruct).
 
-The GPU attention kernels are compiled for a head dimension of 64 or 128; `LeanEngine` rejects a model with another head dimension at load.
+The GPU attention kernels are compiled for a head dimension of 64 or 128; the WebGPU backend rejects a model with another head dimension at load (with the `Auto` backend the engine then loads it on the CPU).
 
 Tensor types (`src/gguf.rs`, `src/quant.rs`, `src/cpu.rs`):
 
@@ -40,28 +40,17 @@ Tensor types (`src/gguf.rs`, `src/quant.rs`, `src/cpu.rs`):
 
 Any other type is rejected at load with an error naming it.
 
-## JavaScript API
+## The engine: text in, text out
 
-The wasm module exports two engines with the same method names wherever both implement a method, so a page can hold either one behind the same calls:
+The engine is `Lean`, with the same surface in Rust and in JavaScript:
 
-- `LeanEngine` (WebGPU): `await LeanEngine.create()`.
-- `LeanEngineCpu` (CPU, one thread or the thread pool, depending on the build): `LeanEngineCpu.create()`.
+- **Load.** `Lean::load(LoadOptions { gguf, tokenizer, max_ctx, backend })` (Rust, `async`), `await Lean.load({ gguf, tokenizer, maxCtx, backend })` (JS). `gguf` is a path, bytes or a reader in Rust and a `Uint8Array` in JS; `tokenizer` is `tokenizer.json` (a path or its text in Rust, its text in JS); `max_ctx` sizes the KV cache. `backend` defaults to `Auto`: WebGPU when an adapter is granted and the model loads on it, otherwise the CPU forward pass, on a thread pool when the build has threads and the pool has more than one thread, else on one thread. `WebGpu` / `"webgpu"` and `Cpu` / `"cpu"` take only that backend. `backend()` (JS: the `backend` property) says which one runs: `"webgpu"`, `"threads"` or `"single"`.
+- **One inference turn.** `generate(text, params, on_token, abort)` tokenizes `text` exactly as given, decodes up to `params.max_new_tokens` tokens, streams each piece of reply text to `on_token` and returns the whole reply. `params` holds `max_new_tokens`, `temperature` (0 = greedy), `top_k`, `top_p`, `repetition_penalty`, `seed` and an optional logit mask (JS: `maxNewTokens`, `temperature`, `topK`, `topP`, `repetitionPenalty`, `seed`, `mask`). `abort` is an `AbortFlag` checked before each token: in JS, pass `flag.cloneFlag()` and call `flag.abort()` from a message handler.
+- **Token count.** `token_count(text)` (JS: `tokenCount(text)`) tokenizes without running the model.
 
-Both load with `engine.load(ggufBytes, tokenizerJson, tokenizerConfigJson, maxCtx)` and run in a Web Worker, never on the main thread.
+The engine applies no chat template and keeps no conversation: the caller renders its messages with the model's template and passes the text. Between calls the engine keeps the KV cache of its previous call and reuses the longest token prefix the new text shares with it, so a growing conversation only prefills its new suffix; the output is the same with or without that reuse. **One client per engine**: two clients sharing one engine evict each other's cached prefix (nothing breaks, each call just costs a full prefill), so give each client its own `Lean`.
 
-lean runs **one inference turn per `generate` call** and keeps no conversation of its own: `messages` is the whole conversation, every call, and the caller decides what stays in it (when to trim, whether there's a system message). This serves a single client at a time - see the KV cache note below.
-
-- **One inference turn.** `await engine.generate(messages, params, onToken, abortFlag)`. `messages` is a plain array of `{role, content}`. `params` is a plain object: `maxNewTokens`, `temperature` (0 = greedy), `topK`, `topP`, `repetitionPenalty`, `seed`, and an optional `mask` (a bitset array, same convention as `buildMaskBitset`; omitted or empty means unmasked). `onToken(text)` is called with each piece of reply text as soon as it is produced - text only, no token ids cross this boundary. Returns the full reply text.
-
-  The engine keeps the KV cache from its last call and reuses whatever prefix the new `messages` still agree with, so a growing conversation only prefills its new suffix - this is invisible to the caller and serves one client at a time: two callers sharing one engine evict each other's cached prefix (nothing breaks, it just costs a full reprefill).
-
-  If `messages` plus `maxNewTokens` would not fit this engine's `maxCtx`, the call rejects with an `Error` whose `name` is `"ContextOverflow"` and which carries numeric `needed`/`available` properties; the engine's own state is untouched, so the next call works normally. A caller drops older messages and retries - see `web/lean-chat-worker.js`'s `generateWithTrim` or the native `examples/chat.rs` for the same policy.
-- **Stop.** `new AbortFlag()`; pass `flag.cloneFlag()` to the call and call `flag.abort()` from a message handler. The engine checks it before each token.
-- **Render / token count, no forward pass.** `engine.renderPrompt(messages)` returns the text `generate` would tokenize; `engine.tokenCount(messages)` returns its token count - a caller uses these to decide whether to trim before calling `generate`.
-- **Logit mask.** `engine.buildMaskBitset(allowedIds)` packs the allowed token ids into a bitset; pass it as `params.mask` (omitted means no mask). `LeanEngine` also takes a mask on the low-level calls `prefillTokens`, `appendTokens` and `decodeStepArgmax`, so a grammar can change the allowed set at every step. A mask shorter than `vocabSize / 32` words is rejected.
-- **KV snapshot** (`LeanEngine`): `await engine.snapshotKv()` returns the KV cache prefix as bytes, `engine.restoreKv(bytes)` puts it back, and `appendTokens(ids, maskBits)` continues from it. A page can store the snapshot of a long fixed prefix and skip its prefill next time.
-- **LoRA.** LoRA adapters are in the Rust API (`apply_lora` / `clear_lora` on the GPU model and on the CPU model); they are not exposed to JavaScript yet.
-- **Low-level, raw token ids.** `tokenize`, `encodeRaw`, `decodeIds`, `prefillTokens`, `appendTokens`, `decodeStepArgmax`, `decodeGreedy`, `kvLen`, `info` - unchanged by the one-turn `generate` API above; a consumer driving its own token-level loop (an agent, a grammar) keeps using these directly.
+If `text` plus `max_new_tokens` does not fit `max_ctx`, `generate` returns `LeanError::ContextOverflow { needed, available }` before touching anything, and the engine stays usable. In JS the promise rejects with an `Error` whose `name` is `"ContextOverflow"`, `code` is `"CONTEXT_OVERFLOW"`, and which carries numeric `needed` and `available`. What to drop before retrying is the caller's choice; `web/lean-chat-worker.js` and `examples/chat.rs` drop the oldest exchange.
 
 A minimal worker:
 
@@ -69,18 +58,23 @@ A minimal worker:
 const mod = await import(`../pkg/lean.js?v=${ENGINE_BUILD}`);
 await mod.default({ module_or_path: `../pkg/lean_bg.wasm?v=${ENGINE_BUILD}` });
 mod.leanInit();
-const engine = await mod.LeanEngine.create(); // or mod.LeanEngineCpu.create()
-engine.load(gguf, tokenizerJson, tokenizerCfgJson, 2048);
+const lean = await mod.Lean.load({ gguf, tokenizer: tokenizerJson, maxCtx: 2048 });
 
 const abortFlag = new mod.AbortFlag();
-const messages = [{ role: "user", content: text }];
+const prompt = mod.chatRender(chatTemplate, [{ role: "user", content: text }], null, true);
 const params = { maxNewTokens: 128, temperature: 0.7, topK: 40, topP: 0.9, repetitionPenalty: 1.1, seed: 1 };
-const reply = await engine.generate(messages, params, (piece) => {
+const reply = await lean.generate(prompt, params, (piece) => {
   self.postMessage({ type: "piece", text: piece });
 }, abortFlag.cloneFlag());
 ```
 
-For CPU threads the page loads `../pkg-mt/lean.js` instead and calls `await mod.initThreadPool(navigator.hardwareConcurrency)` after `mod.default(...)` and before `LeanEngineCpu.create()`.
+For CPU threads the page loads `../pkg-mt/lean.js` instead and calls `await mod.initThreadPool(navigator.hardwareConcurrency)` after `mod.default(...)` and before `Lean.load`. Run the engine in a Web Worker, never on the main thread.
+
+Natively, `load` and `generate` are `async` too; drive them with any executor, e.g. `pollster::block_on(lean.generate(...))`.
+
+### Low-level calls
+
+`LeanEngine` (WebGPU, `await LeanEngine.create()`) and `LeanEngineCpu` (`LeanEngineCpu.create()`) work on raw token ids for a caller that drives its own token loop: `load(ggufBytes, tokenizerJson, maxCtx)`, `encodeRaw`, `decodeIds`, `prefillTokens`, `decodeStepArgmax`, `info`, and on `LeanEngine` also `appendTokens`, `decodeGreedy`, `kvLen`, `buildMaskBitset` (a logit mask that can change at every step), `snapshotKv`/`restoreKv` (store the KV cache of a long fixed prefix and skip its prefill next time) and the diagnostics calls. LoRA adapters are in the Rust API (`apply_lora` / `clear_lora` on the GPU and CPU models), not in JavaScript yet.
 
 ## Build
 
@@ -108,7 +102,8 @@ The parity tests compare lean against fixtures written by HF transformers (`refe
 | `fixture_parity_llama_360m` | SmolLM2-360M Q4_0 and Q8_0, GPU | `LEAN_GGUF_LLAMA_360M_Q4_0`, `LEAN_GGUF_LLAMA_360M_Q8_0`, `LEAN_TOKENIZER_DIR_LLAMA_360M` |
 | `fixture_parity_llama_360m_cpu` | the same on the CPU path (run with and without `--features threads`) | same as above |
 | `fixture_parity_llama_1_7b` | SmolLM2-1.7B Q8_0 | `LEAN_GGUF_LLAMA_1_7B_Q8_0`, `LEAN_TOKENIZER_DIR_LLAMA_1_7B` |
-| `chat_api` | three-turn chat, CPU tokens equal GPU tokens, on Qwen2.5-0.5B and the SmolLM2 models | `LEAN_GGUF`, `LEAN_TOKENIZER_DIR`, the `_LLAMA_360M` pair, `LEAN_GGUF_LLAMA_1_7B_Q4_0`, `LEAN_TOKENIZER_DIR_LLAMA_1_7B` |
+| `fixture_parity_generate` | `Lean::generate` on GPU and CPU: token count and greedy reply equal the fixture, Qwen2.5-0.5B and SmolLM2-360M | `LEAN_GGUF`, `LEAN_TOKENIZER_DIR`, the `_LLAMA_360M` Q4_0 pair |
+| `engine_api` | prefix reuse gives the same replies as a fresh engine (growing conversation, diverging prefixes), CPU equals GPU over three turns, `ContextOverflow` counts and recovery | `LEAN_GGUF`, `LEAN_TOKENIZER_DIR`, the `_LLAMA_360M` pair, `LEAN_GGUF_LLAMA_1_7B_Q4_0`, `LEAN_TOKENIZER_DIR_LLAMA_1_7B` |
 | `logit_mask` | a mask forces an exact string; an all-allowed mask equals no mask | `LEAN_GGUF`, `LEAN_TOKENIZER_DIR` |
 | `kv_snapshot` | restore plus suffix equals a full prefill; snapshot round trip | `LEAN_GGUF`, `LEAN_TOKENIZER_DIR` |
 | `lora_parity` | LoRA on the GPU against a transformers fixture with the LoRA deltas applied | `LEAN_GGUF`, `LEAN_TOKENIZER_DIR`, `LEAN_LORA_BIN` |

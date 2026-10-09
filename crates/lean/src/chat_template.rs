@@ -34,14 +34,7 @@ pub fn render_user_prompt(chat_template: &str, prompt: &str) -> Result<String> {
 }
 
 /// Renders `chat_template` over an arbitrary `(role, content)` message
-/// list, the multi-turn generalization of [`render_user_prompt`], used by
-/// `chat::gpu_generate`/`chat::cpu_generate` to render the whole
-/// conversation a `generate` call is given (system message included
-/// implicitly by the template itself, same as `render_user_prompt`).
-/// Rendering the whole conversation is cheap (pure CPU string work); what
-/// stays cheap on the GPU/CPU side is that the caller only forwards the
-/// *new* suffix of tokens this produces through the model, see
-/// `chat::PrefixCache`'s doc comment.
+/// list, the multi-turn generalization of [`render_user_prompt`].
 pub fn render_conversation(chat_template: &str, messages: &[(&str, &str)], add_generation_prompt: bool) -> Result<String> {
     let mut env = Environment::new();
     // Qwen3's chat_template calls Python string methods (`.startswith`,

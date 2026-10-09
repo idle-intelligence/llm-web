@@ -1,6 +1,5 @@
-//! Shared streaming decode loop, used by `chat::gpu_generate` (the
-//! one-turn API `web.rs`'s wasm-bindgen surface wraps) and this crate's
-//! native tests
+//! Shared streaming decode loop, used by `turn::gpu_turn` (what
+//! `Lean::generate` runs on the GPU) and this crate's native tests
 //! (`tests/streaming_sampling.rs`) - the reason this loop lives in its own
 //! plain (non-wasm-gated) module rather than inline in `web.rs`: a
 //! `js_sys::Function`/`JsValue` callback can't be constructed or called from

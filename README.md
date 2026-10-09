@@ -26,15 +26,15 @@ Then open `http://localhost:8030/web/index.html` for the chat demo, or `http://l
 const mod = await import('./pkg/lean.js');
 await mod.default('./pkg/lean_bg.wasm');
 mod.leanInit();
-const engine = navigator.gpu ? await mod.LeanEngine.create() : mod.LeanEngineCpu.create();
-engine.load(ggufBytes, tokenizerJson, tokenizerConfigJson, 2048);
-const messages = [{ role: 'user', content: prompt }];
+const lean = await mod.Lean.load({ gguf: ggufBytes, tokenizer: tokenizerJson, maxCtx: 2048 });
+const template = JSON.parse(tokenizerConfigJson).chat_template;
+const prompt = mod.chatRender(template, [{ role: 'user', content: question }], null, true);
 const params = { maxNewTokens: 64, temperature: 0.7, topK: 40, topP: 0.9, repetitionPenalty: 1.1, seed: 0 };
-await engine.generate(messages, params, (text) => { /* append text */ }, new mod.AbortFlag().cloneFlag());
+const reply = await lean.generate(prompt, params, (text) => { /* append text */ }, new mod.AbortFlag().cloneFlag());
 </script>
 ```
 
-`generate` runs one inference turn over the given `messages` and returns the reply; it keeps no conversation of its own (see [`crates/lean/README.md`](crates/lean/README.md)) - a page holds its own message history and sends the whole thing each call.
+The engine is text in, text out: `generate` runs one inference turn over the given text and returns the reply. It applies no chat template and keeps no conversation (see [`crates/lean/README.md`](crates/lean/README.md)); a page holds its own message history, renders it with the model's chat template, and sends the whole text each call.
 
 ### Native
 

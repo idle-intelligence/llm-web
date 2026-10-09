@@ -1,17 +1,14 @@
-//! Minimal wasm-bindgen browser surface. One entry point, `LeanEngine`, for
-//! a Web Worker: `LeanEngine::create()` (async - requests the WebGPU
-//! adapter/device), `load()` (parse GGUF bytes + tokenizer + chat template,
-//! upload weights to GPU), `generate()` (one inference turn: render the
-//! given messages -> tokenize -> prefill the part not already cached ->
-//! decode, one `on_token(text: string)` JS callback per piece of text
-//! produced). No agent/tool/grammar layer here (that's llm-wasm's `web.rs`)
-//! and no conversation state either - this engine serves one turn per
-//! call; which messages to send next, and when to trim them, is the
-//! caller's job (see `chat.rs`'s doc comment). The engine still keeps the
-//! previous call's KV cache and reuses whatever prefix the new call's
-//! messages agree on (`chat::PrefixCache`) - a single-client
-//! optimization, invisible to the caller, not conversation state: two
-//! callers sharing one `LeanEngine` evict each other's cached prefix.
+//! The wasm-bindgen browser surface, for a Web Worker.
+//!
+//! - `Lean`: the engine, the same surface as the Rust [`crate::Lean`]:
+//!   `await Lean.load({gguf, tokenizer, maxCtx, backend})`, then
+//!   `await lean.generate(text, params, onToken, abort)` once per turn and
+//!   `lean.tokenCount(text)`. Text in, text out: no chat template, no
+//!   conversation state. One client per engine (see `lean.rs`).
+//! - `AbortFlag`: the Rust [`crate::AbortFlag`] itself.
+//! - `LeanEngine` (WebGPU) and `LeanEngineCpu`: low-level calls on raw
+//!   token ids (prefill, decode steps, KV snapshots, diagnostics), for
+//!   callers that drive their own token loop.
 //!
 //! WebGPU readback is async only in the browser - every GPU-reading call
 //! here is `async`/`.await`s `Engine::read_buffer`'s `into_data_async`-style
@@ -21,17 +18,17 @@
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::io::{Read, Seek, SeekFrom};
-use std::rc::Rc;
 
 use tokenizers::Tokenizer;
 
-use crate::chat::{cpu_generate, gpu_generate, render_prompt as chat_render_prompt, token_count as chat_token_count, GenParams, Message, PrefixCache};
-use crate::chat_template::{chat_template_from_config_json, render_user_prompt};
+use crate::chat_template::render_conversation;
 use crate::cpu::{forward_decode_step_argmax as cpu_decode_step_argmax, forward_prefill as cpu_forward_prefill, CpuKvCache, CpuModel};
 use crate::engine::{now_ms, Engine};
 use crate::error::LeanError;
+use crate::lean::{AbortFlag, Backend, GgufSource, Lean, LoadOptions, TokenizerSource};
+use crate::turn::GenParams;
 use crate::model::{build_mask_bitset, build_rope_tables, decode_greedy_pipelined, forward_decode_step_argmax, forward_prefill, forward_prefill_suffix, GpuModel, KvCache, KvSnapshot};
 
 /// `Read + Seek` adapter over a JS-owned `js_sys::Uint8Array`, so the whole
@@ -123,71 +120,6 @@ pub fn lean_init() {
     console_error_panic_hook::set_once();
 }
 
-/// A JS-shareable abort switch for `generate`: JS holds
-/// the same `AbortFlag` it passed into the call (e.g. from a "stop" button's
-/// click handler) and calls `.abort()` on it whenever it likes; the decode
-/// loop checks `is_aborted()` once per generated token, between GPU
-/// dispatches - see `generate::decode_loop`'s `should_stop` parameter. This
-/// works because every `.await` inside the decode loop actually yields to
-/// the browser's event loop (real GPU-readback awaits, not a synchronous
-/// spin), so a click handler queued while a `generate` promise is
-/// pending still gets to run and flip the flag before the next token.
-#[wasm_bindgen]
-#[derive(Clone)]
-pub struct AbortFlag(Rc<Cell<bool>>);
-
-#[wasm_bindgen]
-impl AbortFlag {
-    #[wasm_bindgen(constructor)]
-    pub fn new() -> AbortFlag {
-        AbortFlag(Rc::new(Cell::new(false)))
-    }
-
-    pub fn abort(&self) {
-        self.0.set(true);
-    }
-
-    #[wasm_bindgen(js_name = isAborted)]
-    pub fn is_aborted(&self) -> bool {
-        self.0.get()
-    }
-
-    /// A cheap `Rc` clone sharing the same underlying flag - **the value to
-    /// pass into `generate`, not the original**.
-    /// wasm-bindgen destroys a by-value class argument's JS-side handle the
-    /// instant it crosses into wasm (`__destroy_into_raw()` in the generated
-    /// glue), so passing the caller's own `AbortFlag` directly would leave
-    /// that JS object unusable (a later `flag.abort()` call would hit a
-    /// freed pointer) even though the call is still in flight. Passing
-    /// `flag.cloneFlag()` instead keeps the caller's original object alive
-    /// and callable for the whole (possibly multi-second) generation, since
-    /// both point at the same `Rc<Cell<bool>>`.
-    #[wasm_bindgen(js_name = cloneFlag)]
-    pub fn clone_flag(&self) -> AbortFlag {
-        self.clone()
-    }
-}
-
-impl Default for AbortFlag {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Converts a JS `messages` array (`{role, content}` objects) into this
-/// crate's `chat::Message` list, the input `generate`/`renderPrompt`/
-/// `tokenCount` all take.
-fn messages_from_js(messages: &JsValue) -> Result<Vec<Message>, JsValue> {
-    let arr: js_sys::Array = messages.clone().dyn_into().map_err(|_| JsValue::from(JsError::new("messages must be an array")))?;
-    let mut out = Vec::with_capacity(arr.length() as usize);
-    for v in arr.iter() {
-        let role = js_sys::Reflect::get(&v, &JsValue::from_str("role")).ok().and_then(|r| r.as_string()).ok_or_else(|| JsValue::from(JsError::new("message missing 'role'")))?;
-        let content = js_sys::Reflect::get(&v, &JsValue::from_str("content")).ok().and_then(|c| c.as_string()).ok_or_else(|| JsValue::from(JsError::new("message missing 'content'")))?;
-        out.push(Message::new(role, content));
-    }
-    Ok(out)
-}
-
 fn get_f64(obj: &JsValue, key: &str, default: f64) -> f64 {
     js_sys::Reflect::get(obj, &JsValue::from_str(key)).ok().and_then(|v| v.as_f64()).unwrap_or(default)
 }
@@ -214,16 +146,17 @@ fn gen_params_from_js(params: &JsValue) -> GenParams {
     }
 }
 
-/// Converts a `LeanError` into the JS exception `generate`/`renderPrompt`/
-/// `tokenCount` throw: `ContextOverflow` becomes an `Error` with `name ===
-/// "ContextOverflow"` and numeric `needed`/`available` properties (so a
-/// caller can branch on `e.name` without parsing a string); anything else
-/// becomes a plain `JsError`.
+/// Converts a `LeanError` into the JS exception `Lean`'s calls throw:
+/// `ContextOverflow` becomes an `Error` with `name === "ContextOverflow"`,
+/// `code === "CONTEXT_OVERFLOW"` and numeric `needed`/`available`
+/// properties (so a caller branches on `e.name` or `e.code` without
+/// parsing a string); anything else becomes a plain `Error`.
 fn lean_error_to_js(e: LeanError) -> JsValue {
     match e {
         LeanError::ContextOverflow { needed, available } => {
-            let err = js_sys::Error::new(&format!("context overflow: needed {needed} tokens, {available} available"));
+            let err = js_sys::Error::new(&e.to_string());
             err.set_name("ContextOverflow");
+            let _ = js_sys::Reflect::set(&err, &JsValue::from_str("code"), &JsValue::from_str("CONTEXT_OVERFLOW"));
             let _ = js_sys::Reflect::set(&err, &JsValue::from_str("needed"), &JsValue::from_f64(needed as f64));
             let _ = js_sys::Reflect::set(&err, &JsValue::from_str("available"), &JsValue::from_f64(available as f64));
             err.into()
@@ -233,9 +166,7 @@ fn lean_error_to_js(e: LeanError) -> JsValue {
 }
 
 /// The page's `onToken` callback for `generate`, called as `onToken(text)`
-/// once per piece of reply text as soon as it is produced (text-in/
-/// text-out: no token ids cross the wasm boundary here - `chat::gpu_generate`/
-/// `chat::cpu_generate` already turn ids into text internally).
+/// once per piece of reply text as soon as it is produced.
 ///
 /// The callback runs while the engine is borrowed for the generation call,
 /// so it must not call methods on the same engine (wasm-bindgen throws
@@ -280,7 +211,7 @@ thread_local! {
 /// `setTimeout(0)` is never clamped to 4 ms), so the worker's own message
 /// handlers - a stop button's `AbortFlag.abort()` - run between CPU tokens.
 /// Resolves at once where `MessageChannel` does not exist.
-async fn yield_to_event_loop() {
+pub(crate) async fn yield_to_event_loop() {
     let promise = js_sys::Promise::new(&mut |resolve, _reject| {
         let posted = YIELD_CHANNEL.with(|cell| {
             let mut cell = cell.borrow_mut();
@@ -307,6 +238,114 @@ async fn yield_to_event_loop() {
     let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
 }
 
+/// Renders `messages` (`[{role, content}]`) through a chat template
+/// (`tokenizer_config.json`'s `chat_template` string), the text a chat page
+/// passes to `Lean.generate`. `tools` must be null or undefined.
+#[wasm_bindgen(js_name = chatRender)]
+pub fn chat_render(template: &str, messages: JsValue, tools: JsValue, add_generation_prompt: bool) -> Result<String, JsValue> {
+    if !tools.is_undefined() && !tools.is_null() {
+        return Err(JsValue::from(JsError::new("tools are not supported by this renderer")));
+    }
+    let arr: js_sys::Array = messages.dyn_into().map_err(|_| JsValue::from(JsError::new("messages must be an array")))?;
+    let mut turns = Vec::with_capacity(arr.length() as usize);
+    for m in arr.iter() {
+        let role = get_field(&m, "role").as_string().ok_or_else(|| JsValue::from(JsError::new("message missing 'role'")))?;
+        let content = get_field(&m, "content").as_string().ok_or_else(|| JsValue::from(JsError::new("message missing 'content'")))?;
+        turns.push((role, content));
+    }
+    let turns: Vec<(&str, &str)> = turns.iter().map(|(r, c)| (r.as_str(), c.as_str())).collect();
+    render_conversation(template, &turns, add_generation_prompt).map_err(|e| JsValue::from(JsError::new(&format!("{e:#}"))))
+}
+
+/// Whether `navigator.gpu` exists in this global scope: the capability
+/// check before asking wgpu for a WebGPU adapter.
+pub(crate) fn has_webgpu() -> bool {
+    let navigator = js_sys::Reflect::get(&js_sys::global(), &JsValue::from_str("navigator")).unwrap_or(JsValue::UNDEFINED);
+    if navigator.is_undefined() || navigator.is_null() {
+        return false;
+    }
+    let gpu = js_sys::Reflect::get(&navigator, &JsValue::from_str("gpu")).unwrap_or(JsValue::UNDEFINED);
+    !gpu.is_undefined() && !gpu.is_null()
+}
+
+fn get_field(obj: &JsValue, key: &str) -> JsValue {
+    js_sys::Reflect::get(obj, &JsValue::from_str(key)).unwrap_or(JsValue::UNDEFINED)
+}
+
+/// The engine: the JS face of [`crate::Lean`], same calls and same
+/// behaviour.
+#[wasm_bindgen(js_name = Lean)]
+pub struct LeanJs {
+    inner: Lean,
+}
+
+#[wasm_bindgen(js_class = Lean)]
+impl LeanJs {
+    /// `opts`: `{ gguf, tokenizer, maxCtx, backend }`. `gguf` is the GGUF
+    /// file as a `Uint8Array` (read one tensor at a time, never copied
+    /// whole into wasm memory; drop your reference after the call so the
+    /// JS heap can reclaim it), `tokenizer` the text of `tokenizer.json`,
+    /// `maxCtx` the KV cache size in tokens, `backend` `"auto"` (default:
+    /// WebGPU, else the CPU forward pass), `"webgpu"` or `"cpu"`. The CPU
+    /// forward pass runs on a thread pool in the threads build after
+    /// `initThreadPool(n)`, and on one thread otherwise.
+    pub async fn load(opts: JsValue) -> Result<LeanJs, JsValue> {
+        let gguf: js_sys::Uint8Array = get_field(&opts, "gguf").dyn_into().map_err(|_| JsValue::from(JsError::new("opts.gguf must be a Uint8Array")))?;
+        let tokenizer = get_field(&opts, "tokenizer").as_string().ok_or_else(|| JsValue::from(JsError::new("opts.tokenizer must be the text of tokenizer.json")))?;
+        let max_ctx = get_field(&opts, "maxCtx").as_f64().ok_or_else(|| JsValue::from(JsError::new("opts.maxCtx must be a number")))? as u32;
+        let backend = match get_field(&opts, "backend").as_string().as_deref() {
+            None | Some("auto") => Backend::Auto,
+            Some("webgpu") => Backend::WebGpu,
+            Some("cpu") => Backend::Cpu,
+            Some(other) => return Err(JsValue::from(JsError::new(&format!("unknown backend {other:?} (expected \"auto\", \"webgpu\" or \"cpu\")")))),
+        };
+        let opts = LoadOptions { gguf: GgufSource::Reader(Box::new(JsBytesReader::new(gguf))), tokenizer: TokenizerSource::Json(tokenizer), max_ctx, backend };
+        let inner = Lean::load(opts).await.map_err(lean_error_to_js)?;
+        wasm_log(&format!("[lean] loaded on {}", inner.backend()));
+        Ok(LeanJs { inner })
+    }
+
+    /// One inference turn over `text`, exactly as given. `params`:
+    /// `maxNewTokens`, `temperature` (0 = greedy), `topK`, `topP`,
+    /// `repetitionPenalty`, `seed`, optional `mask`. `onToken(text)` gets
+    /// each piece of the reply as it is decoded; it must not call this
+    /// engine, and a throw from it stops generation and is rethrown.
+    /// `abort`: `flag.cloneFlag()` of an `AbortFlag`, or nothing. Resolves
+    /// to the whole reply. Rejects with a `ContextOverflow` error (see
+    /// `lean_error_to_js`) when `text` plus `maxNewTokens` does not fit
+    /// `maxCtx`; the engine stays usable.
+    pub async fn generate(&mut self, text: String, params: JsValue, on_token: JsValue, abort: Option<AbortFlag>) -> Result<String, JsValue> {
+        let params = gen_params_from_js(&params);
+        let sink = TextSink::new(on_token);
+        // A throw from `onToken` stops generation through the same flag.
+        let flag = abort.unwrap_or_default();
+        let on_text = |t: &str| {
+            let mut sink = sink.borrow_mut();
+            sink.text(t);
+            if sink.stopped() {
+                flag.abort();
+            }
+        };
+        let result = self.inner.generate(&text, &params, on_text, Some(&flag)).await;
+        if let Some(e) = sink.borrow_mut().take_err() {
+            return Err(e);
+        }
+        result.map_err(lean_error_to_js)
+    }
+
+    /// How many tokens `text` is. No forward pass.
+    #[wasm_bindgen(js_name = tokenCount)]
+    pub fn token_count(&self, text: &str) -> Result<u32, JsValue> {
+        self.inner.token_count(text).map(|n| n as u32).map_err(lean_error_to_js)
+    }
+
+    /// `"webgpu"`, `"threads"` or `"single"`.
+    #[wasm_bindgen(getter)]
+    pub fn backend(&self) -> String {
+        self.inner.backend().to_string()
+    }
+}
+
 #[wasm_bindgen]
 pub struct LeanEngine {
     engine: Engine,
@@ -315,12 +354,7 @@ pub struct LeanEngine {
     cos_buf: Option<wgpu::Buffer>,
     sin_buf: Option<wgpu::Buffer>,
     tokenizer: Option<Tokenizer>,
-    chat_template: Option<String>,
-    /// The ids `generate`'s last call left resident in the KV cache
-    /// (`chat::PrefixCache`). Every other call that writes the cache
-    /// invalidates the cached ids, so the next turn prefills from scratch.
-    prefix: PrefixCache,
-    /// `(GGUF parse + weight upload calls ms, tokenizer + chat template ms)`
+    /// `(GGUF parse + weight upload calls ms, tokenizer ms)`
     /// from the last `load()`, for the diagnostics page.
     load_ms: (f64, f64),
 }
@@ -410,13 +444,12 @@ impl LeanEngine {
     /// one tensor's raw bytes are ever resident in wasm memory at a time,
     /// dropped right after that tensor's GPU upload inside
     /// `GpuModel::load_from_reader`, well before `max_ctx`'s KV cache is
-    /// allocated). `tokenizer_json`/`tokenizer_config_json` are the two
-    /// files' contents as strings. `max_ctx` bounds the KV cache (prompt +
+    /// allocated). `tokenizer_json` is `tokenizer.json`'s text. `max_ctx` bounds the KV cache (prompt +
     /// max_new_tokens must fit). The caller should drop its own reference to
     /// `gguf_bytes`'s backing `ArrayBuffer` right after this call returns so
     /// the JS heap can reclaim it too.
     #[wasm_bindgen(js_name = load)]
-    pub fn load(&mut self, gguf_bytes: js_sys::Uint8Array, tokenizer_json: String, tokenizer_config_json: String, max_ctx: u32) -> Result<(), JsError> {
+    pub fn load(&mut self, gguf_bytes: js_sys::Uint8Array, tokenizer_json: String, max_ctx: u32) -> Result<(), JsError> {
         let t_start = now_ms();
         let model = GpuModel::load_from_reader(&self.engine, JsBytesReader::new(gguf_bytes), true)
             .map_err(|e| JsError::new(&format!("failed to load model: {e}")))?;
@@ -427,7 +460,6 @@ impl LeanEngine {
         let t_weights = now_ms();
 
         let tokenizer = Tokenizer::from_bytes(tokenizer_json.as_bytes()).map_err(|e| JsError::new(&format!("failed to load tokenizer.json: {e}")))?;
-        let chat_template = chat_template_from_config_json(&tokenizer_config_json).map_err(|e| JsError::new(&format!("{e}")))?;
         self.load_ms = (t_weights - t_start, now_ms() - t_weights);
 
         wasm_log(&format!(
@@ -439,72 +471,7 @@ impl LeanEngine {
         self.cos_buf = Some(cos_buf);
         self.sin_buf = Some(sin_buf);
         self.tokenizer = Some(tokenizer);
-        self.chat_template = Some(chat_template);
-        self.prefix.invalidate();
         Ok(())
-    }
-
-    /// One inference turn: renders `messages` (a JS array of `{role,
-    /// content}`) through the model's own chat template, tokenizes it,
-    /// reuses whatever prefix of the previous call's KV cache still
-    /// agrees with the new ids (`chat::PrefixCache` - invisible to the
-    /// caller, see this module's doc comment), prefills the rest, then
-    /// decodes up to `params.maxNewTokens` tokens. `params` is a plain
-    /// object: `maxNewTokens`, `temperature` (0 = greedy), `topK`, `topP`,
-    /// `repetitionPenalty`, `seed`, and an optional `mask` (this crate's
-    /// mask-bitset format, same convention as `decodeStepArgmax`).
-    /// `onToken(text)` is called with each piece of text as soon as it is
-    /// produced (text, not token ids - this is a text-in/text-out
-    /// surface). `abort`, if given, is checked once per generated token.
-    /// Returns the full reply text. Conversation history (which messages
-    /// to send next turn, when to drop old ones) is the caller's job -
-    /// this call does not remember `messages` after it returns.
-    ///
-    /// On a `ContextOverflow` (messages + `maxNewTokens` would not fit
-    /// this engine's `max_ctx`), the rejected `Error` has `name ===
-    /// "ContextOverflow"` and numeric `needed`/`available` properties; the
-    /// engine's own state is unchanged and the next call works normally -
-    /// a caller drops older messages and retries.
-    #[wasm_bindgen(js_name = generate)]
-    pub async fn generate(&mut self, messages: JsValue, params: JsValue, on_token: JsValue, abort: Option<AbortFlag>) -> Result<String, JsValue> {
-        let model = self.model.as_ref().ok_or_else(|| JsValue::from(JsError::new("load() must be called first")))?;
-        let tokenizer = self.tokenizer.as_ref().ok_or_else(|| JsValue::from(JsError::new("load() must be called first")))?;
-        let chat_template = self.chat_template.as_ref().ok_or_else(|| JsValue::from(JsError::new("load() must be called first")))?;
-        let cache = self.cache.as_mut().ok_or_else(|| JsValue::from(JsError::new("load() must be called first")))?;
-        let cos_buf = self.cos_buf.as_ref().ok_or_else(|| JsValue::from(JsError::new("load() must be called first")))?;
-        let sin_buf = self.sin_buf.as_ref().ok_or_else(|| JsValue::from(JsError::new("load() must be called first")))?;
-
-        let messages = messages_from_js(&messages)?;
-        let params = gen_params_from_js(&params);
-        let mask = mask_buf(&self.engine, model.config.vocab_size, params.mask_bits.as_deref().unwrap_or(&[])).map_err(JsValue::from)?;
-
-        let sink = TextSink::new(on_token);
-        let should_stop = || abort.as_ref().is_some_and(AbortFlag::is_aborted) || sink.borrow().stopped();
-        let result = gpu_generate(&self.engine, model, cache, cos_buf, sin_buf, &mut self.prefix, tokenizer, chat_template, &messages, &params, mask.as_ref(), |text| sink.borrow_mut().text(text), should_stop).await;
-        if let Some(e) = sink.borrow_mut().take_err() {
-            return Err(e);
-        }
-        result.map_err(lean_error_to_js)
-    }
-
-    /// Renders `messages` through the model's own chat template, the same
-    /// way `generate()` would - no tokenization, no forward-pass work.
-    #[wasm_bindgen(js_name = renderPrompt)]
-    pub fn render_prompt(&self, messages: JsValue) -> Result<String, JsValue> {
-        let chat_template = self.chat_template.as_ref().ok_or_else(|| JsValue::from(JsError::new("load() must be called first")))?;
-        let messages = messages_from_js(&messages)?;
-        chat_render_prompt(chat_template, &messages).map_err(lean_error_to_js)
-    }
-
-    /// Renders + tokenizes `messages` the same way `generate()` does and
-    /// returns the resulting token count, with no forward-pass work - lets
-    /// a caller decide whether to trim before calling `generate()`.
-    #[wasm_bindgen(js_name = tokenCount)]
-    pub fn token_count(&self, messages: JsValue) -> Result<u32, JsValue> {
-        let tokenizer = self.tokenizer.as_ref().ok_or_else(|| JsValue::from(JsError::new("load() must be called first")))?;
-        let chat_template = self.chat_template.as_ref().ok_or_else(|| JsValue::from(JsError::new("load() must be called first")))?;
-        let messages = messages_from_js(&messages)?;
-        chat_token_count(tokenizer, chat_template, &messages).map(|n| n as u32).map_err(lean_error_to_js)
     }
 
     /// JSON string with basic model/device info, for a status line.
@@ -548,24 +515,7 @@ impl LeanEngine {
         .to_string())
     }
 
-    /// Renders + tokenizes `prompt` through the model's chat template, same
-    /// as `generate()`, but returns the raw token ids instead of running
-    /// generation - the low-level entry point a consumer's own prefix/suffix
-    /// split (e.g. a resident tool-schema prefix) is built on top of, rather
-    /// than `generate()`'s all-in-one path.
-    #[wasm_bindgen(js_name = tokenize)]
-    pub fn tokenize(&self, prompt: String) -> Result<Vec<u32>, JsError> {
-        let tokenizer = self.tokenizer.as_ref().ok_or_else(|| JsError::new("load() must be called first"))?;
-        let chat_template = self.chat_template.as_ref().ok_or_else(|| JsError::new("load() must be called first"))?;
-        let rendered = render_user_prompt(chat_template, &prompt).map_err(|e| JsError::new(&format!("failed to render prompt: {e}")))?;
-        let encoding = tokenizer.encode(rendered, false).map_err(|e| JsError::new(&format!("tokenizer encode failed: {e}")))?;
-        Ok(encoding.get_ids().to_vec())
-    }
-
-    /// Tokenizes raw `text` with no chat-template rendering (unlike
-    /// `tokenize()`) - for building a target/mask continuation from
-    /// arbitrary text (e.g. a fixed string a constrained-decoding test wants
-    /// to force), not a user chat turn.
+    /// Tokenizes `text` as-is (no special tokens added).
     #[wasm_bindgen(js_name = encodeRaw)]
     pub fn encode_raw(&self, text: String) -> Result<Vec<u32>, JsError> {
         let tokenizer = self.tokenizer.as_ref().ok_or_else(|| JsError::new("load() must be called first"))?;
@@ -573,8 +523,8 @@ impl LeanEngine {
         Ok(encoding.get_ids().to_vec())
     }
 
-    /// Decodes `token_ids` back into text - the inverse of `tokenize`/
-    /// `encodeRaw`, exposed so a harness can print what a masked or restored
+    /// Decodes `token_ids` back into text - the inverse of `encodeRaw`,
+    /// exposed so a harness can print what a masked or restored
     /// generation actually produced.
     #[wasm_bindgen(js_name = decodeIds)]
     pub fn decode_ids(&self, token_ids: Vec<u32>) -> Result<String, JsError> {
@@ -592,8 +542,7 @@ impl LeanEngine {
         Ok(build_mask_bitset(model.config.vocab_size, &allowed_ids))
     }
 
-    /// Low-level prefill over raw token ids (no chat-template rendering -
-    /// use `tokenize()` first if needed): resets the pool and starts a fresh
+    /// Low-level prefill over raw token ids: resets the pool and starts a fresh
     /// KV cache at position 0, runs prefill, and returns the last position's
     /// logits (`vocab_size` long). `mask_bits`, if non-empty, constrains the
     /// *first* generated token the same way `decodeStepArgmax`'s mask
@@ -610,7 +559,6 @@ impl LeanEngine {
             return Err(JsError::new("token_ids exceeds max_ctx"));
         }
         cache.kv_len = 0;
-        self.prefix.invalidate();
         Ok(forward_prefill(&self.engine, model, cache, &token_ids, cos_buf, sin_buf, mask.as_ref()).await)
     }
 
@@ -650,7 +598,6 @@ impl LeanEngine {
         }
         model.pool.reset();
         cache.kv_len = 0;
-        self.prefix.invalidate();
         self.engine.set_debug_taps(true);
         let _ = forward_prefill(&self.engine, model, cache, &token_ids, cos_buf, sin_buf, None).await;
         let rows = self.engine.debug_collect().await;
@@ -675,7 +622,6 @@ impl LeanEngine {
         if cache.kv_len + token_ids.len() as u32 > cache.max_ctx {
             return Err(JsError::new("appendTokens would exceed max_ctx"));
         }
-        self.prefix.invalidate();
         Ok(forward_prefill_suffix(&self.engine, model, cache, &token_ids, cos_buf, sin_buf, mask.as_ref()).await)
     }
 
@@ -696,7 +642,6 @@ impl LeanEngine {
         if cache.kv_len >= cache.max_ctx {
             return Err(JsError::new("decodeStepArgmax would exceed max_ctx"));
         }
-        self.prefix.invalidate();
         Ok(forward_decode_step_argmax(&self.engine, model, cache, token_id, cos_buf, sin_buf, mask.as_ref()).await)
     }
 
@@ -761,7 +706,6 @@ impl LeanEngine {
             return Err(JsError::new("kv snapshot's kv_len exceeds this engine's max_ctx"));
         }
         cache.restore(&self.engine, &snapshot);
-        self.prefix.invalidate();
         Ok(())
     }
 
@@ -770,18 +714,15 @@ impl LeanEngine {
 impl LeanEngine {
     fn from_engine(engine: Engine) -> LeanEngine {
         wasm_log(&format!("[lean] device ready, max_storage_buffer_binding_size={}", engine.max_storage_buffer_binding_size()));
-        LeanEngine { engine, model: None, cache: None, cos_buf: None, sin_buf: None, tokenizer: None, chat_template: None, prefix: PrefixCache::new(), load_ms: (0.0, 0.0) }
+        LeanEngine { engine, model: None, cache: None, cos_buf: None, sin_buf: None, tokenizer: None, load_ms: (0.0, 0.0) }
     }
 }
 
-/// The CPU backend's wasm-bindgen surface (`cpu.rs`, one thread or a
-/// rayon pool in the `wasm-mt` build): same method names and argument
-/// shapes as `LeanEngine` wherever a CPU equivalent exists, so a page holds
-/// either behind the same call sites (`create`/`load`/`generate`/
-/// `renderPrompt`/`tokenCount`/`tokenize`/`decodeIds`/`prefillTokens`/
-/// `decodeStepArgmax`). `generate` is async like the GPU one and yields
-/// to the event loop between tokens so an `AbortFlag` can be flipped; the
-/// other methods are synchronous and block the calling thread for the
+/// The CPU backend's low-level wasm-bindgen surface (`cpu.rs`, one thread
+/// or a rayon pool in the `wasm-mt` build): same method names and argument
+/// shapes as `LeanEngine` wherever a CPU equivalent exists (`create`/
+/// `load`/`encodeRaw`/`decodeIds`/`prefillTokens`/`decodeStepArgmax`).
+/// The methods are synchronous and block the calling thread for the
 /// forward pass (run them in a Web Worker). No LoRA or KV-snapshot surface
 /// yet.
 #[wasm_bindgen]
@@ -789,9 +730,6 @@ pub struct LeanEngineCpu {
     model: Option<CpuModel>,
     cache: Option<CpuKvCache>,
     tokenizer: Option<Tokenizer>,
-    chat_template: Option<String>,
-    /// Same role as `LeanEngine::chat`.
-    prefix: PrefixCache,
 }
 
 #[wasm_bindgen]
@@ -802,7 +740,7 @@ impl LeanEngineCpu {
     #[wasm_bindgen(js_name = create)]
     pub fn create() -> LeanEngineCpu {
         console_error_panic_hook::set_once();
-        LeanEngineCpu { model: None, cache: None, tokenizer: None, chat_template: None, prefix: PrefixCache::new() }
+        LeanEngineCpu { model: None, cache: None, tokenizer: None }
     }
 
     /// Parses `gguf_bytes` (a `Uint8Array` view, same reasoning as
@@ -813,64 +751,15 @@ impl LeanEngineCpu {
     /// `CpuKvCache` sized to `max_ctx`. Same signature as `LeanEngine::load`
     /// minus the `Result` needing to report GPU-adapter failures.
     #[wasm_bindgen(js_name = load)]
-    pub fn load(&mut self, gguf_bytes: js_sys::Uint8Array, tokenizer_json: String, tokenizer_config_json: String, max_ctx: u32) -> Result<(), JsError> {
+    pub fn load(&mut self, gguf_bytes: js_sys::Uint8Array, tokenizer_json: String, max_ctx: u32) -> Result<(), JsError> {
         let model = CpuModel::load_from_reader(JsBytesReader::new(gguf_bytes)).map_err(|e| JsError::new(&format!("failed to load model: {e}")))?;
         let cache = CpuKvCache::new(&model.config, max_ctx as usize);
         let tokenizer = Tokenizer::from_bytes(tokenizer_json.as_bytes()).map_err(|e| JsError::new(&format!("failed to load tokenizer.json: {e}")))?;
-        let chat_template = chat_template_from_config_json(&tokenizer_config_json).map_err(|e| JsError::new(&format!("{e}")))?;
         wasm_log(&format!("[lean-cpu] model loaded: layers={} hidden={} vocab={}", model.config.num_layers, model.config.hidden_size, model.config.vocab_size));
         self.model = Some(model);
         self.cache = Some(cache);
         self.tokenizer = Some(tokenizer);
-        self.chat_template = Some(chat_template);
-        self.prefix.invalidate();
         Ok(())
-    }
-
-    /// Same contract as `LeanEngine::generate` (one inference turn over
-    /// `messages`, prefix reuse against the previous call, text streamed
-    /// through `onToken(text)`), on the CPU forward pass. `mask_bits` in
-    /// `params` is applied the same way `mask_logits.wgsl` applies it on
-    /// the GPU.
-    #[wasm_bindgen(js_name = generate)]
-    pub async fn generate(&mut self, messages: JsValue, params: JsValue, on_token: JsValue, abort: Option<AbortFlag>) -> Result<String, JsValue> {
-        let model = self.model.as_ref().ok_or_else(|| JsValue::from(JsError::new("load() must be called first")))?;
-        let tokenizer = self.tokenizer.as_ref().ok_or_else(|| JsValue::from(JsError::new("load() must be called first")))?;
-        let chat_template = self.chat_template.as_ref().ok_or_else(|| JsValue::from(JsError::new("load() must be called first")))?;
-        let cache = self.cache.as_mut().ok_or_else(|| JsValue::from(JsError::new("load() must be called first")))?;
-
-        let messages = messages_from_js(&messages)?;
-        let params = gen_params_from_js(&params);
-        if let Some(bits) = &params.mask_bits {
-            if !bits.is_empty() && bits.len() * 32 < model.config.vocab_size {
-                return Err(JsValue::from(JsError::new("mask is shorter than vocab_size / 32")));
-            }
-        }
-
-        let sink = TextSink::new(on_token);
-        let should_stop = || abort.as_ref().is_some_and(AbortFlag::is_aborted) || sink.borrow().stopped();
-        let result = cpu_generate(model, cache, &mut self.prefix, tokenizer, chat_template, &messages, &params, |text| sink.borrow_mut().text(text), should_stop, yield_to_event_loop).await;
-        if let Some(e) = sink.borrow_mut().take_err() {
-            return Err(e);
-        }
-        result.map_err(lean_error_to_js)
-    }
-
-    /// Same as `LeanEngine::renderPrompt`.
-    #[wasm_bindgen(js_name = renderPrompt)]
-    pub fn render_prompt(&self, messages: JsValue) -> Result<String, JsValue> {
-        let chat_template = self.chat_template.as_ref().ok_or_else(|| JsValue::from(JsError::new("load() must be called first")))?;
-        let messages = messages_from_js(&messages)?;
-        chat_render_prompt(chat_template, &messages).map_err(lean_error_to_js)
-    }
-
-    /// Same as `LeanEngine::tokenCount`.
-    #[wasm_bindgen(js_name = tokenCount)]
-    pub fn token_count(&self, messages: JsValue) -> Result<u32, JsValue> {
-        let tokenizer = self.tokenizer.as_ref().ok_or_else(|| JsValue::from(JsError::new("load() must be called first")))?;
-        let chat_template = self.chat_template.as_ref().ok_or_else(|| JsValue::from(JsError::new("load() must be called first")))?;
-        let messages = messages_from_js(&messages)?;
-        chat_token_count(tokenizer, chat_template, &messages).map(|n| n as u32).map_err(lean_error_to_js)
     }
 
     #[wasm_bindgen(js_name = info)]
@@ -885,15 +774,6 @@ impl LeanEngineCpu {
             .to_string(),
             None => serde_json::json!({ "loaded": false }).to_string(),
         }
-    }
-
-    #[wasm_bindgen(js_name = tokenize)]
-    pub fn tokenize(&self, prompt: String) -> Result<Vec<u32>, JsError> {
-        let tokenizer = self.tokenizer.as_ref().ok_or_else(|| JsError::new("load() must be called first"))?;
-        let chat_template = self.chat_template.as_ref().ok_or_else(|| JsError::new("load() must be called first"))?;
-        let rendered = render_user_prompt(chat_template, &prompt).map_err(|e| JsError::new(&format!("failed to render prompt: {e}")))?;
-        let encoding = tokenizer.encode(rendered, false).map_err(|e| JsError::new(&format!("tokenizer encode failed: {e}")))?;
-        Ok(encoding.get_ids().to_vec())
     }
 
     #[wasm_bindgen(js_name = encodeRaw)]
@@ -921,7 +801,6 @@ impl LeanEngineCpu {
             return Err(JsError::new("token_ids exceeds max_ctx"));
         }
         cache.kv_len = 0;
-        self.prefix.invalidate();
         Ok(cpu_forward_prefill(model, cache, &token_ids))
     }
 
@@ -932,7 +811,6 @@ impl LeanEngineCpu {
         if cache.remaining_capacity() == 0 {
             return Err(JsError::new("decodeStepArgmax would exceed max_ctx"));
         }
-        self.prefix.invalidate();
         Ok(cpu_decode_step_argmax(model, cache, token_id))
     }
 

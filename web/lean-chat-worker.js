@@ -22,17 +22,17 @@
 // loaded on, and plain ready/token/done/error signals. The engine build
 // tag is console.log only.
 //
-// Both LeanEngine (GPU) and LeanEngineCpu (threads/single) expose the same
-// one-turn `generate(messages, params, onToken, abort)` surface
-// (crates/lean/src/chat.rs + src/web.rs) — lean keeps no conversation of
-// its own, so this worker holds the conversation (`HISTORY`) and sends
-// the whole thing on every call. `onToken(text)` streams already-decoded
-// reply text, no token ids. On a `ContextOverflow` error (`e.name ===
+// lean's engine is text in, text out (`Lean.generate(text, params,
+// onToken, abort)`): it applies no chat template and keeps no
+// conversation. This worker holds the conversation (`HISTORY`), renders
+// the whole of it through the model's chat template on every call
+// (`chatRender`), and passes that text to the engine, which reuses the KV
+// cache of the common prefix by itself. `onToken(text)` streams
+// already-decoded reply text. On a `ContextOverflow` error (`e.name ===
 // "ContextOverflow"`), this worker drops the oldest user/assistant pair
 // and retries — the same client-side trim `examples/chat.rs` uses
 // natively. The page's "New chat" button sends {type:'reset'}, which just
-// clears `HISTORY`; the engine's own KV cache catches up on the next call
-// (prefix reuse finds nothing in common and reprefills from scratch).
+// clears `HISTORY`.
 //
 // This file intentionally has NO top-level `import` or `await`: a module
 // worker with a top-level await can drop messages posted before it
@@ -42,7 +42,7 @@
 const EARLY = [];
 self.onmessage = (e) => EARLY.push(e);
 
-const ENGINE_BUILD = "2026-10-09-one-turn-01";
+const ENGINE_BUILD = "2026-10-10-lean-text-01";
 // Rewritten to true by scripts/build.sh when BUILD_THREADS=1 built pkg-mt
 // into this deployment; GitHub Pages never sets it.
 const MT_BUILT = false;
@@ -68,7 +68,8 @@ async function capabilities() {
 
 let engine = null;
 let backend = null; // 'webgpu' | 'threads' | 'single'
-let AbortFlagCtor = null;
+let lean = null; // the loaded wasm module
+let chatTemplate = null;
 let abortFlag = null;
 
 // Conversation state: lean keeps no history of its own (see this file's
@@ -79,24 +80,20 @@ let abortFlag = null;
 const SYSTEM_MESSAGE = { role: "system", content: "Answer briefly, in one or two sentences." };
 let HISTORY = [SYSTEM_MESSAGE];
 
-async function createEngine(which) {
-  if (which === "webgpu") {
-    const mod = await import(`./lean/pkg/lean.js?v=${ENGINE_BUILD}`);
-    await mod.default(`./lean/pkg/lean_bg.wasm?v=${ENGINE_BUILD}`);
-    mod.leanInit();
-    return { engine: await mod.LeanEngine.create(), AbortFlag: mod.AbortFlag };
-  }
+// 'threads' runs the CPU forward pass from the threads build (pkg-mt);
+// 'webgpu' and 'single' use the default build (pkg).
+async function loadModule(which) {
   if (which === "threads") {
     const mod = await import(`./lean/pkg-mt/lean.js?v=${ENGINE_BUILD}`);
     await mod.default(`./lean/pkg-mt/lean_bg.wasm?v=${ENGINE_BUILD}`);
     await mod.initThreadPool(navigator.hardwareConcurrency);
     mod.leanInit();
-    return { engine: mod.LeanEngineCpu.create(), AbortFlag: mod.AbortFlag };
+    return mod;
   }
   const mod = await import(`./lean/pkg/lean.js?v=${ENGINE_BUILD}`);
   await mod.default(`./lean/pkg/lean_bg.wasm?v=${ENGINE_BUILD}`);
   mod.leanInit();
-  return { engine: mod.LeanEngineCpu.create(), AbortFlag: mod.AbortFlag };
+  return mod;
 }
 
 function backendLabel(b) {
@@ -124,17 +121,16 @@ async function load(model, backendChoice) {
     }
   );
   const tokenizerJson = new TextDecoder().decode(tokenizerBytes);
-  const tokenizerCfgJson = new TextDecoder().decode(tokenizerCfgBytes);
+  chatTemplate = JSON.parse(new TextDecoder().decode(tokenizerCfgBytes)).chat_template;
 
   const skipped = [];
   for (const c of candidates) {
     try {
       console.log(`[lean-chat-worker] starting ${c} backend...`);
-      const r = await createEngine(c);
+      const mod = await loadModule(c);
       console.log(`[lean-chat-worker] loading weights on ${c} backend...`);
-      r.engine.load(ggufBytes, tokenizerJson, tokenizerCfgJson, model.maxCtx);
-      engine = r.engine;
-      AbortFlagCtor = r.AbortFlag;
+      engine = await mod.Lean.load({ gguf: ggufBytes, tokenizer: tokenizerJson, maxCtx: model.maxCtx, backend: c === "webgpu" ? "webgpu" : "cpu" });
+      lean = mod;
       backend = c;
       break;
     } catch (e) {
@@ -153,10 +149,13 @@ const GEN_PARAMS = { maxNewTokens: 256, temperature: 0.7, topK: 40, topP: 0.9, r
 // Drops the oldest user/assistant pair (after any leading system message)
 // and retries - the same trim rule examples/chat.rs uses natively. Gives
 // up (rethrows) once there is nothing left to drop.
+// Returns the reply and the prompt it answered.
 async function generateWithTrim(onToken) {
   for (;;) {
+    const prompt = lean.chatRender(chatTemplate, HISTORY, null, true);
     try {
-      return await engine.generate(HISTORY, GEN_PARAMS, onToken, abortFlag.cloneFlag());
+      const reply = await engine.generate(prompt, GEN_PARAMS, onToken, abortFlag.cloneFlag());
+      return { reply, prompt };
     } catch (e) {
       const dropFrom = HISTORY[0] && HISTORY[0].role === "system" ? 1 : 0;
       if (e && e.name === "ContextOverflow" && HISTORY.length > dropFrom + 2) {
@@ -176,11 +175,11 @@ async function chat(text) {
   }
   HISTORY.push({ role: "user", content: text });
   try {
-    abortFlag = new AbortFlagCtor();
-    const reply = await generateWithTrim((text) => self.postMessage({ type: "token", text }));
-    // Prompt size of this turn, after any trimming (before the reply joins HISTORY).
+    abortFlag = new lean.AbortFlag();
+    const { reply, prompt } = await generateWithTrim((text) => self.postMessage({ type: "token", text }));
+    // Prompt size of this turn, after any trimming.
     let promptTokens = null;
-    try { promptTokens = engine.tokenCount(HISTORY); } catch (_) {}
+    try { promptTokens = engine.tokenCount(prompt); } catch (_) {}
     HISTORY.push({ role: "assistant", content: reply });
     self.postMessage({ type: "done", promptTokens });
   } catch (e) {
