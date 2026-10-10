@@ -18,5 +18,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 minijinja = { workspace = true }
 minijinja-contrib = { version = "2.24.0", features = ["pycompat"] }
+# strftime_now: the local clock (through JS Date in the browser) and
+# Python-compatible strftime formatting.
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "wasmbind"] }
 wasm-bindgen = { workspace = true, optional = true }
 js-sys = { workspace = true, optional = true }

@@ -23,11 +23,16 @@
 //!   `none` when no tools are given, as in transformers;
 //! - the tokenizer's `bos_token` and `eos_token` are in the context, as
 //!   transformers passes them; [`template_from_tokenizer_config`] reads
-//!   them along with the template into a [`ChatTemplate`].
+//!   them along with the template into a [`ChatTemplate`];
+//! - `strftime_now(format)` formats the local date and time, as
+//!   transformers' does (Llama 3.x templates write today's date with it);
+//!   [`render_at`] renders at a given date and time instead of now.
 
 use std::ops::Range;
 
 use anyhow::{Context, Result};
+use chrono::format::{Item, StrftimeItems};
+use chrono::NaiveDateTime;
 use minijinja::{context, Environment};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
@@ -137,13 +142,21 @@ impl ChatTemplate {
 /// `{"type": "function", "function": {"name", "description",
 /// "parameters"}}`) through `template`. With `add_generation_prompt`, the
 /// text ends with the opening of an assistant turn, ready for generation.
+/// A template that calls `strftime_now` gets the local date and time.
 pub fn render(template: &ChatTemplate, messages: &[Message], tools: Option<&[Value]>, add_generation_prompt: bool) -> Result<String> {
+    render_at(template, messages, tools, add_generation_prompt, chrono::Local::now().naive_local())
+}
+
+/// [`render`] with `strftime_now` formatting `now` instead of the current
+/// local date and time, for a reproducible prompt.
+pub fn render_at(template: &ChatTemplate, messages: &[Message], tools: Option<&[Value]>, add_generation_prompt: bool, now: NaiveDateTime) -> Result<String> {
     let mut env = Environment::new();
     env.set_trim_blocks(true);
     env.set_lstrip_blocks(true);
     env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
     env.add_filter("tojson", tojson::py_tojson);
     env.add_function("raise_exception", raise_exception);
+    env.add_function("strftime_now", move |format: String| strftime(now, &format));
     env.add_template("chat", &template.source).context("parsing chat_template")?;
     let tmpl = env.get_template("chat")?;
     // A special token the tokenizer does not define stays undefined, as in
@@ -157,6 +170,16 @@ pub fn render(template: &ChatTemplate, messages: &[Message], tools: Option<&[Val
     }
     let rendered = tmpl.render(ctx).context("rendering chat_template")?;
     Ok(rendered)
+}
+
+/// Python's `datetime.strftime(format)`; an unknown directive fails the
+/// render (chrono would panic on it).
+fn strftime(now: NaiveDateTime, format: &str) -> std::result::Result<String, minijinja::Error> {
+    let items: Vec<Item> = StrftimeItems::new(format).collect();
+    if items.contains(&Item::Error) {
+        return Err(minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, format!("strftime_now: unsupported format {format:?}")));
+    }
+    Ok(now.format_with_items(items.into_iter()).to_string())
 }
 
 fn raise_exception(msg: String) -> std::result::Result<String, minijinja::Error> {
@@ -263,6 +286,14 @@ mod tests {
         let t = template_from_tokenizer_config(r#"{"chat_template": "{{ bos_token }}x{{ eos_token }}", "bos_token": {"content": "<s>", "lstrip": false}, "eos_token": "</s>"}"#).unwrap();
         assert_eq!(render(&t, &[], None, false).unwrap(), "<s>x</s>");
         assert_eq!(render(&ChatTemplate::new("{{ bos_token }}x"), &[], None, false).unwrap(), "x");
+    }
+
+    #[test]
+    fn strftime_now_formats_the_given_date() {
+        let now = chrono::NaiveDate::from_ymd_opt(2026, 3, 5).unwrap().and_hms_opt(9, 7, 0).unwrap();
+        let t = ChatTemplate::new("{{ strftime_now('%d %b %Y') }}|{{ strftime_now('%Y-%m-%d %H:%M') }}|{{ strftime_now('%A %B') }}");
+        assert_eq!(render_at(&t, &[], None, false, now).unwrap(), "05 Mar 2026|2026-03-05 09:07|Thursday March");
+        assert!(render_at(&ChatTemplate::new("{{ strftime_now('%Q') }}"), &[], None, false, now).is_err());
     }
 
     #[test]
