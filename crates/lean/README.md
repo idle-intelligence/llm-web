@@ -77,7 +77,7 @@ ENGINE_BUILD=<tag> scripts/build.sh
 
 | test | what it checks | environment |
 |---|---|---|
-| `fixture_parity_generate` | `Lean::generate` on GPU and CPU: token count and greedy reply equal the fixture, Qwen2.5-0.5B and SmolLM2-360M | `LEAN_GGUF`, `LEAN_TOKENIZER_DIR`, the `_LLAMA_360M` Q4_0 pair |
+| `fixture_parity_generate` | `Lean::generate` on GPU and CPU: token count and greedy reply equal the fixture, Qwen2.5-0.5B, SmolLM2-360M and Llama-3.2-1B Q4_0 | `LEAN_GGUF`, `LEAN_TOKENIZER_DIR`, the `_LLAMA_360M` Q4_0 pair, `LEAN_GGUF_LLAMA32_1B_Q4_0`, `LEAN_TOKENIZER_DIR_LLAMA32_1B` |
 | `engine_api` | prefix reuse gives the same replies as a fresh engine (growing conversation, diverging prefixes), CPU equals GPU over three turns, `ContextOverflow` counts and recovery | `LEAN_GGUF`, `LEAN_TOKENIZER_DIR`, the `_LLAMA_360M` pair, `LEAN_GGUF_LLAMA_1_7B_Q4_0`, `LEAN_TOKENIZER_DIR_LLAMA_1_7B` |
 
 ```bash
