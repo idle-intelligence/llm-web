@@ -135,6 +135,34 @@ fn skip_gguf_value<R: Read + Seek>(reader: &mut R, value_type: u32) -> Result<()
     Ok(())
 }
 
+/// Token texts that end a generation. Llama 3's `<|eot_id|>` (end of
+/// turn), `<|eom_id|>` (end of message, after a tool call) and
+/// `<|end_of_text|>` are the ids its `generation_config.json` lists as
+/// `eos_token_id`, while its GGUF names only `<|eot_id|>` as eos; ChatML's
+/// `<|im_end|>` is already the eos of the Qwen and SmolLM2 GGUFs.
+/// `<|endoftext|>` is left out: Qwen's GGUF names it as the padding id
+/// (`config_from_gguf` adds that one), and SmolLM2's `generation_config.json`
+/// does not stop on it.
+const END_OF_GENERATION_TOKENS: [&str; 4] = ["<|eot_id|>", "<|eom_id|>", "<|end_of_text|>", "<|im_end|>"];
+
+/// Reads the `tokenizer.ggml.tokens` string array, keeping only the ids whose
+/// text is in [`END_OF_GENERATION_TOKENS`] (the vocabulary itself is the
+/// tokenizer's business, not the reader's).
+fn read_end_of_generation_ids<R: Read + Seek>(reader: &mut R) -> Result<Vec<u32>> {
+    let (elem_type, count) = read_array_header(reader)?;
+    let mut ids = Vec::new();
+    for i in 0..count {
+        if elem_type == 8 {
+            if END_OF_GENERATION_TOKENS.contains(&read_gguf_string(reader)?.as_str()) {
+                ids.push(i as u32);
+            }
+        } else {
+            skip_gguf_value(reader, elem_type)?;
+        }
+    }
+    Ok(ids)
+}
+
 fn read_gguf_value<R: Read + Seek>(reader: &mut R, value_type: u32) -> Result<GgufValue> {
     if value_type == 9 {
         let (elem_type, count) = read_array_header(reader)?;
@@ -245,6 +273,7 @@ pub struct GgufReader<R: Read + Seek> {
     reader: R,
     tensors: HashMap<String, GgufTensorInfo>,
     metadata: HashMap<String, GgufValue>,
+    end_of_generation_ids: Vec<u32>,
     data_section_offset: u64,
 }
 
@@ -265,9 +294,14 @@ impl<R: Read + Seek> GgufReader<R> {
         let metadata_kv_count = reader.read_u64::<LittleEndian>().context("reading metadata KV count")?;
 
         let mut metadata = HashMap::with_capacity((metadata_kv_count as usize).min(MAX_CAPACITY_HINT));
+        let mut end_of_generation_ids = Vec::new();
         for i in 0..metadata_kv_count {
             let key = read_gguf_string(&mut reader).with_context(|| format!("reading metadata key {i}"))?;
             let value_type = reader.read_u32::<LittleEndian>().with_context(|| format!("reading metadata value type {i}"))?;
+            if key == "tokenizer.ggml.tokens" && value_type == 9 {
+                end_of_generation_ids = read_end_of_generation_ids(&mut reader).context("reading tokenizer.ggml.tokens")?;
+                continue;
+            }
             let value = read_gguf_value(&mut reader, value_type).with_context(|| format!("reading metadata value {i} ('{key}')"))?;
             metadata.insert(key, value);
         }
@@ -297,11 +331,17 @@ impl<R: Read + Seek> GgufReader<R> {
             ensure!(end <= file_len, "tensor '{}': data range [{abs_offset}, {end}) exceeds file length {file_len}", info.name);
         }
 
-        Ok(Self { reader, tensors, metadata, data_section_offset })
+        Ok(Self { reader, tensors, metadata, end_of_generation_ids, data_section_offset })
     }
 
     pub fn tensor_info(&self, name: &str) -> Option<&GgufTensorInfo> {
         self.tensors.get(name)
+    }
+
+    /// Vocabulary ids whose token text ends a generation (see
+    /// [`END_OF_GENERATION_TOKENS`]), in id order.
+    pub(crate) fn end_of_generation_ids(&self) -> &[u32] {
+        &self.end_of_generation_ids
     }
 
     pub fn meta_u32(&self, key: &str) -> Option<u32> {

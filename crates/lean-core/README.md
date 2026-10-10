@@ -61,6 +61,7 @@ The parity tests compare lean against fixtures written by HF transformers (`refe
 | `fixture_parity_llama_1_7b` | SmolLM2-1.7B Q8_0 | `LEAN_GGUF_LLAMA_1_7B_Q8_0`, `LEAN_TOKENIZER_DIR_LLAMA_1_7B` |
 | `fixture_parity_llama32` | Llama-3.2-1B and 3B, Q4_0 and Q8_0, GPU, including a 9044-token prompt (past the 8192 positions of the original context); the prompt is the fixture's HF-rendered chat text | `LEAN_GGUF_LLAMA32_1B_Q4_0`, `LEAN_GGUF_LLAMA32_1B_Q8_0`, `LEAN_TOKENIZER_DIR_LLAMA32_1B`, and the same with `3B` |
 | `fixture_parity_llama32_cpu` | the same on the CPU path; the 9044-token case only with `LEAN_LLAMA32_CPU_LONG=1` | same as above |
+| `stop_ids_match_generation_config` (unit test) | the stop ids read from the GGUF equal the `eos_token_id` list of each model's `generation_config.json`; runs each model whose two variables are set | the Q8_0 `LEAN_GGUF_*` / `LEAN_TOKENIZER_DIR_*` pairs above, `LEAN_GGUF_QWEN3*`, `LEAN_GGUF_QWEN25_3B` |
 | `logit_mask` | a mask forces an exact string; an all-allowed mask equals no mask | `LEAN_GGUF`, `LEAN_TOKENIZER_DIR` |
 | `kv_snapshot` | restore plus suffix equals a full prefill; snapshot round trip | `LEAN_GGUF`, `LEAN_TOKENIZER_DIR` |
 | `lora_parity` | LoRA on the GPU against a transformers fixture with the LoRA deltas applied | `LEAN_GGUF`, `LEAN_TOKENIZER_DIR`, `LEAN_LORA_BIN` |
@@ -72,5 +73,5 @@ LEAN_GGUF_LLAMA_360M_Q4_0=<gguf> LEAN_GGUF_LLAMA_360M_Q8_0=<gguf> LEAN_TOKENIZER
   cargo test -p lean-core --release --features threads --test fixture_parity_llama_360m_cpu -- --ignored
 ```
 
-`cargo test -p lean-core` without `--ignored` runs the tests that need no model file (dequantization against gguf-py's reference blocks, LoRA parsing, kernel unit tests). `embed_head_sliced` and the Q6_K reference test are unit tests in `src/tests/`, since they check private modules. Release gate logs are under `docs/runs/`.
+`cargo test -p lean-core` without `--ignored` runs the tests that need no model file (dequantization against gguf-py's reference blocks, LoRA parsing, kernel unit tests). `embed_head_sliced`, `stop_ids_match_generation_config` and the Q6_K reference test are unit tests in `src/tests/`, since they check private modules. Release gate logs are under `docs/runs/`.
 

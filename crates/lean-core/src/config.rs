@@ -143,10 +143,18 @@ pub(crate) fn config_from_gguf<R: Read + Seek>(reader: &mut GgufReader<R>) -> Re
         .meta_u32("tokenizer.ggml.eos_token_id")
         .or(default_eos)
         .with_context(|| format!("missing tokenizer.ggml.eos_token_id (no safe default for architecture '{arch_str}')"))?;
-    let pad_token_id = reader.meta_u32("tokenizer.ggml.padding_token_id").or(default_bos).unwrap_or(bos_token_id);
+    // Generation stops on the GGUF's eos, its end-of-turn/end-of-message ids
+    // when it names them, an explicit padding id (Qwen's `<|endoftext|>`;
+    // never the bos id, which no model emits to end a reply), and the
+    // vocabulary's end-of-generation tokens (Llama 3's `<|eot_id|>`,
+    // `<|eom_id|>`, `<|end_of_text|>`, which its GGUF does not name).
+    let pad_token_id = reader.meta_u32("tokenizer.ggml.padding_token_id").or(default_bos);
     let mut eos_token_ids = vec![eos_token_id];
-    if pad_token_id != eos_token_id {
-        eos_token_ids.push(pad_token_id);
+    let named = ["tokenizer.ggml.eot_token_id", "tokenizer.ggml.eom_token_id"].map(|k| reader.meta_u32(k));
+    for id in named.into_iter().chain([pad_token_id]).flatten().chain(reader.end_of_generation_ids().iter().copied()) {
+        if !eos_token_ids.contains(&id) {
+            eos_token_ids.push(id);
+        }
     }
 
     let embd_info = reader.tensor_info("token_embd.weight").context("missing tensor 'token_embd.weight'")?;
