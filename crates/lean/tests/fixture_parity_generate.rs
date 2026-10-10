@@ -1,6 +1,6 @@
 //! Token-exact parity through the engine's own entry point, `Lean::generate`
 //! (text in, text out), against the HF transformers fixtures
-//! (`reference/gen_fixture*.py`, which load the same GGUF in transformers).
+//! (`crates/lean-core/reference/gen_fixture*.py`, which load the same GGUF in transformers).
 //!
 //! For each fixture case with a `prompt`, the prompt is rendered through the
 //! model's chat template (the text a chat client would pass), and:
@@ -91,7 +91,7 @@ fn check_generate_matches_fixture(gguf: &str, tokenizer_dir: &str, fixture_path:
 fn generate_matches_hf_fixture_qwen25_0_5b() {
     let gguf = std::env::var("LEAN_GGUF").expect("set LEAN_GGUF to run this test");
     let tokenizer_dir = std::env::var("LEAN_TOKENIZER_DIR").expect("set LEAN_TOKENIZER_DIR to run this test");
-    check_generate_matches_fixture(&gguf, &tokenizer_dir, concat!(env!("CARGO_MANIFEST_DIR"), "/reference/fixture.json"));
+    check_generate_matches_fixture(&gguf, &tokenizer_dir, concat!(env!("CARGO_MANIFEST_DIR"), "/../lean-core/reference/fixture.json"));
 }
 
 #[test]
@@ -99,5 +99,5 @@ fn generate_matches_hf_fixture_qwen25_0_5b() {
 fn generate_matches_hf_fixture_smollm2_360m() {
     let gguf = std::env::var("LEAN_GGUF_LLAMA_360M_Q4_0").expect("set LEAN_GGUF_LLAMA_360M_Q4_0 to run this test");
     let tokenizer_dir = std::env::var("LEAN_TOKENIZER_DIR_LLAMA_360M").expect("set LEAN_TOKENIZER_DIR_LLAMA_360M to run this test");
-    check_generate_matches_fixture(&gguf, &tokenizer_dir, concat!(env!("CARGO_MANIFEST_DIR"), "/reference/fixture_llama_360m_q4_0.json"));
+    check_generate_matches_fixture(&gguf, &tokenizer_dir, concat!(env!("CARGO_MANIFEST_DIR"), "/../lean-core/reference/fixture_llama_360m_q4_0.json"));
 }

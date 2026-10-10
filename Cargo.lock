@@ -768,15 +768,12 @@ name = "lean"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "bytemuck",
- "byteorder",
  "clap",
  "console_error_panic_hook",
- "futures-channel",
  "getrandom",
- "half",
  "js-sys",
  "lean-chat",
+ "lean-core",
  "pollster",
  "rayon",
  "serde",
@@ -800,6 +797,25 @@ dependencies = [
  "serde",
  "serde_json",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "lean-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytemuck",
+ "byteorder",
+ "futures-channel",
+ "half",
+ "lean-chat",
+ "pollster",
+ "rayon",
+ "serde",
+ "serde_json",
+ "tokenizers",
+ "wasm-bindgen",
+ "wgpu",
 ]
 
 [[package]]

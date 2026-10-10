@@ -2,7 +2,7 @@
 //! prefill + greedy decode on the GPU.
 //!
 //! With no `--prompt`, runs every case in `--fixture`
-//! (`crates/lean/reference/fixture.json`, from `reference/gen_fixture.py`'s
+//! (`crates/lean-core/reference/fixture.json`, from `reference/gen_fixture.py`'s
 //! HF-transformers-on-the-same-GGUF output) through this crate's own
 //! tokenizer + chat-template path (lean-chat's `render` + the `tokenizers`
 //! crate) and checks the resulting token ids, prefill top-20 logits, and
@@ -20,7 +20,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
-use lean::model::{build_mask_bitset, build_rope_tables, forward_decode_step, forward_decode_step_argmax, forward_prefill, forward_prefill_suffix, GpuModel, KvCache, KvSnapshot};
+use lean_core::model::{build_mask_bitset, build_rope_tables, forward_decode_step, forward_decode_step_argmax, forward_prefill, forward_prefill_suffix, GpuModel, KvCache, KvSnapshot};
 use lean_chat::{read_chat_template, render, Message};
 use serde::Deserialize;
 use tokenizers::Tokenizer;
@@ -70,7 +70,7 @@ struct Args {
     gguf: String,
     #[arg(long, env = "LEAN_TOKENIZER_DIR")]
     tokenizer_dir: String,
-    #[arg(long, default_value = "crates/lean/reference/fixture.json")]
+    #[arg(long, default_value = "crates/lean-core/reference/fixture.json")]
     fixture: String,
     #[arg(long, value_enum, default_value_t = Kernel::Fast)]
     kernel: Kernel,
@@ -146,7 +146,7 @@ fn tokenize_prompt(tokenizer: &Tokenizer, chat_template: &lean_chat::ChatTemplat
     Ok(encoding.get_ids().to_vec())
 }
 
-fn run_generation(engine: &lean::engine::Engine, model: &GpuModel, token_ids: &[u32], n_tokens: usize) -> (Vec<f32>, Vec<u32>, f64, f64) {
+fn run_generation(engine: &lean_core::engine::Engine, model: &GpuModel, token_ids: &[u32], n_tokens: usize) -> (Vec<f32>, Vec<u32>, f64, f64) {
     // Every call here starts an independent generation against a brand-new
     // KvCache — model.pool must be reset first, or decode can silently
     // rebind to a stale, already-dropped KvCache from a previous call (see
@@ -187,7 +187,7 @@ fn run_generation(engine: &lean::engine::Engine, model: &GpuModel, token_ids: &[
         prefill_dispatches as f64 / seq as f64
     );
     if engine.profiling_enabled() {
-        lean::profile_report::report(n_tokens as u64);
+        lean_core::profile_report::report(n_tokens as u64);
     }
 
     (prefill_logits, got_tokens, prefill_ms / seq as f64, decode_ms_total / n_tokens as f64)
@@ -198,13 +198,13 @@ fn run_generation(engine: &lean::engine::Engine, model: &GpuModel, token_ids: &[
 /// `Pool`/dispatch-count bookkeeping (there is no GPU dispatch here) and no
 /// `pollster::block_on` (the CPU forward functions are plain synchronous
 /// calls, not futures) - otherwise the same contract as `run_generation`.
-fn run_generation_cpu(model: &lean::cpu::CpuModel, token_ids: &[u32], n_tokens: usize) -> (Vec<f32>, Vec<u32>, f64, f64) {
+fn run_generation_cpu(model: &lean_core::cpu::CpuModel, token_ids: &[u32], n_tokens: usize) -> (Vec<f32>, Vec<u32>, f64, f64) {
     let seq = token_ids.len() as u32;
     let max_ctx = seq + n_tokens as u32 + 4;
-    let mut cache = lean::cpu::CpuKvCache::new(&model.config, max_ctx as usize);
+    let mut cache = lean_core::cpu::CpuKvCache::new(&model.config, max_ctx as usize);
 
     let prefill_start = Instant::now();
-    let logits = lean::cpu::forward_prefill(model, &mut cache, token_ids);
+    let logits = lean_core::cpu::forward_prefill(model, &mut cache, token_ids);
     let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
     let prefill_logits = logits.clone();
 
@@ -214,7 +214,7 @@ fn run_generation_cpu(model: &lean::cpu::CpuModel, token_ids: &[u32], n_tokens: 
     for _ in 0..n_tokens {
         got_tokens.push(next_id);
         let decode_start = Instant::now();
-        next_id = lean::cpu::forward_decode_step_argmax(model, &mut cache, next_id);
+        next_id = lean_core::cpu::forward_decode_step_argmax(model, &mut cache, next_id);
         decode_ms_total += decode_start.elapsed().as_secs_f64() * 1000.0;
     }
 
@@ -231,7 +231,7 @@ fn run_generation_cpu(model: &lean::cpu::CpuModel, token_ids: &[u32], n_tokens: 
 /// possible follow-up once both rungs are proven out.
 fn run_fixture_cpu(gguf_path: &str, tokenizer: &Tokenizer, chat_template: &lean_chat::ChatTemplate, fixture: &Fixture, n_tokens: usize, include_long: bool) -> Result<()> {
     let load_start = Instant::now();
-    let model = lean::cpu::CpuModel::load(gguf_path)?;
+    let model = lean_core::cpu::CpuModel::load(gguf_path)?;
     eprintln!("loaded CPU model in {:?}", load_start.elapsed());
 
     println!("engine=cpu  case            seq  tok_match  top1_match  top20_maxdiff  prefill_ms/tok  decode_ms/tok");
@@ -285,7 +285,7 @@ fn run_fixture_cpu(gguf_path: &str, tokenizer: &Tokenizer, chat_template: &lean_
 /// fresh cache -> prefill(suffix) -> greedy generate must reproduce
 /// prefill(prefix+suffix) -> greedy generate exactly, plus an export/import
 /// byte round trip. Uses `--prompt` split at its midpoint token.
-fn check_kv_snapshot(engine: &lean::engine::Engine, model: &GpuModel, tokenizer: &Tokenizer, chat_template: &lean_chat::ChatTemplate, prompt: &str, n_new: usize) -> Result<()> {
+fn check_kv_snapshot(engine: &lean_core::engine::Engine, model: &GpuModel, tokenizer: &Tokenizer, chat_template: &lean_chat::ChatTemplate, prompt: &str, n_new: usize) -> Result<()> {
     let all_ids = tokenize_prompt(tokenizer, chat_template, prompt)?;
     anyhow::ensure!(all_ids.len() >= 4, "prompt too short to split into a prefix/suffix ({} tokens)", all_ids.len());
     let split = all_ids.len() / 2;
@@ -338,7 +338,7 @@ fn check_kv_snapshot(engine: &lean::engine::Engine, model: &GpuModel, tokenizer:
 /// `--check mask`: a per-step singleton mask must force greedy decoding to
 /// reproduce a fixed target string; an all-allowed mask must match
 /// unmasked output.
-fn check_mask(engine: &lean::engine::Engine, model: &GpuModel, tokenizer: &Tokenizer, chat_template: &lean_chat::ChatTemplate, prompt: &str) -> Result<()> {
+fn check_mask(engine: &lean_core::engine::Engine, model: &GpuModel, tokenizer: &Tokenizer, chat_template: &lean_chat::ChatTemplate, prompt: &str) -> Result<()> {
     let vocab = model.config.vocab_size;
     let prompt_ids = tokenize_prompt(tokenizer, chat_template, prompt)?;
     let target = "{\"ok\":true}";
@@ -413,7 +413,7 @@ fn main() -> Result<()> {
         if let Some(prompt) = &args.prompt {
             let token_ids = tokenize_prompt(&tokenizer, &chat_template, prompt)?;
             println!("tokenized prompt into {} ids: {token_ids:?}", token_ids.len());
-            let model = lean::cpu::CpuModel::load(&args.gguf)?;
+            let model = lean_core::cpu::CpuModel::load(&args.gguf)?;
             let (_, got_tokens, prefill_ms_per_tok, decode_ms_per_tok) = run_generation_cpu(&model, &token_ids, args.tokens);
             let text = tokenizer.decode(&got_tokens, true).map_err(|e| anyhow::anyhow!("tokenizer decode failed: {e}"))?;
             println!("continuation: {text}");
@@ -425,7 +425,7 @@ fn main() -> Result<()> {
         return run_fixture_cpu(&args.gguf, &tokenizer, &chat_template, &fixture, args.tokens, args.long);
     }
 
-    let engine = lean::engine::Engine::new()?;
+    let engine = lean_core::engine::Engine::new()?;
     if std::env::var("LEAN_DEBUG_ADAPTER").as_deref() == Ok("1") {
         eprintln!("adapter: {}", engine.adapter_report);
     }

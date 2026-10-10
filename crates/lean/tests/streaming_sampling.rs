@@ -10,9 +10,9 @@
 //! cargo test -p lean --release -- --ignored streaming_sampling
 //! ```
 
-use lean::engine::Engine;
+use lean_core::engine::Engine;
 use lean::generate::decode_loop;
-use lean::model::{argmax, build_rope_tables, decode_greedy_pipelined, forward_decode_step_argmax, forward_prefill, forward_prefill_suffix, GpuModel, KvCache};
+use lean_core::model::{argmax, build_rope_tables, decode_greedy_pipelined, forward_decode_step_argmax, forward_prefill, forward_prefill_suffix, GpuModel, KvCache};
 use lean::sampling::SamplingParams;
 use lean_chat::{read_chat_template, render, Message};
 use tokenizers::Tokenizer;
@@ -43,7 +43,7 @@ fn whole_reply_greedy(engine: &Engine, model: &GpuModel, cache: &mut KvCache, to
             break;
         }
         generated.push(next_id);
-        next_id = pollster::block_on(lean::model::forward_decode_step_argmax(engine, model, cache, next_id, cos, sin, None));
+        next_id = pollster::block_on(lean_core::model::forward_decode_step_argmax(engine, model, cache, next_id, cos, sin, None));
     }
     generated
 }

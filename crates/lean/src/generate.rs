@@ -16,8 +16,8 @@
 //! (`forward_decode_step`) and draws from it via `sampling::sample` - see
 //! `sampling.rs`'s doc comment for why that's an acceptable readback cost.
 
-use crate::engine::Engine;
-use crate::model::{argmax, decode_greedy_pipelined, forward_decode_step, GpuModel, KvCache};
+use lean_core::engine::Engine;
+use lean_core::model::{argmax, decode_greedy_pipelined, forward_decode_step, GpuModel, KvCache};
 use crate::sampling::{sample, Rng64, SamplingParams};
 
 /// Runs the decode loop starting from `first_logits` (the logits already

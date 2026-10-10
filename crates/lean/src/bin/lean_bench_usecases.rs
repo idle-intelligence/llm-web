@@ -17,7 +17,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use lean::model::{build_rope_tables, forward_chunk_spec, forward_decode_step_argmax, forward_prefill, forward_prefill_suffix, ForwardSpec, GpuModel, KvCache};
+use lean_core::model::{build_rope_tables, forward_chunk_spec, forward_decode_step_argmax, forward_prefill, forward_prefill_suffix, ForwardSpec, GpuModel, KvCache};
 use tokenizers::Tokenizer;
 
 #[derive(Parser)]
@@ -38,7 +38,7 @@ enum Cmd {
     /// fixture_qwen3_1_7b.json, for the long_tools_single input_ids),
     /// --turns (default 5), --max-new (default 48).
     SonosTurns {
-        #[arg(long, default_value = "crates/lean/reference/fixture_qwen3_1_7b.json")]
+        #[arg(long, default_value = "crates/lean-core/reference/fixture_qwen3_1_7b.json")]
         fixture: String,
         #[arg(long, default_value_t = 5)]
         turns: usize,
@@ -88,7 +88,7 @@ fn life_cells(cells: usize) -> Result<()> {
     let lora_path = std::env::var("LEAN_LORA_BIN").context("set LEAN_LORA_BIN")?;
 
     let tokenizer = Tokenizer::from_file(format!("{tokenizer_dir}/tokenizer.json")).map_err(|e| anyhow::anyhow!("loading tokenizer: {e}"))?;
-    let engine = lean::engine::Engine::new().map_err(|e| anyhow::anyhow!("wgpu engine init: {e}"))?;
+    let engine = lean_core::engine::Engine::new().map_err(|e| anyhow::anyhow!("wgpu engine init: {e}"))?;
     let mut model = GpuModel::load(&engine, &gguf_path, true)?;
     let lora_bytes = std::fs::read(&lora_path)?;
     model.apply_lora(&engine, &lora_bytes)?;
@@ -159,7 +159,7 @@ fn sonos_turns(fixture_path: &str, turns: usize, max_new: usize) -> Result<()> {
     // same order of magnitude as this).
     let command_text = "Play jazz in the kitchen and set the volume to 30 percent, then tell me what is now playing there.";
 
-    let engine = lean::engine::Engine::new().map_err(|e| anyhow::anyhow!("wgpu engine init: {e}"))?;
+    let engine = lean_core::engine::Engine::new().map_err(|e| anyhow::anyhow!("wgpu engine init: {e}"))?;
     let model = GpuModel::load(&engine, &gguf_path, true)?;
 
     let tokenizer_dir = std::env::var("LEAN_TOKENIZER_DIR").context("set LEAN_TOKENIZER_DIR")?;

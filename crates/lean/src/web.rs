@@ -23,12 +23,12 @@ use std::io::{Read, Seek, SeekFrom};
 
 use tokenizers::Tokenizer;
 
-use crate::cpu::{forward_decode_step_argmax as cpu_decode_step_argmax, forward_prefill as cpu_forward_prefill, CpuKvCache, CpuModel};
-use crate::engine::{now_ms, Engine};
+use lean_core::cpu::{forward_decode_step_argmax as cpu_decode_step_argmax, forward_prefill as cpu_forward_prefill, CpuKvCache, CpuModel};
+use lean_core::engine::{now_ms, Engine};
 use crate::error::LeanError;
 use crate::lean::{AbortFlag, Backend, GgufSource, Lean, LoadOptions, TokenizerSource};
 use crate::turn::GenParams;
-use crate::model::{build_mask_bitset, build_rope_tables, decode_greedy_pipelined, forward_decode_step_argmax, forward_prefill, forward_prefill_suffix, GpuModel, KvCache, KvSnapshot};
+use lean_core::model::{build_mask_bitset, build_rope_tables, decode_greedy_pipelined, forward_decode_step_argmax, forward_prefill, forward_prefill_suffix, GpuModel, KvCache, KvSnapshot};
 
 /// `Read + Seek` adapter over a JS-owned `js_sys::Uint8Array`, so the whole
 /// GGUF file never has to be copied into a wasm-side `Vec<u8>` just to

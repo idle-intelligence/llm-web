@@ -18,11 +18,11 @@ use std::future::Future;
 
 use tokenizers::Tokenizer;
 
-use crate::cpu::{forward_decode_step as cpu_forward_decode_step, forward_prefill as cpu_forward_prefill, CpuKvCache, CpuModel};
-use crate::engine::Engine;
+use lean_core::cpu::{forward_decode_step as cpu_forward_decode_step, forward_prefill as cpu_forward_prefill, CpuKvCache, CpuModel};
+use lean_core::engine::Engine;
 use crate::error::LeanError;
 use crate::generate::decode_loop;
-use crate::model::{argmax, forward_prefill, forward_prefill_suffix, GpuModel, KvCache};
+use lean_core::model::{argmax, forward_prefill, forward_prefill_suffix, GpuModel, KvCache};
 use crate::sampling::{sample, Rng64, SamplingParams};
 
 /// Everything one `generate` call needs beyond its text: how many tokens

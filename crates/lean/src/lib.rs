@@ -9,25 +9,13 @@
 //! cache of its previous call for the longest matching token prefix, which
 //! serves one client per engine: give each client its own `Lean`.
 //!
-//! The lower modules (`model.rs` forward pass, `gguf.rs` parsing,
-//! `engine.rs`/`pool.rs` wgpu plumbing, `cpu.rs` CPU forward pass) stay
-//! public for callers that work on token ids directly.
+//! The forward pass underneath (GGUF loading, GPU and CPU kernels, KV
+//! cache, LoRA) is the `lean-core` crate, for callers that work on token
+//! ids and logits directly.
 
-pub mod config;
-pub mod cpu;
-pub mod cpu_kernels;
-#[cfg(feature = "threads")]
-mod cpu_team;
-pub mod engine;
 pub mod error;
 pub mod generate;
-pub mod gguf;
 mod lean;
-pub mod lora;
-pub mod model;
-pub mod pool;
-pub mod profile_report;
-pub mod quant;
 pub mod sampling;
 mod turn;
 #[cfg(feature = "web")]

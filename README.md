@@ -49,12 +49,12 @@ LEAN_GGUF=<path-to-gguf> LEAN_TOKENIZER_DIR=<dir-with-tokenizer.json> \
 Greedy tokens matching the transformers reference, on every backend:
 
 ```bash
-LEAN_GGUF=<gguf> LEAN_TOKENIZER_DIR=<dir> cargo test -p lean --release --test fixture_parity -- --ignored
+LEAN_GGUF=<gguf> LEAN_TOKENIZER_DIR=<dir> cargo test -p lean-core --release --test fixture_parity -- --ignored
 LEAN_GGUF_LLAMA_360M_Q4_0=<gguf> LEAN_GGUF_LLAMA_360M_Q8_0=<gguf> LEAN_TOKENIZER_DIR_LLAMA_360M=<dir> \
-  cargo test -p lean --release --features threads --test fixture_parity_llama_360m_cpu -- --ignored
+  cargo test -p lean-core --release --features threads --test fixture_parity_llama_360m_cpu -- --ignored
 ```
 
-See [`crates/lean/README.md`](crates/lean/README.md) for the backends, the full JavaScript API, and every parity test and its environment variables.
+See [`crates/lean/README.md`](crates/lean/README.md) for the backends and the full JavaScript API, and [`crates/lean-core/README.md`](crates/lean-core/README.md) for the forward pass underneath (token ids, masks, positions, LoRA) and every parity test with its environment variables.
 
 ## Models
 
@@ -65,7 +65,7 @@ See [`crates/lean/README.md`](crates/lean/README.md) for the backends, the full 
 | [SmolLM2-1.7B-Instruct](https://huggingface.co/HuggingFaceTB/SmolLM2-1.7B-Instruct) | 1.7B | Q4_0 | Apache 2.0 |
 | [Qwen2.5-3B-Instruct](https://huggingface.co/Qwen/Qwen2.5-3B-Instruct) | 3B | Q4_0 (Q6_K embedding) | Apache 2.0 |
 
-See [`crates/lean/README.md`](crates/lean/README.md#supported-models) for the full architecture and tensor-type list.
+See [`crates/lean-core/README.md`](crates/lean-core/README.md#supported-models) for the full architecture and tensor-type list.
 
 ## Credits
 

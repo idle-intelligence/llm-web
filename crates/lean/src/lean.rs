@@ -24,10 +24,10 @@ use std::sync::Arc;
 
 use tokenizers::Tokenizer;
 
-use crate::cpu::{CpuKvCache, CpuModel};
-use crate::engine::Engine;
+use lean_core::cpu::{CpuKvCache, CpuModel};
+use lean_core::engine::Engine;
 use crate::error::LeanError;
-use crate::model::{build_rope_tables, GpuModel, KvCache};
+use lean_core::model::{build_rope_tables, GpuModel, KvCache};
 use crate::turn::{check_fits, cpu_turn, encode, gpu_turn, GenParams, PrefixCache};
 
 #[cfg(feature = "web")]
