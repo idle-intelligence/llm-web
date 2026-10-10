@@ -16,7 +16,8 @@ let prompt = render(&template, &messages, None, true)?;
 ```
 
 - `ChatTemplate { source, bos_token, eos_token }`: the template plus the special tokens transformers passes into the template context, read by `template_from_tokenizer_config(json)` (or, natively, `read_chat_template(path)`) from `tokenizer_config.json`. `ChatTemplate::new(source)` makes one from the source alone, with no special tokens.
-- `render(&template, messages, tools, add_generation_prompt) -> String`. `tools` is `None` or a list of JSON tool definitions (`{"type": "function", "function": {"name", "description", "parameters"}}`). With `add_generation_prompt`, the text ends with the opening of an assistant turn.
+- `render(&template, messages, tools, add_generation_prompt) -> String`. `tools` is `None` or a list of JSON tool definitions (`{"type": "function", "function": {"name", "description", "parameters"}}`). With `add_generation_prompt`, the text ends with the opening of an assistant turn. A template that calls `strftime_now` (Llama 3.x writes today's date with it) gets the local date and time.
+- `render_at(&template, messages, tools, add_generation_prompt, now)` renders with `strftime_now` formatting `now` (a `chrono::NaiveDateTime`) instead, for a reproducible prompt.
 - `Message { role, content, tool_calls, name, tool_call_id }`, with `Message::system/user/assistant/tool` and `Message::assistant_tool_calls(content, calls)` for an assistant turn that called tools (`ToolCall::new(name, arguments)`).
 - `trim_oldest_exchange(&mut messages) -> bool` drops the oldest exchange: the first user message and everything up to the next one (the reply, tool calls and tool results). The system message and the latest user turn stay; it returns `false` when there is nothing older to drop. Whether and when to trim is the caller's choice.
 
@@ -35,8 +36,8 @@ const reply = await lean.generate(mod.chatRender(template, messages, null, true)
 
 ## Exactness
 
-`tests/hf_exactness.rs` renders the conversations in `tests/fixtures/*.json` (Qwen2.5, Qwen3, SmolLM2 and Mistral v0.3 templates, the last one writing `bos_token` and `eos_token` into the text: single and multi-turn chat, system messages, non-ASCII and HTML-like text, tools, tool calls with object and string arguments, parallel calls, tool results) and requires the same bytes transformers produced. `scripts/gen_chat_fixtures.py` writes the fixtures.
+`tests/hf_exactness.rs` renders the conversations in `tests/fixtures/*.json` (Qwen2.5, Qwen3, SmolLM2, Mistral v0.3 and Llama 3.2 templates; Mistral writes `bos_token` and `eos_token` into the text, Llama 3.2 the date from `strftime_now`, pinned in the fixture: single and multi-turn chat, system messages, non-ASCII and HTML-like text, tools, tool calls with object and string arguments, parallel calls, tool results) and requires the same bytes transformers produced. `scripts/gen_chat_fixtures.py` writes the fixtures.
 
-To match transformers, the template is rendered with `trim_blocks` and `lstrip_blocks`, `tojson` is Python's `json.dumps` (`", "` and `": "` separators, no HTML escaping, keys in insertion order), Python string methods come from minijinja-contrib's `pycompat`, `raise_exception` fails the render, `tools` is `none` when absent, and `bos_token` and `eos_token` are in the context.
+To match transformers, the template is rendered with `trim_blocks` and `lstrip_blocks`, `tojson` is Python's `json.dumps` (`", "` and `": "` separators, no HTML escaping, keys in insertion order), Python string methods come from minijinja-contrib's `pycompat`, `raise_exception` fails the render, `tools` is `none` when absent, `bos_token` and `eos_token` are in the context, and `strftime_now(format)` formats the local time like Python's `strftime`.
 
-Not covered: other special tokens (`pad_token`, `unk_token`, ...) and the `strftime_now` function transformers also provides; a template that reads them (Llama 3.x writes today's date with `strftime_now`) renders differently.
+Not covered: other special tokens (`pad_token`, `unk_token`, ...); a template that reads them renders differently.

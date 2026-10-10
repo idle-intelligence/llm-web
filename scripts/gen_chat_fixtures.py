@@ -8,29 +8,53 @@ renders with
                                   add_generation_prompt=..., tokenize=False)
 
 crates/lean-chat/tests/hf_exactness.rs renders the same conversations with
-lean-chat and requires byte-equal text.
+lean-chat and requires byte-equal text. transformers' `strftime_now` is
+pinned to NOW (stored in each fixture), so templates that write today's
+date (Llama 3.x) give the same text on any day.
 
 Needs transformers in a venv (tokenizer files only, no weights, no torch):
 
     python3 -m venv .venv && .venv/bin/pip install transformers jinja2
-    .venv/bin/python scripts/gen_chat_fixtures.py
+    .venv/bin/python scripts/gen_chat_fixtures.py [name ...]
+
+With names (keys of MODELS), only those fixtures are written.
 """
+import datetime
 import json
 import os
+import sys
 
 import transformers
+import transformers.utils.chat_template_utils as chat_template_utils
 from transformers import AutoTokenizer
 
 OUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "crates", "lean-chat", "tests", "fixtures")
 
-# name -> (Hugging Face repo, whether its template renders tools and tool messages)
+# name -> (Hugging Face repo, whether its template renders tools and tool
+# messages, cases its template rejects)
 MODELS = {
-    "qwen2_5": ("Qwen/Qwen2.5-0.5B-Instruct", True),
-    "qwen3": ("Qwen/Qwen3-0.6B", True),
-    "smollm2": ("HuggingFaceTB/SmolLM2-360M-Instruct", False),
+    "qwen2_5": ("Qwen/Qwen2.5-0.5B-Instruct", True, ()),
+    "qwen3": ("Qwen/Qwen3-0.6B", True, ()),
+    "smollm2": ("HuggingFaceTB/SmolLM2-360M-Instruct", False, ()),
     # A template that writes bos_token and eos_token into the text.
-    "mistral_v0_3": ("mistralai/Mistral-7B-Instruct-v0.3", True),
+    "mistral_v0_3": ("mistralai/Mistral-7B-Instruct-v0.3", True, ()),
+    # Writes today's date with strftime_now. An ungated copy of
+    # meta-llama/Llama-3.2-1B-Instruct's tokenizer files; its template
+    # raises on more than one tool call per message.
+    "llama3_2": ("unsloth/Llama-3.2-1B-Instruct", True, ("parallel_tool_calls",)),
 }
+
+# The date and time strftime_now sees.
+NOW = datetime.datetime(2026, 3, 5, 9, 7, 0)
+
+
+class FrozenDatetime(datetime.datetime):
+    @classmethod
+    def now(cls, tz=None):
+        return NOW
+
+
+chat_template_utils.datetime = FrozenDatetime
 
 TOOLS = [
     {
@@ -165,11 +189,13 @@ CASES = [
 
 def main():
     os.makedirs(OUT_DIR, exist_ok=True)
-    for name, (repo, tool_capable) in MODELS.items():
+    names = sys.argv[1:] or list(MODELS)
+    for name in names:
+        repo, tool_capable, rejected = MODELS[name]
         tok = AutoTokenizer.from_pretrained(repo)
         cases = []
         for case_name, messages, use_tools, add_generation_prompt, needs_tools in CASES:
-            if needs_tools and not tool_capable:
+            if (needs_tools and not tool_capable) or case_name in rejected:
                 continue
             tools = TOOLS if use_tools else None
             rendered = tok.apply_chat_template(messages, tools=tools, add_generation_prompt=add_generation_prompt, tokenize=False)
@@ -177,6 +203,7 @@ def main():
         out = {
             "model": repo,
             "transformers": transformers.__version__,
+            "now": NOW.isoformat(),
             "template": tok.chat_template,
             "bos_token": tok.bos_token,
             "eos_token": tok.eos_token,
