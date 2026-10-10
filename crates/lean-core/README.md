@@ -30,7 +30,7 @@ Architectures, from `general.architecture` in the GGUF (`src/config.rs`):
 
 - `qwen2`: Qwen2 and Qwen2.5 (tested: Qwen2.5-0.5B-Instruct, Qwen2.5-3B-Instruct).
 - `qwen3`: Qwen3 (tested: Qwen3-0.6B, Qwen3-1.7B).
-- `llama`: Llama-architecture models (tested: SmolLM2-360M-Instruct, SmolLM2-1.7B-Instruct).
+- `llama`: Llama-architecture models (tested: SmolLM2-360M-Instruct, SmolLM2-1.7B-Instruct, Llama-3.2-1B-Instruct, Llama-3.2-3B-Instruct). Llama 3.1/3.2 RoPE scaling is read from the GGUF's `rope_freqs.weight` tensor.
 
 The GPU attention kernels are compiled for a head dimension of 64 or 128; `GpuModel::load` rejects a model with another head dimension.
 
@@ -59,6 +59,8 @@ The parity tests compare lean against fixtures written by HF transformers (`refe
 | `fixture_parity_llama_360m` | SmolLM2-360M Q4_0 and Q8_0, GPU | `LEAN_GGUF_LLAMA_360M_Q4_0`, `LEAN_GGUF_LLAMA_360M_Q8_0`, `LEAN_TOKENIZER_DIR_LLAMA_360M` |
 | `fixture_parity_llama_360m_cpu` | the same on the CPU path (run with and without `--features threads`) | same as above |
 | `fixture_parity_llama_1_7b` | SmolLM2-1.7B Q8_0 | `LEAN_GGUF_LLAMA_1_7B_Q8_0`, `LEAN_TOKENIZER_DIR_LLAMA_1_7B` |
+| `fixture_parity_llama32` | Llama-3.2-1B and 3B, Q4_0 and Q8_0, GPU, including a 9044-token prompt (past the 8192 positions of the original context); the prompt is the fixture's HF-rendered chat text | `LEAN_GGUF_LLAMA32_1B_Q4_0`, `LEAN_GGUF_LLAMA32_1B_Q8_0`, `LEAN_TOKENIZER_DIR_LLAMA32_1B`, and the same with `3B` |
+| `fixture_parity_llama32_cpu` | the same on the CPU path; the 9044-token case only with `LEAN_LLAMA32_CPU_LONG=1` | same as above |
 | `logit_mask` | a mask forces an exact string; an all-allowed mask equals no mask | `LEAN_GGUF`, `LEAN_TOKENIZER_DIR` |
 | `kv_snapshot` | restore plus suffix equals a full prefill; snapshot round trip | `LEAN_GGUF`, `LEAN_TOKENIZER_DIR` |
 | `lora_parity` | LoRA on the GPU against a transformers fixture with the LoRA deltas applied | `LEAN_GGUF`, `LEAN_TOKENIZER_DIR`, `LEAN_LORA_BIN` |
