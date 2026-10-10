@@ -47,7 +47,7 @@ fn reused_cache_matches_fresh_caches() {
 
     let prompts: Vec<Vec<u32>> = PROMPTS.iter().map(|p| tokenizer.encode(render(&chat_template, &[Message::user(*p)], None, true).unwrap(), false).unwrap().get_ids().to_vec()).collect();
     let max_ctx = prompts.iter().map(|p| p.len()).max().unwrap() as u32 + N_NEW as u32 + 4;
-    let (cos, sin) = build_rope_tables(model.config.head_dim, model.config.rope_theta, max_ctx as usize);
+    let (cos, sin) = build_rope_tables(&model.config, max_ctx as usize);
     let cos_buf = engine.buf_f32(&cos, "rope_cos");
     let sin_buf = engine.buf_f32(&sin, "rope_sin");
 

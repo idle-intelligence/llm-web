@@ -92,7 +92,7 @@ fn kv_snapshot_restore_matches_full_prefill_and_round_trips() {
     mark("loading model");
     let model = GpuModel::load(&engine, &gguf_path, true).expect("loading model");
     let max_ctx = all_ids.len() as u32 + n_new as u32 + 4;
-    let (cos, sin) = build_rope_tables(model.config.head_dim, model.config.rope_theta, max_ctx as usize);
+    let (cos, sin) = build_rope_tables(&model.config, max_ctx as usize);
     let cos_buf = engine.buf_f32(&cos, "rope_cos");
     let sin_buf = engine.buf_f32(&sin, "rope_sin");
 
@@ -178,7 +178,7 @@ fn kv_snapshot_timing_1000_token_prefix() {
     let engine = Engine::new().expect("wgpu engine init");
     let model = GpuModel::load(&engine, &gguf_path, true).expect("loading model");
     let max_ctx = ids.len() as u32 + 8;
-    let (cos, sin) = build_rope_tables(model.config.head_dim, model.config.rope_theta, max_ctx as usize);
+    let (cos, sin) = build_rope_tables(&model.config, max_ctx as usize);
     let cos_buf = engine.buf_f32(&cos, "rope_cos");
     let sin_buf = engine.buf_f32(&sin, "rope_sin");
 

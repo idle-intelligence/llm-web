@@ -30,7 +30,7 @@ const IDS: [u32; 2] = [15, 16]; // "0", "1" in the Qwen2 tokenizer
 
 fn forward(engine: &Engine, model: &GpuModel, ids: &[u32]) -> (wgpu::Buffer, u32) {
     let t = ids.len() as u32;
-    let (cos, sin) = build_rope_tables(model.config.head_dim, model.config.rope_theta, t as usize + 4);
+    let (cos, sin) = build_rope_tables(&model.config, t as usize + 4);
     let cos_buf = engine.buf_f32(&cos, "rope_cos");
     let sin_buf = engine.buf_f32(&sin, "rope_sin");
     model.pool.reset();
@@ -81,7 +81,7 @@ fn adapter_swap_uses_the_new_adapter() {
     let ids = fixture_ids();
     let t = ids.len() as u32;
     let mut model = GpuModel::load(&engine, &gguf_path, true).expect("loading model");
-    let (cos, sin) = build_rope_tables(model.config.head_dim, model.config.rope_theta, t as usize + 4);
+    let (cos, sin) = build_rope_tables(&model.config, t as usize + 4);
     let cos_buf = engine.buf_f32(&cos, "rope_cos");
     let sin_buf = engine.buf_f32(&sin, "rope_sin");
 

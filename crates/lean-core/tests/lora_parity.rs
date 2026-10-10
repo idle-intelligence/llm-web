@@ -50,7 +50,7 @@ fn lora_and_sliced_head_match_reference() {
     let engine = Engine::new().expect("wgpu engine init");
     let mut model = GpuModel::load(&engine, &gguf_path, true).expect("loading model");
     let max_ctx = fixture.input_ids.len() as u32 + 4;
-    let (cos, sin) = build_rope_tables(model.config.head_dim, model.config.rope_theta, max_ctx as usize);
+    let (cos, sin) = build_rope_tables(&model.config, max_ctx as usize);
     let cos_buf = engine.buf_f32(&cos, "rope_cos");
     let sin_buf = engine.buf_f32(&sin, "rope_sin");
     let t = fixture.input_ids.len() as u32;
@@ -138,7 +138,7 @@ fn packed_block_diagonal_matches_per_cell_forward() {
     let engine = Engine::new().expect("wgpu engine init");
     let model = GpuModel::load(&engine, &gguf_path, true).expect("loading model");
     let max_ctx = (prefix_ids.len() + cell_a.len().max(cell_b.len()) * 2 + 8) as u32;
-    let (cos, sin) = build_rope_tables(model.config.head_dim, model.config.rope_theta, max_ctx as usize);
+    let (cos, sin) = build_rope_tables(&model.config, max_ctx as usize);
     let cos_buf = engine.buf_f32(&cos, "rope_cos");
     let sin_buf = engine.buf_f32(&sin, "rope_sin");
 

@@ -20,7 +20,7 @@
 //! and the same with `3B`/`3b` for `fixture_parity_llama32_3b`.
 
 use lean_core::engine::Engine;
-use lean_core::model::{forward_decode_step, forward_prefill, rope_tables, GpuModel, KvCache};
+use lean_core::model::{build_rope_tables, forward_decode_step, forward_prefill, GpuModel, KvCache};
 use serde::Deserialize;
 use tokenizers::Tokenizer;
 
@@ -67,7 +67,7 @@ fn run_fixture(engine: &Engine, gguf_path: &str, fixture_json: &str, tokenizer: 
         let seq = case.input_ids.len() as u32;
         let max_ctx = seq + case.greedy_continuation.len() as u32 + 4;
         let mut cache = KvCache::new(engine, &model.config, max_ctx);
-        let (cos, sin) = rope_tables(&model.config, max_ctx as usize);
+        let (cos, sin) = build_rope_tables(&model.config, max_ctx as usize);
         let cos_buf = engine.buf_f32(&cos, "rope_cos");
         let sin_buf = engine.buf_f32(&sin, "rope_sin");
 

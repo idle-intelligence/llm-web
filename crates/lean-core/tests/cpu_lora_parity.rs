@@ -106,7 +106,7 @@ fn cpu_lora_matches_gpu_and_hf_peft() {
     let engine = Engine::new().expect("wgpu engine init");
     let mut gpu = GpuModel::load(&engine, &gguf, true).expect("load GPU model");
     gpu.apply_lora(&engine, &lora).expect("GPU apply_lora");
-    let (cos, sin) = build_rope_tables(gpu.config.head_dim, gpu.config.rope_theta, max_ctx);
+    let (cos, sin) = build_rope_tables(&gpu.config, max_ctx);
     let (cos, sin) = (engine.buf_f32(&cos, "rope_cos"), engine.buf_f32(&sin, "rope_sin"));
     let mut gpu_cache = KvCache::new(&engine, &gpu.config, max_ctx as u32);
     let _ = pollster::block_on(gpu_chunk(&engine, &gpu, &mut gpu_cache, &cfg.prefix_ids, &cos, &sin, &ForwardSpec::default()));

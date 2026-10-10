@@ -54,7 +54,7 @@ fn greedy_streaming_matches_whole_reply() {
     let (engine, model, tokenizer, chat_template) = setup();
     let prompt_ids = tokenize(&tokenizer, &chat_template, "What is the capital of France?");
     let max_ctx = prompt_ids.len() as u32 + 64;
-    let (cos, sin) = build_rope_tables(model.config.head_dim, model.config.rope_theta, max_ctx as usize);
+    let (cos, sin) = build_rope_tables(&model.config, max_ctx as usize);
     let cos_buf = engine.buf_f32(&cos, "rope_cos");
     let sin_buf = engine.buf_f32(&sin, "rope_sin");
 
@@ -83,7 +83,7 @@ fn pipelined_greedy_matches_step_loop() {
     let (engine, model, tokenizer, chat_template) = setup();
     let prompt_ids = tokenize(&tokenizer, &chat_template, "Write a long story about a lighthouse keeper.");
     let max_ctx = prompt_ids.len() as u32 + 80;
-    let (cos, sin) = build_rope_tables(model.config.head_dim, model.config.rope_theta, max_ctx as usize);
+    let (cos, sin) = build_rope_tables(&model.config, max_ctx as usize);
     let cos_buf = engine.buf_f32(&cos, "rope_cos");
     let sin_buf = engine.buf_f32(&sin, "rope_sin");
     let steps = 40u32;
@@ -122,7 +122,7 @@ fn seeded_sampling_is_reproducible_across_runs() {
     let (engine, model, tokenizer, chat_template) = setup();
     let prompt_ids = tokenize(&tokenizer, &chat_template, "Tell me a short story about a fox.");
     let max_ctx = prompt_ids.len() as u32 + 64;
-    let (cos, sin) = build_rope_tables(model.config.head_dim, model.config.rope_theta, max_ctx as usize);
+    let (cos, sin) = build_rope_tables(&model.config, max_ctx as usize);
     let cos_buf = engine.buf_f32(&cos, "rope_cos");
     let sin_buf = engine.buf_f32(&sin, "rope_sin");
     let params = SamplingParams { temperature: 0.8, top_k: 40, top_p: 0.95, repetition_penalty: 1.1, seed: 12345 };
@@ -146,7 +146,7 @@ fn multi_turn_append_matches_full_reprefill() {
     let p1 = "What is the capital of France?";
     let p2 = "And what is its population?";
     let max_ctx = 256u32;
-    let (cos, sin) = build_rope_tables(model.config.head_dim, model.config.rope_theta, max_ctx as usize);
+    let (cos, sin) = build_rope_tables(&model.config, max_ctx as usize);
     let cos_buf = engine.buf_f32(&cos, "rope_cos");
     let sin_buf = engine.buf_f32(&sin, "rope_sin");
 

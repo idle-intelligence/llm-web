@@ -46,7 +46,7 @@ fn singleton_mask_forces_exact_string() {
     assert!(!target_ids.is_empty());
 
     let max_ctx = prompt_ids.len() as u32 + target_ids.len() as u32 + 4;
-    let (cos, sin) = build_rope_tables(model.config.head_dim, model.config.rope_theta, max_ctx as usize);
+    let (cos, sin) = build_rope_tables(&model.config, max_ctx as usize);
     let cos_buf = engine.buf_f32(&cos, "rope_cos");
     let sin_buf = engine.buf_f32(&sin, "rope_sin");
 
@@ -108,7 +108,7 @@ fn all_allowed_mask_matches_unmasked() {
 
     let prompt_ids = tokenize(&tokenizer, &chat_template, "What is the capital of France?");
     let max_ctx = prompt_ids.len() as u32 + n_steps as u32 + 4;
-    let (cos, sin) = build_rope_tables(model.config.head_dim, model.config.rope_theta, max_ctx as usize);
+    let (cos, sin) = build_rope_tables(&model.config, max_ctx as usize);
     let cos_buf = engine.buf_f32(&cos, "rope_cos");
     let sin_buf = engine.buf_f32(&sin, "rope_sin");
 
@@ -155,7 +155,7 @@ fn mask_upload_per_step_cost() {
 
     let prompt_ids = tokenize(&tokenizer, &chat_template, "Write one sentence about the ocean.");
     let max_ctx = prompt_ids.len() as u32 + n_steps as u32 + 4;
-    let (cos, sin) = build_rope_tables(model.config.head_dim, model.config.rope_theta, max_ctx as usize);
+    let (cos, sin) = build_rope_tables(&model.config, max_ctx as usize);
     let cos_buf = engine.buf_f32(&cos, "rope_cos");
     let sin_buf = engine.buf_f32(&sin, "rope_sin");
     let all_mask_bits = build_mask_bitset(vocab, &(0..vocab as u32).collect::<Vec<_>>());

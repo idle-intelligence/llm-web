@@ -73,7 +73,7 @@ fn run_fixture(engine: &Engine, gguf_path: &str, fixture_json: &str, tokenizer: 
         let seq = case.input_ids.len() as u32;
         let max_ctx = seq + case.greedy_continuation.len() as u32 + 4;
         let mut cache = KvCache::new(engine, &model.config, max_ctx);
-        let (cos, sin) = build_rope_tables(model.config.head_dim, model.config.rope_theta, max_ctx as usize);
+        let (cos, sin) = build_rope_tables(&model.config, max_ctx as usize);
         let cos_buf = engine.buf_f32(&cos, "rope_cos");
         let sin_buf = engine.buf_f32(&sin, "rope_sin");
 

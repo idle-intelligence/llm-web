@@ -27,7 +27,7 @@ use tokenizers::Tokenizer;
 use lean_core::cpu::{CpuKvCache, CpuModel};
 use lean_core::engine::Engine;
 use crate::error::LeanError;
-use lean_core::model::{rope_tables, GpuModel, KvCache};
+use lean_core::model::{build_rope_tables, GpuModel, KvCache};
 use crate::turn::{check_fits, cpu_turn, encode, gpu_turn, GenParams, PrefixCache};
 
 #[cfg(feature = "web")]
@@ -173,7 +173,7 @@ async fn webgpu_engine() -> anyhow::Result<Engine> {
 fn gpu_parts(engine: Engine, gguf: &mut GgufSource, max_ctx: u32) -> anyhow::Result<Parts> {
     let model = GpuModel::load_from_reader(&engine, gguf.open()?, true)?;
     let cache = KvCache::new(&engine, &model.config, max_ctx);
-    let (cos, sin) = rope_tables(&model.config, max_ctx as usize);
+    let (cos, sin) = build_rope_tables(&model.config, max_ctx as usize);
     let cos = engine.buf_f32(&cos, "rope_cos");
     let sin = engine.buf_f32(&sin, "rope_sin");
     Ok(Parts::Gpu { engine, model, cache, cos, sin })

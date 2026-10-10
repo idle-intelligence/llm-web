@@ -968,21 +968,13 @@ impl GpuModel {
 /// RoPE cos/sin tables for absolute positions `[0, max_pos)`, `half =
 /// head_dim/2` columns each. `inv_freq[j] = theta^(-2j/head_dim)` - HF
 /// Qwen2RotaryEmbedding's convention (`gen_fixture.py`'s reference reads the
-/// same `qwen2.rope.freq_base` metadata key). Unscaled: for a model whose
-/// GGUF carries `rope_freqs.weight` (Llama 3.1/3.2) use [`rope_tables`].
-pub fn build_rope_tables(head_dim: usize, theta: f32, max_pos: usize) -> (Vec<f32>, Vec<f32>) {
-    build_rope_tables_scaled(head_dim, theta, None, max_pos)
-}
-
-/// The RoPE cos/sin tables `config`'s model needs: [`build_rope_tables`]
-/// with `config.rope_freq_factors` applied when the GGUF has them.
-pub fn rope_tables(config: &Qwen2Config, max_pos: usize) -> (Vec<f32>, Vec<f32>) {
-    build_rope_tables_scaled(config.head_dim, config.rope_theta, config.rope_freq_factors.as_deref(), max_pos)
-}
-
-fn build_rope_tables_scaled(head_dim: usize, theta: f32, freq_factors: Option<&[f32]>, max_pos: usize) -> (Vec<f32>, Vec<f32>) {
-    let half = head_dim / 2;
-    let inv_freq: Vec<f32> = (0..half).map(|j| rope_inv_freq(head_dim, theta, freq_factors, j)).collect();
+/// same `qwen2.rope.freq_base` metadata key), divided by
+/// `config.rope_freq_factors[j]` when the GGUF carries `rope_freqs.weight`
+/// (Llama 3.1/3.2's llama3 frequency scaling).
+pub fn build_rope_tables(config: &Qwen2Config, max_pos: usize) -> (Vec<f32>, Vec<f32>) {
+    let (head_dim, half) = (config.head_dim, config.head_dim / 2);
+    let freq_factors = config.rope_freq_factors.as_deref();
+    let inv_freq: Vec<f32> = (0..half).map(|j| rope_inv_freq(head_dim, config.rope_theta, freq_factors, j)).collect();
     let mut cos = vec![0f32; max_pos * half];
     let mut sin = vec![0f32; max_pos * half];
     for pos in 0..max_pos {

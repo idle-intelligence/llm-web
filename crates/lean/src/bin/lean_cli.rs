@@ -20,7 +20,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
-use lean_core::model::{build_mask_bitset, rope_tables, forward_decode_step, forward_decode_step_argmax, forward_prefill, forward_prefill_suffix, GpuModel, KvCache, KvSnapshot};
+use lean_core::model::{build_mask_bitset, build_rope_tables, forward_decode_step, forward_decode_step_argmax, forward_prefill, forward_prefill_suffix, GpuModel, KvCache, KvSnapshot};
 use lean_chat::{read_chat_template, render, Message};
 use serde::Deserialize;
 use tokenizers::Tokenizer;
@@ -155,7 +155,7 @@ fn run_generation(engine: &lean_core::engine::Engine, model: &GpuModel, token_id
     let seq = token_ids.len() as u32;
     let max_ctx = seq + n_tokens as u32 + 4;
     let mut cache = KvCache::new(engine, &model.config, max_ctx);
-    let (cos, sin) = rope_tables(&model.config, max_ctx as usize);
+    let (cos, sin) = build_rope_tables(&model.config, max_ctx as usize);
     let cos_buf = engine.buf_f32(&cos, "rope_cos");
     let sin_buf = engine.buf_f32(&sin, "rope_sin");
 
@@ -291,7 +291,7 @@ fn check_kv_snapshot(engine: &lean_core::engine::Engine, model: &GpuModel, token
     let split = all_ids.len() / 2;
     let (prefix, suffix) = all_ids.split_at(split);
     let max_ctx = all_ids.len() as u32 + n_new as u32 + 4;
-    let (cos, sin) = rope_tables(&model.config, max_ctx as usize);
+    let (cos, sin) = build_rope_tables(&model.config, max_ctx as usize);
     let cos_buf = engine.buf_f32(&cos, "rope_cos");
     let sin_buf = engine.buf_f32(&sin, "rope_sin");
 
@@ -345,7 +345,7 @@ fn check_mask(engine: &lean_core::engine::Engine, model: &GpuModel, tokenizer: &
     let target_ids = tokenizer.encode(target, false).map_err(|e| anyhow::anyhow!("tokenizer encode failed: {e}"))?.get_ids().to_vec();
 
     let max_ctx = prompt_ids.len() as u32 + target_ids.len() as u32 + 4;
-    let (cos, sin) = rope_tables(&model.config, max_ctx as usize);
+    let (cos, sin) = build_rope_tables(&model.config, max_ctx as usize);
     let cos_buf = engine.buf_f32(&cos, "rope_cos");
     let sin_buf = engine.buf_f32(&sin, "rope_sin");
 

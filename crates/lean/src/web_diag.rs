@@ -10,7 +10,7 @@ use tokenizers::Tokenizer;
 use crate::web::{wasm_log, JsBytesReader};
 use lean_core::cpu::{forward_decode_step_argmax as cpu_decode_step_argmax, forward_prefill as cpu_forward_prefill, CpuKvCache, CpuModel};
 use lean_core::engine::{now_ms, Engine};
-use lean_core::model::{build_mask_bitset, rope_tables, decode_greedy_pipelined, forward_decode_step_argmax, forward_prefill, forward_prefill_suffix, GpuModel, KvCache, KvSnapshot};
+use lean_core::model::{build_mask_bitset, build_rope_tables, decode_greedy_pipelined, forward_decode_step_argmax, forward_prefill, forward_prefill_suffix, GpuModel, KvCache, KvSnapshot};
 
 /// `mask_bits` is this crate's packed bitset format (`build_mask_bitset`/
 /// `buildMaskBitset`) - an empty vec means "no mask" (unmasked path, byte-
@@ -144,7 +144,7 @@ impl LeanEngine {
         let model = GpuModel::load_from_reader(&self.engine, JsBytesReader::new(gguf_bytes), true)
             .map_err(|e| JsError::new(&format!("failed to load model: {e}")))?;
         let cache = KvCache::new(&self.engine, &model.config, max_ctx);
-        let (cos, sin) = rope_tables(&model.config, max_ctx as usize);
+        let (cos, sin) = build_rope_tables(&model.config, max_ctx as usize);
         let cos_buf = self.engine.buf_f32(&cos, "rope_cos");
         let sin_buf = self.engine.buf_f32(&sin, "rope_sin");
         let t_weights = now_ms();
