@@ -10,7 +10,8 @@
 #                       idle-intelligence/t0-web PR #8)
 #
 # then rewrites the `?v=` build tag to ENGINE_BUILD on every loading URL
-# (web/lean-chat-worker.js, web/device/device_worker.js, web/device/index.html)
+# (web/index.html, web/lean-chat-worker.js, web/device/device_worker.js,
+# web/device/index.html)
 # and checks neither built wasm carries a local build path.
 #
 # Requires wasm-pack, wasm-bindgen-cli (version matching Cargo.lock's
@@ -157,12 +158,12 @@ echo "==> Rewriting ENGINE_BUILD tag to $ENGINE_BUILD"
 sed -i.bak "s/const ENGINE_BUILD = \"[^\"]*\"/const ENGINE_BUILD = \"$ENGINE_BUILD\"/" \
   _site/web/lean-chat-worker.js _site/web/device/device_worker.js
 sed -i.bak "s/const ENGINE_BUILD = \"[^\"]*\";/const ENGINE_BUILD = \"$ENGINE_BUILD\";/" \
-  _site/web/device/index.html
-rm -f _site/web/lean-chat-worker.js.bak _site/web/device/device_worker.js.bak _site/web/device/index.html.bak
+  _site/web/index.html _site/web/device/index.html
+rm -f _site/web/lean-chat-worker.js.bak _site/web/device/device_worker.js.bak _site/web/index.html.bak _site/web/device/index.html.bak
 
-COUNT="$(grep -rEo 'ENGINE_BUILD = "[^"]*"' _site/web/lean-chat-worker.js _site/web/device/device_worker.js _site/web/device/index.html | grep -Fc "\"$ENGINE_BUILD\"")"
-if [ "$COUNT" -ne 3 ]; then
-    echo "error: expected 3 ENGINE_BUILD assignments rewritten to $ENGINE_BUILD, found $COUNT" >&2
+COUNT="$(grep -rEo 'ENGINE_BUILD = "[^"]*"' _site/web/index.html _site/web/lean-chat-worker.js _site/web/device/device_worker.js _site/web/device/index.html | grep -Fc "\"$ENGINE_BUILD\"")"
+if [ "$COUNT" -ne 4 ]; then
+    echo "error: expected 4 ENGINE_BUILD assignments rewritten to $ENGINE_BUILD, found $COUNT" >&2
     exit 1
 fi
 
