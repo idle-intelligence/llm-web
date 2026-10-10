@@ -44,6 +44,9 @@ jobs:
       - name: Clippy (wasm32, web feature)
         run: cargo clippy -p lean-core -p lean -p lean-chat --target wasm32-unknown-unknown --no-default-features --features lean/web,lean-chat/web -- -D warnings
 
+      - name: Clippy (wasm32, web + diag features)
+        run: cargo clippy -p lean-core -p lean -p lean-chat --target wasm32-unknown-unknown --no-default-features --features lean/web,lean/diag,lean-chat/web -- -D warnings
+
       - name: Build lean and assemble the site
         run: ENGINE_BUILD="${{ github.sha }}" scripts/build.sh
 

@@ -25,7 +25,6 @@ Then open `http://localhost:8030/web/index.html` for the chat demo, or `http://l
 <script type="module">
 const mod = await import('./pkg/lean.js');
 await mod.default('./pkg/lean_bg.wasm');
-mod.leanInit();
 const lean = await mod.Lean.load({ gguf: ggufBytes, tokenizer: tokenizerJson, maxCtx: 2048 });
 const template = mod.ChatTemplate.fromTokenizerConfig(tokenizerConfigJson);
 const prompt = mod.chatRender(template, [{ role: 'user', content: question }], null, true);

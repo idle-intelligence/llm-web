@@ -14,9 +14,6 @@
 //!   `ContextOverflow` with `needed` = its token count + `max_new_tokens`
 //!   and `available` = `max_ctx`, and the next call returns what a fresh
 //!   engine returns.
-//! - `text_stream_*`: `TextStream` deltas concatenate to the full decode
-//!   for a multilingual string (multi-byte characters split across
-//!   byte-level BPE tokens) on the Qwen2.5 and SmolLM2 tokenizers.
 //! - `smollm2_1_7b_q4_0_gpu_streams_text`: that model streams non-empty
 //!   text on the GPU.
 //!
@@ -32,9 +29,8 @@
 //! cargo test -p lean --release --features threads --test engine_api -- --ignored
 //! ```
 
-use lean::{Backend, GenParams, GgufSource, Lean, LeanError, LoadOptions, TextStream, TokenizerSource};
+use lean::{Backend, GenParams, GgufSource, Lean, LeanError, LoadOptions, TokenizerSource};
 use lean_chat::{read_chat_template, Message};
-use tokenizers::Tokenizer;
 
 const TURNS: [&str; 3] = [
     "What is the capital of France?",
@@ -221,35 +217,6 @@ fn context_overflow_then_recovers_gpu() {
 #[ignore = "needs LEAN_GGUF and LEAN_TOKENIZER_DIR on disk; never committed to this repo"]
 fn context_overflow_then_recovers_cpu() {
     context_overflow_then_recovers(Backend::Cpu);
-}
-
-/// Accents, CJK and emoji: several of these characters are split across
-/// byte-level BPE tokens, so decoding one id at a time yields U+FFFD halves.
-const MULTILINGUAL: &str = " Hello, world! Ça va très bien. 東京は日本の首都です。 Emoji: 🎉🚀 and naïve café.\nNew line.";
-
-fn text_stream_roundtrip(tok_var: &str) {
-    let tokenizer = Tokenizer::from_file(format!("{}/tokenizer.json", env(tok_var))).expect("loading tokenizer.json");
-    let ids = tokenizer.encode(MULTILINGUAL, false).unwrap().get_ids().to_vec();
-    let full = tokenizer.decode(&ids, true).unwrap();
-    let mut s = TextStream::new();
-    let mut deltas: Vec<String> = ids.iter().map(|&id| s.push(&tokenizer, id).unwrap()).collect();
-    deltas.push(s.finish(&tokenizer).unwrap());
-    assert_eq!(deltas.concat(), full);
-    assert!(deltas.iter().all(|d| !d.contains('\u{FFFD}')), "a delta carries half a character: {deltas:?}");
-    let per_id: String = ids.iter().map(|&id| tokenizer.decode(&[id], true).unwrap()).collect();
-    println!("{} ids; per-id decode equals full decode: {}", ids.len(), per_id == full);
-}
-
-#[test]
-#[ignore = "needs LEAN_TOKENIZER_DIR on disk; never committed to this repo"]
-fn text_stream_qwen25() {
-    text_stream_roundtrip("LEAN_TOKENIZER_DIR");
-}
-
-#[test]
-#[ignore = "needs LEAN_TOKENIZER_DIR_LLAMA_360M on disk; never committed to this repo"]
-fn text_stream_smollm2() {
-    text_stream_roundtrip("LEAN_TOKENIZER_DIR_LLAMA_360M");
 }
 
 #[test]

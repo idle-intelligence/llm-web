@@ -38,6 +38,11 @@ web = [
     "dep:console_error_panic_hook",
     "getrandom/wasm_js",
 ]
+# Token-level and diagnostics wasm exports (LeanEngine, LeanEngineCpu:
+# prefill/decode on raw ids, KV snapshots, masks, device and timing
+# reports) for lab tools; the default web package exports only Lean,
+# AbortFlag and lean-chat's functions.
+diag = ["web"]
 # See lean-core's feature of the same name.
 force_scalar = ["lean-core/force_scalar"]
 # The CPU forward pass on a thread pool (lean-core's `threads`).

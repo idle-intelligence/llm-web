@@ -11,9 +11,9 @@
 //! ```
 
 use lean_core::engine::Engine;
-use lean::generate::decode_loop;
+use crate::generate::decode_loop;
 use lean_core::model::{argmax, build_rope_tables, decode_greedy_pipelined, forward_decode_step_argmax, forward_prefill, forward_prefill_suffix, GpuModel, KvCache};
-use lean::sampling::SamplingParams;
+use crate::sampling::SamplingParams;
 use lean_chat::{read_chat_template, render, Message};
 use tokenizers::Tokenizer;
 

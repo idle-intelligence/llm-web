@@ -13,17 +13,25 @@
 //! cache, LoRA) is the `lean-core` crate, for callers that work on token
 //! ids and logits directly.
 
-pub mod error;
-pub mod generate;
+mod error;
+mod generate;
 mod lean;
-pub mod sampling;
+mod sampling;
 mod turn;
 #[cfg(feature = "web")]
-pub mod web;
+mod web;
+// Links lean-chat into the web package, so its wasm-bindgen exports
+// (ChatTemplate, chatRender, chatTrimOldestExchange) ship in the same wasm.
+#[cfg(feature = "web")]
+extern crate lean_chat as _;
+#[cfg(feature = "diag")]
+mod web_diag;
+#[cfg(test)]
+mod tests;
 
 pub use error::LeanError;
 pub use lean::{AbortFlag, Backend, GgufSource, Lean, LoadOptions, ReadSeek, TokenizerSource};
-pub use turn::{GenParams, TextStream};
+pub use turn::GenParams;
 
 /// wasm-bindgen-rayon's worker-pool bootstrap, re-exported so the page can
 /// call `await initThreadPool(navigator.hardwareConcurrency)` once (after

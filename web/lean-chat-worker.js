@@ -42,7 +42,7 @@
 const EARLY = [];
 self.onmessage = (e) => EARLY.push(e);
 
-const ENGINE_BUILD = "2026-10-10-lean-core-01";
+const ENGINE_BUILD = "2026-10-10-lean-api-01";
 // Rewritten to true by scripts/build.sh when BUILD_THREADS=1 built pkg-mt
 // into this deployment; GitHub Pages never sets it.
 const MT_BUILT = false;
@@ -87,12 +87,10 @@ async function loadModule(which) {
     const mod = await import(`./lean/pkg-mt/lean.js?v=${ENGINE_BUILD}`);
     await mod.default(`./lean/pkg-mt/lean_bg.wasm?v=${ENGINE_BUILD}`);
     await mod.initThreadPool(navigator.hardwareConcurrency);
-    mod.leanInit();
     return mod;
   }
   const mod = await import(`./lean/pkg/lean.js?v=${ENGINE_BUILD}`);
   await mod.default(`./lean/pkg/lean_bg.wasm?v=${ENGINE_BUILD}`);
-  mod.leanInit();
   return mod;
 }
 

@@ -39,7 +39,6 @@ A minimal worker:
 ```js
 const mod = await import(`../pkg/lean.js?v=${ENGINE_BUILD}`);
 await mod.default({ module_or_path: `../pkg/lean_bg.wasm?v=${ENGINE_BUILD}` });
-mod.leanInit();
 const lean = await mod.Lean.load({ gguf, tokenizer: tokenizerJson, maxCtx: 2048 });
 
 const abortFlag = new mod.AbortFlag();
@@ -57,7 +56,7 @@ Natively, `load` and `generate` are `async` too; drive them with any executor, e
 
 ### Low-level calls
 
-`LeanEngine` (WebGPU, `await LeanEngine.create()`) and `LeanEngineCpu` (`LeanEngineCpu.create()`) work on raw token ids for a caller that drives its own token loop: `load(ggufBytes, tokenizerJson, maxCtx)`, `encodeRaw`, `decodeIds`, `prefillTokens`, `decodeStepArgmax`, `info`, and on `LeanEngine` also `appendTokens`, `decodeGreedy`, `kvLen`, `buildMaskBitset` (a logit mask that can change at every step), `snapshotKv`/`restoreKv` (store the KV cache of a long fixed prefix and skip its prefill next time) and the diagnostics calls. LoRA adapters are in the Rust API (`apply_lora` / `clear_lora` on the GPU and CPU models), not in JavaScript yet.
+Built with the `diag` cargo feature (not in the default web package), the wasm also exports `LeanEngine` (WebGPU, `await LeanEngine.create()`, plus `leanInit()` for the panic hook) and `LeanEngineCpu` (`LeanEngineCpu.create()`), which work on raw token ids for a caller that drives its own token loop: `load(ggufBytes, tokenizerJson, maxCtx)`, `encodeRaw`, `decodeIds`, `prefillTokens`, `decodeStepArgmax`, `info`, and on `LeanEngine` also `appendTokens`, `decodeGreedy`, `kvLen`, `buildMaskBitset` (a logit mask that can change at every step), `snapshotKv`/`restoreKv` (store the KV cache of a long fixed prefix and skip its prefill next time) and the diagnostics calls. In Rust, token ids, masks, positions and LoRA adapters are the `lean-core` crate's API.
 
 ## Build
 
@@ -80,11 +79,12 @@ ENGINE_BUILD=<tag> scripts/build.sh
 |---|---|---|
 | `fixture_parity_generate` | `Lean::generate` on GPU and CPU: token count and greedy reply equal the fixture, Qwen2.5-0.5B and SmolLM2-360M | `LEAN_GGUF`, `LEAN_TOKENIZER_DIR`, the `_LLAMA_360M` Q4_0 pair |
 | `engine_api` | prefix reuse gives the same replies as a fresh engine (growing conversation, diverging prefixes), CPU equals GPU over three turns, `ContextOverflow` counts and recovery | `LEAN_GGUF`, `LEAN_TOKENIZER_DIR`, the `_LLAMA_360M` pair, `LEAN_GGUF_LLAMA_1_7B_Q4_0`, `LEAN_TOKENIZER_DIR_LLAMA_1_7B` |
-| `streaming_sampling` | the decode loop: streaming equals the whole reply, pipelined greedy equals the step loop, seeded sampling reproduces | `LEAN_GGUF`, `LEAN_TOKENIZER_DIR` |
 
 ```bash
 LEAN_GGUF=<gguf> LEAN_TOKENIZER_DIR=<dir> cargo test -p lean --release --test engine_api -- --ignored
 ```
+
+The decode loop, sampling and streaming detokenization are checked by unit tests (`src/tests`, same environment variables, `cargo test -p lean --release --lib -- --ignored`).
 
 The forward-pass parity gates (logits and greedy tokens against transformers, every model and backend, LoRA, masks, KV snapshots) are in [`lean-core`](../lean-core/README.md#parity-gates); the chat-template exactness tests are in [`lean-chat`](../lean-chat/README.md). Release gate logs are under `docs/runs/`.
 
