@@ -173,4 +173,10 @@ if [ -n "$MT_WASM" ]; then
     fi
 fi
 
+# --- Target features: every wasm keeps SIMD, the threads build keeps atomics ---
+echo "==> Checking wasm target features"
+FEATURE_ARGS=("$ST_WASM" +simd128)
+[ -n "$MT_WASM" ] && FEATURE_ARGS+=(-- "$MT_WASM" +simd128 +atomics)
+python3 scripts/check_wasm_features.py "${FEATURE_ARGS[@]}"
+
 echo "==> Wrote _site"
