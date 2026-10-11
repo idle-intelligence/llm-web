@@ -7,10 +7,10 @@ license.workspace = true
 [lib]
 crate-type = ["cdylib", "rlib"]
 
-# Raw wgpu + hand-written WGSL only. No Burn, no CubeCL, no training.
+# The text-in/text-out engine on lean-core's forward pass.
 [features]
 default = ["native-bin"]
-wasm = ["wgpu/webgpu"]
+wasm = ["lean-core/wasm"]
 # Native CLI binaries (lean-cli, lean-bench-usecases): pulls in pollster/clap,
 # which are not wasm32-safe. Gated behind a feature (rather than a bare
 # target cfg) and required-features on the [[bin]] entries below, so
@@ -18,12 +18,19 @@ wasm = ["wgpu/webgpu"]
 # --features web` skips the bins outright instead of failing to compile
 # them for wasm32. Included in `default` so a plain native `cargo build`/
 # `cargo clippy --all-targets` still builds both binaries.
-native-bin = ["dep:pollster", "dep:clap"]
-# Minimal wasm-bindgen surface (src/web.rs): load GGUF + tokenizer bytes from
-# JS, generate greedily. onig/esaxx_fast are not wasm32-safe; unstable_wasm
-# swaps out rayon for wasm32.
+# lean-cli renders fixture prompts with lean-chat; the library itself never
+# uses it.
+native-bin = ["dep:pollster", "dep:clap", "dep:lean-chat"]
+# wasm-bindgen surface (src/web.rs). The web package also carries lean-chat's
+# bindings (ChatTemplate, chatRender, chatTrimOldestExchange), so a page
+# loads one wasm for both; the engine code never calls lean-chat.
+# onig/esaxx_fast are not wasm32-safe; unstable_wasm swaps out rayon for
+# wasm32.
 web = [
     "wasm",
+    "lean-core/web",
+    "dep:lean-chat",
+    "lean-chat/web",
     "dep:wasm-bindgen",
     "dep:wasm-bindgen-futures",
     "dep:js-sys",
@@ -31,34 +38,28 @@ web = [
     "dep:console_error_panic_hook",
     "getrandom/wasm_js",
 ]
-# Dev-only: forces cpu_kernels' aarch64 dot kernels to the scalar fallback
-# even when compiled for aarch64, so the NEON-vs-scalar delta can be
-# measured with the same lean-cli binary otherwise unchanged - see
-# docs/runs/2026-09-28-lean-cpu.md.
-force_scalar = []
-# CPU threads rung (cpu.rs's `linear()`): parallelises the rows*out_dim
-# independent dot products in each matvec/GEMM across a thread pool sized
-# by capability (`rayon::current_num_threads()`, which is
-# `std::thread::available_parallelism()` on native and whatever
-# `initThreadPool(n)` set on wasm - see `cpu.rs`'s doc comment). Native-only
-# by itself; combine with `wasm-mt` for the browser build.
-threads = ["dep:rayon"]
+# Token-level and diagnostics wasm exports (LeanEngine, LeanEngineCpu:
+# prefill/decode on raw ids, KV snapshots, masks, device and timing
+# reports) for lab tools; the default web package exports only Lean,
+# AbortFlag and lean-chat's functions.
+diag = ["web"]
+# See lean-core's feature of the same name.
+force_scalar = ["lean-core/force_scalar"]
+# The CPU forward pass on a thread pool (lean-core's `threads`).
+threads = ["lean-core/threads", "dep:rayon"]
 # Threaded wasm build: `threads` plus the wasm-bindgen-rayon worker-pool
 # shim (re-exported as `init_thread_pool` from `lib.rs`). Needs a separate
-# nightly + atomics wasm build - see scripts/build-lean-mt.sh - and a
+# nightly + atomics wasm build (scripts/build.sh with BUILD_THREADS=1) and a
 # cross-origin-isolated page (COOP/COEP) to actually spin up workers.
 wasm-mt = ["web", "threads", "dep:wasm-bindgen-rayon"]
 
 [dependencies]
+lean-core = { path = "../lean-core" }
 anyhow = { workspace = true }
-byteorder = { workspace = true }
-bytemuck = { version = "1.25", features = ["derive"] }
-half = "2.4"
 wgpu = { workspace = true }
-futures-channel = "0.3"
 serde = { workspace = true }
 serde_json = { workspace = true }
-minijinja = { workspace = true }
+lean-chat = { path = "../lean-chat", optional = true }
 
 wasm-bindgen = { workspace = true, optional = true }
 wasm-bindgen-futures = { workspace = true, optional = true }
@@ -66,8 +67,11 @@ js-sys = { workspace = true, optional = true }
 web-sys = { workspace = true, optional = true }
 console_error_panic_hook = { workspace = true, optional = true }
 getrandom = { workspace = true, optional = true }
-minijinja-contrib = { version = "2.24.0", features = ["pycompat"] }
 rayon = { version = "1", optional = true }
+
+[dev-dependencies]
+lean-chat = { path = "../lean-chat" }
+pollster = "0.3"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 pollster = { version = "0.3", optional = true }

@@ -8,8 +8,8 @@
 //! `--split` adds the per-op-group GPU time of one prefill per length and of
 //! the decode steps (pass timestamps, needs `TIMESTAMP_QUERY`).
 
-use lean::engine::Engine;
-use lean::model::{build_rope_tables, decode_greedy_pipelined, forward_decode_step_argmax, forward_prefill, GpuModel, KvCache};
+use lean_core::engine::Engine;
+use lean_core::model::{build_rope_tables, decode_greedy_pipelined, forward_decode_step_argmax, forward_prefill, GpuModel, KvCache};
 
 const PROMPT: [u32; 36] = [
     151644, 8948, 198, 2610, 525, 1207, 16948, 11, 3465, 553, 54364, 14817, 13, 1446, 525, 264, 10950, 17847, 13, 151645, 198, 151644, 872, 198, 3838, 374, 279, 6722, 315, 9625, 30, 151645, 198, 151644, 77091, 198,
@@ -44,7 +44,7 @@ fn main() -> anyhow::Result<()> {
     let model = GpuModel::load(&engine, &gguf, true)?;
     let max_len = *lens.iter().max().unwrap();
     let max_ctx = max_len + n_decode as u32 + 4;
-    let (cos, sin) = build_rope_tables(model.config.head_dim, model.config.rope_theta, max_ctx as usize);
+    let (cos, sin) = build_rope_tables(&model.config, max_ctx as usize);
     let cos_buf = engine.buf_f32(&cos, "rope_cos");
     let sin_buf = engine.buf_f32(&sin, "rope_sin");
     let mut cache = KvCache::new(&engine, &model.config, max_ctx);
@@ -79,7 +79,7 @@ fn main() -> anyhow::Result<()> {
         model.pool.reset();
         cache.kv_len = 0;
         let logits = pollster::block_on(forward_prefill(&engine, &model, &mut cache, &ids, &cos_buf, &sin_buf, None));
-        let mut next = lean::model::argmax(&logits);
+        let mut next = lean_core::model::argmax(&logits);
         let mut times = Vec::new();
         let mut encode = Vec::new();
         for i in 0..n_decode {
@@ -98,7 +98,7 @@ fn main() -> anyhow::Result<()> {
             cache.kv_len = 0;
             let logits = pollster::block_on(forward_prefill(&engine, &model, &mut cache, &ids, &cos_buf, &sin_buf, None));
             let t = std::time::Instant::now();
-            let _ = pollster::block_on(decode_greedy_pipelined(&engine, &model, &mut cache, lean::model::argmax(&logits), n_decode as u32, false, &cos_buf, &sin_buf, None, |_| true));
+            let _ = pollster::block_on(decode_greedy_pipelined(&engine, &model, &mut cache, lean_core::model::argmax(&logits), n_decode as u32, false, &cos_buf, &sin_buf, None, |_| true));
             piped.push(t.elapsed().as_secs_f64() * 1e3 / n_decode as f64);
         }
         println!("decode pipelined ms/step median of 3 runs {:.2}", median(&mut piped));

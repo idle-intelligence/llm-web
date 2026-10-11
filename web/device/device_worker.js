@@ -11,8 +11,9 @@
 //
 // 'detect' only runs capability checks: no model download, no engine
 // start. 'run' downloads the model once (cached after that) and then runs
-// one short generation per requested backend, verified against the
-// transformers reference hash. 'run' with backend:'all' runs every
+// one short greedy generation per requested backend through the engine's
+// public API (Lean.generate on the chat-template-rendered prompt), checked
+// against the transformers reference text. 'run' with backend:'all' runs every
 // available backend in turn, posting a 'result' after each.
 //
 // This file has no top-level `import` or `await`: a module worker with a
@@ -21,11 +22,10 @@
 const EARLY = [];
 self.onmessage = (e) => EARLY.push(e);
 
-const ENGINE_BUILD = "2026-10-05-demos-06";
+const ENGINE_BUILD = "2026-10-11-turn-stats-01";
 // Rewritten to true by scripts/build.sh when BUILD_THREADS=1 built pkg-mt
 // into this deployment; GitHub Pages never sets it.
 const MT_BUILT = false;
-const N_GEN = 64;
 const MAX_CTX = 256;
 
 function status(text) {
@@ -58,65 +58,40 @@ async function ensureModel() {
 }
 
 async function runBackend(backend) {
-  const { MODEL, argmaxJs, sha256Hex, median } = await import(`./device_common.js?v=${ENGINE_BUILD}`);
+  const { MODEL, median } = await import(`./device_common.js?v=${ENGINE_BUILD}`);
   const { ggufBytes, tokenizerJson, tokenizerCfgJson } = await ensureModel();
 
   status(`starting ${backend} backend...`);
   const timing = {};
-  let t0 = performance.now();
-  let engine, gpu;
-  if (backend === "webgpu") {
-    const mod = await loadSingle(timing);
-    engine = await mod.LeanEngine.create();
-    gpu = true;
-  } else if (backend === "threads") {
-    const mod = await loadThreads(timing);
-    engine = mod.LeanEngineCpu.create();
-    gpu = false;
-  } else {
-    const mod = await loadSingle(timing);
-    engine = mod.LeanEngineCpu.create();
-    gpu = false;
-  }
+  const mod = backend === "threads" ? await loadThreads(timing) : await loadSingle(timing);
 
   status(`loading weights on ${backend} backend...`);
-  t0 = performance.now();
-  engine.load(ggufBytes, tokenizerJson, tokenizerCfgJson, MAX_CTX);
+  let t0 = performance.now();
+  const lean = await mod.Lean.load({ gguf: ggufBytes, tokenizer: tokenizerJson, maxCtx: MAX_CTX, backend: backend === "webgpu" ? "webgpu" : "cpu" });
   timing.loadMs = performance.now() - t0;
 
-  status(`running ${N_GEN} greedy tokens on the ${backend} backend...`);
+  const template = mod.ChatTemplate.fromTokenizerConfig(tokenizerCfgJson);
+  const prompt = mod.chatRender(template, [{ role: "user", content: MODEL.prompt }], null, true);
+
+  status(`running ${MODEL.referenceTokens} greedy tokens on the ${backend} backend...`);
+  // One timestamp per piece of streamed text (a piece is one token, except
+  // where a character spans several).
+  const stamps = [];
   t0 = performance.now();
-  const logits = gpu ? await engine.prefillTokens(MODEL.promptIds, []) : engine.prefillTokens(MODEL.promptIds);
-  const prefillMs = performance.now() - t0;
-  const ids = [argmaxJs(logits)];
-  const stepMs = [];
-  let decodeMsPerTok;
-  if (gpu) {
-    // WebGPU: pipelined greedy decode, as lean ships it (each step is
-    // submitted before the previous token is read back).
-    const ts = performance.now();
-    ids.push(...(await engine.decodeGreedy(ids[0], N_GEN - 1)));
-    decodeMsPerTok = (performance.now() - ts) / (N_GEN - 1);
-  } else {
-    for (let i = 1; i < N_GEN; i++) {
-      const ts = performance.now();
-      ids.push(engine.decodeStepArgmax(ids[i - 1]));
-      stepMs.push(performance.now() - ts);
-    }
-    decodeMsPerTok = stepMs.reduce((a, b) => a + b, 0) / stepMs.length;
-  }
-  const hash = await sha256Hex(ids);
+  const reply = await lean.generate(prompt, { maxNewTokens: MODEL.referenceTokens, temperature: 0 }, () => stamps.push(performance.now()));
+  const prefillMs = stamps.length ? stamps[0] - t0 : null;
+  const stepMs = stamps.slice(1).map((t, i) => t - stamps[i]);
+  const nTokens = lean.tokenCount(reply);
+  const decodeMsPerTok = stamps.length > 1 && nTokens > 1 ? (stamps[stamps.length - 1] - stamps[0]) / (nTokens - 1) : NaN;
 
   const result = {
     backend,
     engineBuild: ENGINE_BUILD,
-    promptLen: MODEL.promptIds.length,
     prefillMs,
     decodeMsPerTok,
     tokPerSec: 1000 / decodeMsPerTok,
-    hash,
-    matchesReference: hash === MODEL.referenceHash,
-    text: engine.decodeIds(Uint32Array.from(ids)),
+    matchesReference: reply === MODEL.referenceText,
+    text: reply,
     timing: {
       wasmInitMs: timing.wasmInitMs,
       threadPoolMs: timing.threadPoolMs,
@@ -128,7 +103,7 @@ async function runBackend(backend) {
       decodeMaxMs: stepMs.length ? Math.max(...stepMs) : null,
     },
   };
-  engine.free();
+  lean.free();
   self.postMessage({ type: "result", result });
 }
 
@@ -143,7 +118,6 @@ function loadSingle(timing) {
       const t0 = performance.now();
       const mod = await import(`../lean/pkg/lean.js?v=${ENGINE_BUILD}`);
       await mod.default(`../lean/pkg/lean_bg.wasm?v=${ENGINE_BUILD}`);
-      mod.leanInit();
       timing.wasmInitMs = performance.now() - t0;
       return mod;
     })();
@@ -162,7 +136,6 @@ function loadThreads(timing) {
       t0 = performance.now();
       await mod.initThreadPool(caps.hardwareConcurrency);
       timing.threadPoolMs = performance.now() - t0;
-      mod.leanInit();
       return mod;
     })();
   }

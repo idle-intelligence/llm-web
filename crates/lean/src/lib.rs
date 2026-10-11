@@ -1,26 +1,37 @@
-//! Raw wgpu + hand-written WGSL Qwen2 engine: no Burn, no CubeCL, no
-//! training. See this crate's `README.md`-equivalent doc comments in
-//! `model.rs` (forward pass), `gguf.rs` (parsing), `engine.rs`/`pool.rs`
-//! (wgpu plumbing, ported from `t0-web/crates/t0-fast`).
+//! lean: a small LLM inference engine on raw wgpu + hand-written WGSL
+//! kernels (and SIMD CPU kernels), from one source for native and wasm.
+//!
+//! The engine is [`Lean`]: text in, text out. [`Lean::load`] picks a
+//! backend by capability (WebGPU, then CPU threads, then one CPU thread),
+//! [`Lean::generate`] runs one inference turn over the given text, and
+//! [`Lean::token_count`] tokenizes without running anything. The engine
+//! applies no chat template and keeps no conversation. It reuses the KV
+//! cache of its previous call for the longest matching token prefix, which
+//! serves one client per engine: give each client its own `Lean`.
+//!
+//! The forward pass underneath (GGUF loading, GPU and CPU kernels, KV
+//! cache, LoRA) is the `lean-core` crate, for callers that work on token
+//! ids and logits directly.
 
-pub mod chat;
-pub mod chat_template;
-pub mod config;
-pub mod cpu;
-pub mod cpu_kernels;
-#[cfg(feature = "threads")]
-mod cpu_team;
-pub mod engine;
-pub mod generate;
-pub mod gguf;
-pub mod lora;
-pub mod model;
-pub mod pool;
-pub mod profile_report;
-pub mod quant;
-pub mod sampling;
+mod error;
+mod generate;
+mod lean;
+mod sampling;
+mod turn;
 #[cfg(feature = "web")]
-pub mod web;
+mod web;
+// Links lean-chat into the web package, so its wasm-bindgen exports
+// (ChatTemplate, chatRender, chatTrimOldestExchange) ship in the same wasm.
+#[cfg(feature = "web")]
+extern crate lean_chat as _;
+#[cfg(feature = "diag")]
+mod web_diag;
+#[cfg(test)]
+mod tests;
+
+pub use error::LeanError;
+pub use lean::{AbortFlag, Backend, GgufSource, Lean, LoadOptions, ReadSeek, TokenizerSource};
+pub use turn::GenParams;
 
 /// wasm-bindgen-rayon's worker-pool bootstrap, re-exported so the page can
 /// call `await initThreadPool(navigator.hardwareConcurrency)` once (after

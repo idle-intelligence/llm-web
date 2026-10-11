@@ -1,0 +1,177 @@
+{
+ "model": "HuggingFaceTB/SmolLM2-360M-Instruct",
+ "transformers": "5.19.0",
+ "template": "{% for message in messages %}{% if loop.first and messages[0]['role'] != 'system' %}{{ '<|im_start|>system\nYou are a helpful AI assistant named SmolLM, trained by Hugging Face<|im_end|>\n' }}{% endif %}{{'<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>' + '\n'}}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}{% endif %}",
+ "bos_token": "<|im_start|>",
+ "eos_token": "<|im_end|>",
+ "cases": [
+  {
+   "name": "user_only",
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is the capital of France?"
+    }
+   ],
+   "tools": null,
+   "add_generation_prompt": true,
+   "rendered": "<|im_start|>system\nYou are a helpful AI assistant named SmolLM, trained by Hugging Face<|im_end|>\n<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+   "name": "system_user",
+   "messages": [
+    {
+     "role": "system",
+     "content": "Answer briefly, in one or two sentences."
+    },
+    {
+     "role": "user",
+     "content": "What is the capital of France?"
+    }
+   ],
+   "tools": null,
+   "add_generation_prompt": true,
+   "rendered": "<|im_start|>system\nAnswer briefly, in one or two sentences.<|im_end|>\n<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+   "name": "multi_turn",
+   "messages": [
+    {
+     "role": "system",
+     "content": "Answer briefly, in one or two sentences."
+    },
+    {
+     "role": "user",
+     "content": "What is the capital of France?"
+    },
+    {
+     "role": "assistant",
+     "content": "The capital of France is Paris."
+    },
+    {
+     "role": "user",
+     "content": "And of Germany?"
+    }
+   ],
+   "tools": null,
+   "add_generation_prompt": true,
+   "rendered": "<|im_start|>system\nAnswer briefly, in one or two sentences.<|im_end|>\n<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\nThe capital of France is Paris.<|im_end|>\n<|im_start|>user\nAnd of Germany?<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+   "name": "multi_turn_closed",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hello!"
+    },
+    {
+     "role": "assistant",
+     "content": "Hi! How can I help?"
+    }
+   ],
+   "tools": null,
+   "add_generation_prompt": false,
+   "rendered": "<|im_start|>system\nYou are a helpful AI assistant named SmolLM, trained by Hugging Face<|im_end|>\n<|im_start|>user\nHello!<|im_end|>\n<|im_start|>assistant\nHi! How can I help?<|im_end|>\n"
+  },
+  {
+   "name": "unicode",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Écris une phrase sur la Seine 🌊, avec <balises> & \"guillemets\".\nNouvelle ligne.\tTab."
+    }
+   ],
+   "tools": null,
+   "add_generation_prompt": true,
+   "rendered": "<|im_start|>system\nYou are a helpful AI assistant named SmolLM, trained by Hugging Face<|im_end|>\n<|im_start|>user\nÉcris une phrase sur la Seine 🌊, avec <balises> & \"guillemets\".\nNouvelle ligne.\tTab.<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+   "name": "tools_user",
+   "messages": [
+    {
+     "role": "user",
+     "content": "What's the weather in Zürich?"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the current weather in a city. Pass <city> names & 'quotes' as given.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name, e.g. Zürich"
+        },
+        "unit": {
+         "type": "string",
+         "enum": [
+          "celsius",
+          "fahrenheit"
+         ]
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "set_volume",
+      "description": "Set the speaker volume in a room.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "room": {
+         "type": "string"
+        },
+        "level": {
+         "type": "integer",
+         "minimum": 0,
+         "maximum": 100
+        },
+        "fade": {
+         "type": "number"
+        },
+        "mute": {
+         "type": "boolean"
+        }
+       },
+       "required": [
+        "level"
+       ]
+      }
+     }
+    }
+   ],
+   "add_generation_prompt": true,
+   "rendered": "<|im_start|>system\nYou are a helpful AI assistant named SmolLM, trained by Hugging Face<|im_end|>\n<|im_start|>user\nWhat's the weather in Zürich?<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+   "name": "think_in_history",
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is 2 + 2?"
+    },
+    {
+     "role": "assistant",
+     "content": "<think>\nTwo plus two is four.\n</think>\n\n4"
+    },
+    {
+     "role": "user",
+     "content": "And 3 + 3?"
+    }
+   ],
+   "tools": null,
+   "add_generation_prompt": true,
+   "rendered": "<|im_start|>system\nYou are a helpful AI assistant named SmolLM, trained by Hugging Face<|im_end|>\n<|im_start|>user\nWhat is 2 + 2?<|im_end|>\n<|im_start|>assistant\n<think>\nTwo plus two is four.\n</think>\n\n4<|im_end|>\n<|im_start|>user\nAnd 3 + 3?<|im_end|>\n<|im_start|>assistant\n"
+  }
+ ]
+}

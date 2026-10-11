@@ -1,6 +1,8 @@
-// Shared by device_worker.js: capability checks, the one model this page
-// verifies against, and the token hash (the same reference hash for
-// SmolLM2-360M-Instruct Q4_0 the lean engine's own parity gates use).
+// Shared by device_worker.js: capability checks and the one model this page
+// verifies against. The reference is transformers' greedy continuation of
+// one prompt (crates/lean-core/reference/fixture_llama_360m_q4_0.json, case
+// "long": 32 tokens, decoded to text), the same reference the engine's own
+// parity gates use.
 export const MODEL = {
   label: "SmolLM2-360M-Instruct Q4_0",
   name: "SmolLM2-360M-Instruct",
@@ -8,14 +10,10 @@ export const MODEL = {
   gguf: "https://huggingface.co/bartowski/SmolLM2-360M-Instruct-GGUF/resolve/main/SmolLM2-360M-Instruct-Q4_0.gguf",
   tokenizer: "https://huggingface.co/HuggingFaceTB/SmolLM2-360M-Instruct/resolve/main/tokenizer.json",
   tokenizerCfg: "https://huggingface.co/HuggingFaceTB/SmolLM2-360M-Instruct/resolve/main/tokenizer_config.json",
-  // crates/lean/reference/fixture_llama_360m_q4_0.json, case "short".
-  promptIds: [
-    1, 9690, 198, 2683, 359, 253, 5356, 5646, 11173, 3365, 3511, 308, 34519, 28, 7018, 411, 407, 19712, 8182, 2, 198,
-    1, 4093, 198, 1780, 314, 260, 3575, 282, 4649, 47, 2, 198, 1, 520, 9531, 198,
-  ],
-  referenceHash: "907b12597274deb6960d713d58e4f55f11c2ab037a841106a3984c067d2ca8fa",
+  prompt: "Please list, in order, the first fifteen elements of the periodic table together with their atomic number, their standard atomic weight, and one short fact about each element's most common industrial use, so that a student studying for a chemistry exam next week can memorize the table more easily.",
+  referenceTokens: 32,
+  referenceText: "Sure, here are the first fifteen elements of the periodic table along with their atomic number, standard atomic weight, and one short fact about each element's most common",
 };
-export const N_GEN = 64;
 export const MAX_CTX = 256;
 
 import { getModel } from "../lib/model-cache.js";
@@ -31,20 +29,6 @@ export async function fetchText(url) {
   const r = await fetch(url);
   if (!r.ok) throw new Error(`fetch ${url}: HTTP ${r.status}`);
   return await r.text();
-}
-
-export function argmaxJs(arr) {
-  let best = 0;
-  for (let i = 1; i < arr.length; i++) if (arr[i] > arr[best]) best = i;
-  return best;
-}
-
-export async function sha256Hex(ids) {
-  const buf = new ArrayBuffer(ids.length * 4);
-  const view = new DataView(buf);
-  ids.forEach((id, i) => view.setUint32(i * 4, id, true));
-  const digest = await crypto.subtle.digest("SHA-256", buf);
-  return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
 // mtBuilt: whether this deployment's build included pkg-mt (scripts/

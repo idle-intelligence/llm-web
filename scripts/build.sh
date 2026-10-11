@@ -10,7 +10,8 @@
 #                       idle-intelligence/t0-web PR #8)
 #
 # then rewrites the `?v=` build tag to ENGINE_BUILD on every loading URL
-# (web/lean-chat-worker.js, web/device/device_worker.js, web/device/index.html)
+# (web/index.html, web/lean-chat-worker.js, web/device/device_worker.js,
+# web/device/index.html)
 # and checks neither built wasm carries a local build path.
 #
 # Requires wasm-pack, wasm-bindgen-cli (version matching Cargo.lock's
@@ -38,11 +39,15 @@ cd "$REPO_ROOT"
 
 # --- crates/lean/pkg: WebGPU + single-thread CPU ---
 # Compiled-in source paths (panic locations, std and registry crates) would
-# carry the home directory; map it to a neutral prefix. RUSTFLAGS replaces
-# .cargo/config.toml's rustflags, so +simd128 is repeated here.
+# carry the home directory; map it to a neutral prefix. The remap flag is
+# passed via --config (wasm-pack forwards EXTRA_OPTIONS straight to `cargo
+# build`, with no `--` separator) so cargo merges it with
+# .cargo/config.toml's target rustflags instead of replacing them. Setting
+# RUSTFLAGS directly would drop +simd128.
+ST_CONFIG="target.wasm32-unknown-unknown.rustflags=[\"--remap-path-prefix=$HOME=/home\"]"
 echo "==> Building lean (web feature, single thread) for ENGINE_BUILD=$ENGINE_BUILD"
-RUSTFLAGS="-C target-feature=+simd128 --remap-path-prefix=$HOME=/home" \
-  wasm-pack build crates/lean --target web --release --no-default-features --features web
+wasm-pack build crates/lean --target web --release --no-default-features --features web \
+  --config "$ST_CONFIG"
 
 ST_WASM="crates/lean/pkg/lean_bg.wasm"
 MT_WASM=""
@@ -66,18 +71,21 @@ if [ "$BUILD_THREADS" = "1" ]; then
     # wasm32's 4 GiB, since a shared memory's maximum may be reserved up front.
     MAX_MEMORY="${MAX_MEMORY:-2684354560}"
 
+    # Flags are passed via --config rather than RUSTFLAGS so cargo merges
+    # them with .cargo/config.toml's target rustflags (+simd128) instead of
+    # replacing them; -C target-feature flags from different config sources
+    # accumulate in rustc rather than the last one winning, so +simd128 does
+    # not need to be repeated here. -Z build-std recompiles std with the
+    # same merged rustflags, so std also gets every feature below.
+    MT_CONFIG="target.wasm32-unknown-unknown.rustflags=[\"-C\",\"target-feature=+atomics,+bulk-memory,+mutable-globals\",\"-C\",\"link-arg=--shared-memory\",\"-C\",\"link-arg=--max-memory=$MAX_MEMORY\",\"-C\",\"link-arg=--import-memory\",\"-C\",\"link-arg=--export=__wasm_init_tls\",\"-C\",\"link-arg=--export=__tls_size\",\"-C\",\"link-arg=--export=__tls_align\",\"-C\",\"link-arg=--export=__tls_base\",\"--remap-path-prefix=$HOME=/home\"]"
+
     echo "==> Building lean (wasm-mt feature, nightly build-std)"
-    RUSTFLAGS="-C target-feature=+atomics,+bulk-memory,+mutable-globals,+simd128 \
--C link-arg=--shared-memory -C link-arg=--max-memory=$MAX_MEMORY \
--C link-arg=--import-memory \
--C link-arg=--export=__wasm_init_tls -C link-arg=--export=__tls_size \
--C link-arg=--export=__tls_align -C link-arg=--export=__tls_base \
---remap-path-prefix=$HOME=/home" \
-      cargo +"${LEAN_NIGHTLY}" build -p lean --lib \
+    cargo +"${LEAN_NIGHTLY}" build -p lean --lib \
         --target wasm32-unknown-unknown \
         --release \
         --no-default-features --features wasm-mt \
-        -Z build-std=panic_abort,std
+        -Z build-std=panic_abort,std \
+        --config "$MT_CONFIG"
 
     WASM_IN="target/wasm32-unknown-unknown/release/lean.wasm"
     if [ ! -f "$WASM_IN" ]; then
@@ -150,12 +158,12 @@ echo "==> Rewriting ENGINE_BUILD tag to $ENGINE_BUILD"
 sed -i.bak "s/const ENGINE_BUILD = \"[^\"]*\"/const ENGINE_BUILD = \"$ENGINE_BUILD\"/" \
   _site/web/lean-chat-worker.js _site/web/device/device_worker.js
 sed -i.bak "s/const ENGINE_BUILD = \"[^\"]*\";/const ENGINE_BUILD = \"$ENGINE_BUILD\";/" \
-  _site/web/device/index.html
-rm -f _site/web/lean-chat-worker.js.bak _site/web/device/device_worker.js.bak _site/web/device/index.html.bak
+  _site/web/index.html _site/web/device/index.html
+rm -f _site/web/lean-chat-worker.js.bak _site/web/device/device_worker.js.bak _site/web/index.html.bak _site/web/device/index.html.bak
 
-COUNT="$(grep -rEo 'ENGINE_BUILD = "[^"]*"' _site/web/lean-chat-worker.js _site/web/device/device_worker.js _site/web/device/index.html | grep -Fc "\"$ENGINE_BUILD\"")"
-if [ "$COUNT" -ne 3 ]; then
-    echo "error: expected 3 ENGINE_BUILD assignments rewritten to $ENGINE_BUILD, found $COUNT" >&2
+COUNT="$(grep -rEo 'ENGINE_BUILD = "[^"]*"' _site/web/index.html _site/web/lean-chat-worker.js _site/web/device/device_worker.js _site/web/device/index.html | grep -Fc "\"$ENGINE_BUILD\"")"
+if [ "$COUNT" -ne 4 ]; then
+    echo "error: expected 4 ENGINE_BUILD assignments rewritten to $ENGINE_BUILD, found $COUNT" >&2
     exit 1
 fi
 

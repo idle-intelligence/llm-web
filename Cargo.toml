@@ -1,6 +1,8 @@
 [workspace]
 members = [
     "crates/lean",
+    "crates/lean-core",
+    "crates/lean-chat",
 ]
 resolver = "2"
 

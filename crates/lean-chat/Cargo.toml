@@ -1,0 +1,25 @@
+[package]
+name = "lean-chat"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Messages to prompt text with a model's own chat template, byte-exact with
+# transformers' apply_chat_template. No inference: the text goes to lean's
+# engine (or any other).
+[features]
+# wasm-bindgen exports (chatRender, chatTrimOldestExchange), bundled into
+# lean's web package.
+web = ["dep:wasm-bindgen", "dep:js-sys"]
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+minijinja = { workspace = true }
+minijinja-contrib = { version = "2.24.0", features = ["pycompat"] }
+# strftime_now: the local clock (through JS Date in the browser) and
+# Python-compatible strftime formatting.
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "wasmbind"] }
+wasm-bindgen = { workspace = true, optional = true }
+js-sys = { workspace = true, optional = true }

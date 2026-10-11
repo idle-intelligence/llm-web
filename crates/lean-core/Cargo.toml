@@ -1,0 +1,44 @@
+[package]
+name = "lean-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# The forward pass: GGUF loading, the GPU (wgpu + WGSL) and CPU (SIMD)
+# forward passes with positions, masks and a sliced head, the KV cache and
+# LoRA. No tokenizer, no sampling, no text: that is lean, which builds on it.
+[features]
+# wgpu on WebGPU (browser builds).
+wasm = ["wgpu/webgpu"]
+# Browser builds: also `performance.now()` for the diagnostics timings.
+web = ["wasm", "dep:wasm-bindgen"]
+# The CPU forward pass on a rayon pool: each matrix product's independent
+# dot products are split across the pool, sized by capability
+# (`rayon::current_num_threads()`: `available_parallelism()` natively,
+# `initThreadPool(n)` in the browser).
+threads = ["dep:rayon"]
+# Dev-only: forces the aarch64 dot kernels to the scalar fallback, to
+# measure the NEON delta with the same binary.
+force_scalar = []
+
+[dependencies]
+anyhow = { workspace = true }
+byteorder = { workspace = true }
+bytemuck = { version = "1.25", features = ["derive"] }
+half = "2.4"
+wgpu = { workspace = true }
+futures-channel = "0.3"
+rayon = { version = "1", optional = true }
+wasm-bindgen = { workspace = true, optional = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# Engine::new: the blocking device request, native only.
+pollster = "0.3"
+
+[dev-dependencies]
+lean-chat = { path = "../lean-chat" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+tokenizers = { workspace = true, features = ["fancy-regex"] }

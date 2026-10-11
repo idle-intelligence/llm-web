@@ -1,0 +1,553 @@
+{
+ "model": "Qwen/Qwen2.5-0.5B-Instruct",
+ "transformers": "5.19.0",
+ "template": "{%- if tools %}\n    {{- '<|im_start|>system\\n' }}\n    {%- if messages[0]['role'] == 'system' %}\n        {{- messages[0]['content'] }}\n    {%- else %}\n        {{- 'You are Qwen, created by Alibaba Cloud. You are a helpful assistant.' }}\n    {%- endif %}\n    {{- \"\\n\\n# Tools\\n\\nYou may call one or more functions to assist with the user query.\\n\\nYou are provided with function signatures within <tools></tools> XML tags:\\n<tools>\" }}\n    {%- for tool in tools %}\n        {{- \"\\n\" }}\n        {{- tool | tojson }}\n    {%- endfor %}\n    {{- \"\\n</tools>\\n\\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\\n<tool_call>\\n{\\\"name\\\": <function-name>, \\\"arguments\\\": <args-json-object>}\\n</tool_call><|im_end|>\\n\" }}\n{%- else %}\n    {%- if messages[0]['role'] == 'system' %}\n        {{- '<|im_start|>system\\n' + messages[0]['content'] + '<|im_end|>\\n' }}\n    {%- else %}\n        {{- '<|im_start|>system\\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\\n' }}\n    {%- endif %}\n{%- endif %}\n{%- for message in messages %}\n    {%- if (message.role == \"user\") or (message.role == \"system\" and not loop.first) or (message.role == \"assistant\" and not message.tool_calls) %}\n        {{- '<|im_start|>' + message.role + '\\n' + message.content + '<|im_end|>' + '\\n' }}\n    {%- elif message.role == \"assistant\" %}\n        {{- '<|im_start|>' + message.role }}\n        {%- if message.content %}\n            {{- '\\n' + message.content }}\n        {%- endif %}\n        {%- for tool_call in message.tool_calls %}\n            {%- if tool_call.function is defined %}\n                {%- set tool_call = tool_call.function %}\n            {%- endif %}\n            {{- '\\n<tool_call>\\n{\"name\": \"' }}\n            {{- tool_call.name }}\n            {{- '\", \"arguments\": ' }}\n            {{- tool_call.arguments | tojson }}\n            {{- '}\\n</tool_call>' }}\n        {%- endfor %}\n        {{- '<|im_end|>\\n' }}\n    {%- elif message.role == \"tool\" %}\n        {%- if (loop.index0 == 0) or (messages[loop.index0 - 1].role != \"tool\") %}\n            {{- '<|im_start|>user' }}\n        {%- endif %}\n        {{- '\\n<tool_response>\\n' }}\n        {{- message.content }}\n        {{- '\\n</tool_response>' }}\n        {%- if loop.last or (messages[loop.index0 + 1].role != \"tool\") %}\n            {{- '<|im_end|>\\n' }}\n        {%- endif %}\n    {%- endif %}\n{%- endfor %}\n{%- if add_generation_prompt %}\n    {{- '<|im_start|>assistant\\n' }}\n{%- endif %}\n",
+ "bos_token": null,
+ "eos_token": "<|im_end|>",
+ "cases": [
+  {
+   "name": "user_only",
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is the capital of France?"
+    }
+   ],
+   "tools": null,
+   "add_generation_prompt": true,
+   "rendered": "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+   "name": "system_user",
+   "messages": [
+    {
+     "role": "system",
+     "content": "Answer briefly, in one or two sentences."
+    },
+    {
+     "role": "user",
+     "content": "What is the capital of France?"
+    }
+   ],
+   "tools": null,
+   "add_generation_prompt": true,
+   "rendered": "<|im_start|>system\nAnswer briefly, in one or two sentences.<|im_end|>\n<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+   "name": "multi_turn",
+   "messages": [
+    {
+     "role": "system",
+     "content": "Answer briefly, in one or two sentences."
+    },
+    {
+     "role": "user",
+     "content": "What is the capital of France?"
+    },
+    {
+     "role": "assistant",
+     "content": "The capital of France is Paris."
+    },
+    {
+     "role": "user",
+     "content": "And of Germany?"
+    }
+   ],
+   "tools": null,
+   "add_generation_prompt": true,
+   "rendered": "<|im_start|>system\nAnswer briefly, in one or two sentences.<|im_end|>\n<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\nThe capital of France is Paris.<|im_end|>\n<|im_start|>user\nAnd of Germany?<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+   "name": "multi_turn_closed",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hello!"
+    },
+    {
+     "role": "assistant",
+     "content": "Hi! How can I help?"
+    }
+   ],
+   "tools": null,
+   "add_generation_prompt": false,
+   "rendered": "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n<|im_start|>user\nHello!<|im_end|>\n<|im_start|>assistant\nHi! How can I help?<|im_end|>\n"
+  },
+  {
+   "name": "unicode",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Écris une phrase sur la Seine 🌊, avec <balises> & \"guillemets\".\nNouvelle ligne.\tTab."
+    }
+   ],
+   "tools": null,
+   "add_generation_prompt": true,
+   "rendered": "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n<|im_start|>user\nÉcris une phrase sur la Seine 🌊, avec <balises> & \"guillemets\".\nNouvelle ligne.\tTab.<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+   "name": "tools_user",
+   "messages": [
+    {
+     "role": "user",
+     "content": "What's the weather in Zürich?"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the current weather in a city. Pass <city> names & 'quotes' as given.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name, e.g. Zürich"
+        },
+        "unit": {
+         "type": "string",
+         "enum": [
+          "celsius",
+          "fahrenheit"
+         ]
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "set_volume",
+      "description": "Set the speaker volume in a room.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "room": {
+         "type": "string"
+        },
+        "level": {
+         "type": "integer",
+         "minimum": 0,
+         "maximum": 100
+        },
+        "fade": {
+         "type": "number"
+        },
+        "mute": {
+         "type": "boolean"
+        }
+       },
+       "required": [
+        "level"
+       ]
+      }
+     }
+    }
+   ],
+   "add_generation_prompt": true,
+   "rendered": "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the current weather in a city. Pass <city> names & 'quotes' as given.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name, e.g. Zürich\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}\n{\"type\": \"function\", \"function\": {\"name\": \"set_volume\", \"description\": \"Set the speaker volume in a room.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"room\": {\"type\": \"string\"}, \"level\": {\"type\": \"integer\", \"minimum\": 0, \"maximum\": 100}, \"fade\": {\"type\": \"number\"}, \"mute\": {\"type\": \"boolean\"}}, \"required\": [\"level\"]}}}\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n<|im_start|>user\nWhat's the weather in Zürich?<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+   "name": "tools_system",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You control the house."
+    },
+    {
+     "role": "user",
+     "content": "Turn the kitchen up to 30."
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the current weather in a city. Pass <city> names & 'quotes' as given.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name, e.g. Zürich"
+        },
+        "unit": {
+         "type": "string",
+         "enum": [
+          "celsius",
+          "fahrenheit"
+         ]
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "set_volume",
+      "description": "Set the speaker volume in a room.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "room": {
+         "type": "string"
+        },
+        "level": {
+         "type": "integer",
+         "minimum": 0,
+         "maximum": 100
+        },
+        "fade": {
+         "type": "number"
+        },
+        "mute": {
+         "type": "boolean"
+        }
+       },
+       "required": [
+        "level"
+       ]
+      }
+     }
+    }
+   ],
+   "add_generation_prompt": true,
+   "rendered": "<|im_start|>system\nYou control the house.\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the current weather in a city. Pass <city> names & 'quotes' as given.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name, e.g. Zürich\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}\n{\"type\": \"function\", \"function\": {\"name\": \"set_volume\", \"description\": \"Set the speaker volume in a room.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"room\": {\"type\": \"string\"}, \"level\": {\"type\": \"integer\", \"minimum\": 0, \"maximum\": 100}, \"fade\": {\"type\": \"number\"}, \"mute\": {\"type\": \"boolean\"}}, \"required\": [\"level\"]}}}\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n<|im_start|>user\nTurn the kitchen up to 30.<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+   "name": "tool_call_roundtrip",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You control the house."
+    },
+    {
+     "role": "user",
+     "content": "What's the weather in Zürich?"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "id": "call00001",
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "unit": "celsius",
+         "city": "Zürich"
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call00001",
+     "content": "{\"temperature\": 21, \"condition\": \"sunny\"}"
+    },
+    {
+     "role": "assistant",
+     "content": "It is 21 °C and sunny in Zürich."
+    },
+    {
+     "role": "user",
+     "content": "Set the kitchen volume to 30."
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the current weather in a city. Pass <city> names & 'quotes' as given.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name, e.g. Zürich"
+        },
+        "unit": {
+         "type": "string",
+         "enum": [
+          "celsius",
+          "fahrenheit"
+         ]
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "set_volume",
+      "description": "Set the speaker volume in a room.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "room": {
+         "type": "string"
+        },
+        "level": {
+         "type": "integer",
+         "minimum": 0,
+         "maximum": 100
+        },
+        "fade": {
+         "type": "number"
+        },
+        "mute": {
+         "type": "boolean"
+        }
+       },
+       "required": [
+        "level"
+       ]
+      }
+     }
+    }
+   ],
+   "add_generation_prompt": true,
+   "rendered": "<|im_start|>system\nYou control the house.\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the current weather in a city. Pass <city> names & 'quotes' as given.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name, e.g. Zürich\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}\n{\"type\": \"function\", \"function\": {\"name\": \"set_volume\", \"description\": \"Set the speaker volume in a room.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"room\": {\"type\": \"string\"}, \"level\": {\"type\": \"integer\", \"minimum\": 0, \"maximum\": 100}, \"fade\": {\"type\": \"number\"}, \"mute\": {\"type\": \"boolean\"}}, \"required\": [\"level\"]}}}\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n<|im_start|>user\nWhat's the weather in Zürich?<|im_end|>\n<|im_start|>assistant\n<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"unit\": \"celsius\", \"city\": \"Zürich\"}}\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n{\"temperature\": 21, \"condition\": \"sunny\"}\n</tool_response><|im_end|>\n<|im_start|>assistant\nIt is 21 °C and sunny in Zürich.<|im_end|>\n<|im_start|>user\nSet the kitchen volume to 30.<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+   "name": "parallel_tool_calls",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Mute the kitchen and tell me the weather in Paris."
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "id": "call00002",
+       "type": "function",
+       "function": {
+        "name": "set_volume",
+        "arguments": {
+         "room": "kitchen",
+         "level": 0,
+         "fade": 0.5,
+         "mute": true
+        }
+       }
+      },
+      {
+       "id": "call00003",
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Paris"
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call00002",
+     "content": "{\"ok\": true}"
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call00003",
+     "content": "{\"temperature\": 18, \"condition\": \"rain\", \"alerts\": null}"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the current weather in a city. Pass <city> names & 'quotes' as given.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name, e.g. Zürich"
+        },
+        "unit": {
+         "type": "string",
+         "enum": [
+          "celsius",
+          "fahrenheit"
+         ]
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "set_volume",
+      "description": "Set the speaker volume in a room.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "room": {
+         "type": "string"
+        },
+        "level": {
+         "type": "integer",
+         "minimum": 0,
+         "maximum": 100
+        },
+        "fade": {
+         "type": "number"
+        },
+        "mute": {
+         "type": "boolean"
+        }
+       },
+       "required": [
+        "level"
+       ]
+      }
+     }
+    }
+   ],
+   "add_generation_prompt": true,
+   "rendered": "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the current weather in a city. Pass <city> names & 'quotes' as given.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name, e.g. Zürich\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}\n{\"type\": \"function\", \"function\": {\"name\": \"set_volume\", \"description\": \"Set the speaker volume in a room.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"room\": {\"type\": \"string\"}, \"level\": {\"type\": \"integer\", \"minimum\": 0, \"maximum\": 100}, \"fade\": {\"type\": \"number\"}, \"mute\": {\"type\": \"boolean\"}}, \"required\": [\"level\"]}}}\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n<|im_start|>user\nMute the kitchen and tell me the weather in Paris.<|im_end|>\n<|im_start|>assistant\n<tool_call>\n{\"name\": \"set_volume\", \"arguments\": {\"room\": \"kitchen\", \"level\": 0, \"fade\": 0.5, \"mute\": true}}\n</tool_call>\n<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n{\"ok\": true}\n</tool_response>\n<tool_response>\n{\"temperature\": 18, \"condition\": \"rain\", \"alerts\": null}\n</tool_response><|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+   "name": "string_arguments",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Weather in Paris?"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "id": "call00004",
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "arguments": "{\"city\": \"Paris\"}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call00004",
+     "content": "18 °C"
+    },
+    {
+     "role": "assistant",
+     "content": "18 °C in Paris."
+    },
+    {
+     "role": "user",
+     "content": "Thanks!"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the current weather in a city. Pass <city> names & 'quotes' as given.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name, e.g. Zürich"
+        },
+        "unit": {
+         "type": "string",
+         "enum": [
+          "celsius",
+          "fahrenheit"
+         ]
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "set_volume",
+      "description": "Set the speaker volume in a room.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "room": {
+         "type": "string"
+        },
+        "level": {
+         "type": "integer",
+         "minimum": 0,
+         "maximum": 100
+        },
+        "fade": {
+         "type": "number"
+        },
+        "mute": {
+         "type": "boolean"
+        }
+       },
+       "required": [
+        "level"
+       ]
+      }
+     }
+    }
+   ],
+   "add_generation_prompt": true,
+   "rendered": "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the current weather in a city. Pass <city> names & 'quotes' as given.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name, e.g. Zürich\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}\n{\"type\": \"function\", \"function\": {\"name\": \"set_volume\", \"description\": \"Set the speaker volume in a room.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"room\": {\"type\": \"string\"}, \"level\": {\"type\": \"integer\", \"minimum\": 0, \"maximum\": 100}, \"fade\": {\"type\": \"number\"}, \"mute\": {\"type\": \"boolean\"}}, \"required\": [\"level\"]}}}\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n<|im_start|>user\nWeather in Paris?<|im_end|>\n<|im_start|>assistant\n<tool_call>\n{\"name\": \"get_weather\", \"arguments\": \"{\\\"city\\\": \\\"Paris\\\"}\"}\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n18 °C\n</tool_response><|im_end|>\n<|im_start|>assistant\n18 °C in Paris.<|im_end|>\n<|im_start|>user\nThanks!<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+   "name": "think_in_history",
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is 2 + 2?"
+    },
+    {
+     "role": "assistant",
+     "content": "<think>\nTwo plus two is four.\n</think>\n\n4"
+    },
+    {
+     "role": "user",
+     "content": "And 3 + 3?"
+    }
+   ],
+   "tools": null,
+   "add_generation_prompt": true,
+   "rendered": "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n<|im_start|>user\nWhat is 2 + 2?<|im_end|>\n<|im_start|>assistant\n<think>\nTwo plus two is four.\n</think>\n\n4<|im_end|>\n<|im_start|>user\nAnd 3 + 3?<|im_end|>\n<|im_start|>assistant\n"
+  }
+ ]
+}

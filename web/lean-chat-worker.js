@@ -4,7 +4,7 @@
 //   worker -> page:  {type:'progress', loaded, total}
 //                     {type:'ready', backend}
 //                     {type:'token', text}
-//                     {type:'done'}
+//                     {type:'done', promptTokens, trimmed}
 //                     {type:'error', message}
 //
 // `model` is one of web/index.html's MODELS entries (label, gguf,
@@ -22,13 +22,17 @@
 // loaded on, and plain ready/token/done/error signals. The engine build
 // tag is console.log only.
 //
-// Both LeanEngine (GPU) and LeanEngineCpu (threads/single) expose the same
-// multi-turn chatGenerate/chatReset/AbortFlag surface (crates/lean/src/
-// chat.rs + src/web.rs). chat() does NOT call chatReset() before each
-// turn — the conversation persists across Send clicks; the page's "New
-// chat" button sends {type:'reset'} to start a fresh one. on_token's
-// second argument (`text`) is the already-decoded delta for this token;
-// this worker streams that directly.
+// lean's engine is text in, text out (`Lean.generate(text, params,
+// onToken, abort)`): it applies no chat template and keeps no
+// conversation. This worker holds the conversation (`HISTORY`), renders
+// the whole of it through the model's chat template on every call
+// (`chatRender`, from lean-chat, in the same wasm package), and passes
+// that text to the engine, which reuses the KV cache of the common prefix
+// by itself. `onToken(text)` streams already-decoded reply text. On a
+// `ContextOverflow` error (`e.name === "ContextOverflow"`), this worker
+// drops the oldest exchange (`chatTrimOldestExchange`) and retries, the
+// same client-side trim `examples/chat.rs` uses natively. The page's "New chat" button sends {type:'reset'}, which just
+// clears `HISTORY`.
 //
 // This file intentionally has NO top-level `import` or `await`: a module
 // worker with a top-level await can drop messages posted before it
@@ -38,7 +42,7 @@
 const EARLY = [];
 self.onmessage = (e) => EARLY.push(e);
 
-const ENGINE_BUILD = "2026-10-04-demos-03";
+const ENGINE_BUILD = "2026-10-11-turn-stats-01";
 // Rewritten to true by scripts/build.sh when BUILD_THREADS=1 built pkg-mt
 // into this deployment; GitHub Pages never sets it.
 const MT_BUILT = false;
@@ -64,27 +68,30 @@ async function capabilities() {
 
 let engine = null;
 let backend = null; // 'webgpu' | 'threads' | 'single'
-let AbortFlagCtor = null;
+let lean = null; // the loaded wasm module
+let chatTemplate = null;
 let abortFlag = null;
 
-async function createEngine(which) {
-  if (which === "webgpu") {
-    const mod = await import(`./lean/pkg/lean.js?v=${ENGINE_BUILD}`);
-    await mod.default(`./lean/pkg/lean_bg.wasm?v=${ENGINE_BUILD}`);
-    mod.leanInit();
-    return { engine: await mod.LeanEngine.create(), AbortFlag: mod.AbortFlag };
-  }
+// Conversation state: lean keeps no history of its own (see this file's
+// doc comment), so the worker owns it, same role as examples/chat.rs's
+// `history` on the native side.
+// Every conversation opens with a short system message; context trimming
+// keeps it (see generateWithTrim).
+const SYSTEM_MESSAGE = { role: "system", content: "Answer briefly, in one or two sentences." };
+let HISTORY = [SYSTEM_MESSAGE];
+
+// 'threads' runs the CPU forward pass from the threads build (pkg-mt);
+// 'webgpu' and 'single' use the default build (pkg).
+async function loadModule(which) {
   if (which === "threads") {
     const mod = await import(`./lean/pkg-mt/lean.js?v=${ENGINE_BUILD}`);
     await mod.default(`./lean/pkg-mt/lean_bg.wasm?v=${ENGINE_BUILD}`);
     await mod.initThreadPool(navigator.hardwareConcurrency);
-    mod.leanInit();
-    return { engine: mod.LeanEngineCpu.create(), AbortFlag: mod.AbortFlag };
+    return mod;
   }
   const mod = await import(`./lean/pkg/lean.js?v=${ENGINE_BUILD}`);
   await mod.default(`./lean/pkg/lean_bg.wasm?v=${ENGINE_BUILD}`);
-  mod.leanInit();
-  return { engine: mod.LeanEngineCpu.create(), AbortFlag: mod.AbortFlag };
+  return mod;
 }
 
 function backendLabel(b) {
@@ -118,11 +125,11 @@ async function load(model, backendChoice) {
   for (const c of candidates) {
     try {
       console.log(`[lean-chat-worker] starting ${c} backend...`);
-      const r = await createEngine(c);
+      const mod = await loadModule(c);
       console.log(`[lean-chat-worker] loading weights on ${c} backend...`);
-      r.engine.load(ggufBytes, tokenizerJson, tokenizerCfgJson, model.maxCtx);
-      engine = r.engine;
-      AbortFlagCtor = r.AbortFlag;
+      engine = await mod.Lean.load({ gguf: ggufBytes, tokenizer: tokenizerJson, maxCtx: model.maxCtx, backend: c === "webgpu" ? "webgpu" : "cpu" });
+      chatTemplate = mod.ChatTemplate.fromTokenizerConfig(tokenizerCfgJson);
+      lean = mod;
       backend = c;
       break;
     } catch (e) {
@@ -136,27 +143,49 @@ async function load(model, backendChoice) {
   self.postMessage({ type: "ready", backend });
 }
 
+const GEN_PARAMS = { maxNewTokens: 256, temperature: 0.7, topK: 40, topP: 0.9, repetitionPenalty: 1.1, seed: 0 };
+
+// On a context overflow, drops the oldest exchange (chatTrimOldestExchange
+// keeps the system message and the current question) and retries - the
+// same rule examples/chat.rs uses natively. Gives up (rethrows) once there
+// is nothing left to drop. Returns the reply, the prompt it answered and
+// whether any exchange was dropped.
+async function generateWithTrim(onToken) {
+  let trimmedAny = false;
+  for (;;) {
+    const prompt = lean.chatRender(chatTemplate, HISTORY, null, true);
+    try {
+      const reply = await engine.generate(prompt, GEN_PARAMS, onToken, abortFlag.cloneFlag());
+      return { reply, prompt, trimmed: trimmedAny };
+    } catch (e) {
+      const trimmed = e && e.name === "ContextOverflow" ? lean.chatTrimOldestExchange(HISTORY) : undefined;
+      if (trimmed) {
+        console.log(`[lean-chat-worker] context overflow (needed=${e.needed} available=${e.available}); dropping the oldest turn`);
+        HISTORY = trimmed;
+        trimmedAny = true;
+        continue;
+      }
+      throw e;
+    }
+  }
+}
+
 async function chat(text) {
   if (!engine) {
     self.postMessage({ type: "error", message: "engine not loaded; send {type:'load'} first" });
     return;
   }
+  HISTORY.push({ role: "user", content: text });
   try {
-    abortFlag = new AbortFlagCtor();
-    await engine.chatGenerate(
-      text,
-      256,
-      0.7,
-      40,
-      0.9,
-      1.1,
-      0,
-      new Uint32Array(0),
-      (_id, text) => self.postMessage({ type: "token", text }),
-      abortFlag.cloneFlag()
-    );
-    self.postMessage({ type: "done" });
+    abortFlag = new lean.AbortFlag();
+    const { reply, prompt, trimmed } = await generateWithTrim((text) => self.postMessage({ type: "token", text }));
+    // Prompt size of this turn, after any trimming.
+    let promptTokens = null;
+    try { promptTokens = engine.tokenCount(prompt); } catch (_) {}
+    HISTORY.push({ role: "assistant", content: reply });
+    self.postMessage({ type: "done", promptTokens, trimmed });
   } catch (e) {
+    HISTORY.pop(); // the user turn never got a reply - take it back out.
     self.postMessage({ type: "error", message: e && e.message ? e.message : String(e) });
   } finally {
     abortFlag = null;
@@ -168,7 +197,7 @@ function stop() {
 }
 
 function reset() {
-  if (engine) engine.chatReset();
+  HISTORY = [SYSTEM_MESSAGE];
 }
 
 const handlers = {
