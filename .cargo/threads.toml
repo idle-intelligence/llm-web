@@ -1,0 +1,24 @@
+# Extra flags for the CPU-threads wasm build (shared memory, wasm threads).
+# Merged on top of .cargo/config.toml with `cargo --config .cargo/threads.toml`,
+# so +simd128 comes from there. -Z build-std recompiles std with the same
+# merged rustflags.
+#
+# Shared wasm memory needs a declared maximum. 1 GiB was too small for
+# SmolLM2-1.7B Q4_0: the CPU backend keeps its 0.93 GiB of quantized weights
+# resident and allocates a float32 KV cache of 384 KiB per position (0.75 GiB
+# at max_ctx 2048), and the load trapped with `unreachable`. Loaded at
+# max_ctx 2048 with 8 pool threads, the memory reached 1.96 GiB (2106130432
+# bytes) after a 3-turn chat; 2 GiB would leave 40 MiB. 2.5 GiB leaves about
+# 0.54 GiB for longer contexts and more pool threads, and stays well under
+# wasm32's 4 GiB, since a shared memory's maximum may be reserved up front.
+[target.wasm32-unknown-unknown]
+rustflags = [
+  "-C", "target-feature=+atomics,+bulk-memory,+mutable-globals",
+  "-C", "link-arg=--shared-memory",
+  "-C", "link-arg=--max-memory=2684354560",
+  "-C", "link-arg=--import-memory",
+  "-C", "link-arg=--export=__wasm_init_tls",
+  "-C", "link-arg=--export=__tls_size",
+  "-C", "link-arg=--export=__tls_align",
+  "-C", "link-arg=--export=__tls_base",
+]

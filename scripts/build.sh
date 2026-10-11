@@ -38,16 +38,23 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
 # --- crates/lean/pkg: WebGPU + single-thread CPU ---
-# Compiled-in source paths (panic locations, std and registry crates) would
-# carry the home directory; map it to a neutral prefix. The remap flag is
-# passed via --config (wasm-pack forwards EXTRA_OPTIONS straight to `cargo
-# build`, with no `--` separator) so cargo merges it with
-# .cargo/config.toml's target rustflags instead of replacing them. Setting
-# RUSTFLAGS directly would drop +simd128.
-ST_CONFIG="target.wasm32-unknown-unknown.rustflags=[\"--remap-path-prefix=$HOME=/home\"]"
+# Per-target flags (+simd128) live in .cargo/config.toml and the threads
+# build's flags in .cargo/threads.toml. Only the machine-dependent
+# --remap-path-prefix flags are passed inline, so compiled-in source paths
+# (panic locations, std and registry crates) carry no home directory. They
+# go in with --config, which merges with the config files (RUSTFLAGS would
+# replace them and drop +simd128); wasm-pack forwards the extra args to
+# `cargo build` with no `--` separator. The cfg(all()) key puts them after
+# any user-level cfg(all()) remap, so they win (rustc applies the last
+# matching remap); with --target they still apply only to the wasm, not to
+# host build scripts.
+# This moves to `trim-paths = "all"` in the release profile once cargo
+# stabilizes it.
+CARGO_HOME_PATH="${CARGO_HOME:-$HOME/.cargo}"
+REMAP="target.'cfg(all())'.rustflags=[\"--remap-path-prefix=$HOME=/home\", \"--remap-path-prefix=$CARGO_HOME_PATH=/cargo\"]"
 echo "==> Building lean (web feature, single thread) for ENGINE_BUILD=$ENGINE_BUILD"
 wasm-pack build crates/lean --target web --release --no-default-features --features web \
-  --config "$ST_CONFIG"
+  --config "$REMAP"
 
 ST_WASM="crates/lean/pkg/lean_bg.wasm"
 MT_WASM=""
@@ -56,28 +63,9 @@ if [ "$BUILD_THREADS" = "1" ]; then
     echo "==> nightly toolchain: $(cargo +"$LEAN_NIGHTLY" --version)"
 
     # --- crates/lean/pkg-mt: CPU threads ---
-    # Separate from the single-thread pkg build above: the atomics/bulk-memory/
-    # mutable-globals target features and the `-Z build-std` nightly flag must
-    # never land in .cargo/config.toml (that would break the single-thread
-    # pkg build's +simd128-only rustflags).
-    #
-    # Shared wasm memory needs a declared maximum. 1 GiB was too small for
-    # SmolLM2-1.7B Q4_0: the CPU backend keeps its 0.93 GiB of quantized weights
-    # resident and allocates a float32 KV cache of 384 KiB per position (0.75 GiB
-    # at max_ctx 2048), and the load trapped with `unreachable`. Loaded at
-    # max_ctx 2048 with 8 pool threads, the memory reached 1.96 GiB (2106130432
-    # bytes) after a 3-turn chat; 2 GiB would leave 40 MiB. 2.5 GiB leaves about
-    # 0.54 GiB for longer contexts and more pool threads, and stays well under
-    # wasm32's 4 GiB, since a shared memory's maximum may be reserved up front.
-    MAX_MEMORY="${MAX_MEMORY:-2684354560}"
-
-    # Flags are passed via --config rather than RUSTFLAGS so cargo merges
-    # them with .cargo/config.toml's target rustflags (+simd128) instead of
-    # replacing them; -C target-feature flags from different config sources
-    # accumulate in rustc rather than the last one winning, so +simd128 does
-    # not need to be repeated here. -Z build-std recompiles std with the
-    # same merged rustflags, so std also gets every feature below.
-    MT_CONFIG="target.wasm32-unknown-unknown.rustflags=[\"-C\",\"target-feature=+atomics,+bulk-memory,+mutable-globals\",\"-C\",\"link-arg=--shared-memory\",\"-C\",\"link-arg=--max-memory=$MAX_MEMORY\",\"-C\",\"link-arg=--import-memory\",\"-C\",\"link-arg=--export=__wasm_init_tls\",\"-C\",\"link-arg=--export=__tls_size\",\"-C\",\"link-arg=--export=__tls_align\",\"-C\",\"link-arg=--export=__tls_base\",\"--remap-path-prefix=$HOME=/home\"]"
+    # The atomics/bulk-memory/mutable-globals target features and the
+    # shared-memory link arguments live in .cargo/threads.toml, never in
+    # .cargo/config.toml (that would break the single-thread pkg build).
 
     echo "==> Building lean (wasm-mt feature, nightly build-std)"
     cargo +"${LEAN_NIGHTLY}" build -p lean --lib \
@@ -85,7 +73,7 @@ if [ "$BUILD_THREADS" = "1" ]; then
         --release \
         --no-default-features --features wasm-mt \
         -Z build-std=panic_abort,std \
-        --config "$MT_CONFIG"
+        --config .cargo/threads.toml --config "$REMAP"
 
     WASM_IN="target/wasm32-unknown-unknown/release/lean.wasm"
     if [ ! -f "$WASM_IN" ]; then
