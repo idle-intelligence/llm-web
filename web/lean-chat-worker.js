@@ -4,7 +4,7 @@
 //   worker -> page:  {type:'progress', loaded, total}
 //                     {type:'ready', backend}
 //                     {type:'token', text}
-//                     {type:'done'}
+//                     {type:'done', promptTokens, trimmed}
 //                     {type:'error', message}
 //
 // `model` is one of web/index.html's MODELS entries (label, gguf,
@@ -42,7 +42,7 @@
 const EARLY = [];
 self.onmessage = (e) => EARLY.push(e);
 
-const ENGINE_BUILD = "2026-10-10-lean-api-01";
+const ENGINE_BUILD = "2026-10-11-turn-stats-01";
 // Rewritten to true by scripts/build.sh when BUILD_THREADS=1 built pkg-mt
 // into this deployment; GitHub Pages never sets it.
 const MT_BUILT = false;
@@ -148,18 +148,21 @@ const GEN_PARAMS = { maxNewTokens: 256, temperature: 0.7, topK: 40, topP: 0.9, r
 // On a context overflow, drops the oldest exchange (chatTrimOldestExchange
 // keeps the system message and the current question) and retries - the
 // same rule examples/chat.rs uses natively. Gives up (rethrows) once there
-// is nothing left to drop. Returns the reply and the prompt it answered.
+// is nothing left to drop. Returns the reply, the prompt it answered and
+// whether any exchange was dropped.
 async function generateWithTrim(onToken) {
+  let trimmedAny = false;
   for (;;) {
     const prompt = lean.chatRender(chatTemplate, HISTORY, null, true);
     try {
       const reply = await engine.generate(prompt, GEN_PARAMS, onToken, abortFlag.cloneFlag());
-      return { reply, prompt };
+      return { reply, prompt, trimmed: trimmedAny };
     } catch (e) {
       const trimmed = e && e.name === "ContextOverflow" ? lean.chatTrimOldestExchange(HISTORY) : undefined;
       if (trimmed) {
         console.log(`[lean-chat-worker] context overflow (needed=${e.needed} available=${e.available}); dropping the oldest turn`);
         HISTORY = trimmed;
+        trimmedAny = true;
         continue;
       }
       throw e;
@@ -175,12 +178,12 @@ async function chat(text) {
   HISTORY.push({ role: "user", content: text });
   try {
     abortFlag = new lean.AbortFlag();
-    const { reply, prompt } = await generateWithTrim((text) => self.postMessage({ type: "token", text }));
+    const { reply, prompt, trimmed } = await generateWithTrim((text) => self.postMessage({ type: "token", text }));
     // Prompt size of this turn, after any trimming.
     let promptTokens = null;
     try { promptTokens = engine.tokenCount(prompt); } catch (_) {}
     HISTORY.push({ role: "assistant", content: reply });
-    self.postMessage({ type: "done", promptTokens });
+    self.postMessage({ type: "done", promptTokens, trimmed });
   } catch (e) {
     HISTORY.pop(); // the user turn never got a reply - take it back out.
     self.postMessage({ type: "error", message: e && e.message ? e.message : String(e) });
