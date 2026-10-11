@@ -66,6 +66,10 @@ if [ "$BUILD_THREADS" = "1" ]; then
     # The atomics/bulk-memory/mutable-globals target features and the
     # shared-memory link arguments live in .cargo/threads.toml, never in
     # .cargo/config.toml (that would break the single-thread pkg build).
+    # build-std compiles std from the toolchain's own source tree, so its
+    # paths need a remap too.
+    NIGHTLY_SRC="$(rustc +"$LEAN_NIGHTLY" --print sysroot)/lib/rustlib/src/rust"
+    REMAP_STD="target.'cfg(all())'.rustflags=[\"--remap-path-prefix=$NIGHTLY_SRC=/rust\"]"
 
     echo "==> Building lean (wasm-mt feature, nightly build-std)"
     cargo +"${LEAN_NIGHTLY}" build -p lean --lib \
@@ -73,7 +77,7 @@ if [ "$BUILD_THREADS" = "1" ]; then
         --release \
         --no-default-features --features wasm-mt \
         -Z build-std=panic_abort,std \
-        --config .cargo/threads.toml --config "$REMAP"
+        --config .cargo/threads.toml --config "$REMAP" --config "$REMAP_STD"
 
     WASM_IN="target/wasm32-unknown-unknown/release/lean.wasm"
     if [ ! -f "$WASM_IN" ]; then
