@@ -8,6 +8,35 @@
 const EARLY = [];
 self.onmessage = (e) => EARLY.push(e);
 
+// Panic messages and engine warnings go to console.error; keep them for the report.
+const logs = [];
+for (const level of ["error", "warn"]) {
+  const orig = console[level].bind(console);
+  console[level] = (...a) => { const t = a.map(String).join(" ").slice(0, 600); logs.push(t); self.postMessage({ type: "log", text: t }); orig(...a); };
+}
+
+// WebGPU validation errors the engine does not look at: log them too.
+if (self.GPUAdapter) {
+  const requestDevice = GPUAdapter.prototype.requestDevice;
+  GPUAdapter.prototype.requestDevice = async function (...a) {
+    const device = await requestDevice.apply(this, a);
+    device.addEventListener("uncapturederror", (e) => console.error("uncaptured WebGPU error: " + e.error.message + " @" + JSON.stringify(gpuStats)));
+    device.lost.then((i) => console.error("device lost: " + i.reason + " " + i.message));
+    return device;
+  };
+}
+
+// Running totals of what the engine hands to the device, printed with the first uncaptured error.
+const gpuStats = { createdBytes: 0, createdCount: 0, writtenBytes: 0, writeCount: 0, submits: 0 };
+if (self.GPUDevice) {
+  const createBuffer = GPUDevice.prototype.createBuffer;
+  GPUDevice.prototype.createBuffer = function (d) { gpuStats.createdBytes += d.size; gpuStats.createdCount++; return createBuffer.call(this, d); };
+  const writeBuffer = GPUQueue.prototype.writeBuffer;
+  GPUQueue.prototype.writeBuffer = function (b, o, data, ...r) { gpuStats.writtenBytes += data.byteLength ?? 0; gpuStats.writeCount++; return writeBuffer.call(this, b, o, data, ...r); };
+  const submit = GPUQueue.prototype.submit;
+  GPUQueue.prototype.submit = function (c) { gpuStats.submits++; return submit.call(this, c); };
+}
+
 const status = (text) => self.postMessage({ type: "status", text });
 const median = (xs) => { const s = [...xs].sort((a, b) => a - b); return s.length ? s[s.length >> 1] : NaN; };
 
@@ -116,5 +145,5 @@ async function run({ backend, build, prompts, reps, decode, mini, phases }) {
   self.postMessage({ type: "result", result });
 }
 
-self.onmessage = (e) => run(e.data).catch((err) => self.postMessage({ type: "error", message: String(err) + " :: " + String(err && err.stack ? err.stack.split("\n").slice(0, 3).join(" ; ") : "") }));
+self.onmessage = (e) => run(e.data).catch((err) => self.postMessage({ type: "error", logs: logs.slice(0, 12), message: String(err) + " :: " + String(err && err.stack ? err.stack.split("\n").slice(0, 3).join(" ; ") : "") }));
 for (const e of EARLY) self.onmessage(e);
