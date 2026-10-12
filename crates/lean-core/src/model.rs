@@ -199,8 +199,8 @@ struct AttnPrefillDims {
     n_kv_heads: u32,
     head_dim: u32,
     scale: f32,
-    _p0: u32,
-    _p1: u32,
+    prefix: u32,
+    max_ctx: u32,
     _p2: u32,
 }
 #[repr(C)]
@@ -1678,8 +1678,12 @@ fn scatter_kv_kernel<'a>(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputeP
     engine.dispatch(pass, &engine.kv_scatter, &bg, (gx, gy, 1), key);
 }
 
+/// Prefill attention over this call's own q/k/v (`resident = None`), or, for
+/// a suffix prefill, over a KV cache that already holds `prefix` positions
+/// and this call's rows after them (`resident = Some((k_cache, v_cache,
+/// prefix, max_ctx))`; head_dim 64 and 128 only, see `suffix_batched`).
 #[allow(clippy::too_many_arguments)]
-fn attn_prefill<'a>(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &str, q: impl Into<BufView<'a>>, k: impl Into<BufView<'a>>, v: impl Into<BufView<'a>>, seq: u32, cfg: &Qwen2Config) -> wgpu::Buffer {
+fn attn_prefill<'a>(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &str, q: impl Into<BufView<'a>>, k: impl Into<BufView<'a>>, v: impl Into<BufView<'a>>, seq: u32, cfg: &Qwen2Config, resident: Option<(&wgpu::Buffer, &wgpu::Buffer, u32, u32)>) -> wgpu::Buffer {
     let (q, k, v) = (q.into(), k.into(), v.into());
     // Concatenated-heads width (`num_heads * head_dim`): equal to
     // `cfg.hidden_size` for Qwen2 (head_dim is derived that way) but *not*
@@ -1689,26 +1693,36 @@ fn attn_prefill<'a>(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'
     let skey = scratch_key(key);
     let out = pool.data(&format!("{skey}.out"), (seq * hidden) as usize);
     let scale = 1.0 / (cfg.head_dim as f32).sqrt();
+    let (prefix, max_ctx) = resident.map_or((0, 0), |r| (r.2, r.3));
     let dims = pool.uniform(
         &format!("{skey}.dims"),
-        AttnPrefillDims { seq, n_heads: cfg.num_heads as u32, n_kv_heads: cfg.num_kv_heads as u32, head_dim: cfg.head_dim as u32, scale, _p0: 0, _p1: 0, _p2: 0 },
+        AttnPrefillDims { seq, n_heads: cfg.num_heads as u32, n_kv_heads: cfg.num_kv_heads as u32, head_dim: cfg.head_dim as u32, scale, prefix, max_ctx, _p2: 0 },
     );
     // head_dim 64 and 128: the tiled kernel (attn_prefill_tiled.wgsl); any
     // other head_dim: the one-thread-per-row kernel.
-    let (pipeline, wgs) = match cfg.head_dim {
-        64 => (&engine.attn_prefill_tiled, (cfg.num_heads as u32, seq.div_ceil(8), 1)),
-        128 => (&engine.attn_prefill_tiled_128, (cfg.num_heads as u32, seq.div_ceil(8), 1)),
+    let (pipeline, wgs) = match (cfg.head_dim, resident.is_some()) {
+        (64, false) => (&engine.attn_prefill_tiled, (cfg.num_heads as u32, seq.div_ceil(8), 1)),
+        (128, false) => (&engine.attn_prefill_tiled_128, (cfg.num_heads as u32, seq.div_ceil(8), 1)),
+        (64, true) => (&engine.attn_prefill_cache, (cfg.num_heads as u32, seq.div_ceil(8), 1)),
+        (128, true) => (&engine.attn_prefill_cache_128, (cfg.num_heads as u32, seq.div_ceil(8), 1)),
         // wg.y = query tile index (256 rows/tile, see attn_prefill.wgsl's doc
         // comment on why this scales with `seq` instead of a fixed dispatch).
         _ => (&engine.attn_prefill, (cfg.num_heads as u32, seq.div_ceil(256), 1)),
     };
+    let (kb, vb) = match resident {
+        Some((kc, vc, _, _)) => (kc.as_entire_binding(), vc.as_entire_binding()),
+        None => (k.binding(), v.binding()),
+    };
+    // The pool caches bind groups by key, and the two pipelines have
+    // different layouts: they need different keys.
+    let bg_key = if resident.is_some() { format!("{key}.cache") } else { key.to_string() };
     let bg = pool.bind_group(
-        key,
+        &bg_key,
         pipeline,
         &[
             BindGroupEntry { binding: 0, resource: q.binding() },
-            BindGroupEntry { binding: 1, resource: k.binding() },
-            BindGroupEntry { binding: 2, resource: v.binding() },
+            BindGroupEntry { binding: 1, resource: kb },
+            BindGroupEntry { binding: 2, resource: vb },
             BindGroupEntry { binding: 3, resource: out.as_entire_binding() },
             BindGroupEntry { binding: 4, resource: dims.as_entire_binding() },
         ],
@@ -1952,9 +1966,20 @@ macro_rules! tap {
 /// GPU-scatters every position's K/V into `cache`, and returns the last
 /// position's logits ([vocab]).
 pub async fn forward_prefill(engine: &Engine, model: &GpuModel, cache: &mut KvCache, token_ids: &[u32], cos: &wgpu::Buffer, sin: &wgpu::Buffer, mask: Option<&wgpu::Buffer>) -> Vec<f32> {
+    cache.kv_len = 0;
+    prefill_batched(engine, model, cache, token_ids, cos, sin, mask).await
+}
+
+/// Batched prefill of `token_ids` after the `cache.kv_len` positions already
+/// resident (0 for a plain prefill): the same tiled matmuls as a cold
+/// prefill, RoPE and the K/V scatter offset by the prefix, attention reading
+/// the cache. Leaves `cache.kv_len` at prefix + `token_ids.len()`.
+async fn prefill_batched(engine: &Engine, model: &GpuModel, cache: &mut KvCache, token_ids: &[u32], cos: &wgpu::Buffer, sin: &wgpu::Buffer, mask: Option<&wgpu::Buffer>) -> Vec<f32> {
     model.pool.use_kv_cache(cache.id);
+    let prefix = cache.kv_len;
     let cfg = &model.config;
     let seq = token_ids.len() as u32;
+    assert!(prefix + seq <= cache.max_ctx, "prefill: prefix {prefix} + {seq} tokens exceeds max_ctx {}", cache.max_ctx);
     let hidden = cfg.hidden_size as u32;
     let pool = &model.pool;
     let t_start = crate::engine::now_ms();
@@ -1983,16 +2008,17 @@ pub async fn forward_prefill(engine: &Engine, model: &GpuModel, cache: &mut KvCa
         tap!(engine, &mut encoder, pass, format!("{key}.k"), &k, seq * kv_dim);
         tap!(engine, &mut encoder, pass, format!("{key}.v"), &v, seq * kv_dim);
         seg!(engine, &mut encoder, pass, "rope");
-        rope(engine, pool, &mut pass, &format!("{key}.ropeq"), &q, cos, sin, seq, cfg.num_heads as u32, cfg.head_dim as u32, 0);
-        rope(engine, pool, &mut pass, &format!("{key}.ropek"), &k, cos, sin, seq, cfg.num_kv_heads as u32, cfg.head_dim as u32, 0);
+        rope(engine, pool, &mut pass, &format!("{key}.ropeq"), &q, cos, sin, seq, cfg.num_heads as u32, cfg.head_dim as u32, prefix);
+        rope(engine, pool, &mut pass, &format!("{key}.ropek"), &k, cos, sin, seq, cfg.num_kv_heads as u32, cfg.head_dim as u32, prefix);
         tap!(engine, &mut encoder, pass, format!("{key}.ropeq"), &q, seq * q_dim);
         tap!(engine, &mut encoder, pass, format!("{key}.ropek"), &k, seq * kv_dim);
-        seg!(engine, &mut encoder, pass, "attn");
-        let attn_out = attn_prefill(engine, pool, &mut pass, &format!("{key}.attn"), &q, &k, &v, seq, cfg);
-        tap!(engine, &mut encoder, pass, format!("{key}.attn"), &attn_out, seq * q_dim);
         seg!(engine, &mut encoder, pass, "kv");
-        scatter_kv_kernel(engine, pool, &mut pass, &format!("{key}.kscatter"), &cache.k[i], &k, seq, cfg, 0, cache.max_ctx);
-        scatter_kv_kernel(engine, pool, &mut pass, &format!("{key}.vscatter"), &cache.v[i], &v, seq, cfg, 0, cache.max_ctx);
+        scatter_kv_kernel(engine, pool, &mut pass, &format!("{key}.kscatter"), &cache.k[i], &k, seq, cfg, prefix, cache.max_ctx);
+        scatter_kv_kernel(engine, pool, &mut pass, &format!("{key}.vscatter"), &cache.v[i], &v, seq, cfg, prefix, cache.max_ctx);
+        seg!(engine, &mut encoder, pass, "attn");
+        let resident = (prefix > 0).then(|| (&cache.k[i], &cache.v[i], prefix, cache.max_ctx));
+        let attn_out = attn_prefill(engine, pool, &mut pass, &format!("{key}.attn"), &q, &k, &v, seq, cfg, resident);
+        tap!(engine, &mut encoder, pass, format!("{key}.attn"), &attn_out, seq * q_dim);
         seg!(engine, &mut encoder, pass, "o_proj");
 
         let attn_dim = (cfg.num_heads * cfg.head_dim) as u32;
@@ -2073,7 +2099,7 @@ pub async fn forward_prefill(engine: &Engine, model: &GpuModel, cache: &mut KvCa
     if let Some((buf, count)) = diag {
         engine.diag_collect(&buf, count).await;
     }
-    cache.kv_len = seq;
+    cache.kv_len = prefix + seq;
     all_logits
 }
 
@@ -2390,6 +2416,9 @@ pub async fn decode_greedy_pipelined(engine: &Engine, model: &GpuModel, cache: &
 /// dispatches that depend on it run, at the cost of `token_ids.len()`
 /// submits instead of 1 (still zero *readbacks* except the last).
 pub async fn forward_prefill_suffix(engine: &Engine, model: &GpuModel, cache: &mut KvCache, token_ids: &[u32], cos: &wgpu::Buffer, sin: &wgpu::Buffer, mask: Option<&wgpu::Buffer>) -> Vec<f32> {
+    if matches!(model.config.head_dim, 64 | 128) {
+        return prefill_batched(engine, model, cache, token_ids, cos, sin, mask).await;
+    }
     let (last, rest) = token_ids.split_last().expect("forward_prefill_suffix needs at least one token");
     for &tok in rest {
         let mut encoder = engine.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("prefill_suffix_step") });

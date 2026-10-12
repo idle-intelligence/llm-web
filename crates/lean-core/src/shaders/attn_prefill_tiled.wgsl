@@ -32,7 +32,14 @@ override DV: u32 = HEAD_DIM / 4u; // vec4s per row
 override RS: u32 = HEAD_DIM / 4u + 1u; // padded row stride in vec4s
 override UPL: u32 = HEAD_DIM / 32u; // output vec4s per lane (2 or 4)
 
-struct Dims { seq: u32, n_heads: u32, n_kv_heads: u32, head_dim: u32, scale: f32, _p0: u32, _p1: u32, _p2: u32 };
+// CACHE build (suffix prefill after a resident prefix): k and v are the KV
+// cache buffers ([kv_head, max_ctx, head_dim]) already holding the prefix
+// and this call's own rows at positions [prefix, prefix + seq); query row i
+// sits at absolute position prefix + i. prefix = 0 and CACHE = false is the
+// plain prefill over freshly computed k/v.
+override CACHE: bool = false;
+
+struct Dims { seq: u32, n_heads: u32, n_kv_heads: u32, head_dim: u32, scale: f32, prefix: u32, max_ctx: u32, _p2: u32 };
 
 @group(0) @binding(0) var<storage, read> q: array<vec4<f32>>;
 @group(0) @binding(1) var<storage, read> k: array<vec4<f32>>;
@@ -53,7 +60,8 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
     let r = tid / 8u;
     let i0 = wg.y * QT;
     let i = i0 + r;
-    let last = min(i0 + QT, dims.seq) - 1u;
+    let last = min(i0 + QT, dims.seq) - 1u + dims.prefix;
+    let ia = i + dims.prefix;
 
     // Stage the tile's q rows (rows past seq read row 0 and are never written).
     for (var e: u32 = tid; e < QT * DV; e = e + 64u) {
@@ -74,8 +82,14 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
         for (var e: u32 = tid; e < KT * DV; e = e + 64u) {
             let kk = e / DV;
             let d = e % DV;
-            let j = select(0u, j0 + kk, j0 + kk < dims.seq);
-            let src = (j * dims.n_kv_heads + kv_head) * DV + d;
+            var src: u32;
+            if (CACHE) {
+                let j = select(0u, j0 + kk, j0 + kk < dims.prefix + dims.seq);
+                src = (kv_head * dims.max_ctx + j) * DV + d;
+            } else {
+                let j = select(0u, j0 + kk, j0 + kk < dims.seq);
+                src = (j * dims.n_kv_heads + kv_head) * DV + d;
+            }
             ks[kk * RS + d] = k[src];
             vs[kk * RS + d] = v[src];
         }
@@ -87,7 +101,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
             s = s + dot(qs[r * RS + d], ks[lane * RS + d]);
         }
         let j = j0 + lane;
-        sc[tid] = select(-1e30, s * dims.scale, j <= i && i < dims.seq);
+        sc[tid] = select(-1e30, s * dims.scale, j <= ia && i < dims.seq);
         workgroupBarrier();
 
         let sb = r * 8u;
