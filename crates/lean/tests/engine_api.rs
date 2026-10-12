@@ -96,7 +96,11 @@ fn conversation(gguf: &str, tokenizer_dir: &str, backend: Backend, reuse: bool) 
 }
 
 fn reuse_equivalence(backend: Backend) {
-    let (gguf, dir) = (env("LEAN_GGUF"), env("LEAN_TOKENIZER_DIR"));
+    reuse_equivalence_with(backend, "LEAN_GGUF", "LEAN_TOKENIZER_DIR");
+}
+
+fn reuse_equivalence_with(backend: Backend, gguf_var: &str, tok_var: &str) {
+    let (gguf, dir) = (env(gguf_var), env(tok_var));
     let with_reuse = conversation(&gguf, &dir, backend, true);
     let fresh = conversation(&gguf, &dir, backend, false);
     for (turn, (a, b)) in with_reuse.iter().zip(&fresh).enumerate() {
@@ -118,7 +122,11 @@ fn reuse_equivalence_cpu_qwen25_0_5b() {
 }
 
 fn reuse_diverging_prefix(backend: Backend) {
-    let (gguf, dir) = (env("LEAN_GGUF"), env("LEAN_TOKENIZER_DIR"));
+    reuse_diverging_prefix_with(backend, "LEAN_GGUF", "LEAN_TOKENIZER_DIR");
+}
+
+fn reuse_diverging_prefix_with(backend: Backend, gguf_var: &str, tok_var: &str) {
+    let (gguf, dir) = (env(gguf_var), env(tok_var));
     let template = template(&dir);
     let first = prompt(&template, &[("user", TURNS[0])]);
     let texts = [
@@ -152,6 +160,30 @@ fn reuse_diverging_prefix_gpu_qwen25_0_5b() {
 #[ignore = "needs LEAN_GGUF and LEAN_TOKENIZER_DIR on disk; never committed to this repo"]
 fn reuse_diverging_prefix_cpu_qwen25_0_5b() {
     reuse_diverging_prefix(Backend::Cpu);
+}
+
+#[test]
+#[ignore = "needs LEAN_GGUF_LLAMA_360M_Q4_0 and LEAN_TOKENIZER_DIR_LLAMA_360M on disk; never committed to this repo"]
+fn reuse_equivalence_gpu_smollm2_360m() {
+    reuse_equivalence_with(Backend::WebGpu, "LEAN_GGUF_LLAMA_360M_Q4_0", "LEAN_TOKENIZER_DIR_LLAMA_360M");
+}
+
+#[test]
+#[ignore = "needs LEAN_GGUF_LLAMA_360M_Q4_0 and LEAN_TOKENIZER_DIR_LLAMA_360M on disk; never committed to this repo"]
+fn reuse_diverging_prefix_gpu_smollm2_360m() {
+    reuse_diverging_prefix_with(Backend::WebGpu, "LEAN_GGUF_LLAMA_360M_Q4_0", "LEAN_TOKENIZER_DIR_LLAMA_360M");
+}
+
+#[test]
+#[ignore = "needs LEAN_GGUF_LLAMA_1_7B_Q4_0 and LEAN_TOKENIZER_DIR_LLAMA_1_7B on disk; never committed to this repo"]
+fn reuse_equivalence_gpu_smollm2_1_7b() {
+    reuse_equivalence_with(Backend::WebGpu, "LEAN_GGUF_LLAMA_1_7B_Q4_0", "LEAN_TOKENIZER_DIR_LLAMA_1_7B");
+}
+
+#[test]
+#[ignore = "needs LEAN_GGUF_LLAMA_1_7B_Q4_0 and LEAN_TOKENIZER_DIR_LLAMA_1_7B on disk; never committed to this repo"]
+fn reuse_diverging_prefix_gpu_smollm2_1_7b() {
+    reuse_diverging_prefix_with(Backend::WebGpu, "LEAN_GGUF_LLAMA_1_7B_Q4_0", "LEAN_TOKENIZER_DIR_LLAMA_1_7B");
 }
 
 fn cpu_matches_gpu(gguf_var: &str, tok_var: &str) {
@@ -229,4 +261,36 @@ fn smollm2_1_7b_q4_0_gpu_streams_text() {
     let reply = pollster::block_on(lean.generate(&text, &params, |_| {}, None)).unwrap();
     println!("{reply:?}");
     assert!(!reply.trim().is_empty(), "empty reply");
+}
+
+fn filler(n_words: usize, salt: usize) -> String {
+    const WORDS: [&str; 20] = ["the", "quick", "brown", "fox", "jumps", "over", "a", "lazy", "dog", "while", "seven", "small", "birds", "sing", "near", "an", "old", "stone", "bridge", "across"];
+    let mut t = format!("Document {salt}. ");
+    for i in 0..n_words {
+        t.push_str(WORDS[(salt * 7 + i) % WORDS.len()]);
+        t.push(' ');
+    }
+    t
+}
+
+/// Raw-text calls with one-token replies (a different prompt each time, the
+/// next one extending the last), then three chat questions: the replies must
+/// be what fresh engines give.
+#[test]
+#[ignore = "needs LEAN_GGUF_LLAMA_1_7B_Q4_0 and LEAN_TOKENIZER_DIR_LLAMA_1_7B on disk; never committed to this repo"]
+fn reuse_after_short_calls_gpu_smollm2_1_7b() {
+    let (gguf, dir) = (env("LEAN_GGUF_LLAMA_1_7B_Q4_0"), env("LEAN_TOKENIZER_DIR_LLAMA_1_7B"));
+    let template = template(&dir);
+    let mut lean = load(&gguf, &dir, MAX_CTX, Backend::WebGpu);
+    let one = GenParams { max_new_tokens: 1, ..GenParams::default() };
+    let base = filler(80, 1);
+    for text in [filler(30, 99), base.clone(), format!("{base}{}", filler(25, 50))] {
+        pollster::block_on(lean.generate(&text, &one, |_| {}, None)).unwrap();
+    }
+    for question in TURNS {
+        let text = prompt(&template, &[("user", question)]);
+        let shared = generate(&mut lean, &text);
+        let fresh = generate(&mut load(&gguf, &dir, MAX_CTX, Backend::WebGpu), &text);
+        assert_eq!(shared, fresh, "{question}");
+    }
 }
