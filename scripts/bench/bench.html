@@ -1,0 +1,28 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>lean bench</title>
+<pre id="out">starting</pre>
+<script type="module">
+// Timing harness for headless browser runs: drives scripts/bench/bench_worker.js
+// and exposes the result as window.benchResult (JSON) when done.
+const q = new URLSearchParams(location.search);
+const backend = q.get("backend") || "webgpu";
+const build = q.get("v") || "dev";
+const out = document.getElementById("out");
+// A browser with no automation protocol reports through POST /report.
+function finish(r) {
+  r.userAgent = navigator.userAgent;
+  window.benchResult = r;
+  out.textContent = "done: " + JSON.stringify(r, null, 1);
+  if (q.get("report")) fetch("/report?name=" + encodeURIComponent(q.get("report")), { method: "POST", body: JSON.stringify(r) }).catch(() => {});
+}
+const w = new Worker(`./bench_worker.js?v=${build}`, { type: "module" });
+w.onmessage = (e) => {
+  const m = e.data;
+  if (m.type === "status") out.textContent = m.text;
+  else if (m.type === "result") finish(m.result);
+  else if (m.type === "error") finish({ error: m.message });
+};
+w.onerror = (e) => finish({ error: "worker: " + e.message });
+w.postMessage({ backend, build, prompts: q.get("prompts") || "100,500", reps: Number(q.get("reps") || 3), decode: Number(q.get("decode") || 64), mini: q.get("mini") === "1", phases: q.get("phases") || "cold,decode,exact" });
+</script>
