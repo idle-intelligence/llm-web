@@ -62,7 +62,7 @@ async function timeFirstToken(lean, text, maxNew) {
   return { ttft: first - t0, total: performance.now() - t0, n, reply };
 }
 
-async function run({ backend, build, prompts, reps, decode, mini, phases }) {
+async function run({ backend, build, prompts, reps, decode, mini, phases, sampling }) {
   status("fetching");
   const [gguf, tokenizer, tokenizerCfg] = await Promise.all([
     fetch("./model.gguf").then((r) => r.arrayBuffer()).then((b) => new Uint8Array(b)),
@@ -118,7 +118,10 @@ async function run({ backend, build, prompts, reps, decode, mini, phases }) {
   // buffer reads at once), so the rate is the mean over the whole run, from
   // the first token to the last.
   const stamps = [];
-  const reply = await lean.generate(chat("Write a long story about a lighthouse keeper."), { maxNewTokens: decode, temperature: 0 }, () => stamps.push(performance.now()));
+  // sampling=1 uses the chat page's sampler (temperature, top-k, top-p, repetition penalty).
+  const params = sampling ? { maxNewTokens: decode, temperature: 0.7, topK: 40, topP: 0.9, repetitionPenalty: 1.1, seed: 0 } : { maxNewTokens: decode, temperature: 0 };
+  result.sampling = !!sampling;
+  const reply = await lean.generate(chat("Write a long story about a lighthouse keeper."), params, () => stamps.push(performance.now()));
   result.decodeTokens = stamps.length;
   result.decodeMsPerTok = (stamps[stamps.length - 1] - stamps[0]) / (stamps.length - 1);
   result.decodeTokPerSec = 1000 / result.decodeMsPerTok;
@@ -132,16 +135,18 @@ async function run({ backend, build, prompts, reps, decode, mini, phases }) {
   result.exactHash = await sha(exact);
   result.exactText = exact;
   lean.free();
-  // The same questions, each on a freshly loaded engine (nothing reused from
-  // an earlier call). The reply must not depend on what the cache held.
-  let fresh = "";
-  for (const q of QUESTIONS) {
-    const l2 = await mod.Lean.load({ gguf, tokenizer, maxCtx: 2048, backend: backend === "webgpu" ? "webgpu" : "cpu" });
-    fresh += (await l2.generate(chat(q), { maxNewTokens: 48, temperature: 0 }, () => {})) + "\n";
-    l2.free();
+  if (phases.includes("fresh")) {
+    // The same questions, each on a freshly loaded engine (nothing reused from
+    // an earlier call). The reply must not depend on what the cache held.
+    let fresh = "";
+    for (const q of QUESTIONS) {
+      const l2 = await mod.Lean.load({ gguf, tokenizer, maxCtx: 2048, backend: backend === "webgpu" ? "webgpu" : "cpu" });
+      fresh += (await l2.generate(chat(q), { maxNewTokens: 48, temperature: 0 }, () => {})) + "\n";
+      l2.free();
+    }
+    result.freshHash = await sha(fresh);
+    result.freshEqualsReuse = fresh === exact;
   }
-  result.freshHash = await sha(fresh);
-  result.freshEqualsReuse = fresh === exact;
   self.postMessage({ type: "result", result });
 }
 

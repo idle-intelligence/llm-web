@@ -27,5 +27,5 @@ w.onmessage = (e) => {
   else if (m.type === "error") finish({ error: m.message });
 };
 w.onerror = (e) => finish({ error: "worker: " + e.message });
-w.postMessage({ backend, build, prompts: q.get("prompts") || "100,500", reps: Number(q.get("reps") || 3), decode: Number(q.get("decode") || 64), mini: q.get("mini") === "1", phases: q.get("phases") || "cold,decode,exact" });
+w.postMessage({ backend, build, prompts: q.get("prompts") || "100,500", reps: Number(q.get("reps") || 3), decode: Number(q.get("decode") || 64), mini: q.get("mini") === "1", phases: q.get("phases") || "cold,decode,exact,fresh", sampling: q.get("sampling") === "1" });
 </script>
