@@ -38,6 +38,10 @@ extern "C" {
     fn performance_now() -> f64;
 }
 
+/// Largest single `write_buffer` and the pending bytes that trigger a flush
+/// submit; see `Engine::buf_upload`.
+const UPLOAD_PIECE: usize = 8 << 20;
+
 /// Wall clock in milliseconds for the diagnostics timings: `performance.now()`
 /// in the browser (window or worker), a process-relative `Instant` natively.
 pub fn now_ms() -> f64 {
@@ -115,6 +119,8 @@ pub struct Engine {
     /// the bytes handed to the GPU, so `debug_verify_uploads` can read each
     /// buffer back and say whether the device holds what was uploaded.
     debug_uploads: RefCell<Option<Vec<(String, wgpu::Buffer, u64)>>>,
+    /// Bytes handed to `queue.write_buffer` since the last submit (see `buf_upload`).
+    pending_upload_bytes: Cell<usize>,
     /// Adapter name/backend, features and the limits kernel selection or
     /// buffer chunking depends on, as seen at device creation (JSON).
     pub adapter_report: String,
@@ -388,6 +394,7 @@ impl Engine {
             diag_init_ms: (0.0, 0.0),
             debug_taps: RefCell::new(None),
             debug_uploads: RefCell::new(None),
+            pending_upload_bytes: Cell::new(0),
             adapter_report,
             embed_gather_q4: make_pipeline(&device, "embed_gather_q4", include_str!("shaders/embed_gather_q4.wgsl")),
             embed_gather_q8: make_pipeline(&device, "embed_gather_q8", include_str!("shaders/embed_gather_q8.wgsl")),
@@ -482,10 +489,24 @@ impl Engine {
     /// which made greedy output vary from load to load. `write_buffer` is the
     /// plain WebGPU upload every backend supports, so this is the path on
     /// every device, not a per-device choice.
+    ///
+    /// A `write_buffer` stays staged until the next submit. A browser can
+    /// hold only so much staged data (Firefox on Linux loses the device with
+    /// "Not enough memory left" once about 100 MB are staged, which a ~1 GB model
+    /// reaches), so uploads go in pieces of at most `UPLOAD_PIECE` bytes and
+    /// an empty submit flushes them once `UPLOAD_PIECE` bytes are pending.
+    /// The same on every device.
     pub(crate) fn buf_upload(&self, label: &str, bytes: &[u8], usage: wgpu::BufferUsages) -> wgpu::Buffer {
         let buf = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size: (bytes.len() as u64).max(4), usage, mapped_at_creation: false });
-        if !bytes.is_empty() {
-            self.queue.write_buffer(&buf, 0, bytes);
+        for (i, piece) in bytes.chunks(UPLOAD_PIECE).enumerate() {
+            self.queue.write_buffer(&buf, (i * UPLOAD_PIECE) as u64, piece);
+            let pending = self.pending_upload_bytes.get() + piece.len();
+            if pending >= UPLOAD_PIECE {
+                self.queue.submit([]);
+                self.pending_upload_bytes.set(0);
+            } else {
+                self.pending_upload_bytes.set(pending);
+            }
         }
         buf
     }
