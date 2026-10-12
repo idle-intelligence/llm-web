@@ -2333,7 +2333,7 @@ pub async fn forward_decode_step_argmax(engine: &Engine, model: &GpuModel, cache
 /// browser resolves buffer maps on its own schedule, which on some browsers
 /// is coarse, so a deeper pipeline turns one resolution into several tokens
 /// instead of one. A fixed number, the same on every device.
-const PIPELINE_DEPTH: usize = 8;
+const PIPELINE_DEPTH: usize = 3;
 
 /// One submitted greedy decode step: its argmax id on the GPU (`idx`) and
 /// the 4-byte staging copy of it that `read` maps.
