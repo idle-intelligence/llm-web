@@ -642,9 +642,7 @@ impl Engine {
         slice.map_async(wgpu::MapMode::Read, move |res| {
             let _ = tx.send(res);
         });
-        #[cfg(not(target_arch = "wasm32"))]
-        self.device.poll(wgpu::PollType::Wait).expect("device poll failed");
-        rx.await.expect("map_async channel dropped").expect("buffer map failed");
+        self.map_done(rx).await;
         let data = slice.get_mapped_range();
         let raw: &[u64] = bytemuck::cast_slice(&data);
         let labels = self.profile_labels.borrow();
@@ -743,9 +741,7 @@ impl Engine {
         slice.map_async(wgpu::MapMode::Read, move |res| {
             let _ = tx.send(res);
         });
-        #[cfg(not(target_arch = "wasm32"))]
-        self.device.poll(wgpu::PollType::Wait).expect("device poll failed");
-        rx.await.expect("map_async channel dropped").expect("buffer map failed");
+        self.map_done(rx).await;
         let data = slice.get_mapped_range();
         let raw: &[u64] = bytemuck::cast_slice(&data);
         let period = f64::from(self.timestamp_period);
@@ -887,6 +883,48 @@ impl Engine {
         self.dispatch_count.get()
     }
 
+    /// Waits until a `map_async` request resolved. Natively that is one
+    /// blocking device poll. In the browser nothing here drives the
+    /// resolution, and Firefox only resolves a map when a queue submission
+    /// wakes its poll: left alone, a map takes about 100 ms to resolve there
+    /// (against well under a millisecond in Chromium), so every token read
+    /// back cost 100 ms. While the map is pending, an empty submit goes out
+    /// every timer tick (about 4 ms), which gets it resolved within one tick
+    /// of the GPU finishing; the wait ends the moment the map resolves, so
+    /// browsers that resolve on their own lose nothing.
+    async fn map_done(&self, rx: futures_channel::oneshot::Receiver<Result<(), wgpu::BufferAsyncError>>) {
+        #[cfg(not(target_arch = "wasm32"))]
+        self.device.poll(wgpu::PollType::Wait).expect("device poll failed");
+        #[cfg(all(target_arch = "wasm32", feature = "web"))]
+        let mut rx = rx;
+        #[cfg(all(target_arch = "wasm32", feature = "web"))]
+        let res = loop {
+            use std::future::Future;
+            use std::pin::Pin;
+            use std::task::Poll;
+            let mut tick = timer::Tick::new();
+            let ready = std::future::poll_fn(|cx| {
+                if let Poll::Ready(v) = Pin::new(&mut rx).poll(cx) {
+                    return Poll::Ready(Some(v));
+                }
+                if Pin::new(&mut tick).poll(cx).is_ready() {
+                    return Poll::Ready(None);
+                }
+                Poll::Pending
+            })
+            .await;
+            match ready {
+                Some(v) => break v,
+                None => {
+                    self.queue.submit([]);
+                }
+            }
+        };
+        #[cfg(not(all(target_arch = "wasm32", feature = "web")))]
+        let res = rx.await;
+        res.expect("map_async channel dropped").expect("buffer map failed");
+    }
+
     /// One copy-to-staging + map + read. NEVER call this crate's equivalent
     /// of `.into_data()` synchronously in WASM (deadlocks the browser) :
     /// this is the only readback path, always awaited.
@@ -907,9 +945,7 @@ impl Engine {
         slice.map_async(wgpu::MapMode::Read, move |res| {
             let _ = tx.send(res);
         });
-        #[cfg(not(target_arch = "wasm32"))]
-        self.device.poll(wgpu::PollType::Wait).expect("device poll failed");
-        rx.await.expect("map_async channel dropped").expect("buffer map failed");
+        self.map_done(rx).await;
         let data = slice.get_mapped_range();
         let result: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
         drop(data);
@@ -961,14 +997,69 @@ impl Engine {
     }
 
     pub(crate) async fn finish_map_u32(&self, staging: &wgpu::Buffer, rx: futures_channel::oneshot::Receiver<Result<(), wgpu::BufferAsyncError>>) -> u32 {
-        #[cfg(not(target_arch = "wasm32"))]
-        self.device.poll(wgpu::PollType::Wait).expect("device poll failed");
-        rx.await.expect("map_async channel dropped").expect("buffer map failed");
+        self.map_done(rx).await;
         let slice = staging.slice(..);
         let data = slice.get_mapped_range();
         let result: u32 = bytemuck::cast_slice(&data)[0];
         drop(data);
         staging.unmap();
         result
+    }
+}
+
+/// A timer tick for `Engine::map_done`: resolves after one `setTimeout(0)`.
+#[cfg(all(target_arch = "wasm32", feature = "web"))]
+mod timer {
+    use std::cell::RefCell;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::rc::Rc;
+    use std::task::{Context, Poll, Waker};
+    use wasm_bindgen::prelude::*;
+
+    #[wasm_bindgen]
+    extern "C" {
+        #[wasm_bindgen(js_name = setTimeout)]
+        fn set_timeout(handler: JsValue, ms: i32) -> i32;
+    }
+
+    #[derive(Default)]
+    struct State {
+        fired: bool,
+        waker: Option<Waker>,
+    }
+
+    pub(super) struct Tick {
+        state: Rc<RefCell<State>>,
+        started: bool,
+    }
+
+    impl Tick {
+        pub(super) fn new() -> Self {
+            Tick { state: Rc::default(), started: false }
+        }
+    }
+
+    impl Future for Tick {
+        type Output = ();
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            if self.state.borrow().fired {
+                return Poll::Ready(());
+            }
+            self.state.borrow_mut().waker = Some(cx.waker().clone());
+            if !self.started {
+                self.started = true;
+                let state = self.state.clone();
+                let fire = Closure::once_into_js(move || {
+                    let mut s = state.borrow_mut();
+                    s.fired = true;
+                    if let Some(w) = s.waker.take() {
+                        w.wake();
+                    }
+                });
+                set_timeout(fire, 0);
+            }
+            Poll::Pending
+        }
     }
 }
