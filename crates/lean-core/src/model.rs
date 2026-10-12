@@ -1082,6 +1082,12 @@ fn linear(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &
                 // previously hit the naive per-output-element kernel below.
                 let bg = pool.bind_group(&format!("{key}.decode"), &engine.linear_f32_decode, &entries);
                 engine.dispatch(pass, &engine.linear_f32_decode, &bg, (out_dim.div_ceil(4), 1, 1), key);
+            } else if fast && in_dim % 32 == 0 {
+                // Prefill over F32 weights: the 64x64 register-blocked tile
+                // (linear_f32_tiled.wgsl) instead of one scalar loop per
+                // output.
+                let bg = pool.bind_group(&format!("{key}.tiled"), &engine.linear_f32_tiled, &entries);
+                engine.dispatch(pass, &engine.linear_f32_tiled, &bg, (out_dim.div_ceil(64), rows.div_ceil(64), 1), key);
             } else {
                 let bg = pool.bind_group(key, &engine.linear, &entries);
                 engine.dispatch(pass, &engine.linear, &bg, wgs, key);

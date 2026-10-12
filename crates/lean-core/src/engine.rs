@@ -160,6 +160,8 @@ pub struct Engine {
     /// See `linear_q4_tiled_rb.wgsl`'s header: 64x64 register-blocked tiled
     /// Q4_0 matmul, prefill at `SMALL_M_MAX_ROWS` rows and above.
     pub(crate) linear_q4_tiled_rb: wgpu::ComputePipeline,
+    /// `linear_f32_tiled.wgsl`: the same tile over F32 weights (prefill).
+    pub(crate) linear_f32_tiled: wgpu::ComputePipeline,
     /// `linear_q4_tiled_rb.wgsl` with its `Q8` override: Q8_0 prefill.
     pub(crate) linear_q8_tiled_rb: wgpu::ComputePipeline,
     /// Coalesced Q4_0 matvec (decode, M=1): ported from llm-wasm's
@@ -409,6 +411,7 @@ impl Engine {
             linear_q6k: make_pipeline(&device, "linear_q6k", include_str!("shaders/linear_q6k.wgsl")),
             linear_q6k_decode: make_pipeline(&device, "linear_q6k_decode", include_str!("shaders/linear_q6k_decode.wgsl")),
             linear_q4_tiled_rb: make_pipeline(&device, "linear_q4_tiled_rb", include_str!("shaders/linear_q4_tiled_rb.wgsl")),
+            linear_f32_tiled: make_pipeline(&device, "linear_f32_tiled", include_str!("shaders/linear_f32_tiled.wgsl")),
             linear_q8_tiled_rb: make_pipeline_with_constants(&device, "linear_q8_tiled_rb", include_str!("shaders/linear_q4_tiled_rb.wgsl"), &[("Q8", 1.0)]),
             linear_q4_decode: make_pipeline(&device, "linear_q4_decode", include_str!("shaders/linear_q4_decode.wgsl")),
             linear_q4_decode_swiglu: make_pipeline_with_constants(&device, "linear_q4_decode_swiglu", include_str!("shaders/linear_q4_decode.wgsl"), &[("GATE_UP", 1.0)]),
