@@ -34,6 +34,7 @@
 //! includes the current position).
 
 use anyhow::{Context, Result};
+use std::collections::VecDeque;
 #[cfg(not(target_arch = "wasm32"))]
 use std::fs::File;
 #[cfg(not(target_arch = "wasm32"))]
@@ -2321,6 +2322,13 @@ pub async fn forward_decode_step_argmax(engine: &Engine, model: &GpuModel, cache
     result
 }
 
+/// Greedy decode steps kept submitted ahead of the one being read back (the
+/// oldest step's id is awaited while up to this many are in flight). The
+/// browser resolves buffer maps on its own schedule, which on some browsers
+/// is coarse, so a deeper pipeline turns one resolution into several tokens
+/// instead of one. A fixed number, the same on every device.
+const PIPELINE_DEPTH: usize = 8;
+
 /// One submitted greedy decode step: its argmax id on the GPU (`idx`) and
 /// the 4-byte staging copy of it that `read` maps.
 struct PendingToken {
@@ -2355,9 +2363,10 @@ fn submit_greedy_step(engine: &Engine, model: &GpuModel, cache: &mut KvCache, to
 /// its embedding reads that id from the GPU buffer the previous argmax
 /// wrote (`decode_layers`'s `token_src`). The CPU encodes step t+1 and the
 /// readback latency of step t overlaps the GPU work instead of adding to
-/// it. When the loop stops, the one step submitted ahead is discarded
-/// (its K/V row lies past `cache.kv_len` and is overwritten by the next
-/// write). The pool's uniforms are rewritten between the two submits with
+/// it. Up to `PIPELINE_DEPTH` steps are in flight, each with its map
+/// already requested. When the loop stops, the steps submitted ahead are
+/// discarded (their K/V rows lie past `cache.kv_len` and are overwritten
+/// by the next write). The pool's uniforms are rewritten between the two submits with
 /// `queue.write_buffer`, which the queue orders after the earlier submit,
 /// so each step sees its own positions. `mask` stays the same for every
 /// step. Returns the tokens passed to `on_token`, in order, and the last id
@@ -2371,36 +2380,48 @@ pub async fn decode_greedy_pipelined(engine: &Engine, model: &GpuModel, cache: &
         return (out, None);
     }
     out.push(first_id);
-    let mut pending = submit_greedy_step(engine, model, cache, first_id, None, cos, sin, mask);
-    let mut steps = 1;
+    let mut inflight: VecDeque<(PendingToken, _)> = VecDeque::new();
+    let first = submit_greedy_step(engine, model, cache, first_id, None, cos, sin, mask);
+    let rx = engine.start_map_u32(&first.staging);
+    inflight.push_back((first, rx));
+    let mut submitted = 1;
     loop {
-        let ahead = (steps < max_steps).then(|| submit_greedy_step(engine, model, cache, 0, Some(&pending.idx), cos, sin, mask));
-        let id = engine.map_u32(&pending.staging).await;
-        let Some(ahead) = ahead else { return (out, Some(id)) };
+        while inflight.len() < PIPELINE_DEPTH && submitted < max_steps {
+            let prev = &inflight.back().expect("a step is in flight").0.idx;
+            let next = submit_greedy_step(engine, model, cache, 0, Some(prev), cos, sin, mask);
+            let rx = engine.start_map_u32(&next.staging);
+            inflight.push_back((next, rx));
+            submitted += 1;
+        }
+        let (step, rx) = inflight.pop_front().expect("a step is in flight");
+        let id = engine.finish_map_u32(&step.staging, rx).await;
+        if inflight.is_empty() {
+            return (out, Some(id));
+        }
         if is_stop(id) || !on_token(id) {
-            // The discarded step's staging buffer is dropped unread; any
-            // later GPU work is queued after it.
-            drop(ahead);
-            cache.kv_len -= 1;
+            // The steps submitted ahead are discarded: their staging
+            // buffers are dropped unread and later GPU work is queued
+            // after them.
+            cache.kv_len -= inflight.len() as u32;
             return (out, Some(id));
         }
         out.push(id);
-        steps += 1;
-        pending = ahead;
     }
 }
 
 /// Appends `token_ids` onto a cache already populated up to `cache.kv_len`
 /// (typically just after `KvCache::restore` from a resident-prefix
-/// snapshot) - the "prefill(suffix)" half of KV snapshot/restore. Each token
+/// snapshot) - the "prefill(suffix)" half of KV snapshot/restore. With
+/// head_dim 64 or 128 the suffix runs as one batched prefill (`prefill_batched`:
+/// tiled matmuls, attention over the resident prefix). Otherwise each token
 /// is forced (no argmax - these are known tokens, not generated ones)
 /// through its own `decode_layers` call/submit, exactly `forward_decode_step`'s
 /// shape, except intermediate tokens' logits are never read back (nothing
 /// needs them) - only the *last* token's logits are, matching
 /// `forward_prefill`'s "returns the last position's logits" contract.
 ///
-/// **Deliberately one submit per token, not one encoder/submit for the
-/// whole suffix.** An earlier version of this function batched every
+/// **In that fallback, deliberately one submit per token, not one
+/// encoder/submit for the whole suffix.** An earlier version of this function batched every
 /// token's `decode_layers` call into a single encoder before one submit, to
 /// save dispatch/submit overhead. That hung on native (Metal) with no CPU
 /// spin and no error: `Pool`'s per-call-site uniform buffers (`RopeDims`'s

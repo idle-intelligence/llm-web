@@ -919,14 +919,28 @@ impl Engine {
     }
 
     pub(crate) async fn map_u32(&self, staging: &wgpu::Buffer) -> u32 {
-        let slice = staging.slice(..);
+        let rx = self.start_map_u32(staging);
+        self.finish_map_u32(staging, rx).await
+    }
+
+    /// Requests the map of a `stage_u32` buffer right away, without waiting
+    /// for it. A pipeline that keeps several steps in flight asks for every
+    /// step's map when it submits the step, so the browser has all of them
+    /// outstanding at once and can resolve them together, instead of
+    /// starting each map only after the previous one resolved.
+    pub(crate) fn start_map_u32(&self, staging: &wgpu::Buffer) -> futures_channel::oneshot::Receiver<Result<(), wgpu::BufferAsyncError>> {
         let (tx, rx) = futures_channel::oneshot::channel();
-        slice.map_async(wgpu::MapMode::Read, move |res| {
+        staging.slice(..).map_async(wgpu::MapMode::Read, move |res| {
             let _ = tx.send(res);
         });
+        rx
+    }
+
+    pub(crate) async fn finish_map_u32(&self, staging: &wgpu::Buffer, rx: futures_channel::oneshot::Receiver<Result<(), wgpu::BufferAsyncError>>) -> u32 {
         #[cfg(not(target_arch = "wasm32"))]
         self.device.poll(wgpu::PollType::Wait).expect("device poll failed");
         rx.await.expect("map_async channel dropped").expect("buffer map failed");
+        let slice = staging.slice(..);
         let data = slice.get_mapped_range();
         let result: u32 = bytemuck::cast_slice(&data)[0];
         drop(data);
