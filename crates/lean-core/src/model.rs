@@ -2328,31 +2328,41 @@ pub async fn forward_decode_step_argmax(engine: &Engine, model: &GpuModel, cache
     result
 }
 
-/// Greedy decode steps kept submitted ahead of the one being read back (the
-/// oldest step's id is awaited while up to this many are in flight). The
-/// browser resolves buffer maps on its own schedule, which on some browsers
-/// is coarse, so a deeper pipeline turns one resolution into several tokens
-/// instead of one. A fixed number, the same on every device.
-const PIPELINE_DEPTH: usize = 3;
+/// Greedy decode steps per readback block. Every step appends its argmax id
+/// to a GPU-side block buffer; the host maps that buffer once per block
+/// instead of once per token. Browsers resolve a buffer map on their own
+/// schedule (tens of milliseconds on some), so the cost of a map is paid
+/// once per `GREEDY_BLOCK` tokens. A fixed number, the same on every device.
+const GREEDY_BLOCK: u32 = 8;
 
-/// One submitted greedy decode step: its argmax id on the GPU (`idx`) and
-/// the 4-byte staging copy of it that `read` maps.
-struct PendingToken {
-    idx: wgpu::Buffer,
+/// Blocks kept submitted at once: while the host waits on one block's map
+/// the next block's steps are already queued, so the GPU does not idle.
+const BLOCKS_IN_FLIGHT: usize = 2;
+
+/// One submitted block of greedy steps and the mappable copy of its ids.
+struct PendingBlock {
     staging: wgpu::Buffer,
+    rx: futures_channel::oneshot::Receiver<Result<(), wgpu::BufferAsyncError>>,
 }
 
+/// Submits one greedy decode step. Its argmax id stays on the GPU: it is
+/// copied into `ring` at element `slot` (and, when `stage` is given, the
+/// whole ring is then copied to `stage` for the host). The returned buffer
+/// holds the id for the next step's embedding (`token_src`).
 #[allow(clippy::too_many_arguments)]
-fn submit_greedy_step(engine: &Engine, model: &GpuModel, cache: &mut KvCache, token_id: u32, token_src: Option<&wgpu::Buffer>, cos: &wgpu::Buffer, sin: &wgpu::Buffer, mask: Option<&wgpu::Buffer>) -> PendingToken {
+fn submit_greedy_step(engine: &Engine, model: &GpuModel, cache: &mut KvCache, token_id: u32, token_src: Option<&wgpu::Buffer>, ring: &wgpu::Buffer, slot: u32, stage: Option<(&wgpu::Buffer, u64)>, cos: &wgpu::Buffer, sin: &wgpu::Buffer, mask: Option<&wgpu::Buffer>) -> wgpu::Buffer {
     let t_start = crate::engine::now_ms();
     let mut encoder = engine.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("decode_greedy") });
     let (_, idx) = decode_layers(engine, model, &mut encoder, cache, token_id, token_src, cos, sin, mask, true);
     let idx = idx.expect("decode_layers(argmax=true) always returns Some");
-    let staging = engine.stage_u32(&mut encoder, &idx);
+    encoder.copy_buffer_to_buffer(&idx, 0, ring, 4 * slot as u64, 4);
+    if let Some((staging, bytes)) = stage {
+        encoder.copy_buffer_to_buffer(ring, 0, staging, 0, bytes);
+    }
     engine.queue.submit(Some(encoder.finish()));
     engine.diag_encode_ms.set(crate::engine::now_ms() - t_start);
     cache.kv_len += 1;
-    PendingToken { idx, staging }
+    idx
 }
 
 /// Greedy decode of up to `max_steps` forward steps from `first_id`, with
@@ -2365,19 +2375,21 @@ fn submit_greedy_step(engine: &Engine, model: &GpuModel, cache: &mut KvCache, to
 ///     on_token(next) returns false; next = decode(next)
 /// ```
 ///
-/// but each step is submitted before the previous step's id is read back:
-/// its embedding reads that id from the GPU buffer the previous argmax
-/// wrote (`decode_layers`'s `token_src`). The CPU encodes step t+1 and the
-/// readback latency of step t overlaps the GPU work instead of adding to
-/// it. Up to `PIPELINE_DEPTH` steps are in flight, each with its map
-/// already requested. When the loop stops, the steps submitted ahead are
-/// discarded (their K/V rows lie past `cache.kv_len` and are overwritten
-/// by the next write). The pool's uniforms are rewritten between the two submits with
-/// `queue.write_buffer`, which the queue orders after the earlier submit,
-/// so each step sees its own positions. `mask` stays the same for every
-/// step. Returns the tokens passed to `on_token`, in order, and the last id
-/// read back that was not passed to it (the output of the last step run;
-/// `None` when no step ran).
+/// but the loop stays on the GPU: each step's embedding reads the id the
+/// previous step's argmax wrote (`decode_layers`'s `token_src`), and each
+/// id is appended to a block buffer on the GPU. Steps are submitted in
+/// blocks of `GREEDY_BLOCK`; the host maps one block's ids at a time, with
+/// `BLOCKS_IN_FLIGHT` blocks queued so the GPU keeps working while a map
+/// resolves. The ids of a block reach `on_token` together, in order. When
+/// the loop stops inside a block (EOS, or `on_token` returning false), the
+/// steps submitted past the stopping one are discarded: `cache.kv_len` is
+/// rolled back to what the step-by-step loop would have, and their K/V
+/// rows lie past it and are overwritten by the next write. The pool's
+/// uniforms are rewritten between submits with `queue.write_buffer`, which
+/// the queue orders after the earlier submit, so each step sees its own
+/// positions. `mask` stays the same for every step. Returns the tokens
+/// passed to `on_token`, in order, and the last id read back that was not
+/// passed to it (the output of the last step run; `None` when no step ran).
 #[allow(clippy::too_many_arguments)]
 pub async fn decode_greedy_pipelined(engine: &Engine, model: &GpuModel, cache: &mut KvCache, first_id: u32, max_steps: u32, stop_at_eos: bool, cos: &wgpu::Buffer, sin: &wgpu::Buffer, mask: Option<&wgpu::Buffer>, mut on_token: impl FnMut(u32) -> bool) -> (Vec<u32>, Option<u32>) {
     let is_stop = |id: u32| stop_at_eos && model.config.eos_token_ids.contains(&id);
@@ -2386,32 +2398,52 @@ pub async fn decode_greedy_pipelined(engine: &Engine, model: &GpuModel, cache: &
         return (out, None);
     }
     out.push(first_id);
-    let mut inflight: VecDeque<(PendingToken, _)> = VecDeque::new();
-    let first = submit_greedy_step(engine, model, cache, first_id, None, cos, sin, mask);
-    let rx = engine.start_map_u32(&first.staging);
-    inflight.push_back((first, rx));
-    let mut submitted = 1;
+    let mut blocks: VecDeque<PendingBlock> = VecDeque::new();
+    let mut prev: Option<wgpu::Buffer> = None;
+    let mut submitted = 0u32;
+    let mut consumed = 0u32;
     loop {
-        while inflight.len() < PIPELINE_DEPTH && submitted < max_steps {
-            let prev = &inflight.back().expect("a step is in flight").0.idx;
-            let next = submit_greedy_step(engine, model, cache, 0, Some(prev), cos, sin, mask);
-            let rx = engine.start_map_u32(&next.staging);
-            inflight.push_back((next, rx));
-            submitted += 1;
+        while blocks.len() < BLOCKS_IN_FLIGHT && submitted < max_steps {
+            let n = GREEDY_BLOCK.min(max_steps - submitted);
+            let bytes = 4 * n as u64;
+            let ring = engine.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("greedy_ring"),
+                size: bytes,
+                usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let staging = engine.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("greedy_staging"),
+                size: bytes,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            for slot in 0..n {
+                let stage = (slot + 1 == n).then_some((&staging, bytes));
+                let (token_id, src) = if submitted == 0 && slot == 0 { (first_id, None) } else { (0, prev.as_ref()) };
+                let idx = submit_greedy_step(engine, model, cache, token_id, src, &ring, slot, stage, cos, sin, mask);
+                prev = Some(idx);
+            }
+            submitted += n;
+            let rx = engine.start_map_u32(&staging);
+            blocks.push_back(PendingBlock { staging, rx });
         }
-        let (step, rx) = inflight.pop_front().expect("a step is in flight");
-        let id = engine.finish_map_u32(&step.staging, rx).await;
-        if inflight.is_empty() {
-            return (out, Some(id));
+        let block = blocks.pop_front().expect("a block is in flight");
+        let ids = engine.finish_map_u32s(&block.staging, block.rx).await;
+        for id in ids {
+            consumed += 1;
+            if consumed == max_steps {
+                return (out, Some(id));
+            }
+            if is_stop(id) || !on_token(id) {
+                // The steps submitted past this one are discarded: their
+                // block buffers are dropped unread and later GPU work is
+                // queued after them.
+                cache.kv_len -= submitted - consumed;
+                return (out, Some(id));
+            }
+            out.push(id);
         }
-        if is_stop(id) || !on_token(id) {
-            // The steps submitted ahead are discarded: their staging
-            // buffers are dropped unread and later GPU work is queued
-            // after them.
-            cache.kv_len -= inflight.len() as u32;
-            return (out, Some(id));
-        }
-        out.push(id);
     }
 }
 

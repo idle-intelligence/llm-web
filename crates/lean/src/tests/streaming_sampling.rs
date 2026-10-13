@@ -97,7 +97,7 @@ fn pipelined_greedy_matches_step_loop() {
         expected.push(next);
     }
 
-    for stop_after in [steps, 7] {
+    for stop_after in [steps, 1, 7, 8, 9, 16, 17] {
         let mut cache_b = KvCache::new(&engine, &model.config, max_ctx);
         let logits = pollster::block_on(forward_prefill(&engine, &model, &mut cache_b, &prompt_ids, &cos_buf, &sin_buf, None));
         assert_eq!(argmax(&logits), first);

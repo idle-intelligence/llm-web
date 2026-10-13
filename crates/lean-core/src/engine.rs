@@ -1016,6 +1016,17 @@ impl Engine {
         staging.unmap();
         result
     }
+
+    /// Reads every `u32` of a mapped block buffer made by `start_map_u32`.
+    pub(crate) async fn finish_map_u32s(&self, staging: &wgpu::Buffer, rx: futures_channel::oneshot::Receiver<Result<(), wgpu::BufferAsyncError>>) -> Vec<u32> {
+        self.map_done(rx).await;
+        let slice = staging.slice(..);
+        let data = slice.get_mapped_range();
+        let result: Vec<u32> = bytemuck::cast_slice(&data).to_vec();
+        drop(data);
+        staging.unmap();
+        result
+    }
 }
 
 /// A timer tick for `Engine::map_done`: resolves after one `setTimeout(0)`.
