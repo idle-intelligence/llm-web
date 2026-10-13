@@ -18,5 +18,7 @@ http.createServer((req, res) => {
   res.setHeader("Content-Type", types[path.extname(f)] || "application/octet-stream");
   res.setHeader("Content-Length", fs.statSync(f).size);
   res.setHeader("Cache-Control", "no-store");
+  res.setHeader("Cross-Origin-Opener-Policy", "same-origin");
+  res.setHeader("Cross-Origin-Embedder-Policy", "require-corp");
   fs.createReadStream(f).pipe(res);
 }).listen(Number(port), "127.0.0.1");
