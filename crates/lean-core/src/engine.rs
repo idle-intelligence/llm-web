@@ -309,6 +309,17 @@ fn adapter_report(adapter: &wgpu::Adapter, device: &wgpu::Device) -> String {
     )
 }
 
+/// Every engine owns its device, so dropping the engine destroys the device
+/// and with it every buffer, texture and bind group made from it. Without
+/// this, a browser frees GPU memory only when the JS wrapper objects are
+/// garbage collected (Firefox does so late), and a page that loads several
+/// engines in a row runs the GPU out of memory.
+impl Drop for Engine {
+    fn drop(&mut self) {
+        self.device.destroy();
+    }
+}
+
 impl Engine {
     pub async fn new_async() -> anyhow::Result<Self> {
         Self::new_async_with(false).await

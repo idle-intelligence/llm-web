@@ -3,6 +3,7 @@
 //   suffix prefill the same prompt with ~N/4 more tokens appended (prefix reused)
 //   decode         greedy 64 tokens from a short prompt, ms per token after the first
 //   exact          hash of a fixed 48-token greedy reply (same on every browser and backend)
+// phases=loads: `reps` loads and frees of the engine, `decode` ms pause after each (see run()).
 // Expects ../lean/pkg (built wasm), model.gguf, tokenizer.json and
 // tokenizer_config.json next to the page.
 const EARLY = [];
@@ -72,6 +73,25 @@ async function run({ backend, build, prompts, reps, decode, mini, phases, sampli
   status("loading wasm");
   const mod = await import(`../lean/pkg/lean.js?v=${build}`);
   await mod.default(`../lean/pkg/lean_bg.wasm?v=${build}`);
+  if (phases === "loads") {
+    // Load, answer one fixed question, free, wait, repeat. The page status reads
+    // "settled <k>" once load k has been freed and the pause is over: an outside
+    // sampler of GPU memory reads it there, and it must not grow with k.
+    const n = reps;
+    const settleMs = decode;
+    const template0 = mod.ChatTemplate.fromTokenizerConfig(tokenizerCfg);
+    const hashes = [];
+    for (let k = 1; k <= n; k++) {
+      const l = await mod.Lean.load({ gguf, tokenizer, maxCtx: 2048, backend: backend === "webgpu" ? "webgpu" : "cpu" });
+      const reply = await l.generate(mod.chatRender(template0, [{ role: "user", content: QUESTIONS[0] }], null, true), { maxNewTokens: 32, temperature: 0 }, () => {});
+      hashes.push(await sha(reply));
+      l.free();
+      await new Promise((r) => setTimeout(r, settleMs));
+      status("settled " + k);
+    }
+    self.postMessage({ type: "result", result: { build, loads: n, hashes, allEqual: hashes.every((h) => h === hashes[0]) } });
+    return;
+  }
   const t0 = performance.now();
   const lean = await mod.Lean.load({ gguf, tokenizer, maxCtx: 2048, backend: backend === "webgpu" ? "webgpu" : "cpu" });
   const loadMs = performance.now() - t0;

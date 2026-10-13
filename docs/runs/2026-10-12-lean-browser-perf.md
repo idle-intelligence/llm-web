@@ -74,5 +74,20 @@ These come from the previous session on intermediate builds, same model and prom
 ## What is left
 
 - Firefox decode on macOS (about 9.4 tok/s against 48 on the same machine in other engines): needs profiling of the submit and read path in that browser; the in-flight steps did not change it.
-- Explicit destruction of GPU buffers when an engine is freed, so a page that loads several engines does not depend on garbage collection.
 - Chromium on the Linux test machine and Firefox with the final build on the M2 are not in the tables.
+
+## Engine free destroys the GPU device
+
+`Engine` now implements `Drop` as `device.destroy()`. Each engine owns its device, so freeing a `Lean` releases every buffer, texture and bind group at once instead of when the browser collects the wrapper objects (Firefox does so late, which ran the 10 GB card out of memory on repeated loads).
+
+- Harness: `scripts/bench`, phase `loads` (`phases=loads&reps=4&decode=4000`): load SmolLM2-1.7B Q4_0, answer one fixed question greedily (32 tokens), free, wait 4 s, repeat 4 times. GPU memory is read from `nvidia-smi` (whole card) at each "settled k" status.
+- Linux test machine (RTX 3080), Chromium 152 headed on Xwayland with Vulkan, card at 505 MiB before the run. wasm built from the same tree with and without the `Drop` impl.
+
+| Build | GPU MiB after free, loads 2, 3, 4 (load 1 not sampled) | Peak MiB | Reply hash, 4 loads |
+|---|---|---|---|
+| Without destroy | 3329, 3263, 3269 | 3993 | a1b7eb2ee7a6aded x4 |
+| With destroy | 989, 947, 933 | 3265 | a1b7eb2ee7a6aded x4 |
+
+- Exactness (phases `exact,fresh`, with destroy): exactness hash efa85acfe7945318 and fresh-engine hash efa85acfe7945318, equal to the table above.
+- Freeing now logs one "device lost: destroyed" per engine on the device's `lost` promise (reason `destroyed`); it is the expected result of the destroy.
+- Chromium collected the buffers on its own at roughly constant size, so it showed no growth even without the change; the change returns the memory at the free call. Firefox on the Linux test machine was not run for this check (unverified there).
