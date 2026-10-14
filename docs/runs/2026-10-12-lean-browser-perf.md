@@ -149,3 +149,130 @@ First loads of each cell, before the machine slowed: Chromium 48.2 and 47.9 (128
 
 - Check the build on Firefox 157 release (the browser with the slow readback) with the chat page: expected effect is one map wait per 8 tokens instead of per token; unverified.
 - Quiet-machine rerun of the tables above.
+
+## 2026-10-14: Q4_1 kept quantized on the GPU, Q6_K decode matvec
+
+### Parameters
+
+- Model: SmolLM2-1.7B-Instruct "Q4_0" GGUF. Tensor mix measured from the file: 165 Q4_0 (1560 M weights), 3 Q4_1 (`ffn_down` of three layers, 50.3 M weights, 31.5 MB), 1 Q6_K (tied embedding and output, 100.7 M weights, 82.6 MB), 49 F32 (norms, 0.4 MB).
+- Before: tree at the logit_dump commit (no kernel change). After: this branch. The 3 Q4_1 tensors were dequantized to F32 at load (201.3 MB, read in full every step); the Q6_K head ran the scalar byte-by-byte matvec.
+- Q4_1: the nibbles repack as for Q4_0, `d` and `m` are stored as interleaved f32 pairs in the scales buffer, and the Q4_0 matvec and matmul kernels gain a `Q41` override (value = nibble * d + m): decode with one and with four rows per lane, short and long prefill, and the naive reference kernel. The dequantized values are the same as the F32 load.
+- Q6_K: units of 64 weights read as vec4<u32>, 8 lanes per row with consecutive lanes on consecutive units, four 6-bit values assembled per u32 and converted with the exponent trick.
+- Native decode: `crates/lean/examples/profile_roofline` (decode, 32 steps after 2 warm-up steps; group times from pass timestamps in a split run, wall from unsplit steps), release build, interleaved before/after (ABAB), 5 pairs per context on the M2, median with min and max. Prefill: len 100 and 500, 3 pairs. M2 load average 1.4 to 2.5 at the runs (run script waits for below 2.5), under the shared GPU lock. RTX 3080: 3 pairs at context 128 under the shared GPU lock, 1-minute load 0.8 to 1.5; context 512 and the box test suites were not run (the box stopped answering over SSH for the last hours of this work).
+- Browsers (M2): Chromium 153 (`--use-angle=metal`), WebKit (Playwright build), Firefox Developer Edition 159 headed with a throwaway profile; harness `scripts/bench`, phases `decode,exact` at 128 tokens (3 loads per variant on Chromium, 2 on WebKit and Firefox) and `decode` at 512 tokens (1 load each), before and after interleaved. Served bytes checked by fetching `lean_bg.wasm` back from each server: before 5cf5941146783dc429f9a9f06c0343c6, after 62bf3b6f8cfe82925e6fd87841ebd840 (ENGINE_BUILD 2026-10-14-quant-01 on all four loading URLs).
+- Ceilings (from the profile run doc): M2 read 91.4 GB/s, RTX 3080 read 711 GB/s.
+
+### Results: native decode, M2 (Metal), SmolLM2-1.7B, median [min-max] of 5
+
+| ms | ctx 128 before | ctx 128 after | ctx 512 before | ctx 512 after |
+|---|---:|---:|---:|---:|
+| wall per step | 20.00 [19.98-20.02] | 17.02 [17.00-17.03] | 24.59 [24.58-24.64] | 21.54 [21.52-21.58] |
+| tok/s from wall | 50.0 | 58.8 | 40.7 | 46.4 |
+| down (24 layers, group time) | 4.89 [4.88-4.90] | 3.12 [3.12-3.13] | 4.85 [4.83-4.86] | 3.09 [3.09-3.09] |
+| lm_head (group time) | 2.63 [2.63-2.63] | 0.89 [0.89-0.89] | 2.63 [2.63-2.63] | 0.89 [0.89-0.89] |
+| qkv | 2.42 | 2.41 | 2.41 | 2.41 |
+| o_proj | 0.95 | 0.95 | 0.94 | 0.94 |
+| gate_up | 5.82 | 5.82 | 5.77 | 5.76 |
+| attn | 2.07 | 2.07 | 5.81 | 5.80 |
+
+GPU-resident weights: 1346.4 MB before, 1182.8 MB after.
+
+| Group, M2, ctx 128 | MB read per step before | GB/s before | % of 91.4 | MB after | GB/s after | % of 91.4 |
+|---|---:|---:|---:|---:|---:|---:|
+| down | 399.5 | 81.7 | 89 | 229.7 | 73.6 | 81 |
+| lm_head | 82.6 | 31.4 | 34 | 82.6 | 92.8 | 101 |
+
+### Results: native prefill, M2, wall ms, median of 3
+
+| Prompt | before | after |
+|---|---:|---:|
+| 100 tokens | 625.78 [625.45-626.08] | 620.67 [620.52-621.27] |
+| 500 tokens | 2623.86 [2622.88-2626.75] | 2620.77 [2618.77-2620.82] |
+
+### Results: native decode, RTX 3080 (Vulkan), ctx 128, group time in ms (3 pairs with the final kernels; wall range over 6 runs each)
+
+| ms | before | after |
+|---|---:|---:|
+| down | 1.193 to 1.203 | 1.025 to 1.035 |
+| lm_head | 0.2147 to 0.2163 | 0.1388 to 0.1394 |
+| qkv, o_proj, gate_up, attn | 0.589, 0.340, 0.867, 0.786 | 0.590, 0.341, 0.870, 0.786 |
+| wall per step | 6.98 to 9.43 | 6.77 to 9.13 |
+
+| Group, 3080, ctx 128 | MB per step before | GB/s before | % of 711 | MB after | GB/s after | % of 711 |
+|---|---:|---:|---:|---:|---:|---:|
+| down | 399.5 | 334 | 47 | 229.7 | 223 | 31 |
+| lm_head | 82.6 | 385 | 54 | 82.6 | 595 | 84 |
+
+GPU-resident weights on the 3080 build: same as the M2, 1346.4 MB before and 1182.8 MB after.
+
+### Results: browsers on the M2, decode tok/s, median [min-max]
+
+| Browser | 128 tokens before | 128 after | 512 tokens before | 512 after |
+|---|---:|---:|---:|---:|
+| Chromium 153 | 47.6 [47.5-47.7] (n=3) | 68.3 [68.2-68.4] (n=3) | 43.3 (n=1) | 59.8 (n=1) |
+| WebKit | 50.7 [50.7-50.8] (n=2) | 61.4 [61.3-61.6] (n=2) | 45.3 (n=1) | 53.5 (n=1) |
+| Firefox Dev 159 | 53.7 [53.7-53.7] (n=2) | 66.1 [66.0-66.2] (n=2) | 48.5 (n=1) | 58.5 (n=1) |
+
+Hashes: exactness efa85acfe7945318 in all 20 loads, 128-token decode hash 941622dd5a82970f in all 14 loads that decoded 128 tokens, 512-token decode hash 9731a7102ed3b8d7 in all 6 loads that decoded 512, before and after alike. Browser load averages 1.0 to 1.5.
+
+### Correctness
+
+- Logits against the before build on SmolLM2-1.7B, fixed 100-token prompt, prefill plus 16 greedy decode steps, all 49152 logits compared (`crates/lean/examples/logit_dump.rs`): max |diff| 5.1e-5, same 16 greedy tokens. With the Q4_1 change alone: 5.1e-5 at 100 tokens (also with the four-rows-per-lane decode kernel forced on the Q4_1 tensors: 5.1e-5, bit-identical to the one-row kernel). Q6_K kernel against the previous Q6_K kernel: 1.1e-5 (100 tokens), 9.1e-6 (20 tokens). Naive reference path (12 tokens, 4 steps): 3.2e-3 against the before build, whose naive path runs the F32 kernel; the two differ in summation order over K = 8192.
+- Against HF transformers: `fixture_parity_llama_1_7b` on the Q4_0 GGUF itself (3 Q4_1 and a Q6_K tensor; fixture `fixture_llama_1_7b_q4_0.json`, HF dequantizes the same file), naive and fast kernels: max |prefill top-20 logit - HF| 4.7e-5 and 4.2e-5 (RTX 3080), 4.9e-5 and 5.3e-5 (M2), greedy continuations equal. The Q8_0 file of the same model: 6.3e-5 and 6.7e-5 (3080), 5.4e-5 and 6.5e-5 (M2). New test: `generate_matches_hf_fixture_smollm2_1_7b` in `fixture_parity_generate`.
+- M2 native, ignored suites: `fixture_parity_qwen25_3b` (Q6_K output tensor), `fixture_parity_llama_360m`, `fixture_parity` (both kernel paths), `fixture_parity_generate` for Qwen2.5-0.5B, SmolLM2-360M and SmolLM2-1.7B, `engine_api` 14 of 14: all pass. RTX 3080: `fixture_parity_llama_1_7b`, `fixture_parity` ok; the rest of the box suite was not completed (box unreachable).
+- Non-ignored suites of lean-core, lean, lean-chat pass (release), including the new `q4_1_split_matches_reference_dequant`. clippy `-D warnings` clean: native all targets, wasm32 web, wasm32 web+diag.
+
+### Kernel variants tried for the Q6_K head (ms for the whole head, ctx 128)
+
+| Variant (lanes per row x units per lane) | M2 | RTX 3080 |
+|---|---:|---:|
+| previous scalar kernel | 2.63 | 0.215 |
+| one block per lane, 8 lanes | 1.06 | 0.260 |
+| consecutive units, 32 x 1 | 1.98 | 0.135 |
+| consecutive units, 16 x 2 | 1.18 | 0.131 |
+| consecutive units, 8 x 4 (chosen) | 0.89 | 0.139 |
+| consecutive units, 4 x 8 | 0.87 | 0.146 |
+| consecutive units, 2 x 16 | 0.89 | 0.345 |
+
+(M2 variant rows measured at load 1.0 to 2.1, one run each; 3080 rows two runs each.)
+
+### Observations
+
+- The head was bound by ALU on the M2, not by memory: the scalar kernel did about 30 operations per weight; at the measured 1057 GFLOP/s that is the 2.63 ms. The new kernel does 5 to 6 per weight and reads 82.6 MB in 0.89 ms, at the read ceiling. On the 3080 the same kernel takes the head from 54% to 84% of the read ceiling; the consecutive-lane layout matters there (one block per lane was 1.2x slower than before on the 3080) and is neutral on the M2 at 8 x 4.
+- Keeping the three Q4_1 tensors quantized removes 169.8 MB from the per-step reads (399.5 to 229.7 MB for `down`) and 163.6 MB from GPU memory (13% of 1346.4 MB). On the M2 the `down` group falls from 4.89 to 3.12 ms; its rate drops from 89% to 81% of the read ceiling because the Q4_1 kernel does a fused multiply-add per weight more than the F32 matvec. Prefill is unchanged within noise (`down` 143.63 to 142.75 ms at 100 tokens).
+- On the 3080 `down` reads at 31% of the read ceiling after the change: the one-row-per-lane matvec for 2048-row outputs launches 128 workgroups. That was already the case for the 21 Q4_0 layers and is not part of this change.
+- Whole step at ctx 128 on the M2: 1042 MB (weights plus KV) in 17.02 ms is 61 GB/s, 67% of the read ceiling (before: 1212 MB in 20.00 ms, 61 GB/s, 66%). The remaining gap is qkv (77% of the read ceiling), o_proj (65%), gate_up (85%), down (81%) and attention.
+- The browser gains (Chromium +43%, WebKit +21%, Firefox +23% at 128 tokens) are larger than the native +18% (50.0 to 58.8 tok/s); native and browser use different shader compilers (naga for Metal, Tint for Chromium, the browsers' own for WebKit and Firefox), and the cause was not isolated.
+- On the RTX 3080 box a prefill-only run (8 tokens, 0 decode steps, same binary, same file) gives different logits from process to process: 11 of 40 runs differed from the most common value, in the before build as well, with small-M kernels disabled too. All 562 uploaded buffers (1.37 GB) read back identical to the uploaded bytes in 12 of 12 runs, and repeated prefills inside one process agree with each other (12 of 12). The M2 gave one value in 20 of 20 runs. Cause not found. It limits the box to checking logits by tolerance (the differences are about 1e-3), not by hash. A build there also died once with a rustc SIGSEGV, which matches the flaky-RAM suspicion.
+
+### Quant types the loader does not keep quantized
+
+The loader (`gguf.rs::GgmlDtype`) reads F32, F16, Q4_0, Q4_1, Q8_0 and Q6_K and rejects every other type while parsing the tensor index, so a file holding any other type does not load at all. Before this change Q4_1, F16 and F32 matmul weights became F32 on the GPU; after it only F16 and F32 do. The CPU backend still dequantizes Q4_1 to F32.
+
+| Type | Bytes per weight | As F32 | Ratio | State |
+|---|---:|---:|---:|---|
+| Q4_1 | 0.625 | 4 | 6.4x | kept quantized now |
+| F16 | 2 | 4 | 2x | loaded as F32 |
+| Q5_0 | 0.6875 | 4 | 5.8x | file rejected |
+| Q5_1 | 0.75 | 4 | 5.3x | file rejected |
+| Q4_K | 0.5625 | 4 | 7.1x | file rejected |
+| Q5_K | 0.6875 | 4 | 5.8x | file rejected |
+| Q3_K | 0.4297 | 4 | 9.3x | file rejected |
+| Q2_K | 0.3281 | 4 | 12.2x | file rejected |
+
+Measured tensor mixes of GGUFs on disk (weights per type, native bytes against the F32 expansion):
+
+| File | Type: tensors, MB native (MB as F32) |
+|---|---|
+| SmolLM2-1.7B Q4_0 | Q4_0: 165, 877.7 (6241); Q4_1: 3, 31.5 (201); Q6_K: 1, 82.6 (403); F32: 49 |
+| SmolLM2-360M Q4_0 | Q4_0: 220, 171.4 (1219); Q4_1: 4, 6.1 (39); Q8_0: 1, 50.1 (189); F32: 65 |
+| SmolLM2-360M Q4_K_M (does not load) | Q5_0: 176, 158.8 (924); Q4_K: 16, 22.1 (157); Q6_K: 16, 32.3 (157); Q8_0: 17, 55.4 (208); F32: 65 |
+| Qwen2.5-3B Q4_0 | Q4_0: 253, 1735.7 (12343); Q6_K: 1, 255.3 (1245); F32: 181 |
+| Qwen2.5-0.5B Q4_0 | Q4_0: 169, 277.9 (1976); Q8_0: 1, 144.6 (545); F32: 121 |
+| Qwen3-1.7B Q8_0 | Q8_0: 197, 1828.0 (6882); F32: 113 |
+
+### What is left
+
+- Q5_0 and Q4_K (the two types behind the Q4_K_M file above, 181 MB of its 268 MB) are the next types worth a kernel: a "Q4_K_M" file is what most Hub models ship, and none of them loads today.
+- Q4_1 on the CPU backend is still dequantized to F32 at load.
+- Box: context 512, the remaining test suites, and the process-to-process logit variation above.
