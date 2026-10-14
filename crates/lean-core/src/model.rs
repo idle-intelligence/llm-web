@@ -1148,7 +1148,11 @@ pub(crate) fn linear(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<
             for chunk in chunks {
                 let ckey = format!("{key}.{}", chunk.row_start);
                 let sckey = scratch_key(&ckey);
-                let dims = pool.uniform(&format!("{sckey}.dims"), LinearQDims { m: rows, k: in_dim, n: chunk.rows, act: 0, blocks_per_row: *blocks_per_row, n_offset: chunk.row_start, n_total: *n_total, _p2: 0 });
+                // Its own key: `blocks_per_row` counts 256-value blocks here, 32-value
+                // blocks for every other format, and layers of one model can mix both
+                // (Q4_K_M files keep half of attn_v and ffn_down at Q6_K) while sharing
+                // this scratch key, so one value would be written over the other.
+                let dims = pool.uniform(&format!("{sckey}.dims_q6k"), LinearQDims { m: rows, k: in_dim, n: chunk.rows, act: 0, blocks_per_row: *blocks_per_row, n_offset: chunk.row_start, n_total: *n_total, _p2: 0 });
                 let entries = [
                     BindGroupEntry { binding: 0, resource: x.as_entire_binding() },
                     BindGroupEntry { binding: 1, resource: chunk.ql.as_entire_binding() },
@@ -1162,6 +1166,13 @@ pub(crate) fn linear(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<
                 if fast && rows == 1 {
                     let bg = pool.bind_group(&format!("{ckey}.decode"), &engine.linear_q6k_decode, &entries);
                     engine.dispatch(pass, &engine.linear_q6k_decode, &bg, (chunk.rows.div_ceil(16), 1, 1), &ckey);
+                } else if fast && rows > 1 {
+                    // Prefill: 64x64 tile (see linear_q6k_tiled.wgsl). The
+                    // half of attn_v/ffn_down that Q4_K_M files keep at Q6_K
+                    // runs here in every layer.
+                    let pipeline = engine.pipe(&engine.linear_q6k_tiled);
+                    let bg = pool.bind_group(&format!("{ckey}.tiled"), pipeline, &entries);
+                    engine.dispatch(pass, pipeline, &bg, (chunk.rows.div_ceil(64), rows.div_ceil(64), 1), &ckey);
                 } else {
                     let bg = pool.bind_group(&ckey, &engine.linear_q6k, &entries);
                     engine.dispatch(pass, &engine.linear_q6k, &bg, (chunk.rows.div_ceil(16), rows.div_ceil(16), 1), &ckey);

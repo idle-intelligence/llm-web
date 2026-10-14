@@ -199,6 +199,8 @@ pub struct Engine {
     /// Q5_0 and Q4_K builds of the Q4_0-family kernels, compiled on first use.
     pub(crate) q50: Q4Family,
     pub(crate) k4: Q4Family,
+    /// `linear_q6k_tiled.wgsl`: Q6_K prefill tile.
+    pub(crate) linear_q6k_tiled: LazyPipeline,
     pub(crate) embed_gather_q5: LazyPipeline,
     pub(crate) embed_gather_q4k: LazyPipeline,
     pub(crate) attn_prefill: wgpu::ComputePipeline,
@@ -564,6 +566,7 @@ impl Engine {
             linear_q41_decode_r4: make_pipeline_with_constants(&device, "linear_q41_decode_r4", include_str!("shaders/linear_q4_decode_r4.wgsl"), &[("Q41", 1.0)]),
             linear_q41_small_m: make_pipeline_with_constants(&device, "linear_q41_small_m", include_str!("shaders/linear_q4_small_m.wgsl"), &[("Q41", 1.0)]),
             linear_q41_tiled_rb: make_pipeline_with_constants(&device, "linear_q41_tiled_rb", include_str!("shaders/linear_q4_tiled_rb.wgsl"), &[("Q41", 1.0)]),
+            linear_q6k_tiled: LazyPipeline::new("linear_q6k_tiled", include_str!("shaders/linear_q6k_tiled.wgsl"), &[], false),
             embed_gather_q5: LazyPipeline::new("embed_gather_q5", include_str!("shaders/embed_gather_q5.wgsl"), &[], false),
             embed_gather_q4k: LazyPipeline::new("embed_gather_q4k", EMBED_GATHER_Q4K, &[], false),
             q50: Q4Family::q50(grant_f16),
