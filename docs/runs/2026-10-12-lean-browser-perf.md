@@ -276,3 +276,74 @@ Measured tensor mixes of GGUFs on disk (weights per type, native bytes against t
 - Q5_0 and Q4_K (the two types behind the Q4_K_M file above, 181 MB of its 268 MB) are the next types worth a kernel: a "Q4_K_M" file is what most Hub models ship, and none of them loads today.
 - Q4_1 on the CPU backend is still dequantized to F32 at load.
 - Box: context 512, the remaining test suites, and the process-to-process logit variation above.
+
+## 2026-10-14: decode attention against context length
+
+Change: the split-K pass 1 kernel (`attn_decode_split.wgsl`) read each key row with one thread per key, so neighbouring threads were 256 bytes apart (SmolLM2-1.7B, head_dim 64). Now 8 adjacent threads share one key and read contiguous vec4 slices of its row; the tile max and sum use broadcast reads of workgroup memory instead of two barrier trees; the V accumulation is unrolled by four keys. The split count and chunk size (`decode_split_plan`) are unchanged, so there is no new tuning input and no API change. Workgroup size stays at head_dim (64 or 128), no subgroups.
+
+### Parameters
+
+- Model SmolLM2-1.7B-Instruct Q4_0 (32 query heads, 32 KV heads, head_dim 64, F32 KV cache), greedy. Native harness: `crates/lean/examples/decode_ctx.rs` (prefill N tokens of a repeated prompt, then 64 pipelined greedy steps, median of 3 loads of the loop per cell; 5 interleaved process runs, before then after). Browser harness: `scripts/bench` phase decode, 128 / 512 / 1900 new tokens (the story ends by itself at 963 tokens, so the 1900 row is a 963-token run), 5 page loads per cell (3 for 1900), before then after interleaved.
+- Before: shader of the previous commit. After: this branch. wasm md5 before 120efbdcac048db0523e3a0053c52a01, after 9d1dae68c4b92487ff03dbf701dd6ba0 (built once on the Linux test machine, copied to the M2 with matching md5, served under distinct tags and fetched back).
+- M2 laptop: 1-minute load average 0.8 to 2.7 for the native runs; 1.0 to 6.7 for the browser runs (other workers built and ran on it). Linux test machine (RTX 3080): load under 1 for native, GPU behind a lock. Chromium 153 (Metal, headless) and WebKit via Playwright; Firefox Developer Edition 159 headed with a throwaway profile on the M2; Chromium 152 headed on Vulkan on the Linux machine.
+
+### Results: native decode, ms per token (median, min-max)
+
+| Context | M2 before | M2 after | RTX 3080 before | RTX 3080 after |
+|---|---|---|---|---|
+| 128 | 21.5 (21.3-21.6) | 21.0 (20.9-23.2) | 4.61 (4.55-4.64) | 4.28 (4.24-4.30) |
+| 512 | 25.2 (25.1-25.2) | 22.8 (22.7-23.6) | 4.82 (4.78-4.86) | 4.47 (4.43-4.48) |
+| 1024 | 28.8 (28.6-28.8) | 25.3 (25.2-25.4) | 5.26 (5.23-5.29) | 4.78 (4.73-4.78) |
+| 2048 | 38.2 (37.9-38.3) | 33.3 (33.2-33.4) | 11.45 (11.41-11.46) | 5.59 (5.56-5.60) |
+
+M2 before has 4 runs (the first one timed out waiting for the GPU lock), after has 5. A quieter earlier M2 session gave before 19.3 / 23.5 / 27.7 / 36.8 ms and after 18.9 / 21.3 / 24.6 / 32.5 ms at the same four contexts (single run each).
+
+RTX 3080, finer contexts, ms per token:
+
+| Context | 1024 | 1100 | 1300 | 1536 | 1800 | 2048 |
+|---|---|---|---|---|---|---|
+| Before | 5.25 | 5.47 | 6.02 | 7.34 | 9.93 | 11.41 |
+| After | 4.77 | 4.85 | 4.98 | 5.11 | 5.31 | 5.60 |
+
+### Results: browser decode, tok/s (median, min-max)
+
+M2:
+
+| Browser | New tokens | Before | After |
+|---|---|---|---|
+| Chromium 153 | 128 | 47.3 (39.2-47.6) | 46.7 (37.9-48.9) |
+| Chromium 153 | 512 | 37.1 (36.7-38.3) | 39.5 (39.1-42.2) |
+| Chromium 153 | 963 | 33.5 (32.0-34.7) | 38.3 (37.9-39.8) |
+| WebKit | 128 | 39.5 (38.1-40.9) | 40.4 (38.1-41.7) |
+| WebKit | 512 | 39.3 (39.0-39.4) | 41.1 (40.9-41.6) |
+| WebKit | 963 | 34.5 (34.2-34.6) | 36.7 (36.4-37.1) |
+| Firefox Dev 159 | 128 | 45.3 (42.2-45.5) | 46.0 (43.4-49.5) |
+| Firefox Dev 159 | 512 | 41.5 (40.2-41.8) | 43.7 (42.9-43.9) |
+| Firefox Dev 159 | 963 | 35.5 (35.4-36.0) | 39.0 (38.6-39.1) |
+
+RTX 3080, Chromium 152 headed (Vulkan), 5 loads:
+
+| New tokens | Before | After |
+|---|---|---|
+| 128 | 226.1 (225.1-227.1) | 243.3 (241.9-243.6) |
+| 512 | 221.4 (220.9-221.6) | 241.9 (241.5-242.3) |
+| 963 | 212.6 (212.4-212.9) | 233.5 (233.4-233.6) |
+
+### Correctness
+
+- Decode text hashes before and after are identical in every browser run: 941622dd5a82970f (128 tokens), 9731a7102ed3b8d7 (512), da4a25fb6ebc98b8 (963); exactness hash efa85acfe7945318 before and after on the Linux machine's Chromium. Native greedy id hashes per context (128 to 2048, and 33 to 300 around the 64-key split threshold) are identical before and after on both machines; a 60-token chat reply is identical on the RTX 3080.
+- Largest absolute logit difference against the previous kernel, over the first 4 to 6 decode steps after each prefill: SmolLM2-1.7B 2.3e-5 (M2) and 4.0e-5 / 4.7e-5 (RTX 3080, contexts 128 to 2048 and 33 to 300); Qwen3-1.7B Q8_0 (head_dim 128) 5.2e-5 (M2), with identical id hashes at 512 and 2048.
+- Tests on the M2 (release): lean-core, lean, lean-chat suites pass; with models on disk: engine_api 14 of 14, fixture_parity_generate Qwen2.5-0.5B and SmolLM2-360M, fixture_parity (both kernel paths), llama 360M (GPU and CPU), llama 1.7B, Qwen2.5-3B, Qwen3-0.6B, Qwen3-1.7B, kv_snapshot, logit_mask, pool_reuse, all ok. Not run (missing model, LoRA or config files on this machine): the Llama-3.2 cases, the LoRA tests, two lean-core unit tests that read files. clippy `-D warnings` as in CI: native all targets, wasm32 web, wasm32 web+diag, clean.
+- A first version of the shader named a local `dot` and then called the builtin `dot()`. naga (native) accepted it, Chromium's Tint rejected the module, the pipeline was invalid and the browser's greedy reply stopped after 25 tokens with a different hash. Fixed in the next commit; the browser tables above are from the fixed build. Native tests cannot catch this class of error; the browser decode hash can.
+
+### Observations
+
+- The 3080 curve before the change was not linear: 5.25 ms at 1024, then 7.3 at 1536 and 11.4 at 2048, against 4.2 ms of non-attention time, so attention went from 1.0 to 7.2 ms for 2x the keys. After the change the same curve is linear (attention 0.6 ms at 1024, 1.3 at 2048, read floor about 1.1 ms). The cause is not proven (no hardware counters); the old kernel read each 256-byte key row one float at a time with neighbours a row apart, so every load touched a separate cache line and relied on later loads of the same row hitting in cache. With more split workgroups resident at once (the split count grows with the context up to 32) that reuse would be lost. The change removes the dependence on reuse, and the cliff goes with it.
+- On the M2 the attention part at 2048 fell from about 17.5 to 12.5 ms of the added step time (38.2 and 33.3 ms against about 21 at 128), the read floor being about 8.8 ms (F32 KV, 32 KV heads). Decode at 2048 context is still 1.6x slower than at 128 there.
+- Browser gains follow the context the run reaches: none at 128 tokens (within spread), 6 to 7% at 512, 9 to 14% at 963 on M2 browsers, 9 to 10% on the RTX 3080.
+
+### What is left
+
+- M2 attention at 2048 is about 1.4x its read floor; an f16 or int8 KV cache would lower the floor itself but changes numerics and is not part of this change.
+- Long prompt with a short reply was measured natively only (decode after prefill of N tokens), not through the browser pages.
+- Firefox on the Linux machine was not run.
