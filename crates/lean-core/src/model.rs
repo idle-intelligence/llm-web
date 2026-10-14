@@ -1129,8 +1129,9 @@ fn linear(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &
                 } else if fast {
                     // Prefill, M >= SMALL_M_MAX_ROWS: the 64x64 tiled kernel
                     // (linear_q4_tiled_rb.wgsl with its Q8 override).
-                    let bg = pool.bind_group(&format!("{ckey}.tiled_rb"), &engine.linear_q8_tiled_rb, &entries);
-                    engine.dispatch(pass, &engine.linear_q8_tiled_rb, &bg, (chunk.rows.div_ceil(64), rows.div_ceil(64), 1), &ckey);
+                    let pipeline = engine.linear_q8_tiled_f16.as_ref().unwrap_or(&engine.linear_q8_tiled_rb);
+                    let bg = pool.bind_group(&format!("{ckey}.tiled_rb"), pipeline, &entries);
+                    engine.dispatch(pass, pipeline, &bg, (chunk.rows.div_ceil(64), rows.div_ceil(64), 1), &ckey);
                 } else {
                     let bg = pool.bind_group(&ckey, &engine.linear_q8, &entries);
                     engine.dispatch(pass, &engine.linear_q8, &bg, (chunk.rows.div_ceil(16), rows.div_ceil(16), 1), &ckey);
@@ -1208,7 +1209,7 @@ fn linear(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &
                 } else {
                     // Prefill, M >= SMALL_M_MAX_ROWS: 64x64 register-blocked
                     // tiled kernel (see linear_q4_tiled_rb.wgsl's header).
-                    let pipeline = if q41 { &engine.linear_q41_tiled_rb } else { &engine.linear_q4_tiled_rb };
+                    let pipeline = if q41 { &engine.linear_q41_tiled_rb } else { engine.linear_q4_tiled_f16.as_ref().unwrap_or(&engine.linear_q4_tiled_rb) };
                     let bg = pool.bind_group(&format!("{ckey}.tiled_rb"), pipeline, &entries);
                     engine.dispatch(pass, pipeline, &bg, (chunk.rows.div_ceil(64), rows.div_ceil(64), 1), &ckey);
                 }

@@ -164,6 +164,12 @@ pub struct Engine {
     pub(crate) linear_f32_tiled: wgpu::ComputePipeline,
     /// `linear_q4_tiled_rb.wgsl` with its `Q8` override: Q8_0 prefill.
     pub(crate) linear_q8_tiled_rb: wgpu::ComputePipeline,
+    /// `linear_q4_tiled_f16.wgsl` (and its `Q8` override): the prefill tile
+    /// with f16 shared tiles and f16 partial sums. `Some` only when the
+    /// device was granted `shader-f16`, which is requested whenever the
+    /// adapter offers it; the F32 pipelines above are used otherwise.
+    pub(crate) linear_q4_tiled_f16: Option<wgpu::ComputePipeline>,
+    pub(crate) linear_q8_tiled_f16: Option<wgpu::ComputePipeline>,
     /// Coalesced Q4_0 matvec (decode, M=1): ported from llm-wasm's
     /// shader_q4_matvec_coalesced.wgsl. The fast decode kernel; it uses no
     /// cooperative-group extension, so it runs on any WebGPU adapter.
@@ -254,6 +260,9 @@ pub struct Engine {
     /// `model.rs::gather_dequant_head_rows`.
     pub(crate) gather_dequant_q8_rows: wgpu::ComputePipeline,
 }
+
+/// Set to `0` to leave `shader-f16` ungranted even when the adapter has it.
+const F16_ENV_VAR: &str = "LEAN_F16";
 
 fn make_pipeline(device: &wgpu::Device, label: &str, src: &str) -> wgpu::ComputePipeline {
     make_pipeline_with_constants(device, label, src, &[])
@@ -371,6 +380,12 @@ impl Engine {
         if grant_pass_timestamps {
             required_features |= wgpu::Features::TIMESTAMP_QUERY;
         }
+        // shader-f16 is requested whenever the adapter has it. LEAN_F16=0
+        // keeps the F32 prefill kernels on such an adapter (native A/B runs).
+        let grant_f16 = adapter.features().contains(wgpu::Features::SHADER_F16) && std::env::var(F16_ENV_VAR).as_deref() != Ok("0");
+        if grant_f16 {
+            required_features |= wgpu::Features::SHADER_F16;
+        }
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("lean"),
@@ -431,6 +446,8 @@ impl Engine {
             linear_q4_tiled_rb: make_pipeline(&device, "linear_q4_tiled_rb", include_str!("shaders/linear_q4_tiled_rb.wgsl")),
             linear_f32_tiled: make_pipeline(&device, "linear_f32_tiled", include_str!("shaders/linear_f32_tiled.wgsl")),
             linear_q8_tiled_rb: make_pipeline_with_constants(&device, "linear_q8_tiled_rb", include_str!("shaders/linear_q4_tiled_rb.wgsl"), &[("Q8", 1.0)]),
+            linear_q4_tiled_f16: grant_f16.then(|| make_pipeline(&device, "linear_q4_tiled_f16", include_str!("shaders/linear_q4_tiled_f16.wgsl"))),
+            linear_q8_tiled_f16: grant_f16.then(|| make_pipeline_with_constants(&device, "linear_q8_tiled_f16", include_str!("shaders/linear_q4_tiled_f16.wgsl"), &[("Q8", 1.0)])),
             linear_q4_decode: make_pipeline(&device, "linear_q4_decode", include_str!("shaders/linear_q4_decode.wgsl")),
             linear_q4_decode_swiglu: make_pipeline_with_constants(&device, "linear_q4_decode_swiglu", include_str!("shaders/linear_q4_decode.wgsl"), &[("GATE_UP", 1.0)]),
             linear_q4_decode_r4: make_pipeline(&device, "linear_q4_decode_r4", include_str!("shaders/linear_q4_decode_r4.wgsl")),
