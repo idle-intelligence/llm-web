@@ -3,6 +3,10 @@
 //   suffix prefill the same prompt with ~N/4 more tokens appended (prefix reused)
 //   decode         greedy 64 tokens from a short prompt, ms per token after the first
 //   exact          hash of a fixed 48-token greedy reply (same on every browser and backend)
+// phases=reuse: prompt-reuse sequences. On one engine, a story prompt is
+//   generated once or more with short replies (the repeat finds all of the
+//   prompt cached but its last token), then a different question; the reply
+//   to the question must equal the reply of a freshly loaded engine.
 // phases=loads: `reps` loads and frees of the engine, `decode` ms pause after each (see run()).
 // Expects ../lean/pkg (built wasm), model.gguf, tokenizer.json and
 // tokenizer_config.json next to the page.
@@ -77,6 +81,29 @@ async function run({ backend, build, prompts, reps, decode, mini, phases, sampli
   status("loading wasm");
   const mod = await import(`../lean/pkg/lean.js?v=${build}`);
   await mod.default(`../lean/pkg/lean_bg.wasm?v=${build}`);
+  if (phases === "reuse") {
+    const tpl = mod.ChatTemplate.fromTokenizerConfig(tokenizerCfg);
+    const ask = (t) => mod.chatRender(tpl, [{ role: "user", content: t }], null, true);
+    const STORY = "Write a long story about a lighthouse keeper.";
+    const load = () => mod.Lean.load({ gguf, tokenizer, maxCtx: 2048, backend: backend === "webgpu" ? "webgpu" : "cpu" });
+    const fresh = [];
+    for (const q of QUESTIONS) {
+      const l = await load();
+      fresh.push(await l.generate(ask(q), { maxNewTokens: 48, temperature: 0 }, () => {}));
+      l.free();
+    }
+    const out = {};
+    for (const [name, prior] of Object.entries({ "S1,S1": [[STORY, 1], [STORY, 1]], "S8,S8": [[STORY, 8], [STORY, 8]], "S64,S64,S64": [[STORY, 64], [STORY, 64], [STORY, 64]], "Q2,Q2": [[QUESTIONS[1], 48], [QUESTIONS[1], 48]] })) {
+      const l = await load();
+      for (const [t, n] of prior) await l.generate(ask(t), { maxNewTokens: n, temperature: 0 }, () => {});
+      const replies = [];
+      for (const q of QUESTIONS) replies.push(await l.generate(ask(q), { maxNewTokens: 48, temperature: 0 }, () => {}));
+      l.free();
+      out[name] = { hash: await sha(replies.join("\n")), equalsFresh: replies.every((r, i) => r === fresh[i]), first: replies[0].slice(0, 60) };
+    }
+    self.postMessage({ type: "result", result: { build, freshHash: await sha(fresh.join("\n")), reuse: out, reuseOk: Object.values(out).every((o) => o.equalsFresh) } });
+    return;
+  }
   if (phases === "loads") {
     // Load, answer one fixed question, free, wait, repeat. The page status reads
     // "settled <k>" once load k has been freed and the pause is over: an outside
