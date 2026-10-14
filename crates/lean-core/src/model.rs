@@ -1991,6 +1991,9 @@ async fn prefill_batched(engine: &Engine, model: &GpuModel, cache: &mut KvCache,
     let pool = &model.pool;
     let t_start = crate::engine::now_ms();
     engine.diag_begin();
+    if engine.profiling_enabled() {
+        engine.reset_profile();
+    }
 
     let mut encoder = engine.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("prefill") });
     // One open ComputePass for the whole prefill outside the per-layer
@@ -2096,6 +2099,7 @@ async fn prefill_batched(engine: &Engine, model: &GpuModel, cache: &mut KvCache,
     }
     drop(pass);
 
+    let profile = engine.resolve_profile(&mut encoder);
     let diag = engine.diag_resolve(&mut encoder);
     engine.queue.submit(Some(encoder.finish()));
     let t_submitted = crate::engine::now_ms();
@@ -2105,6 +2109,10 @@ async fn prefill_batched(engine: &Engine, model: &GpuModel, cache: &mut KvCache,
     engine.diag_wait_ms.set(crate::engine::now_ms() - t_submitted);
     if let Some((buf, count)) = diag {
         engine.diag_collect(&buf, count).await;
+    }
+    if let Some((buf, count)) = profile {
+        let data = engine.read_profile(&buf, count).await;
+        crate::profile_report::record_step(&data);
     }
     cache.kv_len = prefix + seq;
     all_logits
