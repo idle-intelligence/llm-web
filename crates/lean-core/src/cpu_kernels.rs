@@ -561,6 +561,83 @@ pub fn dot_q6_k(bytes: &[u8], x: &[f32]) -> f32 {
     }
 }
 
+/// One row's Q5_0 block bytes (22 bytes per 32 values) dotted against `x`
+/// (`x.len()` must equal `blocks_per_row * 32`). Plain Rust on every target:
+/// the block is widened to integers in a fixed-size array the compiler
+/// vectorizes (NEON, simd128) without a hand-written kernel.
+#[inline]
+pub fn dot_q5_0(bytes: &[u8], x: &[f32]) -> f32 {
+    let mut acc = 0f32;
+    for (block, xb) in bytes.as_chunks::<22>().0.iter().zip(x.as_chunks::<32>().0) {
+        let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+        let qh = u32::from_le_bytes([block[2], block[3], block[4], block[5]]);
+        let mut s = 0f32;
+        for j in 0..16 {
+            let byte = block[6 + j];
+            let lo = ((byte & 0x0F) as u32 | (((qh >> j) & 1) << 4)) as i32 - 16;
+            let hi = ((byte >> 4) as u32 | (((qh >> (j + 16)) & 1) << 4)) as i32 - 16;
+            s += lo as f32 * xb[j] + hi as f32 * xb[j + 16];
+        }
+        acc += s * d;
+    }
+    acc
+}
+
+/// One row's Q4_K block bytes (144 bytes per 256 values) dotted against `x`
+/// (`x.len()` must equal the row's value count). Per sub-block of 32 values
+/// the sums of `nibble * x` and of `x` are formed, then
+/// `d * sc * sum(nibble * x) - dmin * m * sum(x)`. Plain Rust on every target.
+#[inline]
+pub fn dot_q4_k(bytes: &[u8], x: &[f32]) -> f32 {
+    let mut acc = 0f32;
+    for (block, xb) in bytes.as_chunks::<144>().0.iter().zip(x.as_chunks::<256>().0) {
+        let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+        let dmin = f16_to_f32(u16::from_le_bytes([block[2], block[3]]));
+        let scales = &block[4..16];
+        let qs = &block[16..144];
+        for g in 0..4 {
+            let (sc1, m1) = crate::gguf::q4_k_scale_min(2 * g, scales);
+            let (sc2, m2) = crate::gguf::q4_k_scale_min(2 * g + 1, scales);
+            let (mut qx1, mut sx1, mut qx2, mut sx2) = (0f32, 0f32, 0f32, 0f32);
+            for l in 0..32 {
+                let q = qs[g * 32 + l];
+                let (x1, x2) = (xb[g * 64 + l], xb[g * 64 + 32 + l]);
+                qx1 += (q & 0xF) as f32 * x1;
+                sx1 += x1;
+                qx2 += (q >> 4) as f32 * x2;
+                sx2 += x2;
+            }
+            acc += d * sc1 as f32 * qx1 - dmin * m1 as f32 * sx1;
+            acc += d * sc2 as f32 * qx2 - dmin * m2 as f32 * sx2;
+        }
+    }
+    acc
+}
+
+/// One row of F16 values (2 bytes each, little-endian) dotted against `x`.
+#[inline]
+pub fn dot_f16(bytes: &[u8], x: &[f32]) -> f32 {
+    let mut acc = [0f32; 4];
+    for (b, xc) in bytes.as_chunks::<8>().0.iter().zip(x.as_chunks::<4>().0) {
+        for l in 0..4 {
+            acc[l] += f16_to_f32(u16::from_le_bytes([b[2 * l], b[2 * l + 1]])) * xc[l];
+        }
+    }
+    (acc[0] + acc[1]) + (acc[2] + acc[3])
+}
+
+/// One row of BF16 values (the top 16 bits of an f32, little-endian) dotted against `x`.
+#[inline]
+pub fn dot_bf16(bytes: &[u8], x: &[f32]) -> f32 {
+    let mut acc = [0f32; 4];
+    for (b, xc) in bytes.as_chunks::<8>().0.iter().zip(x.as_chunks::<4>().0) {
+        for l in 0..4 {
+            acc[l] += f32::from_bits((u16::from_le_bytes([b[2 * l], b[2 * l + 1]]) as u32) << 16) * xc[l];
+        }
+    }
+    (acc[0] + acc[1]) + (acc[2] + acc[3])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -635,5 +712,45 @@ mod tests {
         let scalar = dot_q6_k_scalar(&bytes, &x);
         let dispatched = dot_q6_k(&bytes, &x);
         assert!((scalar - dispatched).abs() < 1e-2, "scalar={scalar} dispatched={dispatched}");
+    }
+
+    fn lcg(seed: &mut u32) -> u32 {
+        *seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+        *seed >> 8
+    }
+
+    fn close(a: f32, b: f32) -> bool {
+        (a - b).abs() <= 1e-3 * (1.0 + b.abs())
+    }
+
+    #[test]
+    fn q5_0_dot_matches_dequantized_dot() {
+        let mut seed = 7;
+        let bytes: Vec<u8> = (0..22 * 6).map(|i| if i % 22 < 2 { if i % 22 == 0 { 0x66 } else { 0x2c } } else { lcg(&mut seed) as u8 }).collect();
+        let x: Vec<f32> = (0..6 * 32).map(|i| (i as f32) * 0.013 - 1.2).collect();
+        let want: f32 = crate::gguf::dequantize_q5_0(&bytes, x.len()).iter().zip(&x).map(|(w, v)| w * v).sum();
+        assert!(close(dot_q5_0(&bytes, &x), want), "{} vs {want}", dot_q5_0(&bytes, &x));
+    }
+
+    #[test]
+    fn q4_k_dot_matches_dequantized_dot() {
+        let mut seed = 11;
+        let bytes: Vec<u8> = (0..144 * 3).map(|i| if i % 144 < 4 { [0x66, 0x2c, 0x1a, 0x24][i % 144] } else { lcg(&mut seed) as u8 }).collect();
+        let x: Vec<f32> = (0..3 * 256).map(|i| ((i * 7 % 101) as f32) * 0.02 - 1.0).collect();
+        let want: f32 = crate::gguf::dequantize_q4_k(&bytes, x.len()).iter().zip(&x).map(|(w, v)| w * v).sum();
+        assert!(close(dot_q4_k(&bytes, &x), want), "{} vs {want}", dot_q4_k(&bytes, &x));
+    }
+
+    #[test]
+    fn half_dots_match_dequantized_dot() {
+        let mut seed = 3;
+        let vals: Vec<f32> = (0..64).map(|_| (lcg(&mut seed) % 2000) as f32 * 0.001 - 1.0).collect();
+        let x: Vec<f32> = (0..64).map(|i| (i as f32) * 0.03 - 1.0).collect();
+        let f16: Vec<u8> = vals.iter().flat_map(|v| half::f16::from_f32(*v).to_le_bytes()).collect();
+        let bf16: Vec<u8> = vals.iter().flat_map(|v| ((v.to_bits() >> 16) as u16).to_le_bytes()).collect();
+        let want16: f32 = crate::gguf::dequantize_f16(&f16, 64).iter().zip(&x).map(|(w, v)| w * v).sum();
+        let wantb: f32 = crate::gguf::dequantize_bf16(&bf16, 64).iter().zip(&x).map(|(w, v)| w * v).sum();
+        assert!(close(dot_f16(&f16, &x), want16));
+        assert!(close(dot_bf16(&bf16, &x), wantb));
     }
 }

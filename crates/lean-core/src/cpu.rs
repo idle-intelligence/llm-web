@@ -21,7 +21,7 @@ use anyhow::{Context, Result};
 use std::io::{Read, Seek};
 
 use crate::config::{config_from_gguf, Architecture, Qwen2Config};
-use crate::cpu_kernels::{dot_q4_0, dot_q6_k, dot_q8_0, F4};
+use crate::cpu_kernels::{dot_bf16, dot_f16, dot_q4_0, dot_q4_k, dot_q5_0, dot_q6_k, dot_q8_0, F4};
 use crate::gguf::{dequantize_for, GgmlDtype, GgufReader};
 use crate::model::{rope_inv_freq, unpermute_rope_rows};
 
@@ -37,6 +37,11 @@ pub(crate) enum CpuWeight {
     Q4_0 { bytes: Vec<u8>, out_dim: usize, in_dim: usize, blocks_per_row: usize },
     Q8_0 { bytes: Vec<u8>, out_dim: usize, in_dim: usize, blocks_per_row: usize },
     Q6_K { bytes: Vec<u8>, out_dim: usize, in_dim: usize, blocks_per_row: usize },
+    Q5_0 { bytes: Vec<u8>, out_dim: usize, in_dim: usize, blocks_per_row: usize },
+    Q4_K { bytes: Vec<u8>, out_dim: usize, in_dim: usize, blocks_per_row: usize },
+    /// F16 and BF16 rows stay at two bytes per value.
+    F16 { bytes: Vec<u8>, out_dim: usize, in_dim: usize },
+    BF16 { bytes: Vec<u8>, out_dim: usize, in_dim: usize },
 }
 
 impl CpuWeight {
@@ -45,7 +50,11 @@ impl CpuWeight {
             CpuWeight::F32 { out_dim, in_dim, .. } => (*out_dim, *in_dim),
             CpuWeight::Q4_0 { out_dim, in_dim, .. } => (*out_dim, *in_dim),
             CpuWeight::Q8_0 { out_dim, in_dim, .. } => (*out_dim, *in_dim),
-            CpuWeight::Q6_K { out_dim, in_dim, .. } => (*out_dim, *in_dim),
+            CpuWeight::Q6_K { out_dim, in_dim, .. }
+            | CpuWeight::Q5_0 { out_dim, in_dim, .. }
+            | CpuWeight::Q4_K { out_dim, in_dim, .. }
+            | CpuWeight::F16 { out_dim, in_dim, .. }
+            | CpuWeight::BF16 { out_dim, in_dim, .. } => (*out_dim, *in_dim),
         }
     }
 
@@ -72,6 +81,16 @@ impl CpuWeight {
                 let bytes_per_row = blocks_per_row * 210;
                 dot_q6_k(&bytes[row * bytes_per_row..(row + 1) * bytes_per_row], x)
             }
+            CpuWeight::Q5_0 { bytes, blocks_per_row, .. } => {
+                let bytes_per_row = blocks_per_row * 22;
+                dot_q5_0(&bytes[row * bytes_per_row..(row + 1) * bytes_per_row], x)
+            }
+            CpuWeight::Q4_K { bytes, blocks_per_row, .. } => {
+                let bytes_per_row = blocks_per_row * 144;
+                dot_q4_k(&bytes[row * bytes_per_row..(row + 1) * bytes_per_row], x)
+            }
+            CpuWeight::F16 { bytes, in_dim, .. } => dot_f16(&bytes[row * in_dim * 2..(row + 1) * in_dim * 2], x),
+            CpuWeight::BF16 { bytes, in_dim, .. } => dot_bf16(&bytes[row * in_dim * 2..(row + 1) * in_dim * 2], x),
         }
     }
 }
@@ -107,6 +126,16 @@ impl CpuWeight {
                 let n = blocks_per_row * 210;
                 out.copy_from_slice(&crate::gguf::dequantize_q6_k(&bytes[row * n..(row + 1) * n], out.len()));
             }
+            CpuWeight::Q5_0 { bytes, blocks_per_row, .. } => {
+                let n = blocks_per_row * 22;
+                out.copy_from_slice(&crate::gguf::dequantize_q5_0(&bytes[row * n..(row + 1) * n], out.len()));
+            }
+            CpuWeight::Q4_K { bytes, blocks_per_row, .. } => {
+                let n = blocks_per_row * 144;
+                out.copy_from_slice(&crate::gguf::dequantize_q4_k(&bytes[row * n..(row + 1) * n], out.len()));
+            }
+            CpuWeight::F16 { bytes, in_dim, .. } => out.copy_from_slice(&crate::gguf::dequantize_f16(&bytes[row * in_dim * 2..(row + 1) * in_dim * 2], *in_dim)),
+            CpuWeight::BF16 { bytes, in_dim, .. } => out.copy_from_slice(&crate::gguf::dequantize_bf16(&bytes[row * in_dim * 2..(row + 1) * in_dim * 2], *in_dim)),
         }
     }
 }
@@ -427,6 +456,10 @@ enum CpuEmbed {
     Q4_0 { bytes: Vec<u8>, blocks_per_row: usize, hidden: usize },
     Q8_0 { bytes: Vec<u8>, blocks_per_row: usize, hidden: usize },
     Q6_K { bytes: Vec<u8>, blocks_per_row: usize, hidden: usize },
+    Q5_0 { bytes: Vec<u8>, blocks_per_row: usize, hidden: usize },
+    Q4_K { bytes: Vec<u8>, blocks_per_row: usize, hidden: usize },
+    F16 { bytes: Vec<u8>, hidden: usize },
+    BF16 { bytes: Vec<u8>, hidden: usize },
 }
 
 impl CpuEmbed {
@@ -449,6 +482,24 @@ impl CpuEmbed {
                 let bytes_per_row = blocks_per_row * 210;
                 let start = token_id as usize * bytes_per_row;
                 crate::gguf::dequantize_q6_k(&bytes[start..start + bytes_per_row], *hidden)
+            }
+            CpuEmbed::Q5_0 { bytes, blocks_per_row, hidden } => {
+                let bytes_per_row = blocks_per_row * 22;
+                let start = token_id as usize * bytes_per_row;
+                crate::gguf::dequantize_q5_0(&bytes[start..start + bytes_per_row], *hidden)
+            }
+            CpuEmbed::Q4_K { bytes, blocks_per_row, hidden } => {
+                let bytes_per_row = blocks_per_row * 144;
+                let start = token_id as usize * bytes_per_row;
+                crate::gguf::dequantize_q4_k(&bytes[start..start + bytes_per_row], *hidden)
+            }
+            CpuEmbed::F16 { bytes, hidden } => {
+                let start = token_id as usize * hidden * 2;
+                crate::gguf::dequantize_f16(&bytes[start..start + hidden * 2], *hidden)
+            }
+            CpuEmbed::BF16 { bytes, hidden } => {
+                let start = token_id as usize * hidden * 2;
+                crate::gguf::dequantize_bf16(&bytes[start..start + hidden * 2], *hidden)
             }
         }
     }
@@ -494,6 +545,10 @@ fn weight_from_bytes(bytes: Vec<u8>, dtype: GgmlDtype, out_dim: usize, in_dim: u
         GgmlDtype::Q4_0 => CpuWeight::Q4_0 { bytes, out_dim, in_dim, blocks_per_row: in_dim / 32 },
         GgmlDtype::Q8_0 => CpuWeight::Q8_0 { bytes, out_dim, in_dim, blocks_per_row: in_dim / 32 },
         GgmlDtype::Q6_K => CpuWeight::Q6_K { bytes, out_dim, in_dim, blocks_per_row: in_dim / 256 },
+        GgmlDtype::Q5_0 => CpuWeight::Q5_0 { bytes, out_dim, in_dim, blocks_per_row: in_dim / 32 },
+        GgmlDtype::Q4_K => CpuWeight::Q4_K { bytes, out_dim, in_dim, blocks_per_row: in_dim / 256 },
+        GgmlDtype::F16 if in_dim.is_multiple_of(4) => CpuWeight::F16 { bytes, out_dim, in_dim },
+        GgmlDtype::BF16 if in_dim.is_multiple_of(4) => CpuWeight::BF16 { bytes, out_dim, in_dim },
         other => CpuWeight::F32 { data: dequantize_for(other, &bytes, out_dim * in_dim), out_dim, in_dim },
     }
 }
@@ -548,21 +603,20 @@ impl CpuModel {
         let embed_shape = embed_info.shape();
         let embed_dtype = embed_info.dtype();
         anyhow::ensure!(
-            matches!(embed_dtype, GgmlDtype::Q4_0 | GgmlDtype::Q8_0 | GgmlDtype::Q6_K),
-            "expected token_embd.weight to be Q4_0, Q8_0 or Q6_K, got {embed_dtype:?}"
+            matches!(embed_dtype, GgmlDtype::Q4_0 | GgmlDtype::Q5_0 | GgmlDtype::Q8_0 | GgmlDtype::Q4_K | GgmlDtype::Q6_K | GgmlDtype::F16 | GgmlDtype::BF16),
+            "token_embd.weight: {embed_dtype:?} is not supported as an embedding table (Q4_0, Q5_0, Q8_0, Q4_K, Q6_K, F16 and BF16 are)"
         );
         let hidden = embed_shape[1];
         let embed_bytes = reader.tensor_data("token_embd.weight")?;
-        let tied_lm_head = config.tied_embeddings.then(|| match embed_dtype {
-            GgmlDtype::Q4_0 => CpuWeight::Q4_0 { bytes: embed_bytes.clone(), out_dim: embed_shape[0], in_dim: hidden, blocks_per_row: hidden / 32 },
-            GgmlDtype::Q8_0 => CpuWeight::Q8_0 { bytes: embed_bytes.clone(), out_dim: embed_shape[0], in_dim: hidden, blocks_per_row: hidden / 32 },
-            GgmlDtype::Q6_K => CpuWeight::Q6_K { bytes: embed_bytes.clone(), out_dim: embed_shape[0], in_dim: hidden, blocks_per_row: hidden / 256 },
-            _ => unreachable!(),
-        });
+        let tied_lm_head = config.tied_embeddings.then(|| weight_from_bytes(embed_bytes.clone(), embed_dtype, embed_shape[0], hidden));
         let embed = match embed_dtype {
             GgmlDtype::Q4_0 => CpuEmbed::Q4_0 { bytes: embed_bytes, blocks_per_row: hidden / 32, hidden },
+            GgmlDtype::Q5_0 => CpuEmbed::Q5_0 { bytes: embed_bytes, blocks_per_row: hidden / 32, hidden },
             GgmlDtype::Q8_0 => CpuEmbed::Q8_0 { bytes: embed_bytes, blocks_per_row: hidden / 32, hidden },
+            GgmlDtype::Q4_K => CpuEmbed::Q4_K { bytes: embed_bytes, blocks_per_row: hidden / 256, hidden },
             GgmlDtype::Q6_K => CpuEmbed::Q6_K { bytes: embed_bytes, blocks_per_row: hidden / 256, hidden },
+            GgmlDtype::F16 => CpuEmbed::F16 { bytes: embed_bytes, hidden },
+            GgmlDtype::BF16 => CpuEmbed::BF16 { bytes: embed_bytes, hidden },
             _ => unreachable!(),
         };
 
