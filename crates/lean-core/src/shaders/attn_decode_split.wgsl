@@ -35,16 +35,22 @@
 // per-thread-owns-one-output-dim design and `HEAD_DIM` override constant as
 // `attn_decode.wgsl` - see that file's doc comment).
 override HEAD_DIM: u32 = 64u;
-const SHARED_CAP: u32 = 256u;
 const MAX_SPLITS: u32 = 32u;
-var<workgroup> q_shared: array<f32, SHARED_CAP>;
-var<workgroup> tile_scores: array<f32, SHARED_CAP>;
-var<workgroup> reduce_buf: array<f32, SHARED_CAP>;
+// Each key's dot product is shared by LANES adjacent threads, each reading a
+// contiguous slice of the key row as vec4 loads (adjacent threads read
+// adjacent memory), instead of one thread walking a whole row with a
+// HEAD_DIM-float stride between neighbours. The LANES partial sums go through
+// workgroup memory and the key's owner thread adds them.
+const LANES: u32 = 8u;
+// Workgroup arrays are sized for the largest head_dim (128).
+var<workgroup> q_shared: array<vec4<f32>, 32>;
+var<workgroup> partial: array<f32, 1024>;
+var<workgroup> tile_scores: array<f32, 128>;
 
 struct Dims { n_heads: u32, n_kv_heads: u32, head_dim: u32, kv_len: u32, max_ctx: u32, scale: f32, chunk: u32, _p0: u32 };
 
 @group(0) @binding(0) var<storage, read> q: array<f32>;
-@group(0) @binding(1) var<storage, read> k_cache: array<f32>;
+@group(0) @binding(1) var<storage, read> k_cache: array<vec4<f32>>;
 @group(0) @binding(2) var<storage, read> v_cache: array<f32>;
 @group(0) @binding(3) var<storage, read_write> partial_m: array<f32>;
 @group(0) @binding(4) var<storage, read_write> partial_l: array<f32>;
@@ -59,22 +65,25 @@ fn main(@builtin(workgroup_id) wg_id: vec3<u32>, @builtin(local_invocation_id) l
     let kv_head = h / n_rep;
     let tid = local_id.x;
     let hd = dims.head_dim;
+    let lane = tid % LANES;
+    let key_in_pass = tid / LANES;
+    let slice4 = HEAD_DIM / (LANES * 4u); // vec4 loads per lane per key
+    let kpp = HEAD_DIM / LANES;           // keys covered per pass
 
     let kv_start = split * dims.chunk;
     let kv_end = min(kv_start + dims.chunk, dims.kv_len);
 
-    q_shared[tid] = q[h * hd + tid];
+    if (tid < HEAD_DIM / 4u) {
+        let b = h * hd + tid * 4u;
+        q_shared[tid] = vec4<f32>(q[b], q[b + 1u], q[b + 2u], q[b + 3u]);
+    }
     workgroupBarrier();
 
     var m: f32 = -1e30;
     var l: f32 = 0.0;
     var acc: f32 = 0.0; // this thread owns output dimension `tid`
 
-    // Defensive: ceil-division split boundaries should never put kv_start
-    // past kv_len for a dispatched split index, but writing a neutral
-    // partial here (instead of trusting the arithmetic) makes an off-by-one
-    // in the split/chunk formula a no-op in the reduce merge rather than a
-    // NaN from an empty softmax.
+    // An empty chunk writes a neutral partial so the reduce merge ignores it.
     if (kv_start >= kv_end) {
         let idx0 = h * MAX_SPLITS + split;
         if (tid == 0u) {
@@ -90,69 +99,60 @@ fn main(@builtin(workgroup_id) wg_id: vec3<u32>, @builtin(local_invocation_id) l
         if (tile_start >= kv_end) {
             break;
         }
-        let key = tile_start + tid;
-        var raw: f32 = -1e30;
-        if (key < kv_end) {
+        // Scores: pass p covers keys tile_start + p*kpp + key_in_pass.
+        for (var p: u32 = 0u; p < LANES; p = p + 1u) {
+            let key = tile_start + p * kpp + key_in_pass;
             var dot: f32 = 0.0;
-            let k_base = (kv_head * dims.max_ctx + key) * hd;
-            for (var d: u32 = 0u; d < hd; d = d + 1u) {
-                dot = dot + k_cache[k_base + d] * q_shared[d];
+            if (key < kv_end) {
+                let base4 = ((kv_head * dims.max_ctx + key) * hd) / 4u + lane * slice4;
+                for (var i: u32 = 0u; i < slice4; i = i + 1u) {
+                    dot = dot + dot(k_cache[base4 + i], q_shared[lane * slice4 + i]);
+                }
             }
-            raw = dot * dims.scale;
+            partial[p * HEAD_DIM + tid] = dot;
         }
-        tile_scores[tid] = raw;
         workgroupBarrier();
 
-        reduce_buf[tid] = raw;
-        workgroupBarrier();
-        var stride: u32 = HEAD_DIM / 2u;
-        loop {
-            if (stride == 0u) {
-                break;
-            }
-            if (tid < stride) {
-                reduce_buf[tid] = max(reduce_buf[tid], reduce_buf[tid + stride]);
-            }
-            workgroupBarrier();
-            stride = stride / 2u;
+        // Thread `tid` owns key tile_start + tid: partials of key j live at
+        // pass j / kpp, threads (j % kpp) * LANES .. + LANES.
+        let pass_of = tid / kpp;
+        let pbase = pass_of * HEAD_DIM + (tid % kpp) * LANES;
+        var s: f32 = 0.0;
+        for (var i: u32 = 0u; i < LANES; i = i + 1u) {
+            s = s + partial[pbase + i];
         }
-        let tile_max = reduce_buf[0];
+        let key_o = tile_start + tid;
+        tile_scores[tid] = select(-1e30, s * dims.scale, key_o < kv_end);
         workgroupBarrier();
 
+        // Tile max: every thread reads the same shared values (broadcast).
+        var tile_max: f32 = -1e30;
+        for (var j: u32 = 0u; j < HEAD_DIM; j = j + 1u) {
+            tile_max = max(tile_max, tile_scores[j]);
+        }
         let new_m = max(m, tile_max);
         let factor = exp(m - new_m);
         l = l * factor;
         acc = acc * factor;
-
-        let this_p = select(0.0, exp(raw - new_m), key < kv_end);
-        tile_scores[tid] = this_p;
-        reduce_buf[tid] = this_p;
         workgroupBarrier();
-        stride = HEAD_DIM / 2u;
-        loop {
-            if (stride == 0u) {
-                break;
-            }
-            if (tid < stride) {
-                reduce_buf[tid] = reduce_buf[tid] + reduce_buf[tid + stride];
-            }
-            workgroupBarrier();
-            stride = stride / 2u;
-        }
-        l = l + reduce_buf[0];
+        tile_scores[tid] = select(0.0, exp(tile_scores[tid] - new_m), key_o < kv_end);
         workgroupBarrier();
 
+        let n_valid = min(HEAD_DIM, kv_end - tile_start);
+        let v_base = (kv_head * dims.max_ctx + tile_start) * hd + tid;
         var j: u32 = 0u;
-        loop {
-            if (j >= HEAD_DIM) {
-                break;
-            }
-            let kk = tile_start + j;
-            if (kk >= kv_end) {
-                break;
-            }
-            acc = acc + tile_scores[j] * v_cache[(kv_head * dims.max_ctx + kk) * hd + tid];
-            j = j + 1u;
+        for (; j + 4u <= n_valid; j = j + 4u) {
+            let p0 = tile_scores[j];
+            let p1 = tile_scores[j + 1u];
+            let p2 = tile_scores[j + 2u];
+            let p3 = tile_scores[j + 3u];
+            l = l + (p0 + p1 + p2 + p3);
+            acc = acc + p0 * v_cache[v_base + j * hd] + p1 * v_cache[v_base + (j + 1u) * hd] + p2 * v_cache[v_base + (j + 2u) * hd] + p3 * v_cache[v_base + (j + 3u) * hd];
+        }
+        for (; j < n_valid; j = j + 1u) {
+            let pj = tile_scores[j];
+            l = l + pj;
+            acc = acc + pj * v_cache[v_base + j * hd];
         }
 
         m = new_m;
