@@ -196,6 +196,11 @@ pub struct Engine {
     pub(crate) linear_q41_decode_r4: wgpu::ComputePipeline,
     pub(crate) linear_q41_small_m: wgpu::ComputePipeline,
     pub(crate) linear_q41_tiled_rb: wgpu::ComputePipeline,
+    /// Q5_0 and Q4_K builds of the Q4_0-family kernels, compiled on first use.
+    pub(crate) q50: Q4Family,
+    pub(crate) k4: Q4Family,
+    pub(crate) embed_gather_q5: LazyPipeline,
+    pub(crate) embed_gather_q4k: LazyPipeline,
     pub(crate) attn_prefill: wgpu::ComputePipeline,
     /// `attn_prefill_tiled.wgsl` (head_dim 64) and its HEAD_DIM = 128 build.
     pub(crate) attn_prefill_tiled: wgpu::ComputePipeline,
@@ -264,6 +269,103 @@ pub struct Engine {
 /// Set to `0` to leave `shader-f16` ungranted even when the adapter has it.
 const F16_ENV_VAR: &str = "LEAN_F16";
 
+/// Where the Q4_0-family shaders (`linear_q4*.wgsl`) take their block-metadata
+/// declarations: `compose_aux` replaces this comment with `aux_with.wgsl`
+/// (a seventh binding, `aux`, for the Q5_0 and Q4_K builds) or `aux_none.wgsl`
+/// (no binding, so the Q4_0, Q4_1 and Q8_0 builds keep the six-binding layout
+/// they always had), then `aux_common.wgsl`.
+const AUX_MARKER: &str = "//@AUX";
+/// Where a shader that declares its own `aux` and `scales` bindings
+/// (`embed_gather_q4k.wgsl`) takes the shared block-metadata helpers.
+const K4_DM_MARKER: &str = "//@K4_DM";
+
+fn compose_aux(src: &str, with_binding: bool) -> String {
+    let decl = if with_binding { include_str!("shaders/aux_with.wgsl") } else { include_str!("shaders/aux_none.wgsl") };
+    src.replace(AUX_MARKER, &format!("{decl}\n{}", include_str!("shaders/aux_common.wgsl")))
+}
+
+/// A pipeline compiled on first use: formats a model does not contain never
+/// pay for their shaders at engine start.
+pub(crate) struct LazyPipeline {
+    cell: std::cell::OnceCell<wgpu::ComputePipeline>,
+    label: &'static str,
+    src: &'static str,
+    constants: &'static [(&'static str, f64)],
+    with_aux: bool,
+}
+
+impl LazyPipeline {
+    pub(crate) const fn new(label: &'static str, src: &'static str, constants: &'static [(&'static str, f64)], with_aux: bool) -> Self {
+        Self { cell: std::cell::OnceCell::new(), label, src, constants, with_aux }
+    }
+
+    fn get(&self, device: &wgpu::Device) -> &wgpu::ComputePipeline {
+        self.cell.get_or_init(|| {
+            let mut src = if self.with_aux { Cow::Owned(compose_aux(self.src, true)) } else { Cow::Borrowed(self.src) };
+            if src.contains(K4_DM_MARKER) {
+                src = Cow::Owned(src.replace(K4_DM_MARKER, include_str!("shaders/aux_common.wgsl")));
+            }
+            make_pipeline_with_constants(device, self.label, &src, self.constants)
+        })
+    }
+}
+
+/// The Q4_0-family kernels built for one block format that needs the `aux`
+/// binding (Q5_0 or Q4_K): naive reference, decode matvec (one and four rows
+/// per lane), their fused gate/up builds, short and long prefill, and the f16
+/// prefill tile when the device grants `shader-f16`.
+pub(crate) struct Q4Family {
+    pub(crate) naive: LazyPipeline,
+    pub(crate) decode: LazyPipeline,
+    pub(crate) decode_r4: LazyPipeline,
+    pub(crate) swiglu: LazyPipeline,
+    pub(crate) swiglu_r4: LazyPipeline,
+    pub(crate) small_m: LazyPipeline,
+    pub(crate) tiled_rb: LazyPipeline,
+    pub(crate) tiled_f16: Option<LazyPipeline>,
+}
+
+const EMBED_GATHER_Q4K: &str = include_str!("shaders/embed_gather_q4k.wgsl");
+
+const SRC_Q4_NAIVE: &str = include_str!("shaders/linear_q4.wgsl");
+const SRC_Q4_DECODE: &str = include_str!("shaders/linear_q4_decode.wgsl");
+const SRC_Q4_DECODE_R4: &str = include_str!("shaders/linear_q4_decode_r4.wgsl");
+const SRC_Q4_SMALL_M: &str = include_str!("shaders/linear_q4_small_m.wgsl");
+const SRC_Q4_TILED_RB: &str = include_str!("shaders/linear_q4_tiled_rb.wgsl");
+const SRC_Q4_TILED_F16: &str = include_str!("shaders/linear_q4_tiled_f16.wgsl");
+
+impl Q4Family {
+    fn q50(grant_f16: bool) -> Self {
+        const C: &[(&str, f64)] = &[("Q50", 1.0)];
+        const C_GATE_UP: &[(&str, f64)] = &[("Q50", 1.0), ("GATE_UP", 1.0)];
+        Self {
+            naive: LazyPipeline::new("linear_q50", SRC_Q4_NAIVE, C, true),
+            decode: LazyPipeline::new("linear_q50_decode", SRC_Q4_DECODE, C, true),
+            decode_r4: LazyPipeline::new("linear_q50_decode_r4", SRC_Q4_DECODE_R4, C, true),
+            swiglu: LazyPipeline::new("linear_q50_decode_swiglu", SRC_Q4_DECODE, C_GATE_UP, true),
+            swiglu_r4: LazyPipeline::new("linear_q50_decode_swiglu_r4", SRC_Q4_DECODE_R4, C_GATE_UP, true),
+            small_m: LazyPipeline::new("linear_q50_small_m", SRC_Q4_SMALL_M, C, true),
+            tiled_rb: LazyPipeline::new("linear_q50_tiled_rb", SRC_Q4_TILED_RB, C, true),
+            tiled_f16: grant_f16.then(|| LazyPipeline::new("linear_q50_tiled_f16", SRC_Q4_TILED_F16, C, true)),
+        }
+    }
+
+    fn k4(grant_f16: bool) -> Self {
+        const C: &[(&str, f64)] = &[("K4", 1.0)];
+        const C_GATE_UP: &[(&str, f64)] = &[("K4", 1.0), ("GATE_UP", 1.0)];
+        Self {
+            naive: LazyPipeline::new("linear_k4", SRC_Q4_NAIVE, C, true),
+            decode: LazyPipeline::new("linear_k4_decode", SRC_Q4_DECODE, C, true),
+            decode_r4: LazyPipeline::new("linear_k4_decode_r4", SRC_Q4_DECODE_R4, C, true),
+            swiglu: LazyPipeline::new("linear_k4_decode_swiglu", SRC_Q4_DECODE, C_GATE_UP, true),
+            swiglu_r4: LazyPipeline::new("linear_k4_decode_swiglu_r4", SRC_Q4_DECODE_R4, C_GATE_UP, true),
+            small_m: LazyPipeline::new("linear_k4_small_m", SRC_Q4_SMALL_M, C, true),
+            tiled_rb: LazyPipeline::new("linear_k4_tiled_rb", SRC_Q4_TILED_RB, C, true),
+            tiled_f16: grant_f16.then(|| LazyPipeline::new("linear_k4_tiled_f16", SRC_Q4_TILED_F16, C, true)),
+        }
+    }
+}
+
 fn make_pipeline(device: &wgpu::Device, label: &str, src: &str) -> wgpu::ComputePipeline {
     make_pipeline_with_constants(device, label, src, &[])
 }
@@ -273,9 +375,10 @@ fn make_pipeline(device: &wgpu::Device, label: &str, src: &str) -> wgpu::Compute
 /// `PipelineCompilationOptions`, so one shader source compiles to a
 /// different fixed `@workgroup_size` per model.
 fn make_pipeline_with_constants(device: &wgpu::Device, label: &str, src: &str, constants: &[(&str, f64)]) -> wgpu::ComputePipeline {
+    let src: Cow<str> = if src.contains(AUX_MARKER) { Cow::Owned(compose_aux(src, false)) } else { Cow::Borrowed(src) };
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some(label),
-        source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(src)),
+        source: wgpu::ShaderSource::Wgsl(src),
     });
     device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
         label: Some(label),
@@ -461,6 +564,10 @@ impl Engine {
             linear_q41_decode_r4: make_pipeline_with_constants(&device, "linear_q41_decode_r4", include_str!("shaders/linear_q4_decode_r4.wgsl"), &[("Q41", 1.0)]),
             linear_q41_small_m: make_pipeline_with_constants(&device, "linear_q41_small_m", include_str!("shaders/linear_q4_small_m.wgsl"), &[("Q41", 1.0)]),
             linear_q41_tiled_rb: make_pipeline_with_constants(&device, "linear_q41_tiled_rb", include_str!("shaders/linear_q4_tiled_rb.wgsl"), &[("Q41", 1.0)]),
+            embed_gather_q5: LazyPipeline::new("embed_gather_q5", include_str!("shaders/embed_gather_q5.wgsl"), &[], false),
+            embed_gather_q4k: LazyPipeline::new("embed_gather_q4k", EMBED_GATHER_Q4K, &[], false),
+            q50: Q4Family::q50(grant_f16),
+            k4: Q4Family::k4(grant_f16),
             attn_prefill: make_pipeline(&device, "attn_prefill", include_str!("shaders/attn_prefill.wgsl")),
             attn_prefill_tiled: make_pipeline(&device, "attn_prefill_tiled", include_str!("shaders/attn_prefill_tiled.wgsl")),
             attn_prefill_tiled_128: make_pipeline_with_constants(&device, "attn_prefill_tiled_128", include_str!("shaders/attn_prefill_tiled.wgsl"), &[("HEAD_DIM", 128.0)]),
@@ -609,6 +716,11 @@ impl Engine {
     /// A `label` is still accepted for call-site readability but no longer
     /// used to name a pass (the caller's `begin_compute_pass` call names the
     /// batch instead).
+    /// The compiled pipeline of a lazily created kernel.
+    pub(crate) fn pipe<'a>(&'a self, p: &'a LazyPipeline) -> &'a wgpu::ComputePipeline {
+        p.get(&self.device)
+    }
+
     pub(crate) fn dispatch(&self, pass: &mut wgpu::ComputePass, pipeline: &wgpu::ComputePipeline, bind_group: &wgpu::BindGroup, wgs: (u32, u32, u32), _label: &str) {
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, bind_group, &[]);

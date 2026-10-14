@@ -49,6 +49,16 @@ override GATE_UP: bool = false;
 // value = nibble * d + m, `scales` holds [d, m] f32 pairs. Not combined with
 // GATE_UP.
 override Q41: bool = false;
+// Q50 and K4 (pipeline overrides, `linear_q50_decode_r4`, `linear_k4_decode_r4`
+// and their GATE_UP builds in engine.rs): Q5_0 and Q4_K blocks; see
+// aux_common.wgsl. K4 runs the Q4_1 arithmetic with the block's
+// (d * sc, -dmin * m) in place of its (d, m); with 8 lanes per row and blocks
+// taken lane, lane + 8, ... a lane always handles the same sub-block of a
+// super-block.
+override Q50: bool = false;
+override K4: bool = false;
+
+//@AUX
 
 var<workgroup> partial_sums: array<vec4<f32>, WG_SIZE>;
 
@@ -77,6 +87,11 @@ fn nibu_hi(w: u32, s: f32, m: f32) -> vec4<f32> {
 fn block_dot41(q: vec4<u32>, sd: f32, sm: f32, x0: vec4<f32>, x1: vec4<f32>, x2: vec4<f32>, x3: vec4<f32>, x4: vec4<f32>, x5: vec4<f32>, x6: vec4<f32>, x7: vec4<f32>) -> f32 {
     return dot(nibu_lo(q.x, sd, sm), x0) + dot(nibu_lo(q.y, sd, sm), x1) + dot(nibu_lo(q.z, sd, sm), x2) + dot(nibu_lo(q.w, sd, sm), x3)
         + dot(nibu_hi(q.x, sd, sm), x4) + dot(nibu_hi(q.y, sd, sm), x5) + dot(nibu_hi(q.z, sd, sm), x6) + dot(nibu_hi(q.w, sd, sm), x7);
+}
+
+fn block_dot50(q: vec4<u32>, qh: u32, x0: vec4<f32>, x1: vec4<f32>, x2: vec4<f32>, x3: vec4<f32>, x4: vec4<f32>, x5: vec4<f32>, x6: vec4<f32>, x7: vec4<f32>) -> f32 {
+    return dot(q5_vals(q.x, false, 0u, qh), x0) + dot(q5_vals(q.y, false, 1u, qh), x1) + dot(q5_vals(q.z, false, 2u, qh), x2) + dot(q5_vals(q.w, false, 3u, qh), x3)
+        + dot(q5_vals(q.x, true, 0u, qh), x4) + dot(q5_vals(q.y, true, 1u, qh), x5) + dot(q5_vals(q.z, true, 2u, qh), x6) + dot(q5_vals(q.w, true, 3u, qh), x7);
 }
 
 @compute @workgroup_size(64, 1, 1)
@@ -119,6 +134,30 @@ fn main(
         let x5 = x[xb + 5u];
         let x6 = x[xb + 6u];
         let x7 = x[xb + 7u];
+        if (K4) {
+            let p0 = k4_dm((r0 + blk) >> 3u, blk & 7u);
+            let p1 = k4_dm((r1 + blk) >> 3u, blk & 7u);
+            let p2 = k4_dm((r2 + blk) >> 3u, blk & 7u);
+            let p3 = k4_dm((r3 + blk) >> 3u, blk & 7u);
+            acc += vec4<f32>(
+                block_dot41(qs[r0 + blk], p0.x, p0.y, x0, x1, x2, x3, x4, x5, x6, x7),
+                block_dot41(qs[r1 + blk], p1.x, p1.y, x0, x1, x2, x3, x4, x5, x6, x7),
+                block_dot41(qs[r2 + blk], p2.x, p2.y, x0, x1, x2, x3, x4, x5, x6, x7),
+                block_dot41(qs[r3 + blk], p3.x, p3.y, x0, x1, x2, x3, x4, x5, x6, x7),
+            );
+            continue;
+        }
+        if (Q50) {
+            let s = vec4<f32>(scales[r0 + blk], scales[r1 + blk], scales[r2 + blk], scales[r3 + blk]);
+            let d = vec4<f32>(
+                block_dot50(qs[r0 + blk], aux_at(r0 + blk), x0, x1, x2, x3, x4, x5, x6, x7),
+                block_dot50(qs[r1 + blk], aux_at(r1 + blk), x0, x1, x2, x3, x4, x5, x6, x7),
+                block_dot50(qs[r2 + blk], aux_at(r2 + blk), x0, x1, x2, x3, x4, x5, x6, x7),
+                block_dot50(qs[r3 + blk], aux_at(r3 + blk), x0, x1, x2, x3, x4, x5, x6, x7),
+            );
+            acc += d * s;
+            continue;
+        }
         if (Q41) {
             acc += vec4<f32>(
                 block_dot41(qs[r0 + blk], scales[2u * (r0 + blk)], scales[2u * (r0 + blk) + 1u], x0, x1, x2, x3, x4, x5, x6, x7),

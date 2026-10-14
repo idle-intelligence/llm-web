@@ -54,6 +54,13 @@ override Q8: bool = false;
 // Q41 (pipeline override, `linear_q41_tiled_rb` in engine.rs): Q4_1 blocks,
 // value = nibble * d + m; `scales` holds [d, m] f32 pairs.
 override Q41: bool = false;
+// Q50 and K4 (pipeline overrides, `linear_q50_tiled_rb`, `linear_k4_tiled_rb`
+// in engine.rs): Q5_0 and Q4_K blocks; see aux_common.wgsl. K4 runs the Q4_1
+// arithmetic with the block's (d * sc, -dmin * m) in place of its (d, m).
+override Q50: bool = false;
+override K4: bool = false;
+
+//@AUX
 
 const TM: u32 = 64u;
 const TN: u32 = 64u;
@@ -96,7 +103,11 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wg:
     for (var blk: u32 = 0u; blk < bpr; blk = blk + 1u) {
         var scale = 0.0;
         var mn = 0.0;
-        if (Q41) {
+        if (K4) {
+            let dm = k4_dm((n_safe * bpr + blk) >> 3u, blk & 7u);
+            scale = select(0.0, dm.x, n_ok);
+            mn = select(0.0, dm.y, n_ok);
+        } else if (Q41) {
             scale = select(0.0, scales[2u * (n_safe * bpr + blk)], n_ok);
             mn = select(0.0, scales[2u * (n_safe * bpr + blk) + 1u], n_ok);
         } else {
@@ -107,7 +118,12 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wg:
             let w1 = qs[(n_safe * bpr + blk) * 8u + p + 4u];
             ws[sw(l, p)] = vec4<f32>(bitcast<vec4<i32>>(vec4<u32>(w0 << 24u, w0 << 16u, w0 << 8u, w0)) >> vec4<u32>(24u)) * scale;
             ws[sw(l, p + 4u)] = vec4<f32>(bitcast<vec4<i32>>(vec4<u32>(w1 << 24u, w1 << 16u, w1 << 8u, w1)) >> vec4<u32>(24u)) * scale;
-        } else if (Q41) {
+        } else if (Q50) {
+            let word = qs[(n_safe * bpr + blk) * 4u + p];
+            let qh = aux_at(n_safe * bpr + blk);
+            ws[sw(l, p)] = q5_vals(word, false, p, qh) * scale;
+            ws[sw(l, p + 4u)] = q5_vals(word, true, p, qh) * scale;
+        } else if (Q41 || K4) {
             let word = qs[(n_safe * bpr + blk) * 4u + p];
             ws[sw(l, p)] = vec4<f32>(vec4<u32>(word, word >> 8u, word >> 16u, word >> 24u) & vec4<u32>(0xFu)) * scale + vec4<f32>(mn);
             ws[sw(l, p + 4u)] = vec4<f32>(vec4<u32>(word >> 4u, word >> 12u, word >> 20u, word >> 28u) & vec4<u32>(0xFu)) * scale + vec4<f32>(mn);

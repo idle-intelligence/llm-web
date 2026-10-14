@@ -30,6 +30,12 @@ struct Dims {
 // Q41 (pipeline override, `linear_q41` in engine.rs): Q4_1 blocks, value =
 // nibble * d + m. Same `qs` layout; `scales` holds [d, m] f32 pairs.
 override Q41: bool = false;
+// Q50 and K4 (pipeline overrides, `linear_q50`, `linear_k4` in engine.rs):
+// Q5_0 and Q4_K blocks; see aux_common.wgsl for their buffers.
+override Q50: bool = false;
+override K4: bool = false;
+
+//@AUX
 
 @compute @workgroup_size(16, 16)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -52,10 +58,20 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         var scale = 0.0;
         var mn = 0.0;
         var off = 8.0;
+        var qh = 0u;
         if (Q41) {
             scale = scales[2u * (row_blk_base + blk)];
             mn = scales[2u * (row_blk_base + blk) + 1u];
             off = 0.0;
+        } else if (K4) {
+            let dm = k4_dm((row_blk_base + blk) >> 3u, blk & 7u);
+            scale = dm.x;
+            mn = dm.y;
+            off = 0.0;
+        } else if (Q50) {
+            scale = scales[row_blk_base + blk];
+            qh = aux_at(row_blk_base + blk);
+            off = 16.0;
         } else {
             scale = scales[row_blk_base + blk];
         }
@@ -64,9 +80,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             let word = qs[word_base + wi];
             for (var byte_i: u32 = 0u; byte_i < 4u; byte_i = byte_i + 1u) {
                 let byteval = (word >> (byte_i * 8u)) & 0xFFu;
-                let lo = f32(byteval & 0xFu) - off;
-                let hi = f32((byteval >> 4u) & 0xFu) - off;
                 let j = wi * 4u + byte_i;
+                var lo = f32(byteval & 0xFu) - off;
+                var hi = f32((byteval >> 4u) & 0xFu) - off;
+                if (Q50) {
+                    lo += f32(((qh >> j) & 1u) * 16u);
+                    hi += f32(((qh >> (j + 16u)) & 1u) * 16u);
+                }
                 acc = acc + x[x_base + k + j] * (lo * scale + mn);
                 acc = acc + x[x_base + k + 16u + j] * (hi * scale + mn);
             }

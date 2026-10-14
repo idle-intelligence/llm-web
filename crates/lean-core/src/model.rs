@@ -782,8 +782,8 @@ impl GpuModel {
         let embed_shape = embed_info.shape();
         let embed_dtype = embed_info.dtype();
         anyhow::ensure!(
-            matches!(embed_dtype, GgmlDtype::Q4_0 | GgmlDtype::Q8_0 | GgmlDtype::Q6_K),
-            "expected token_embd.weight to be Q4_0, Q8_0 or Q6_K, got {embed_dtype:?}"
+            matches!(embed_dtype, GgmlDtype::Q4_0 | GgmlDtype::Q5_0 | GgmlDtype::Q8_0 | GgmlDtype::Q4_K | GgmlDtype::Q6_K ),
+            "token_embd.weight: {embed_dtype:?} is not supported as an embedding table (Q4_0, Q5_0, Q8_0, Q4_K and Q6_K are)"
         );
         let embed_bytes = reader.tensor_data("token_embd.weight")?;
         // Tied embeddings (`config.tied_embeddings`, e.g. Qwen3-0.6B/1.7B):
@@ -795,7 +795,7 @@ impl GpuModel {
         // it's still resident, then it's dropped once, not read twice from
         // disk.
         let tied_lm_head = config.tied_embeddings.then(|| load_matmul_weight_gguf(engine, "token_embd(lm_head)", &embed_shape, embed_dtype, &embed_bytes)).transpose()?;
-        let embed = load_embedding_table_gguf(engine, "token_embd", &embed_shape, embed_dtype, &embed_bytes);
+        let embed = load_embedding_table_gguf(engine, "token_embd", &embed_shape, embed_dtype, &embed_bytes)?;
         drop(embed_bytes);
 
         let mut layers = Vec::with_capacity(config.num_layers);
@@ -1061,7 +1061,7 @@ fn scratch_key(key: &str) -> std::borrow::Cow<'_, str> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn linear(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &str, x: &wgpu::Buffer, rows: u32, in_dim: u32, w: &MatMulWeight, b: &wgpu::Buffer, out_dim: u32, fast: bool) -> wgpu::Buffer {
+pub(crate) fn linear(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &str, x: &wgpu::Buffer, rows: u32, in_dim: u32, w: &MatMulWeight, b: &wgpu::Buffer, out_dim: u32, fast: bool) -> wgpu::Buffer {
     let skey = scratch_key(key);
     let out = pool.data(&format!("{skey}.out"), (rows * out_dim) as usize);
     let wgs = (out_dim.div_ceil(16), rows.div_ceil(16), 1);
@@ -1168,14 +1168,24 @@ fn linear(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &
                 }
             }
         }
-        MatMulWeight::Q4_0 { chunks, blocks_per_row, out_dim: n_total } | MatMulWeight::Q4_1 { chunks, blocks_per_row, out_dim: n_total } => {
-            // Q4_1 runs the same kernels as Q4_0 through their `Q41` builds.
+        MatMulWeight::Q4_0 { chunks, blocks_per_row, out_dim: n_total }
+        | MatMulWeight::Q4_1 { chunks, blocks_per_row, out_dim: n_total }
+        | MatMulWeight::Q5_0 { chunks, blocks_per_row, out_dim: n_total }
+        | MatMulWeight::Q4_K { chunks, blocks_per_row, out_dim: n_total } => {
+            // Q4_1 runs the same kernels as Q4_0 through their `Q41` builds;
+            // Q5_0 and Q4_K through their `Q4Family` builds, which also bind
+            // the chunk's `aux` buffer.
             let q41 = matches!(w, MatMulWeight::Q4_1 { .. });
+            let family = match w {
+                MatMulWeight::Q5_0 { .. } => Some(&engine.q50),
+                MatMulWeight::Q4_K { .. } => Some(&engine.k4),
+                _ => None,
+            };
             for chunk in chunks {
                 let ckey = format!("{key}.{}", chunk.row_start);
                 let sckey = scratch_key(&ckey);
                 let dims = pool.uniform(&format!("{sckey}.dims"), LinearQDims { m: rows, k: in_dim, n: chunk.rows, act: 0, blocks_per_row: *blocks_per_row, n_offset: chunk.row_start, n_total: *n_total, _p2: 0 });
-                let entries = [
+                let mut entries = vec![
                     BindGroupEntry { binding: 0, resource: x.as_entire_binding() },
                     BindGroupEntry { binding: 1, resource: chunk.qs.as_entire_binding() },
                     BindGroupEntry { binding: 2, resource: chunk.scales.as_entire_binding() },
@@ -1183,33 +1193,52 @@ fn linear(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &
                     BindGroupEntry { binding: 4, resource: out.as_entire_binding() },
                     BindGroupEntry { binding: 5, resource: dims.as_entire_binding() },
                 ];
+                if let Some(aux) = &chunk.aux {
+                    entries.push(BindGroupEntry { binding: 6, resource: aux.as_entire_binding() });
+                }
                 if !fast {
                     // Reference/naive path - always linear_q4.wgsl regardless
                     // of `rows`, kept for the fixture-parity gate and as the
                     // fallback when a fast kernel's correctness is in doubt.
-                    let pipeline = if q41 { &engine.linear_q41 } else { &engine.linear_q4 };
+                    let pipeline = match family {
+                        Some(f) => engine.pipe(&f.naive),
+                        None if q41 => &engine.linear_q41,
+                        None => &engine.linear_q4,
+                    };
                     let bg = pool.bind_group(&ckey, pipeline, &entries);
                     engine.dispatch(pass, pipeline, &bg, (chunk.rows.div_ceil(16), rows.div_ceil(16), 1), &ckey);
                 } else if rows == 1 {
                     // Decode: coalesced matvec (llm-wasm's shader_q4_matvec_coalesced.wgsl port).
-                    let (pipeline, rows_per_wg) = match (chunk.rows >= DECODE_R4_MIN_ROWS, q41) {
-                        (true, false) => (&engine.linear_q4_decode_r4, DECODE_R4_ROWS_PER_WG),
-                        (true, true) => (&engine.linear_q41_decode_r4, DECODE_R4_ROWS_PER_WG),
-                        (false, false) => (&engine.linear_q4_decode, DECODE_ROWS_PER_WG),
-                        (false, true) => (&engine.linear_q41_decode, DECODE_ROWS_PER_WG),
+                    let wide = chunk.rows >= DECODE_R4_MIN_ROWS;
+                    let rows_per_wg = if wide { DECODE_R4_ROWS_PER_WG } else { DECODE_ROWS_PER_WG };
+                    let pipeline = match (family, wide, q41) {
+                        (Some(f), true, _) => engine.pipe(&f.decode_r4),
+                        (Some(f), false, _) => engine.pipe(&f.decode),
+                        (None, true, false) => &engine.linear_q4_decode_r4,
+                        (None, true, true) => &engine.linear_q41_decode_r4,
+                        (None, false, false) => &engine.linear_q4_decode,
+                        (None, false, true) => &engine.linear_q41_decode,
                     };
                     let bg = pool.bind_group(&format!("{ckey}.decode"), pipeline, &entries);
                     engine.dispatch(pass, pipeline, &bg, (chunk.rows.div_ceil(rows_per_wg), 1, 1), &ckey);
                 } else if rows < SMALL_M_MAX_ROWS {
                     // Short prefill: weight words read and dequantised once
                     // per group of 8 query rows (see linear_q4_small_m.wgsl).
-                    let pipeline = if q41 { &engine.linear_q41_small_m } else { &engine.linear_q4_small_m };
+                    let pipeline = match family {
+                        Some(f) => engine.pipe(&f.small_m),
+                        None if q41 => &engine.linear_q41_small_m,
+                        None => &engine.linear_q4_small_m,
+                    };
                     let bg = pool.bind_group(&format!("{ckey}.small_m"), pipeline, &entries);
                     engine.dispatch(pass, pipeline, &bg, (rows.div_ceil(SMALL_M_ROWS), chunk.rows.div_ceil(SMALL_M_COLS), 1), &ckey);
                 } else {
                     // Prefill, M >= SMALL_M_MAX_ROWS: 64x64 register-blocked
                     // tiled kernel (see linear_q4_tiled_rb.wgsl's header).
-                    let pipeline = if q41 { &engine.linear_q41_tiled_rb } else { engine.linear_q4_tiled_f16.as_ref().unwrap_or(&engine.linear_q4_tiled_rb) };
+                    let pipeline = match family {
+                        Some(f) => f.tiled_f16.as_ref().map_or_else(|| engine.pipe(&f.tiled_rb), |p| engine.pipe(p)),
+                        None if q41 => &engine.linear_q41_tiled_rb,
+                        None => engine.linear_q4_tiled_f16.as_ref().unwrap_or(&engine.linear_q4_tiled_rb),
+                    };
                     let bg = pool.bind_group(&format!("{ckey}.tiled_rb"), pipeline, &entries);
                     engine.dispatch(pass, pipeline, &bg, (chunk.rows.div_ceil(64), rows.div_ceil(64), 1), &ckey);
                 }
@@ -1226,9 +1255,13 @@ fn linear(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &
 /// Q8_0 binding (or fast
 /// kernels are off): the caller then runs `linear` + `silu_mul_fused`.
 #[allow(clippy::too_many_arguments)]
-fn gate_up_swiglu_decode(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &str, x: &wgpu::Buffer, in_dim: u32, w: &MatMulWeight, b: &wgpu::Buffer, inter: u32, fast: bool) -> Option<wgpu::Buffer> {
+pub(crate) fn gate_up_swiglu_decode(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &str, x: &wgpu::Buffer, in_dim: u32, w: &MatMulWeight, b: &wgpu::Buffer, inter: u32, fast: bool) -> Option<wgpu::Buffer> {
     let wide = 2 * inter >= DECODE_R4_MIN_ROWS;
     let (chunks, blocks_per_row, out_dim, pipeline, outs_per_wg) = match w {
+        MatMulWeight::Q5_0 { chunks, blocks_per_row, out_dim } if wide => (chunks, blocks_per_row, out_dim, engine.pipe(&engine.q50.swiglu_r4), DECODE_R4_ROWS_PER_WG / 2),
+        MatMulWeight::Q5_0 { chunks, blocks_per_row, out_dim } => (chunks, blocks_per_row, out_dim, engine.pipe(&engine.q50.swiglu), DECODE_ROWS_PER_WG / 2),
+        MatMulWeight::Q4_K { chunks, blocks_per_row, out_dim } if wide => (chunks, blocks_per_row, out_dim, engine.pipe(&engine.k4.swiglu_r4), DECODE_R4_ROWS_PER_WG / 2),
+        MatMulWeight::Q4_K { chunks, blocks_per_row, out_dim } => (chunks, blocks_per_row, out_dim, engine.pipe(&engine.k4.swiglu), DECODE_ROWS_PER_WG / 2),
         MatMulWeight::Q4_0 { chunks, blocks_per_row, out_dim } if wide => (chunks, blocks_per_row, out_dim, &engine.linear_q4_decode_swiglu_r4, DECODE_R4_ROWS_PER_WG / 2),
         MatMulWeight::Q4_0 { chunks, blocks_per_row, out_dim } => (chunks, blocks_per_row, out_dim, &engine.linear_q4_decode_swiglu, DECODE_ROWS_PER_WG / 2),
         MatMulWeight::Q8_0 { chunks, blocks_per_row, out_dim } if wide => (chunks, blocks_per_row, out_dim, &engine.linear_q8_decode_swiglu_r4, DECODE_R4_ROWS_PER_WG / 2),
@@ -1241,18 +1274,18 @@ fn gate_up_swiglu_decode(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputeP
     let skey = scratch_key(key);
     let out = pool.data(&format!("{skey}.swiglu"), inter as usize);
     let dims = pool.uniform(&format!("{skey}.swiglu_dims"), LinearQDims { m: 1, k: in_dim, n: 2 * inter, act: 0, blocks_per_row: *blocks_per_row, n_offset: 0, n_total: 2 * inter, _p2: 0 });
-    let bg = pool.bind_group(
-        &format!("{key}.swiglu"),
-        pipeline,
-        &[
-            BindGroupEntry { binding: 0, resource: x.as_entire_binding() },
-            BindGroupEntry { binding: 1, resource: chunk.qs.as_entire_binding() },
-            BindGroupEntry { binding: 2, resource: chunk.scales.as_entire_binding() },
-            BindGroupEntry { binding: 3, resource: b.as_entire_binding() },
-            BindGroupEntry { binding: 4, resource: out.as_entire_binding() },
-            BindGroupEntry { binding: 5, resource: dims.as_entire_binding() },
-        ],
-    );
+    let mut entries = vec![
+        BindGroupEntry { binding: 0, resource: x.as_entire_binding() },
+        BindGroupEntry { binding: 1, resource: chunk.qs.as_entire_binding() },
+        BindGroupEntry { binding: 2, resource: chunk.scales.as_entire_binding() },
+        BindGroupEntry { binding: 3, resource: b.as_entire_binding() },
+        BindGroupEntry { binding: 4, resource: out.as_entire_binding() },
+        BindGroupEntry { binding: 5, resource: dims.as_entire_binding() },
+    ];
+    if let Some(aux) = &chunk.aux {
+        entries.push(BindGroupEntry { binding: 6, resource: aux.as_entire_binding() });
+    }
+    let bg = pool.bind_group(&format!("{key}.swiglu"), pipeline, &entries);
     engine.dispatch(pass, pipeline, &bg, (inter.div_ceil(outs_per_wg), 1, 1), key);
     Some(out)
 }
@@ -1645,20 +1678,50 @@ fn embed_gather(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, 
     let (pipeline, table) = match &model.embed {
         EmbeddingTable::Q4_0(t) => (&engine.embed_gather_q4, t),
         EmbeddingTable::Q8_0(t) => (&engine.embed_gather_q8, t),
+        EmbeddingTable::Q5_0(t) => (engine.pipe(&engine.embed_gather_q5), t),
+        EmbeddingTable::Q4_K(t) => (engine.pipe(&engine.embed_gather_q4k), t),
         EmbeddingTable::Q6_K(_) => unreachable!("handled above"),
     };
     let dims = pool.uniform("embed.dims", GatherDims { rows, hidden, blocks_per_row: table.blocks_per_row, stride_x });
-    let bg = pool.bind_group(
-        "embed",
-        pipeline,
-        &[
-            BindGroupEntry { binding: 0, resource: ids_buf.as_entire_binding() },
-            BindGroupEntry { binding: 1, resource: table.qs.as_entire_binding() },
-            BindGroupEntry { binding: 2, resource: table.scales.as_entire_binding() },
-            BindGroupEntry { binding: 3, resource: out.as_entire_binding() },
-            BindGroupEntry { binding: 4, resource: dims.as_entire_binding() },
-        ],
-    );
+    let bg = if let (Some(aux), true) = (&table.aux, matches!(model.embed, EmbeddingTable::Q4_K(_))) {
+        // Q4_K keeps everything but the nibbles in `aux` (no `scales` binding).
+        pool.bind_group(
+            "embed",
+            pipeline,
+            &[
+                BindGroupEntry { binding: 0, resource: ids_buf.as_entire_binding() },
+                BindGroupEntry { binding: 1, resource: table.qs.as_entire_binding() },
+                BindGroupEntry { binding: 2, resource: aux.as_entire_binding() },
+                BindGroupEntry { binding: 3, resource: out.as_entire_binding() },
+                BindGroupEntry { binding: 4, resource: dims.as_entire_binding() },
+            ],
+        )
+    } else if let Some(aux) = &table.aux {
+        pool.bind_group(
+            "embed",
+            pipeline,
+            &[
+                BindGroupEntry { binding: 0, resource: ids_buf.as_entire_binding() },
+                BindGroupEntry { binding: 1, resource: table.qs.as_entire_binding() },
+                BindGroupEntry { binding: 2, resource: table.scales.as_entire_binding() },
+                BindGroupEntry { binding: 3, resource: aux.as_entire_binding() },
+                BindGroupEntry { binding: 4, resource: out.as_entire_binding() },
+                BindGroupEntry { binding: 5, resource: dims.as_entire_binding() },
+            ],
+        )
+    } else {
+        pool.bind_group(
+            "embed",
+            pipeline,
+            &[
+                BindGroupEntry { binding: 0, resource: ids_buf.as_entire_binding() },
+                BindGroupEntry { binding: 1, resource: table.qs.as_entire_binding() },
+                BindGroupEntry { binding: 2, resource: table.scales.as_entire_binding() },
+                BindGroupEntry { binding: 3, resource: out.as_entire_binding() },
+                BindGroupEntry { binding: 4, resource: dims.as_entire_binding() },
+            ],
+        )
+    };
     engine.dispatch(pass, pipeline, &bg, (gx, gy, 1), "embed");
     out
 }
