@@ -16,11 +16,15 @@ for (const level of ["error", "warn"]) {
   console[level] = (...a) => { const t = a.map(String).join(" ").slice(0, 600); logs.push(t); self.postMessage({ type: "log", text: t }); orig(...a); };
 }
 
+const deviceInfo = {};
+
 // WebGPU validation errors the engine does not look at: log them too.
 if (self.GPUAdapter) {
   const requestDevice = GPUAdapter.prototype.requestDevice;
   GPUAdapter.prototype.requestDevice = async function (...a) {
     const device = await requestDevice.apply(this, a);
+    deviceInfo.shaderF16 = device.features.has("shader-f16");
+    deviceInfo.adapterShaderF16 = this.features.has("shader-f16");
     device.addEventListener("uncapturederror", (e) => console.error("uncaptured WebGPU error: " + e.error.message + " @" + JSON.stringify(gpuStats)));
     device.lost.then((i) => console.error("device lost: " + i.reason + " " + i.message));
     return device;
@@ -97,7 +101,7 @@ async function run({ backend, build, prompts, reps, decode, mini, phases, sampli
   const loadMs = performance.now() - t0;
   const template = mod.ChatTemplate.fromTokenizerConfig(tokenizerCfg);
   const chat = (text) => mod.chatRender(template, [{ role: "user", content: text }], null, true);
-  const result = { build, requested: backend, backend: lean.backend, loadMs, cold: [], suffix: [] };
+  const result = { build, device: deviceInfo, requested: backend, backend: lean.backend, loadMs, cold: [], suffix: [] };
 
   if (mini) {
     // Two calls that share the chat-template start, then the second on a fresh engine.
