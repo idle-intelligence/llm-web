@@ -102,14 +102,14 @@ fn main(@builtin(workgroup_id) wg_id: vec3<u32>, @builtin(local_invocation_id) l
         // Scores: pass p covers keys tile_start + p*kpp + key_in_pass.
         for (var p: u32 = 0u; p < LANES; p = p + 1u) {
             let key = tile_start + p * kpp + key_in_pass;
-            var dot: f32 = 0.0;
+            var sum: f32 = 0.0;
             if (key < kv_end) {
                 let base4 = ((kv_head * dims.max_ctx + key) * hd) / 4u + lane * slice4;
                 for (var i: u32 = 0u; i < slice4; i = i + 1u) {
-                    dot = dot + dot(k_cache[base4 + i], q_shared[lane * slice4 + i]);
+                    sum = sum + dot(k_cache[base4 + i], q_shared[lane * slice4 + i]);
                 }
             }
-            partial[p * HEAD_DIM + tid] = dot;
+            partial[p * HEAD_DIM + tid] = sum;
         }
         workgroupBarrier();
 
