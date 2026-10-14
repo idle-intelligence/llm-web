@@ -1535,7 +1535,12 @@ fn silu_mul_fused(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>
 /// of three, and returns `q`/`k`/`v` as `BufView`s into that single output
 /// buffer (`QkvSlot::View`, offsets `0` / `q_dim` / `q_dim+kv_dim`) - no copy,
 /// downstream (`rope`/`scatter_kv_gpu`/`attn_decode`) read the fused buffer
-/// directly through those offsets. Every other case (`rows > 1` - prefill and
+/// directly through those offsets. `decode` is true only for the decode
+/// step: the pool caches bind groups by call-site key, so a call site whose
+/// q/k/v buffers differ between calls (a fused view at one row, separate
+/// buffers at more) would be handed the first call's bind group on the
+/// second; a prefill or chunk of one row must take the separate-buffer path
+/// like any other length. Every other case (`rows > 1` - prefill and
 /// the chunked/masked forward path, which need q/k/v as separately
 /// addressable `[rows, dim]` buffers and can't safely read a fused *strided*
 /// per-row layout back with a plain offset+size binding; LoRA active; or
@@ -1554,12 +1559,13 @@ fn qkv_proj(
     layer: &LayerWeights,
     fast: bool,
     lora: Option<&crate::lora::LoraLayer>,
+    decode: bool,
 ) -> (QkvSlot, QkvSlot, QkvSlot) {
     let hidden = cfg.hidden_size as u32;
     let q_dim = (cfg.num_heads * cfg.head_dim) as u32;
     let kv_dim = (cfg.num_kv_heads * cfg.head_dim) as u32;
 
-    let (q, k, v) = if rows == 1 && lora.is_none() {
+    let (q, k, v) = if decode && rows == 1 && lora.is_none() {
         if let (Some(qkv_w), Some(qkv_b)) = (&layer.qkv_w, &layer.qkv_b) {
             let qkv_out = linear(engine, pool, pass, &format!("{key}.qkv_fused"), x, rows, hidden, qkv_w, qkv_b, q_dim + 2 * kv_dim, fast);
             let q = QkvSlot::View { buf: qkv_out.clone(), elem_offset: 0, elem_len: q_dim };
@@ -2024,7 +2030,7 @@ async fn prefill_batched(engine: &Engine, model: &GpuModel, cache: &mut KvCache,
         tap!(engine, &mut encoder, pass, format!("{key}.norm"), &normed, seq * hidden);
         let lora_layer = model.lora.as_ref().map(|l| &l.layers[i]);
         seg!(engine, &mut encoder, pass, "qkv");
-        let (q, k, v) = qkv_proj(engine, pool, &mut pass, &format!("{key}.qkv"), &normed, seq, cfg, layer, model.fast_kernels, lora_layer);
+        let (q, k, v) = qkv_proj(engine, pool, &mut pass, &format!("{key}.qkv"), &normed, seq, cfg, layer, model.fast_kernels, lora_layer, false);
         tap!(engine, &mut encoder, pass, format!("{key}.q"), &q, seq * q_dim);
         tap!(engine, &mut encoder, pass, format!("{key}.k"), &k, seq * kv_dim);
         tap!(engine, &mut encoder, pass, format!("{key}.v"), &v, seq * kv_dim);
@@ -2226,7 +2232,7 @@ fn decode_layers(engine: &Engine, model: &GpuModel, encoder: &mut wgpu::CommandE
         let key = format!("dec_layer{i}");
         let lora_layer = model.lora.as_ref().map(|l| &l.layers[i]);
         seg!(engine, encoder, pass, "qkv");
-        let (q, k, v) = qkv_proj(engine, pool, &mut pass, &format!("{key}.qkv"), &normed, 1, cfg, layer, model.fast_kernels, lora_layer);
+        let (q, k, v) = qkv_proj(engine, pool, &mut pass, &format!("{key}.qkv"), &normed, 1, cfg, layer, model.fast_kernels, lora_layer, true);
         seg!(engine, encoder, pass, "rope");
         let q = rope_kv_decode(engine, pool, &mut pass, &format!("{key}.ropekv"), &q, &k, &v, cos, sin, &cache.k[i], &cache.v[i], pos, cache.max_ctx, cfg);
         seg!(engine, encoder, pass, "attn");
@@ -2570,7 +2576,7 @@ pub async fn forward_chunk_spec(engine: &Engine, model: &GpuModel, cache: &mut K
         let key = format!("chunk_layer{i}");
         let lora_layer = model.lora.as_ref().map(|l| &l.layers[i]);
         let normed = rmsnorm(engine, pool, &mut pass, &format!("{key}.norm"), &x, &layer.attn_norm, t, hidden, cfg.rms_norm_eps);
-        let (q, k, v) = qkv_proj(engine, pool, &mut pass, &format!("{key}.qkv"), &normed, t, cfg, layer, model.fast_kernels, lora_layer);
+        let (q, k, v) = qkv_proj(engine, pool, &mut pass, &format!("{key}.qkv"), &normed, t, cfg, layer, model.fast_kernels, lora_layer, false);
         rope_positions(engine, pool, &mut pass, &format!("{key}.ropeq"), &q, cos, sin, &pos_buf, t, cfg.num_heads as u32, cfg.head_dim as u32);
         rope_positions(engine, pool, &mut pass, &format!("{key}.ropek"), &k, cos, sin, &pos_buf, t, cfg.num_kv_heads as u32, cfg.head_dim as u32);
 

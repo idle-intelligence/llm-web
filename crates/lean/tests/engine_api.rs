@@ -294,3 +294,42 @@ fn reuse_after_short_calls_gpu_smollm2_1_7b() {
         assert_eq!(shared, fresh, "{question}");
     }
 }
+
+/// The same prompt twice (the second call finds all of it cached but the
+/// last token), at several reply lengths, then different questions on the
+/// same engine: each reply must be what a fresh engine gives.
+fn reuse_repeat_then_different(gguf_var: &str, tok_var: &str) {
+    let (gguf, dir) = (env(gguf_var), env(tok_var));
+    let template = template(&dir);
+    let story = prompt(&template, &[("user", "Write a long story about a lighthouse keeper.")]);
+    let fresh_replies: Vec<String> = TURNS.iter().map(|q| generate(&mut load(&gguf, &dir, MAX_CTX, Backend::WebGpu), &prompt(&template, &[("user", q)]))).collect();
+    for n in [1u32, 8, 64] {
+        let mut lean = load(&gguf, &dir, MAX_CTX, Backend::WebGpu);
+        let p = GenParams { max_new_tokens: n, ..GenParams::default() };
+        for _ in 0..2 {
+            pollster::block_on(lean.generate(&story, &p, |_| {}, None)).unwrap();
+        }
+        for (question, fresh) in TURNS.iter().zip(&fresh_replies) {
+            let shared = generate(&mut lean, &prompt(&template, &[("user", question)]));
+            assert_eq!(&shared, fresh, "after the story twice with {n} new tokens: {question}");
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs LEAN_GGUF and LEAN_TOKENIZER_DIR on disk; never committed to this repo"]
+fn reuse_repeat_then_different_gpu_qwen25_0_5b() {
+    reuse_repeat_then_different("LEAN_GGUF", "LEAN_TOKENIZER_DIR");
+}
+
+#[test]
+#[ignore = "needs LEAN_GGUF_LLAMA_360M_Q4_0 and LEAN_TOKENIZER_DIR_LLAMA_360M on disk; never committed to this repo"]
+fn reuse_repeat_then_different_gpu_smollm2_360m() {
+    reuse_repeat_then_different("LEAN_GGUF_LLAMA_360M_Q4_0", "LEAN_TOKENIZER_DIR_LLAMA_360M");
+}
+
+#[test]
+#[ignore = "needs LEAN_GGUF_LLAMA_1_7B_Q4_0 and LEAN_TOKENIZER_DIR_LLAMA_1_7B on disk; never committed to this repo"]
+fn reuse_repeat_then_different_gpu_smollm2_1_7b() {
+    reuse_repeat_then_different("LEAN_GGUF_LLAMA_1_7B_Q4_0", "LEAN_TOKENIZER_DIR_LLAMA_1_7B");
+}

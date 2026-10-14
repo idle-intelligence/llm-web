@@ -142,6 +142,10 @@ fn seeded_sampling_is_reproducible_across_runs() {
 #[test]
 #[ignore = "needs LEAN_GGUF and LEAN_TOKENIZER_DIR on disk; never committed to this repo"]
 fn multi_turn_append_matches_full_reprefill() {
+    // F32 kernels on both paths: the 1e-2 gate compares a short append
+    // against a long re-prefill, which differ by the f16 tile's rounding on
+    // an f16 adapter.
+    std::env::set_var("LEAN_F16", "0");
     let (engine, model, tokenizer, chat_template) = setup();
     let p1 = "What is the capital of France?";
     let p2 = "And what is its population?";
