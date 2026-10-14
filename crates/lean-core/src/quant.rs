@@ -396,13 +396,13 @@ mod tests {
         }
         let deq = dequantize_q4_1(&bytes, 96);
         let (qs, scales) = split_q4_1_blocks(&bytes, 96);
-        for col in 0..96 {
+        for (col, &want) in deq.iter().enumerate() {
             let blk = col / 32;
             let j = col % 32;
             let byte = (qs[blk * 4 + (j % 16) / 4] >> (((j % 16) % 4) * 8)) & 0xFF;
             let nibble = if j < 16 { byte & 0xF } else { byte >> 4 };
             let v = nibble as f32 * scales[2 * blk] + scales[2 * blk + 1];
-            assert_eq!(deq[col], v, "col={col}");
+            assert_eq!(want, v, "col={col}");
         }
     }
 
