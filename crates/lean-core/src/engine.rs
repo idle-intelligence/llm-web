@@ -137,7 +137,7 @@ pub struct Engine {
     pub(crate) rope: wgpu::ComputePipeline,
     pub(crate) linear: wgpu::ComputePipeline,
     /// Coalesced F32 matvec (decode, M=1): same 128-thread,
-    /// rows-per-workgroup structure as `linear_q4_decode`/`linear_q8_decode`,
+    /// vec4 loads and word-wide unpacking,
     /// adapted to a plain (undequantized) f32 weight row - see
     /// `shaders/linear_f32_decode.wgsl`'s header for why a F32-resident
     /// tensor shows up at all in an otherwise-quantized GGUF.
@@ -153,9 +153,9 @@ pub struct Engine {
     /// Naive Q6_K matmul/matvec (`shaders/linear_q6k.wgsl`) - used for
     /// prefill (M>1); decode (M=1) uses `linear_q6k_decode` below.
     pub(crate) linear_q6k: wgpu::ComputePipeline,
-    /// Coalesced Q6_K matvec (decode, M=1): same 128-thread,
-    /// rows-per-workgroup structure as `linear_q4_decode`/`linear_q8_decode`,
-    /// see `shaders/linear_q6k_decode.wgsl`'s header for the per-block split.
+    /// Q6_K matvec (decode, M=1): 128 threads, 16 rows per workgroup, vec4
+    /// loads and word-wide unpacking; see `shaders/linear_q6k_decode.wgsl`'s
+    /// header.
     pub(crate) linear_q6k_decode: wgpu::ComputePipeline,
     /// See `linear_q4_tiled_rb.wgsl`'s header: 64x64 register-blocked tiled
     /// Q4_0 matmul, prefill at `SMALL_M_MAX_ROWS` rows and above.

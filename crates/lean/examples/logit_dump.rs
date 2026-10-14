@@ -1,7 +1,7 @@
 //! Writes the logits of a fixed prompt (prefill, then greedy decode steps) to
 //! a file, so two builds can be compared on the same GGUF.
 //!
-//! `LEAN_GGUF=... cargo run --release -p lean --example logit_dump -- <out.bin> [--len 100] [--steps 16] [--naive]`
+//! `LEAN_GGUF=... cargo run --release -p lean --example logit_dump -- <out.bin> [--len 100] [--steps 16] [--repeat 1] [--verify] [--naive]`
 //!
 //! Prints the greedy token ids and an FNV-1a hash of the raw logits bytes.
 //! The file is the concatenation of the prefill logits and each decode
@@ -28,6 +28,14 @@ fn argmax(v: &[f32]) -> u32 {
     best as u32
 }
 
+fn fnv(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        h = (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3);
+    }
+    h
+}
+
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let out_path = args.get(1).expect("usage: logit_dump <out.bin>");
@@ -36,13 +44,28 @@ fn main() -> anyhow::Result<()> {
     let steps = arg(&args, "--steps").unwrap_or(16);
     let fast = !args.iter().any(|a| a == "--naive");
     let engine = Engine::new()?;
+    let verify = args.iter().any(|a| a == "--verify");
+    engine.set_debug_uploads(verify);
     let model = GpuModel::load(&engine, &gguf, fast)?;
+    if verify {
+        println!("verify_uploads {}", pollster::block_on(engine.debug_verify_uploads()));
+        engine.set_debug_uploads(false);
+    }
     let max_ctx = (len + steps + 4) as u32;
     let (cos, sin) = build_rope_tables(&model.config, max_ctx as usize);
     let cos_buf = engine.buf_f32(&cos, "rope_cos");
     let sin_buf = engine.buf_f32(&sin, "rope_sin");
     let mut cache = KvCache::new(&engine, &model.config, max_ctx);
     let ids: Vec<u32> = (0..len).map(|i| PROMPT[i % PROMPT.len()]).collect();
+    let repeat = arg(&args, "--repeat").unwrap_or(1);
+    for r in 0..repeat.saturating_sub(1) {
+        model.pool.reset();
+        cache.kv_len = 0;
+        let l = pollster::block_on(forward_prefill(&engine, &model, &mut cache, &ids, &cos_buf, &sin_buf, None));
+        println!("repeat {r}: prefill logits fnv={:016x}", fnv(&l.iter().flat_map(|f| f.to_le_bytes()).collect::<Vec<u8>>()));
+    }
+    model.pool.reset();
+    cache.kv_len = 0;
     let mut all: Vec<f32> = Vec::new();
     let mut logits = pollster::block_on(forward_prefill(&engine, &model, &mut cache, &ids, &cos_buf, &sin_buf, None));
     let mut tokens = Vec::new();
@@ -55,10 +78,7 @@ fn main() -> anyhow::Result<()> {
     }
     let bytes: Vec<u8> = all.iter().flat_map(|f| f.to_le_bytes()).collect();
     std::fs::write(out_path, &bytes)?;
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in &bytes {
-        h = (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3);
-    }
+    let h = fnv(&bytes);
     println!("weight_bytes={} tokens={tokens:?} logits_fnv={h:016x}", model.weight_gpu_bytes());
     Ok(())
 }
