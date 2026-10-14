@@ -199,10 +199,16 @@ pub struct Engine {
     /// Q5_0 and Q4_K builds of the Q4_0-family kernels, compiled on first use.
     pub(crate) q50: Q4Family,
     pub(crate) k4: Q4Family,
+    /// F16 and BF16 weights kept at two bytes per value: naive, decode
+    /// matvec and the prefill tile (`linear_half*.wgsl`).
+    pub(crate) half_f16: HalfKernels,
+    pub(crate) half_bf16: HalfKernels,
     /// `linear_q6k_tiled.wgsl`: Q6_K prefill tile.
     pub(crate) linear_q6k_tiled: LazyPipeline,
     pub(crate) embed_gather_q5: LazyPipeline,
     pub(crate) embed_gather_q4k: LazyPipeline,
+    pub(crate) embed_gather_f16: LazyPipeline,
+    pub(crate) embed_gather_bf16: LazyPipeline,
     pub(crate) attn_prefill: wgpu::ComputePipeline,
     /// `attn_prefill_tiled.wgsl` (head_dim 64) and its HEAD_DIM = 128 build.
     pub(crate) attn_prefill_tiled: wgpu::ComputePipeline,
@@ -325,6 +331,27 @@ pub(crate) struct Q4Family {
     pub(crate) small_m: LazyPipeline,
     pub(crate) tiled_rb: LazyPipeline,
     pub(crate) tiled_f16: Option<LazyPipeline>,
+}
+
+/// Kernels over F16 or BF16 weights, compiled on first use.
+pub(crate) struct HalfKernels {
+    pub(crate) naive: LazyPipeline,
+    pub(crate) decode: LazyPipeline,
+    pub(crate) tiled: LazyPipeline,
+}
+
+impl HalfKernels {
+    fn new(bf16: bool) -> Self {
+        const F16: &[(&str, f64)] = &[];
+        const BF16: &[(&str, f64)] = &[("BF16", 1.0)];
+        let c = if bf16 { BF16 } else { F16 };
+        let tag = |f16: &'static str, bf16_label: &'static str| if bf16 { bf16_label } else { f16 };
+        Self {
+            naive: LazyPipeline::new(tag("linear_f16", "linear_bf16"), include_str!("shaders/linear_half.wgsl"), c, false),
+            decode: LazyPipeline::new(tag("linear_f16_decode", "linear_bf16_decode"), include_str!("shaders/linear_half_decode.wgsl"), c, false),
+            tiled: LazyPipeline::new(tag("linear_f16_tiled", "linear_bf16_tiled"), include_str!("shaders/linear_half_tiled.wgsl"), c, false),
+        }
+    }
 }
 
 const EMBED_GATHER_Q4K: &str = include_str!("shaders/embed_gather_q4k.wgsl");
@@ -566,9 +593,13 @@ impl Engine {
             linear_q41_decode_r4: make_pipeline_with_constants(&device, "linear_q41_decode_r4", include_str!("shaders/linear_q4_decode_r4.wgsl"), &[("Q41", 1.0)]),
             linear_q41_small_m: make_pipeline_with_constants(&device, "linear_q41_small_m", include_str!("shaders/linear_q4_small_m.wgsl"), &[("Q41", 1.0)]),
             linear_q41_tiled_rb: make_pipeline_with_constants(&device, "linear_q41_tiled_rb", include_str!("shaders/linear_q4_tiled_rb.wgsl"), &[("Q41", 1.0)]),
+            half_f16: HalfKernels::new(false),
+            half_bf16: HalfKernels::new(true),
             linear_q6k_tiled: LazyPipeline::new("linear_q6k_tiled", include_str!("shaders/linear_q6k_tiled.wgsl"), &[], false),
             embed_gather_q5: LazyPipeline::new("embed_gather_q5", include_str!("shaders/embed_gather_q5.wgsl"), &[], false),
             embed_gather_q4k: LazyPipeline::new("embed_gather_q4k", EMBED_GATHER_Q4K, &[], false),
+            embed_gather_f16: LazyPipeline::new("embed_gather_f16", include_str!("shaders/embed_gather_half.wgsl"), &[], false),
+            embed_gather_bf16: LazyPipeline::new("embed_gather_bf16", include_str!("shaders/embed_gather_half.wgsl"), &[("BF16", 1.0)], false),
             q50: Q4Family::q50(grant_f16),
             k4: Q4Family::k4(grant_f16),
             attn_prefill: make_pipeline(&device, "attn_prefill", include_str!("shaders/attn_prefill.wgsl")),

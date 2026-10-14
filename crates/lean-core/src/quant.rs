@@ -50,6 +50,14 @@ pub struct QChunk6K {
     pub rows: u32,
 }
 
+/// One row-range of an F16 or BF16 weight kept at two bytes per value, packed
+/// two per u32 (the on-disk bytes as little-endian words).
+pub struct QChunkHalf {
+    pub w: wgpu::Buffer,
+    pub row_start: u32,
+    pub rows: u32,
+}
+
 #[allow(non_camel_case_types)]
 pub enum MatMulWeight {
     F32 { w: wgpu::Buffer },
@@ -66,6 +74,10 @@ pub enum MatMulWeight {
     /// those, 8 per super-block); `scales` holds `[d, dmin]` per super-block
     /// and `aux` its 12 packed scale bytes as 3 u32.
     Q4_K { chunks: Vec<QChunk>, blocks_per_row: u32, out_dim: u32 },
+    /// F16 weights, resident at two bytes per value. `in_dim` is a multiple of 32.
+    F16 { chunks: Vec<QChunkHalf>, out_dim: u32 },
+    /// BF16 weights, resident at two bytes per value. `in_dim` is a multiple of 32.
+    BF16 { chunks: Vec<QChunkHalf>, out_dim: u32 },
 }
 
 impl MatMulWeight {
@@ -77,9 +89,16 @@ impl MatMulWeight {
             | MatMulWeight::Q4_1 { chunks, .. }
             | MatMulWeight::Q5_0 { chunks, .. }
             | MatMulWeight::Q4_K { chunks, .. } => chunks.iter().map(|c| c.qs.size() + c.scales.size() + c.aux.as_ref().map_or(0, |a| a.size())).sum(),
+            MatMulWeight::F16 { chunks, .. } | MatMulWeight::BF16 { chunks, .. } => chunks.iter().map(|c| c.w.size()).sum(),
             MatMulWeight::Q6_K { chunks, .. } => chunks.iter().map(|c| c.ql.size() + c.qh.size() + c.scales.size() + c.d.size()).sum(),
         }
     }
+}
+
+/// Packs a stream of 16-bit values (F16 or BF16 weights) two per u32, the
+/// first in the low half: the on-disk bytes as little-endian words.
+fn pack_halves(bytes: &[u8]) -> Vec<u32> {
+    bytes.chunks(4).map(|c| u32::from_le_bytes([c[0], c[1], c.get(2).copied().unwrap_or(0), c.get(3).copied().unwrap_or(0)])).collect()
 }
 
 fn split_q8_blocks(bytes: &[u8], n_elements: usize) -> (Vec<u32>, Vec<f32>) {
@@ -252,6 +271,27 @@ fn chunk_rows(engine: &Engine, label: &str, bytes: &[u8], out_dim: usize, blocks
     Ok(chunks)
 }
 
+/// Half-precision counterpart of `chunk_rows`: row-aligned chunks of the
+/// on-disk 2-byte values under the device's `max_storage_buffer_binding_size`.
+fn chunk_rows_half(engine: &Engine, label: &str, bytes: &[u8], out_dim: usize, in_dim: usize) -> anyhow::Result<Vec<QChunkHalf>> {
+    let limit = engine.max_storage_buffer_binding_size() as usize;
+    let bytes_per_row = in_dim * 2;
+    anyhow::ensure!(
+        bytes_per_row <= limit,
+        "{label}: one row ({bytes_per_row} bytes) exceeds this device's max_storage_buffer_binding_size ({limit} bytes); this weight cannot be chunked to fit"
+    );
+    let rows_per_chunk = (limit / bytes_per_row).clamp(1, out_dim);
+    let mut chunks = Vec::with_capacity(out_dim.div_ceil(rows_per_chunk));
+    let mut row_start = 0usize;
+    while row_start < out_dim {
+        let rows = rows_per_chunk.min(out_dim - row_start);
+        let words = pack_halves(&bytes[row_start * bytes_per_row..(row_start + rows) * bytes_per_row]);
+        chunks.push(QChunkHalf { w: engine.buf_u32(&words, &format!("{label}[{row_start}]")), row_start: row_start as u32, rows: rows as u32 });
+        row_start += rows;
+    }
+    Ok(chunks)
+}
+
 /// Splits a Q6_K block stream into GPU-friendly `u32`-packed arrays: `ql`
 /// (128 bytes/block -> 32 u32), `qh` (64 bytes/block -> 16 u32) and `scales`
 /// (16 signed-i8 bytes/block -> 4 u32, sign-extended in WGSL the same way
@@ -358,6 +398,14 @@ pub fn load_matmul_weight_gguf(engine: &Engine, label: &str, shape: &[usize], dt
             let chunks = chunk_rows(engine, label, bytes, out_dim, in_dim / QK, in_dim / QK4K * Q4K_BLOCK_BYTES, ChunkKind::Q4_K)?;
             MatMulWeight::Q4_K { chunks, blocks_per_row: (in_dim / QK) as u32, out_dim: out_dim as u32 }
         }
+        GgmlDtype::F16 | GgmlDtype::BF16 if in_dim.is_multiple_of(32) => {
+            let chunks = chunk_rows_half(engine, label, bytes, out_dim, in_dim)?;
+            if dtype == GgmlDtype::F16 {
+                MatMulWeight::F16 { chunks, out_dim: out_dim as u32 }
+            } else {
+                MatMulWeight::BF16 { chunks, out_dim: out_dim as u32 }
+            }
+        }
         GgmlDtype::F32 | GgmlDtype::F16 | GgmlDtype::BF16 => {
             let data = crate::gguf::dequantize_for(dtype, bytes, n_elements);
             MatMulWeight::F32 { w: engine.buf_f32(&data, label) }
@@ -378,6 +426,11 @@ pub struct QEmbeddingTable {
     pub blocks_per_row: u32,
 }
 
+/// F16 or BF16 embedding table: two values per u32.
+pub struct QEmbeddingHalf {
+    pub w: wgpu::Buffer,
+}
+
 /// Q6_K counterpart of `QEmbeddingTable` - four buffers instead of two, same
 /// reason as `QChunk6K`.
 pub struct QEmbeddingTable6K {
@@ -395,6 +448,8 @@ pub enum EmbeddingTable {
     Q6_K(QEmbeddingTable6K),
     Q5_0(QEmbeddingTable),
     Q4_K(QEmbeddingTable),
+    F16(QEmbeddingHalf),
+    BF16(QEmbeddingHalf),
 }
 
 impl EmbeddingTable {
@@ -405,6 +460,7 @@ impl EmbeddingTable {
     pub fn gpu_bytes(&self) -> u64 {
         match self {
             EmbeddingTable::Q4_0(t) | EmbeddingTable::Q8_0(t) | EmbeddingTable::Q5_0(t) | EmbeddingTable::Q4_K(t) => t.qs.size() + t.scales.size() + t.aux.as_ref().map_or(0, |a| a.size()),
+            EmbeddingTable::F16(t) | EmbeddingTable::BF16(t) => t.w.size(),
             EmbeddingTable::Q6_K(t) => t.ql.size() + t.qh.size() + t.scales.size() + t.d.size(),
         }
     }
@@ -459,6 +515,15 @@ pub fn load_embedding_table_gguf(engine: &Engine, label: &str, shape: &[usize], 
                 blocks_per_row: (hidden / QK) as u32,
             })
         }
+        GgmlDtype::F16 | GgmlDtype::BF16 => {
+            let words = pack_halves(bytes);
+            let t = QEmbeddingHalf { w: engine.buf_u32(&words, label) };
+            if dtype == GgmlDtype::F16 {
+                EmbeddingTable::F16(t)
+            } else {
+                EmbeddingTable::BF16(t)
+            }
+        }
         GgmlDtype::Q6_K => {
             let (ql, qh, scales, d) = split_q6k_blocks(bytes, n_elements);
             EmbeddingTable::Q6_K(QEmbeddingTable6K {
@@ -469,7 +534,7 @@ pub fn load_embedding_table_gguf(engine: &Engine, label: &str, shape: &[usize], 
                 blocks_per_row: (hidden / QK6K) as u32,
             })
         }
-        other => anyhow::bail!("{label}: {other:?} is not supported as an embedding table (Q4_0, Q5_0, Q8_0, Q4_K and Q6_K are)"),
+        other => anyhow::bail!("{label}: {other:?} is not supported as an embedding table (Q4_0, Q5_0, Q8_0, Q4_K, Q6_K, F16 and BF16 are)"),
     })
 }
 
