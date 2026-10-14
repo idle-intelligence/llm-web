@@ -149,3 +149,81 @@ First loads of each cell, before the machine slowed: Chromium 48.2 and 47.9 (128
 
 - Check the build on Firefox 157 release (the browser with the slow readback) with the chat page: expected effect is one map wait per 8 tokens instead of per token; unverified.
 - Quiet-machine rerun of the tables above.
+
+## 2026-10-14: f16 prefill matmul when the device grants shader-f16
+
+Change: `linear_q4_tiled_f16.wgsl`, the 64x64 register-blocked prefill tile with both shared tiles in `vec4<f16>` (dequantised weights `(q - 8) * scale` rounded once to f16, activations rounded to f16 on staging) and the dot products of one whole Q4_0 block (32 values) summed in f16 before they are widened into the f32 accumulators. Accumulation across blocks, the bias and the output stay f32. The Q8_0 prefill uses the same kernel through its `Q8` override. The device requests `shader-f16` whenever the adapter offers it; without it the F32 tiled kernels run, unchanged. Decode, the small-M prefill kernel (fewer than 64 rows) and attention are untouched. `LEAN_F16=0` keeps the F32 kernels on an f16 adapter (native A/B only; browsers have no such switch).
+
+### Parameters
+
+- SmolLM2-1.7B-Instruct Q4_0, maxCtx 2048, greedy. Browser harness `scripts/bench` (phase cold: prompts of 100, 500 and 1000 tokens, 3 repetitions inside each page load, then the suffix prefill of the same prompt with a quarter more tokens appended; the table value is the median of the 3 repetitions). Native: `prefill_sweep --lens 100,500,1000 --reps 3 --suffix`, whose suffix case is the second half of the prompt after the first half is resident.
+- 5 page loads (native: 5 process runs) per cell, interleaved after, before, after, before. Medians with min and max. Before is the wasm built from the previous commit (md5 82cf52894b4891dc98fb959fdfb82aac), after is this branch (md5 c859bc9ea6b623f2368ff0d1c81d20cc), served from a no-store static server under distinct tags; the bench page records `device.features.has("shader-f16")` for each load.
+- M2 laptop, 16 GB, 1-minute load average 0.9 to 2.1 during the runs, one GPU job at a time. Chromium 153 (Playwright bundled, headless, `--use-angle=metal`), WebKit (Playwright bundled, headless), Firefox Developer Edition 159 (headed, throwaway profile, `dom.webgpu.enabled`), native wgpu on Metal.
+
+### Results: cold prefill, ttft ms (median, min-max)
+
+| Prompt | Chromium before | Chromium after | WebKit before | WebKit after | Firefox Dev 159 before | Firefox Dev 159 after |
+|---|---|---|---|---|---|---|
+| 100 tokens | 587 (511-616) | 440 (405-465) | 619 (618-619) | 473 (473-474) | 596 (595-738) | 453 (453-518) |
+| 500 tokens | 2408 (2217-2475) | 1919 (1682-2059) | 2710 (2705-2861) | 2110 (2108-2110) | 2591 (2587-3140) | 1985 (1975-2372) |
+| 1000 tokens | 4912 (4835-4985) | 3901 (3534-4061) | 5971 (5939-6541) | 4769 (4767-4772) | 5628 (5616-6503) | 4417 (4400-4939) |
+
+### Results: suffix prefill, ttft ms (prefix cached, then a quarter more tokens)
+
+| Case | Chromium before | Chromium after | WebKit before | WebKit after | Firefox Dev 159 before | Firefox Dev 159 after |
+|---|---|---|---|---|---|---|
+| 100 + 24 | 176 (150-186) | 166 (149-178) | 187 (187-187) | 187 (187-187) | 174 (173-222) | 173 (173-206) |
+| 500 + 124 | 653 (617-668) | 540 (473-578) | 790 (788-846) | 642 (642-643) | 744 (743-883) | 596 (593-699) |
+| 1000 + 249 | 1397 (1378-1436) | 1150 (1046-1192) | 1884 (1878-2013) | 1587 (1586-1587) | 1748 (1745-1937) | 1449 (1444-1565) |
+
+The 100 + 24 case runs 24 rows, below the 64-row threshold of the small-M kernel, so it does not use the changed kernel.
+
+### Results: native wgpu on Metal, prefill ms (median, min-max, n = 5)
+
+| Case | F32 kernels (LEAN_F16=0) | f16 kernels |
+|---|---|---|
+| 100 tokens | 660.5 (626.6-664.0) | 521.8 (484.1-522.7) |
+| 500 tokens | 2847.9 (2825.4-2953.9) | 2320.9 (2024.7-2323.5) |
+| 1000 tokens | 6187.7 (6144.5-6366.2) | 4827.4 (4430.1-4881.1) |
+| suffix 250 after 250 | 1518.8 (1502.1-1635.1) | 1218.1 (1104.4-1223.7) |
+| suffix 500 after 500 | 3409.7 (3354.0-3426.4) | 2652.6 (2501.3-2667.1) |
+| suffix 50 after 50 (small-M kernel) | 333.9 (300.0-334.9) | 345.5 (301.4-352.6) |
+| decode ms per step | 20.0 (20.0-20.1) | 20.1 (20.0-20.5) |
+
+The native f16 runs drifted upward between the first and the last run (484 to 522 ms at 100 tokens) while the F32 runs did too (627 to 664), so the min of each column and the median both show the same ratio of about 0.79.
+
+### f16 availability
+
+| Engine | adapter offers shader-f16 | device granted | path taken |
+|---|---|---|---|
+| Chromium 153 on the M2 (Metal) | yes | yes | f16 |
+| WebKit (Playwright build) on the M2 | yes | yes | f16 |
+| Firefox Developer Edition 159 on the M2 | yes | yes | f16 |
+| Native wgpu 26 on Metal (M2) | yes | yes | f16 |
+| Chromium 153 on the Linux test machine (RTX 3080, Vulkan, driver 610.57) | no | no | F32 |
+| Native wgpu 26 on Vulkan (RTX 3080) | no | no | F32 |
+
+On the Linux test machine the F32 path was re-measured with the same wasm pair (headed Chromium, 2 repetitions): cold 100 tokens 59.9 ms (after build) against 60.4 ms (before), 500 tokens 215.8 against 214.8, same exactness hash, so the capability gate leaves that machine's numbers unchanged.
+
+### Correctness
+
+- `crates/lean-core/tests/f16_parity.rs` (ignored test, needs the GGUF and a fixture name) runs every fixture case twice, F32 kernels then f16 kernels, and fails on any prefill top-1 or greedy-continuation token that differs from the F32 run or from the reference fixture. All greedy continuations were identical (first divergence none) on: Qwen2.5-0.5B Q4_0 (5 cases, including the 2225 and 2354 token tool prompts), SmolLM2-360M Q4_0, SmolLM2-1.7B Q8_0, Qwen2.5-3B Q4_0, Qwen3-1.7B Q8_0 and Qwen3-0.6B Q8_0 (including the 2225 token prompt).
+- Largest absolute difference of the last-position logits, f16 against F32 kernels: 0.0457 (Qwen2.5-0.5B, 2354 tokens), 0.0552 (Qwen3-0.6B, 2225 tokens), 0.0503 (Qwen3-1.7B, 2225 tokens), 0.0336 (SmolLM2-1.7B Q8_0, 86 tokens), 0.0266 (Qwen2.5-3B, 86 tokens), 0.0216 (SmolLM2-360M, 86 tokens). Cases shorter than 64 rows use the small-M kernel and show 0 difference. Against the reference fixture's top-20 logits (HF transformers) the F32 kernels stay within 1.2e-4, the f16 kernels within 0.030 (largest: Qwen3-1.7B, 2225 tokens).
+- `fixture_parity` and the sibling fixture tests assert 1e-3 on the prefill top-20 logits. With f16 kernels that assertion fails on the first case of 64 or more rows (Qwen2.5-0.5B `long`: 3.0e-3), while the top-1 and all greedy tokens in the same test would still match. Those tests need `LEAN_F16=0` to run their 1e-3 gate on an f16 adapter; their greedy assertions pass either way. Not changed here.
+- `engine_api` with f16 kernels on: 14 of 14. `fixture_parity_generate` (Qwen2.5-0.5B, SmolLM2-360M): 2 of 2 (the Llama-3.2-1B case needs files that are not on this machine).
+- Browser exactness hash efa85acfe7945318 in all 30 browser loads (Chromium, WebKit, Firefox, before and after).
+- clippy `-D warnings`: native all targets, wasm32 web, wasm32 web+diag, clean (run on the Linux test machine).
+
+### Observations
+
+- The three browsers that offer shader-f16 on the M2 take the f16 path and gain 20 to 25% on cold prefill at 100, 500 and 1000 tokens (Chromium 25%, 21%, 21%; WebKit 24%, 22%, 20%; Firefox 24%, 23%, 22%), and 17 to 22% on suffix prefill of 500 or more rows.
+- A window of 4 slots instead of a whole block for the f16 partial sum cost 4% in time and lowered the logit error by about 15%; a window of 1 was slower than the F32 kernel. The error is dominated by rounding the activations and the weights to f16, not by the f16 sum.
+- A 128 x 64 tile with 8 x 4 outputs per thread (more reuse per shared load) ran 11 to 16% slower than the 64 x 64 tile on the M2 (2949 ms against 2026 ms at 500 tokens, one run each) and was dropped.
+- Native decode, Chromium decode and the exactness hash are unchanged.
+
+### What is left
+
+- Greedy exactness was measured on the fixtures and bench prompts above; it is not guaranteed for arbitrary text, because the logits move by up to 0.055. A near-tie in a prompt not tested could resolve differently from the F32 kernels (and from HF).
+- The 1e-3 prefill logit gates in the fixture tests do not hold with f16 kernels; they need `LEAN_F16=0` or a looser gate for the top-20 values.
+- f16 on the RTX 3080 was not measured: neither native wgpu nor Chromium 153 offers shader-f16 on that machine and driver.
+- The small-M kernel (under 64 rows) and prefill attention still run in f32.
