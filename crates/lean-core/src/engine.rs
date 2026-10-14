@@ -183,6 +183,13 @@ pub struct Engine {
     pub(crate) linear_q4_small_m: wgpu::ComputePipeline,
     /// `linear_q4_small_m.wgsl` with its `Q8` override: Q8_0 short prefill.
     pub(crate) linear_q8_small_m: wgpu::ComputePipeline,
+    /// Q4_1 builds (`Q41` override) of the Q4_0 matmul shaders: naive,
+    /// decode (one row per lane and four rows per lane), short and long prefill.
+    pub(crate) linear_q41: wgpu::ComputePipeline,
+    pub(crate) linear_q41_decode: wgpu::ComputePipeline,
+    pub(crate) linear_q41_decode_r4: wgpu::ComputePipeline,
+    pub(crate) linear_q41_small_m: wgpu::ComputePipeline,
+    pub(crate) linear_q41_tiled_rb: wgpu::ComputePipeline,
     pub(crate) attn_prefill: wgpu::ComputePipeline,
     /// `attn_prefill_tiled.wgsl` (head_dim 64) and its HEAD_DIM = 128 build.
     pub(crate) attn_prefill_tiled: wgpu::ComputePipeline,
@@ -432,6 +439,11 @@ impl Engine {
             linear_q8_decode_swiglu_r4: make_pipeline_with_constants(&device, "linear_q8_decode_swiglu_r4", include_str!("shaders/linear_q8_decode_r4.wgsl"), &[("GATE_UP", 1.0)]),
             linear_q4_small_m: make_pipeline(&device, "linear_q4_small_m", include_str!("shaders/linear_q4_small_m.wgsl")),
             linear_q8_small_m: make_pipeline_with_constants(&device, "linear_q8_small_m", include_str!("shaders/linear_q4_small_m.wgsl"), &[("Q8", 1.0)]),
+            linear_q41: make_pipeline_with_constants(&device, "linear_q41", include_str!("shaders/linear_q4.wgsl"), &[("Q41", 1.0)]),
+            linear_q41_decode: make_pipeline_with_constants(&device, "linear_q41_decode", include_str!("shaders/linear_q4_decode.wgsl"), &[("Q41", 1.0)]),
+            linear_q41_decode_r4: make_pipeline_with_constants(&device, "linear_q41_decode_r4", include_str!("shaders/linear_q4_decode_r4.wgsl"), &[("Q41", 1.0)]),
+            linear_q41_small_m: make_pipeline_with_constants(&device, "linear_q41_small_m", include_str!("shaders/linear_q4_small_m.wgsl"), &[("Q41", 1.0)]),
+            linear_q41_tiled_rb: make_pipeline_with_constants(&device, "linear_q41_tiled_rb", include_str!("shaders/linear_q4_tiled_rb.wgsl"), &[("Q41", 1.0)]),
             attn_prefill: make_pipeline(&device, "attn_prefill", include_str!("shaders/attn_prefill.wgsl")),
             attn_prefill_tiled: make_pipeline(&device, "attn_prefill_tiled", include_str!("shaders/attn_prefill_tiled.wgsl")),
             attn_prefill_tiled_128: make_pipeline_with_constants(&device, "attn_prefill_tiled_128", include_str!("shaders/attn_prefill_tiled.wgsl"), &[("HEAD_DIM", 128.0)]),

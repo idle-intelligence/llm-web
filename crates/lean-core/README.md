@@ -41,7 +41,7 @@ Tensor types (`src/gguf.rs`, `src/quant.rs`, `src/cpu.rs`):
 | Q4_0 | kept quantized, dequantized in the kernels (GPU and CPU) |
 | Q8_0 | kept quantized, dequantized in the kernels (GPU and CPU) |
 | Q6_K | kept quantized, dequantized in the kernels (GPU and CPU); usually the embedding and output tensors of a "Q4_0" GGUF |
-| Q4_1 | dequantized to F32 at load (a few tensors of the SmolLM2 "Q4_0" GGUFs) |
+| Q4_1 | kept quantized on the GPU (`value = nibble * d + m`; a few `ffn_down` tensors of the SmolLM2 "Q4_0" GGUFs), dequantized to F32 on the CPU path |
 | F16, F32 | F32 at load (norms, biases) |
 
 Any other type is rejected at load with an error naming it.

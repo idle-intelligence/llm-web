@@ -51,6 +51,9 @@ struct Dims {
 @group(0) @binding(5) var<uniform> dims: Dims;
 
 override Q8: bool = false;
+// Q41 (pipeline override, `linear_q41_tiled_rb` in engine.rs): Q4_1 blocks,
+// value = nibble * d + m; `scales` holds [d, m] f32 pairs.
+override Q41: bool = false;
 
 const TM: u32 = 64u;
 const TN: u32 = 64u;
@@ -91,12 +94,23 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wg:
     var acc3 = vec4<f32>(0.0);
 
     for (var blk: u32 = 0u; blk < bpr; blk = blk + 1u) {
-        let scale = select(0.0, scales[n_safe * bpr + blk], n_ok);
+        var scale = 0.0;
+        var mn = 0.0;
+        if (Q41) {
+            scale = select(0.0, scales[2u * (n_safe * bpr + blk)], n_ok);
+            mn = select(0.0, scales[2u * (n_safe * bpr + blk) + 1u], n_ok);
+        } else {
+            scale = select(0.0, scales[n_safe * bpr + blk], n_ok);
+        }
         if (Q8) {
             let w0 = qs[(n_safe * bpr + blk) * 8u + p];
             let w1 = qs[(n_safe * bpr + blk) * 8u + p + 4u];
             ws[sw(l, p)] = vec4<f32>(bitcast<vec4<i32>>(vec4<u32>(w0 << 24u, w0 << 16u, w0 << 8u, w0)) >> vec4<u32>(24u)) * scale;
             ws[sw(l, p + 4u)] = vec4<f32>(bitcast<vec4<i32>>(vec4<u32>(w1 << 24u, w1 << 16u, w1 << 8u, w1)) >> vec4<u32>(24u)) * scale;
+        } else if (Q41) {
+            let word = qs[(n_safe * bpr + blk) * 4u + p];
+            ws[sw(l, p)] = vec4<f32>(vec4<u32>(word, word >> 8u, word >> 16u, word >> 24u) & vec4<u32>(0xFu)) * scale + vec4<f32>(mn);
+            ws[sw(l, p + 4u)] = vec4<f32>(vec4<u32>(word >> 4u, word >> 12u, word >> 20u, word >> 28u) & vec4<u32>(0xFu)) * scale + vec4<f32>(mn);
         } else {
             let word = qs[(n_safe * bpr + blk) * 4u + p];
             ws[sw(l, p)] = (vec4<f32>(vec4<u32>(word, word >> 8u, word >> 16u, word >> 24u) & vec4<u32>(0xFu)) - vec4<f32>(8.0)) * scale;

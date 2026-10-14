@@ -57,6 +57,9 @@ struct Dims {
 @group(0) @binding(5) var<uniform> dims: Dims;
 
 override Q8: bool = false;
+// Q41 (pipeline override, `linear_q41_small_m` in engine.rs): Q4_1 blocks,
+// value = nibble * d + m; `scales` holds [d, m] f32 pairs.
+override Q41: bool = false;
 
 const ROWS: u32 = 8u;
 const KS: u32 = 4u;
@@ -74,6 +77,10 @@ var<workgroup> xs: array<vec4<f32>, 512>;
 
 fn nib4(w: u32, s: f32) -> vec4<f32> {
     return (vec4<f32>(vec4<u32>(w, w >> 8u, w >> 16u, w >> 24u) & vec4<u32>(0xFu)) - vec4<f32>(8.0)) * s;
+}
+
+fn nib4_1(w: u32, s: f32, m: f32) -> vec4<f32> {
+    return vec4<f32>(vec4<u32>(w, w >> 8u, w >> 16u, w >> 24u) & vec4<u32>(0xFu)) * s + vec4<f32>(m);
 }
 
 fn i8x4(w: u32, s: f32) -> vec4<f32> {
@@ -129,7 +136,15 @@ fn main(
 
         let blk = blk0 + ks;
         if (blk < bpr) {
-            let s = vec4<f32>(scales[sb.x + blk], scales[sb.y + blk], scales[sb.z + blk], scales[sb.w + blk]);
+            var s = vec4<f32>(0.0);
+            var mn = vec4<f32>(0.0);
+            if (Q41) {
+                let si = (sb + vec4<u32>(blk)) * 2u;
+                s = vec4<f32>(scales[si.x], scales[si.y], scales[si.z], scales[si.w]);
+                mn = vec4<f32>(scales[si.x + 1u], scales[si.y + 1u], scales[si.z + 1u], scales[si.w + 1u]);
+            } else {
+                s = vec4<f32>(scales[sb.x + blk], scales[sb.y + blk], scales[sb.z + blk], scales[sb.w + blk]);
+            }
             let qi = select(sb + vec4<u32>(blk), (sb + vec4<u32>(blk)) * 2u, Q8);
             // 8 k4 slots; Q4_0: slot p < 4 is the low nibbles of word p, slot
             // p + 4 the high nibbles; Q8_0: slot p is word p (second vec4 from 4).
@@ -155,6 +170,12 @@ fn main(
                     w1 = i8x4(wd.y, s.y);
                     w2 = i8x4(wd.z, s.z);
                     w3 = i8x4(wd.w, s.w);
+                } else if (Q41) {
+                    let sh = select(0u, 4u, p >= 4u);
+                    w0 = nib4_1(wd.x >> sh, s.x, mn.x);
+                    w1 = nib4_1(wd.y >> sh, s.y, mn.y);
+                    w2 = nib4_1(wd.z >> sh, s.z, mn.z);
+                    w3 = nib4_1(wd.w >> sh, s.w, mn.w);
                 } else {
                     let sh = select(0u, 4u, p >= 4u);
                     w0 = nib4(wd.x >> sh, s.x);

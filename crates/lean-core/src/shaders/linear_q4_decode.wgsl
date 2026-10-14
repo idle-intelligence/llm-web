@@ -43,6 +43,10 @@ const LANES: u32 = 8u;
 const ROWS_PER_WG: u32 = 16u; // WG_SIZE / LANES
 
 override GATE_UP: bool = false;
+// Q41 (pipeline override, `linear_q41_decode` in engine.rs): Q4_1 blocks,
+// value = nibble * d + m, `scales` holds [d, m] f32 pairs. Not combined with
+// GATE_UP.
+override Q41: bool = false;
 
 var<workgroup> partial_sums: array<f32, WG_SIZE>;
 
@@ -52,6 +56,14 @@ fn nib_lo(w: u32) -> vec4<f32> {
 
 fn nib_hi(w: u32) -> vec4<f32> {
     return vec4<f32>(vec4<u32>(w >> 4u, w >> 12u, w >> 20u, w >> 28u) & vec4<u32>(0xFu)) - vec4<f32>(8.0);
+}
+
+fn nibu_lo(w: u32, s: f32, m: f32) -> vec4<f32> {
+    return vec4<f32>(vec4<u32>(w, w >> 8u, w >> 16u, w >> 24u) & vec4<u32>(0xFu)) * s + vec4<f32>(m);
+}
+
+fn nibu_hi(w: u32, s: f32, m: f32) -> vec4<f32> {
+    return vec4<f32>(vec4<u32>(w >> 4u, w >> 12u, w >> 20u, w >> 28u) & vec4<u32>(0xFu)) * s + vec4<f32>(m);
 }
 
 @compute @workgroup_size(128, 1, 1)
@@ -77,9 +89,18 @@ fn main(
         let row = n * bpr;
         for (var blk: u32 = lane; blk < bpr; blk = blk + LANES) {
             let q = qs[row + blk];
-            let s = scales[row + blk];
             // Word j holds k = 4j..4j+3 (low nibbles) and 16+4j.. (high).
             let xb = blk * 8u;
+            if (Q41) {
+                let sd = scales[2u * (row + blk)];
+                let sm = scales[2u * (row + blk) + 1u];
+                acc += dot(nibu_lo(q.x, sd, sm), x[xb]) + dot(nibu_lo(q.y, sd, sm), x[xb + 1u])
+                    + dot(nibu_lo(q.z, sd, sm), x[xb + 2u]) + dot(nibu_lo(q.w, sd, sm), x[xb + 3u])
+                    + dot(nibu_hi(q.x, sd, sm), x[xb + 4u]) + dot(nibu_hi(q.y, sd, sm), x[xb + 5u])
+                    + dot(nibu_hi(q.z, sd, sm), x[xb + 6u]) + dot(nibu_hi(q.w, sd, sm), x[xb + 7u]);
+                continue;
+            }
+            let s = scales[row + blk];
             let d = dot(nib_lo(q.x), x[xb]) + dot(nib_lo(q.y), x[xb + 1u])
                 + dot(nib_lo(q.z), x[xb + 2u]) + dot(nib_lo(q.w), x[xb + 3u])
                 + dot(nib_hi(q.x), x[xb + 4u]) + dot(nib_hi(q.y), x[xb + 5u])

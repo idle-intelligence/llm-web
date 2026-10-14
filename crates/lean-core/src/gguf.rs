@@ -412,11 +412,9 @@ pub fn dequantize_q4_0(bytes: &[u8], n_elements: usize) -> Vec<f32> {
 /// bytes f16 min (`m`) + 16 bytes of paired nibbles (low nibble -> element
 /// j, high nibble -> element j+16), `value = nibble * d + m` - llama.cpp's
 /// `quantize_row_q4_1_ref` convention (unsigned nibble, no -8 offset,
-/// unlike Q4_0). This crate only ever materializes Q4_1 tensors as F32
-/// (see `quant.rs::load_matmul_weight_gguf`) - no GPU-resident Q4_1 kernel
-/// exists, since the only Q4_1 tensors seen so far (a handful of SmolLM2's
-/// `ffn_down.weight`s) are few enough that a dedicated GPU kernel isn't
-/// worth it.
+/// unlike Q4_0). The GPU path keeps Q4_1 quantized (`quant.rs::split_q4_1_blocks`,
+/// the `Q41` builds of the Q4_0 matmul shaders); this function serves the CPU
+/// path and the reference tests.
 pub fn dequantize_q4_1(bytes: &[u8], n_elements: usize) -> Vec<f32> {
     let mut out = vec![0f32; n_elements];
     for (bi, block) in bytes.as_chunks::<20>().0.iter().enumerate() {

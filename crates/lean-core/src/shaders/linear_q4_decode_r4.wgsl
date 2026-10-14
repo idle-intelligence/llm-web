@@ -45,6 +45,10 @@ const LANES: u32 = 8u;
 const GROUPS: u32 = 8u; // WG_SIZE / LANES, 4 rows each
 
 override GATE_UP: bool = false;
+// Q41 (pipeline override, `linear_q41_decode_r4` in engine.rs): Q4_1 blocks,
+// value = nibble * d + m, `scales` holds [d, m] f32 pairs. Not combined with
+// GATE_UP.
+override Q41: bool = false;
 
 var<workgroup> partial_sums: array<vec4<f32>, WG_SIZE>;
 
@@ -60,6 +64,19 @@ fn nib_hi(w: u32) -> vec4<f32> {
 fn block_dot(q: vec4<u32>, x0: vec4<f32>, x1: vec4<f32>, x2: vec4<f32>, x3: vec4<f32>, x4: vec4<f32>, x5: vec4<f32>, x6: vec4<f32>, x7: vec4<f32>) -> f32 {
     return dot(nib_lo(q.x), x0) + dot(nib_lo(q.y), x1) + dot(nib_lo(q.z), x2) + dot(nib_lo(q.w), x3)
         + dot(nib_hi(q.x), x4) + dot(nib_hi(q.y), x5) + dot(nib_hi(q.z), x6) + dot(nib_hi(q.w), x7);
+}
+
+fn nibu_lo(w: u32, s: f32, m: f32) -> vec4<f32> {
+    return vec4<f32>(vec4<u32>(w, w >> 8u, w >> 16u, w >> 24u) & vec4<u32>(0xFu)) * s + vec4<f32>(m);
+}
+
+fn nibu_hi(w: u32, s: f32, m: f32) -> vec4<f32> {
+    return vec4<f32>(vec4<u32>(w >> 4u, w >> 12u, w >> 20u, w >> 28u) & vec4<u32>(0xFu)) * s + vec4<f32>(m);
+}
+
+fn block_dot41(q: vec4<u32>, sd: f32, sm: f32, x0: vec4<f32>, x1: vec4<f32>, x2: vec4<f32>, x3: vec4<f32>, x4: vec4<f32>, x5: vec4<f32>, x6: vec4<f32>, x7: vec4<f32>) -> f32 {
+    return dot(nibu_lo(q.x, sd, sm), x0) + dot(nibu_lo(q.y, sd, sm), x1) + dot(nibu_lo(q.z, sd, sm), x2) + dot(nibu_lo(q.w, sd, sm), x3)
+        + dot(nibu_hi(q.x, sd, sm), x4) + dot(nibu_hi(q.y, sd, sm), x5) + dot(nibu_hi(q.z, sd, sm), x6) + dot(nibu_hi(q.w, sd, sm), x7);
 }
 
 @compute @workgroup_size(64, 1, 1)
@@ -102,6 +119,15 @@ fn main(
         let x5 = x[xb + 5u];
         let x6 = x[xb + 6u];
         let x7 = x[xb + 7u];
+        if (Q41) {
+            acc += vec4<f32>(
+                block_dot41(qs[r0 + blk], scales[2u * (r0 + blk)], scales[2u * (r0 + blk) + 1u], x0, x1, x2, x3, x4, x5, x6, x7),
+                block_dot41(qs[r1 + blk], scales[2u * (r1 + blk)], scales[2u * (r1 + blk) + 1u], x0, x1, x2, x3, x4, x5, x6, x7),
+                block_dot41(qs[r2 + blk], scales[2u * (r2 + blk)], scales[2u * (r2 + blk) + 1u], x0, x1, x2, x3, x4, x5, x6, x7),
+                block_dot41(qs[r3 + blk], scales[2u * (r3 + blk)], scales[2u * (r3 + blk) + 1u], x0, x1, x2, x3, x4, x5, x6, x7),
+            );
+            continue;
+        }
         let s = vec4<f32>(scales[r0 + blk], scales[r1 + blk], scales[r2 + blk], scales[r3 + blk]);
         let d = vec4<f32>(
             block_dot(qs[r0 + blk], x0, x1, x2, x3, x4, x5, x6, x7),

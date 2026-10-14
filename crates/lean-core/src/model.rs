@@ -1167,7 +1167,9 @@ fn linear(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &
                 }
             }
         }
-        MatMulWeight::Q4_0 { chunks, blocks_per_row, out_dim: n_total } => {
+        MatMulWeight::Q4_0 { chunks, blocks_per_row, out_dim: n_total } | MatMulWeight::Q4_1 { chunks, blocks_per_row, out_dim: n_total } => {
+            // Q4_1 runs the same kernels as Q4_0 through their `Q41` builds.
+            let q41 = matches!(w, MatMulWeight::Q4_1 { .. });
             for chunk in chunks {
                 let ckey = format!("{key}.{}", chunk.row_start);
                 let sckey = scratch_key(&ckey);
@@ -1184,23 +1186,31 @@ fn linear(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &
                     // Reference/naive path - always linear_q4.wgsl regardless
                     // of `rows`, kept for the fixture-parity gate and as the
                     // fallback when a fast kernel's correctness is in doubt.
-                    let bg = pool.bind_group(&ckey, &engine.linear_q4, &entries);
-                    engine.dispatch(pass, &engine.linear_q4, &bg, (chunk.rows.div_ceil(16), rows.div_ceil(16), 1), &ckey);
+                    let pipeline = if q41 { &engine.linear_q41 } else { &engine.linear_q4 };
+                    let bg = pool.bind_group(&ckey, pipeline, &entries);
+                    engine.dispatch(pass, pipeline, &bg, (chunk.rows.div_ceil(16), rows.div_ceil(16), 1), &ckey);
                 } else if rows == 1 {
                     // Decode: coalesced matvec (llm-wasm's shader_q4_matvec_coalesced.wgsl port).
-                    let (pipeline, rows_per_wg) = if chunk.rows >= DECODE_R4_MIN_ROWS { (&engine.linear_q4_decode_r4, DECODE_R4_ROWS_PER_WG) } else { (&engine.linear_q4_decode, DECODE_ROWS_PER_WG) };
+                    let (pipeline, rows_per_wg) = match (chunk.rows >= DECODE_R4_MIN_ROWS, q41) {
+                        (true, false) => (&engine.linear_q4_decode_r4, DECODE_R4_ROWS_PER_WG),
+                        (true, true) => (&engine.linear_q41_decode_r4, DECODE_R4_ROWS_PER_WG),
+                        (false, false) => (&engine.linear_q4_decode, DECODE_ROWS_PER_WG),
+                        (false, true) => (&engine.linear_q41_decode, DECODE_ROWS_PER_WG),
+                    };
                     let bg = pool.bind_group(&format!("{ckey}.decode"), pipeline, &entries);
                     engine.dispatch(pass, pipeline, &bg, (chunk.rows.div_ceil(rows_per_wg), 1, 1), &ckey);
                 } else if rows < SMALL_M_MAX_ROWS {
                     // Short prefill: weight words read and dequantised once
                     // per group of 8 query rows (see linear_q4_small_m.wgsl).
-                    let bg = pool.bind_group(&format!("{ckey}.small_m"), &engine.linear_q4_small_m, &entries);
-                    engine.dispatch(pass, &engine.linear_q4_small_m, &bg, (rows.div_ceil(SMALL_M_ROWS), chunk.rows.div_ceil(SMALL_M_COLS), 1), &ckey);
+                    let pipeline = if q41 { &engine.linear_q41_small_m } else { &engine.linear_q4_small_m };
+                    let bg = pool.bind_group(&format!("{ckey}.small_m"), pipeline, &entries);
+                    engine.dispatch(pass, pipeline, &bg, (rows.div_ceil(SMALL_M_ROWS), chunk.rows.div_ceil(SMALL_M_COLS), 1), &ckey);
                 } else {
                     // Prefill, M >= SMALL_M_MAX_ROWS: 64x64 register-blocked
                     // tiled kernel (see linear_q4_tiled_rb.wgsl's header).
-                    let bg = pool.bind_group(&format!("{ckey}.tiled_rb"), &engine.linear_q4_tiled_rb, &entries);
-                    engine.dispatch(pass, &engine.linear_q4_tiled_rb, &bg, (chunk.rows.div_ceil(64), rows.div_ceil(64), 1), &ckey);
+                    let pipeline = if q41 { &engine.linear_q41_tiled_rb } else { &engine.linear_q4_tiled_rb };
+                    let bg = pool.bind_group(&format!("{ckey}.tiled_rb"), pipeline, &entries);
+                    engine.dispatch(pass, pipeline, &bg, (chunk.rows.div_ceil(64), rows.div_ceil(64), 1), &ckey);
                 }
             }
         }
