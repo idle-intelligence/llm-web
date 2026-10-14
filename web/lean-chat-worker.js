@@ -42,7 +42,7 @@
 const EARLY = [];
 self.onmessage = (e) => EARLY.push(e);
 
-const ENGINE_BUILD = "2026-10-14-perf-merge-01";
+const ENGINE_BUILD = "2026-10-15-reuse-fix-01";
 // Rewritten to true by scripts/build.sh when BUILD_THREADS=1 built pkg-mt
 // into this deployment; GitHub Pages never sets it.
 const MT_BUILT = false;
