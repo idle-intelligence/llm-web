@@ -74,6 +74,8 @@ fn load(gguf: &str, tokenizer_dir: &str, backend: Backend) -> Lean {
 }
 
 fn check_generate_matches_fixture(gguf: &str, tokenizer_dir: &str, fixture_path: &str) {
+    // The reference path: F32 kernels only, whatever the adapter grants.
+    std::env::set_var("LEAN_F16", "0");
     let tokenizer = Tokenizer::from_file(format!("{tokenizer_dir}/tokenizer.json")).expect("loading tokenizer.json");
     let chat_template = read_chat_template(&format!("{tokenizer_dir}/tokenizer_config.json")).expect("reading chat_template");
     let fixture = load_fixture(fixture_path);

@@ -76,6 +76,8 @@ fn fixture_parity_both_kernel_paths() {
     let fixture_json = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/reference/fixture.json")).expect("reading fixture.json");
     let fixture: Fixture = serde_json::from_str(&fixture_json).expect("parsing fixture.json");
 
+    // The reference path: F32 kernels only, whatever the adapter grants.
+    std::env::set_var("LEAN_F16", "0");
     let engine = Engine::new().expect("wgpu engine init");
 
     for fast_kernels in [false, true] {

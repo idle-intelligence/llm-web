@@ -112,6 +112,8 @@ fn fixture_parity_llama_1_7b() {
     let tokenizer_dir = std::env::var("LEAN_TOKENIZER_DIR_LLAMA_1_7B").expect("set LEAN_TOKENIZER_DIR_LLAMA_1_7B to run this test");
     let tokenizer = Tokenizer::from_file(format!("{tokenizer_dir}/tokenizer.json")).expect("loading tokenizer.json");
     let chat_template = read_chat_template(&format!("{tokenizer_dir}/tokenizer_config.json")).expect("reading chat_template");
+    // The reference path: F32 kernels only, whatever the adapter grants.
+    std::env::set_var("LEAN_F16", "0");
     let engine = Engine::new().expect("wgpu engine init");
 
     let q8_gguf = std::env::var("LEAN_GGUF_LLAMA_1_7B_Q8_0").expect("set LEAN_GGUF_LLAMA_1_7B_Q8_0 to run this test");

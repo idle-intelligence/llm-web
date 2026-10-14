@@ -1,14 +1,23 @@
-//! Prefill with the f16 matmul kernels against the F32 kernels and against
-//! the reference fixture. Prints the largest |logit| difference of the
-//! last prefill position and fails if any prefill top-1 or greedy token
-//! differs. Skips with a message when the adapter has no `shader-f16`.
+//! Gate for the f16 path. The F32 path is the HF-exact reference (the
+//! `fixture_parity*` tests pin it to transformers with `LEAN_F16=0`); this
+//! test compares the f16 path to it, in two parts:
+//!
+//! 1. the greedy tokens of the f16 path are identical to the F32 path and to
+//!    the fixture, and the prefill top-1 is the fixture's;
+//! 2. at every generated position (the prefill position included), the token
+//!    chosen by each path is in the other path's top-5 (the logprob-closeness
+//!    check vLLM uses between implementations).
+//!
+//! Prints the largest |logit| difference of the last prefill position per
+//! case. Skips with a message when the adapter has no `shader-f16`.
 //!
 //! ```sh
 //! LEAN_GGUF=/path/to/model.gguf LEAN_FIXTURE=fixture.json \
 //! cargo test -p lean-core --release --test f16_parity -- --ignored --nocapture
 //! ```
 //!
-//! `LEAN_FIXTURE` names a file in `reference/`. Cases longer than
+//! `LEAN_FIXTURE` names a file in `reference/` (default `fixture.json`, which
+//! includes the two long tool-calling prompts). Cases longer than
 //! `LEAN_F16_MAX_TOKENS` (default 3000) are skipped.
 
 use lean_core::engine::Engine;
@@ -44,9 +53,20 @@ fn argmax(logits: &[f32]) -> u32 {
     best as u32
 }
 
+const TOP_K: usize = 5;
+
+fn top_k(logits: &[f32], k: usize) -> Vec<u32> {
+    let mut ids: Vec<u32> = (0..logits.len() as u32).collect();
+    ids.select_nth_unstable_by(k - 1, |&a, &b| logits[b as usize].total_cmp(&logits[a as usize]));
+    ids.truncate(k);
+    ids
+}
+
 struct Out {
     logits: Vec<f32>,
     tokens: Vec<u32>,
+    /// Top-5 token ids of the logits each generated token was chosen from.
+    tops: Vec<Vec<u32>>,
 }
 
 fn run(cases: &[Case], gguf: &str, max_tokens: usize) -> (bool, Vec<Option<Out>>) {
@@ -69,22 +89,24 @@ fn run(cases: &[Case], gguf: &str, max_tokens: usize) -> (bool, Vec<Option<Out>>
         let mut logits = pollster::block_on(forward_prefill(&engine, &model, &mut cache, &case.input_ids, &cos_buf, &sin_buf, None));
         let first = logits.clone();
         let mut tokens = Vec::new();
+        let mut tops = Vec::new();
         for _ in 0..case.greedy_continuation.len() {
             let id = argmax(&logits);
+            tops.push(top_k(&logits, TOP_K));
             tokens.push(id);
             logits = pollster::block_on(forward_decode_step(&engine, &model, &mut cache, id, &cos_buf, &sin_buf, None));
         }
-        outs.push(Some(Out { logits: first, tokens }));
+        outs.push(Some(Out { logits: first, tokens, tops }));
     }
     (f16, outs)
 }
 
 #[test]
-#[ignore = "needs LEAN_GGUF and LEAN_FIXTURE; model files are never committed"]
+#[ignore = "needs LEAN_GGUF (LEAN_FIXTURE optional); model files are never committed"]
 fn f16_prefill_matches_f32() {
     let gguf = std::env::var("LEAN_GGUF").expect("set LEAN_GGUF");
-    let fixture = std::env::var("LEAN_FIXTURE").expect("set LEAN_FIXTURE");
     let max_tokens: usize = std::env::var("LEAN_F16_MAX_TOKENS").ok().and_then(|s| s.parse().ok()).unwrap_or(3000);
+    let fixture = std::env::var("LEAN_FIXTURE").unwrap_or_else(|_| "fixture.json".into());
     let json = std::fs::read_to_string(format!("{}/reference/{fixture}", env!("CARGO_MANIFEST_DIR"))).unwrap();
     let cases = serde_json::from_str::<Fixture>(&json).unwrap().cases;
 
@@ -113,7 +135,10 @@ fn f16_prefill_matches_f32() {
             hf(a),
             hf(b)
         );
-        if !top1_ok || diverge.is_some() || hf_diverge.is_some() {
+        // Each side's chosen token must be in the other side's top-5 at every position.
+        let topk_miss = (0..a.tokens.len()).find(|&p| !b.tops[p].contains(&a.tokens[p]) || !a.tops[p].contains(&b.tokens[p]));
+        eprintln!("  top-{TOP_K} cross-membership first miss: {topk_miss:?}");
+        if !top1_ok || diverge.is_some() || hf_diverge.is_some() || topk_miss.is_some() {
             failures.push(case.name.clone());
         }
     }

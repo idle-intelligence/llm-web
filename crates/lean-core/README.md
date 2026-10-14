@@ -62,10 +62,18 @@ The parity tests compare lean against fixtures written by HF transformers (`refe
 | `fixture_parity_llama32` | Llama-3.2-1B and 3B, Q4_0 and Q8_0, GPU, including a 9044-token prompt (past the 8192 positions of the original context); the prompt is the fixture's HF-rendered chat text | `LEAN_GGUF_LLAMA32_1B_Q4_0`, `LEAN_GGUF_LLAMA32_1B_Q8_0`, `LEAN_TOKENIZER_DIR_LLAMA32_1B`, and the same with `3B` |
 | `fixture_parity_llama32_cpu` | the same on the CPU path; the 9044-token case only with `LEAN_LLAMA32_CPU_LONG=1` | same as above |
 | `stop_ids_match_generation_config` (unit test) | the stop ids read from the GGUF equal the `eos_token_id` list of each model's `generation_config.json`; runs each model whose two variables are set | the Q8_0 `LEAN_GGUF_*` / `LEAN_TOKENIZER_DIR_*` pairs above, `LEAN_GGUF_QWEN3*`, `LEAN_GGUF_QWEN25_3B` |
+| `f16_parity` | the f16 prefill path against the F32 path and the fixture: identical greedy tokens, prefill top-1 equal to the fixture's, and each path's chosen token in the other's top-5 at every generated position; skips when the adapter has no `shader-f16` | `LEAN_GGUF`, optional `LEAN_FIXTURE` (a file in `reference/`, default `fixture.json`, which holds the two long tool-calling prompts) |
 | `logit_mask` | a mask forces an exact string; an all-allowed mask equals no mask | `LEAN_GGUF`, `LEAN_TOKENIZER_DIR` |
 | `kv_snapshot` | restore plus suffix equals a full prefill; snapshot round trip | `LEAN_GGUF`, `LEAN_TOKENIZER_DIR` |
 | `lora_parity` | LoRA on the GPU against a transformers fixture with the LoRA deltas applied | `LEAN_GGUF`, `LEAN_TOKENIZER_DIR`, `LEAN_LORA_BIN` |
 | `cpu_lora_parity` | LoRA on the CPU path against HF PEFT | `LEAN_GGUF`, `LEAN_LORA_BIN`, `LEAN_HF_PEFT_FIXTURE` |
+
+Correctness is checked at two levels. The F32 path is the reference: the `fixture_parity*` GPU tests set `LEAN_F16=0` before creating the engine, so they keep proving the F32 kernels equal transformers (1e-3 on the top-20 logits) even on an adapter that grants `shader-f16`. The f16 path is held to the F32 path by `f16_parity`, which is part of the model suite and is run with every other `--ignored` gate, once per model with that model's fixture:
+
+```bash
+LEAN_GGUF=<gguf> cargo test -p lean-core --release --test f16_parity -- --ignored --nocapture
+LEAN_GGUF=<qwen2.5-3b gguf> LEAN_FIXTURE=fixture_qwen25_3b.json cargo test -p lean-core --release --test f16_parity -- --ignored --nocapture
+```
 
 ```bash
 LEAN_GGUF=<gguf> LEAN_TOKENIZER_DIR=<dir> cargo test -p lean-core --release --test fixture_parity -- --ignored

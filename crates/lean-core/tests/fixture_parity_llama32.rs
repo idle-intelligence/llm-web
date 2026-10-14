@@ -94,6 +94,8 @@ fn run_size(size: &str) {
     let upper = size.to_uppercase();
     let tokenizer_dir = std::env::var(format!("LEAN_TOKENIZER_DIR_LLAMA32_{upper}")).unwrap_or_else(|_| panic!("set LEAN_TOKENIZER_DIR_LLAMA32_{upper} to run this test"));
     let tokenizer = Tokenizer::from_file(format!("{tokenizer_dir}/tokenizer.json")).expect("loading tokenizer.json");
+    // The reference path: F32 kernels only, whatever the adapter grants.
+    std::env::set_var("LEAN_F16", "0");
     let engine = Engine::new().expect("wgpu engine init");
     for quant in ["q4_0", "q8_0"] {
         let var = format!("LEAN_GGUF_LLAMA32_{upper}_{}", quant.to_uppercase());
