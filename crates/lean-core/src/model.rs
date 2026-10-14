@@ -2181,6 +2181,89 @@ fn argmax_gpu(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, ke
     out
 }
 
+/// Candidates the GPU top-k returns, and the layout of its result buffer in
+/// u32 words: `TOPK_CANDS` (value bits, id) pairs, best first, then the raw
+/// logit of each history id handed to `topk_gpu`, in the order given.
+pub const TOPK_CANDS: usize = 64;
+const TOPK_RES_HIST: usize = 2 * TOPK_CANDS;
+/// Items one `topk_stage.wgsl` workgroup sorts.
+const TOPK_GROUP: usize = 1024;
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct TopkStageDims {
+    n_in: u32,
+    mode: u32,
+    out_per_group: u32,
+    out_base: u32,
+}
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct TopkHistDims {
+    n: u32,
+    res_base: u32,
+    _p0: u32,
+    _p1: u32,
+}
+
+/// Top `TOPK_CANDS` logits of `logits`, skipping the ids in `hist` (distinct
+/// ids below `vocab`): `topk_hist.wgsl` first copies their raw logits to the
+/// result buffer and parks them at the lowest f32, then `topk_stage.wgsl`
+/// runs as a tree of 1024-item sorts: a first level of vocab / 1024
+/// workgroups, each keeping its best 64, then a level over those, until one
+/// workgroup is left. The result
+/// buffer is `TOPK_RES_HIST + hist.len()` words (see `TOPK_CANDS`). Selection
+/// is exact; values are copies of the logits, so nothing depends on how a
+/// device rounds arithmetic. This modifies `logits` at the history ids.
+fn topk_gpu(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &str, logits: &wgpu::Buffer, vocab: u32, hist: &[u32]) -> wgpu::Buffer {
+    let res = pool.data(&format!("{key}.res"), TOPK_RES_HIST + hist.len());
+    let mut groups = Vec::new();
+    let mut n_in = vocab as usize;
+    loop {
+        let ng = n_in.div_ceil(TOPK_GROUP);
+        groups.push((n_in, ng));
+        if ng == 1 {
+            break;
+        }
+        n_in = ng * TOPK_CANDS;
+    }
+    let a = pool.data(&format!("{key}.a"), 2 * groups[0].1 * TOPK_CANDS);
+    let b = pool.data(&format!("{key}.b"), 2 * groups.get(1).map_or(1, |g| g.1) * TOPK_CANDS);
+    if !hist.is_empty() {
+        let ids = pool.upload_u32(&format!("{key}.hist"), hist);
+        let dims = pool.uniform(&format!("{key}.hist.dims"), TopkHistDims { n: hist.len() as u32, res_base: TOPK_RES_HIST as u32, _p0: 0, _p1: 0 });
+        let bg = pool.bind_group(
+            &format!("{key}.hist"),
+            &engine.topk_hist,
+            &[
+                BindGroupEntry { binding: 0, resource: logits.as_entire_binding() },
+                BindGroupEntry { binding: 1, resource: ids.as_entire_binding() },
+                BindGroupEntry { binding: 2, resource: res.as_entire_binding() },
+                BindGroupEntry { binding: 3, resource: dims.as_entire_binding() },
+            ],
+        );
+        engine.dispatch(pass, &engine.topk_hist, &bg, ((hist.len() as u32).div_ceil(64), 1, 1), &format!("{key}.hist"));
+    }
+    let last = groups.len() - 1;
+    for (s, &(n_in, ng)) in groups.iter().enumerate() {
+        let out = if s == last { &res } else if s % 2 == 0 { &a } else { &b };
+        let inp = if s == 0 { if last == 0 { &a } else { &b } } else if s % 2 == 1 { &a } else { &b };
+        let dims = pool.uniform(&format!("{key}.s{s}.dims"), TopkStageDims { n_in: n_in as u32, mode: u32::from(s > 0), out_per_group: TOPK_CANDS as u32, out_base: 0 });
+        let bg = pool.bind_group(
+            &format!("{key}.s{s}"),
+            &engine.topk_stage,
+            &[
+                BindGroupEntry { binding: 0, resource: logits.as_entire_binding() },
+                BindGroupEntry { binding: 1, resource: inp.as_entire_binding() },
+                BindGroupEntry { binding: 2, resource: out.as_entire_binding() },
+                BindGroupEntry { binding: 3, resource: dims.as_entire_binding() },
+            ],
+        );
+        engine.dispatch(pass, &engine.topk_stage, &bg, (ng as u32, 1, 1), &format!("{key}.s{s}"));
+    }
+    res
+}
+
 /// Records one decode step's whole layer stack (embed through the lm-head
 /// logits) into `encoder`, without submitting or reading anything back -
 /// shared by `forward_decode_step` (full-logits readback, for samplers) and
@@ -2192,7 +2275,7 @@ fn argmax_gpu(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, ke
 /// returned alongside the logits when requested, `None` otherwise (samplers
 /// that need the full vocab never pay for the extra dispatch).
 #[allow(clippy::too_many_arguments)]
-fn decode_layers(engine: &Engine, model: &GpuModel, encoder: &mut wgpu::CommandEncoder, cache: &mut KvCache, token_id: u32, token_src: Option<&wgpu::Buffer>, cos: &wgpu::Buffer, sin: &wgpu::Buffer, mask: Option<&wgpu::Buffer>, argmax: bool) -> (wgpu::Buffer, Option<wgpu::Buffer>) {
+fn decode_layers(engine: &Engine, model: &GpuModel, encoder: &mut wgpu::CommandEncoder, cache: &mut KvCache, token_id: u32, token_src: Option<&wgpu::Buffer>, cos: &wgpu::Buffer, sin: &wgpu::Buffer, mask: Option<&wgpu::Buffer>, argmax: bool, topk_hist: Option<&[u32]>) -> (wgpu::Buffer, Option<wgpu::Buffer>) {
     model.pool.use_kv_cache(cache.id);
     // `token_src`: the input token id is the first u32 of a GPU buffer (the
     // previous step's argmax), copied into the embedding's id buffer on
@@ -2291,7 +2374,12 @@ fn decode_layers(engine: &Engine, model: &GpuModel, encoder: &mut wgpu::CommandE
     if argmax {
         seg!(engine, encoder, pass, "argmax");
     }
-    let idx = argmax.then(|| argmax_gpu(engine, pool, &mut pass, "dec_argmax", &logits, cfg.vocab_size as u32));
+    let idx = if let Some(hist) = topk_hist {
+        seg!(engine, encoder, pass, "topk");
+        Some(topk_gpu(engine, pool, &mut pass, "dec_topk", &logits, cfg.vocab_size as u32, hist))
+    } else {
+        argmax.then(|| argmax_gpu(engine, pool, &mut pass, "dec_argmax", &logits, cfg.vocab_size as u32))
+    };
     drop(pass);
     (logits, idx)
 }
@@ -2307,7 +2395,7 @@ fn decode_layers(engine: &Engine, model: &GpuModel, encoder: &mut wgpu::CommandE
 /// applied.
 pub async fn forward_decode_step(engine: &Engine, model: &GpuModel, cache: &mut KvCache, token_id: u32, cos: &wgpu::Buffer, sin: &wgpu::Buffer, mask: Option<&wgpu::Buffer>) -> Vec<f32> {
     let mut encoder = engine.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("decode") });
-    let (logits, _) = decode_layers(engine, model, &mut encoder, cache, token_id, None, cos, sin, mask, false);
+    let (logits, _) = decode_layers(engine, model, &mut encoder, cache, token_id, None, cos, sin, mask, false, None);
     engine.queue.submit(Some(encoder.finish()));
     cache.kv_len += 1;
     engine.read_buffer(&logits, model.config.vocab_size).await
@@ -2330,7 +2418,7 @@ pub async fn forward_decode_step_argmax(engine: &Engine, model: &GpuModel, cache
     if engine.profiling_enabled() {
         engine.reset_profile();
     }
-    let (_, idx) = decode_layers(engine, model, &mut encoder, cache, token_id, None, cos, sin, mask, true);
+    let (_, idx) = decode_layers(engine, model, &mut encoder, cache, token_id, None, cos, sin, mask, true, None);
     let idx = idx.expect("decode_layers(argmax=true) always returns Some");
     // Resolve on the same encoder as the profiled dispatches, before it's
     // finished/submitted - see `Engine::resolve_profile`'s doc comment.
@@ -2351,6 +2439,61 @@ pub async fn forward_decode_step_argmax(engine: &Engine, model: &GpuModel, cache
         crate::profile_report::record_step(&data);
     }
     result
+}
+
+/// One sampling step's GPU result: the best `TOPK_CANDS` (id, logit) pairs
+/// of the non-history ids, best first (ties toward the lower id; excluded
+/// and padding slots dropped), and the raw logit of each history id given.
+pub struct TopkStep {
+    pub cands: Vec<(u32, f32)>,
+    pub hist_logits: Vec<f32>,
+    logits: wgpu::Buffer,
+}
+
+/// Same forward as `forward_decode_step`, but instead of reading back the
+/// vocabulary-sized logits, the GPU picks the top `TOPK_CANDS` logits among
+/// the ids not in `hist_ids` and the host reads `8 * TOPK_CANDS + 4 *
+/// hist_ids.len()` bytes. `hist_ids` must be distinct and below the
+/// vocabulary size. The full logits stay on the GPU until the next step;
+/// `read_logits` fetches them when a caller needs the whole vector.
+#[allow(clippy::too_many_arguments)]
+pub async fn forward_decode_step_topk(engine: &Engine, model: &GpuModel, cache: &mut KvCache, token_id: u32, cos: &wgpu::Buffer, sin: &wgpu::Buffer, mask: Option<&wgpu::Buffer>, hist_ids: &[u32]) -> TopkStep {
+    let mut encoder = engine.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("decode_topk") });
+    let (logits, res) = decode_layers(engine, model, &mut encoder, cache, token_id, None, cos, sin, mask, false, Some(hist_ids));
+    let res = res.expect("decode_layers(topk) always returns Some");
+    let words = TOPK_RES_HIST + hist_ids.len();
+    let staging = engine.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("topk_staging"),
+        size: 4 * words as u64,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    encoder.copy_buffer_to_buffer(&res, 0, &staging, 0, 4 * words as u64);
+    engine.queue.submit(Some(encoder.finish()));
+    cache.kv_len += 1;
+    let rx = engine.start_map_u32(&staging);
+    let w = engine.finish_map_u32s(&staging, rx).await;
+    let lowest = f32::MIN;
+    let cands = (0..TOPK_CANDS)
+        .map(|i| (w[2 * i + 1], f32::from_bits(w[2 * i])))
+        .filter(|&(_, v)| v > lowest)
+        .collect();
+    let hist_logits = w[TOPK_RES_HIST..].iter().map(|&b| f32::from_bits(b)).collect();
+    TopkStep { cands, hist_logits, logits }
+}
+
+impl TopkStep {
+    /// The step's full logits, as `forward_decode_step` returns them. Valid
+    /// only until the next forward call. `hist_ids` is the slice given to
+    /// `forward_decode_step_topk`; its logits were parked and are restored
+    /// from `hist_logits`.
+    pub async fn read_logits(&self, engine: &Engine, model: &GpuModel, hist_ids: &[u32]) -> Vec<f32> {
+        let mut logits = engine.read_buffer(&self.logits, model.config.vocab_size).await;
+        for (&id, &v) in hist_ids.iter().zip(&self.hist_logits) {
+            logits[id as usize] = v;
+        }
+        logits
+    }
 }
 
 /// Greedy decode steps per readback block. Every step appends its argmax id
@@ -2378,7 +2521,7 @@ struct PendingBlock {
 fn submit_greedy_step(engine: &Engine, model: &GpuModel, cache: &mut KvCache, token_id: u32, token_src: Option<&wgpu::Buffer>, ring: &wgpu::Buffer, slot: u32, stage: Option<(&wgpu::Buffer, u64)>, cos: &wgpu::Buffer, sin: &wgpu::Buffer, mask: Option<&wgpu::Buffer>) -> wgpu::Buffer {
     let t_start = crate::engine::now_ms();
     let mut encoder = engine.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("decode_greedy") });
-    let (_, idx) = decode_layers(engine, model, &mut encoder, cache, token_id, token_src, cos, sin, mask, true);
+    let (_, idx) = decode_layers(engine, model, &mut encoder, cache, token_id, token_src, cos, sin, mask, true, None);
     let idx = idx.expect("decode_layers(argmax=true) always returns Some");
     encoder.copy_buffer_to_buffer(&idx, 0, ring, 4 * slot as u64, 4);
     if let Some((staging, bytes)) = stage {
@@ -2506,12 +2649,12 @@ pub async fn forward_prefill_suffix(engine: &Engine, model: &GpuModel, cache: &m
     let (last, rest) = token_ids.split_last().expect("forward_prefill_suffix needs at least one token");
     for &tok in rest {
         let mut encoder = engine.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("prefill_suffix_step") });
-        let _ = decode_layers(engine, model, &mut encoder, cache, tok, None, cos, sin, None, false);
+        let _ = decode_layers(engine, model, &mut encoder, cache, tok, None, cos, sin, None, false, None);
         engine.queue.submit(Some(encoder.finish()));
         cache.kv_len += 1;
     }
     let mut encoder = engine.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("prefill_suffix_last") });
-    let (logits, _) = decode_layers(engine, model, &mut encoder, cache, *last, None, cos, sin, mask, false);
+    let (logits, _) = decode_layers(engine, model, &mut encoder, cache, *last, None, cos, sin, mask, false, None);
     engine.queue.submit(Some(encoder.finish()));
     cache.kv_len += 1;
     engine.read_buffer(&logits, model.config.vocab_size).await

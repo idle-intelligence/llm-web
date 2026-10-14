@@ -12,8 +12,8 @@
 
 use lean_core::engine::Engine;
 use crate::generate::decode_loop;
-use lean_core::model::{argmax, build_rope_tables, decode_greedy_pipelined, forward_decode_step_argmax, forward_prefill, forward_prefill_suffix, GpuModel, KvCache};
-use crate::sampling::SamplingParams;
+use lean_core::model::{argmax, build_rope_tables, decode_greedy_pipelined, forward_decode_step, forward_decode_step_argmax, forward_prefill, forward_prefill_suffix, GpuModel, KvCache};
+use crate::sampling::{sample, Rng64, SamplingParams};
 use lean_chat::{read_chat_template, render, Message};
 use tokenizers::Tokenizer;
 
@@ -137,6 +137,53 @@ fn seeded_sampling_is_reproducible_across_runs() {
     let out_a = run();
     let out_b = run();
     assert_eq!(out_a, out_b, "same seed + same params must reproduce the exact same generated token ids");
+}
+
+/// `decode_loop` with the GPU top-k (top_k 40) gives exactly the tokens of
+/// the full-logits loop (`forward_decode_step` + `sample`) for the same seed.
+#[test]
+#[ignore = "needs LEAN_GGUF and LEAN_TOKENIZER_DIR on disk; never committed to this repo"]
+fn gpu_topk_matches_full_logits_sampling() {
+    let (engine, model, tokenizer, chat_template) = setup();
+    let steps = 96u32;
+    let mut total = 0;
+    for (prompt, seed, top_p, penalty) in [
+        ("Write a long story about a lighthouse keeper.", 0u64, 0.9f32, 1.1f32),
+        ("Tell me a short story about a fox.", 12345, 0.95, 1.1),
+        ("List ten animals, one per line.", 7, 1.0, 1.3),
+        ("Say hello.", 99, 0.5, 1.0),
+    ] {
+        let prompt_ids = tokenize(&tokenizer, &chat_template, prompt);
+        let max_ctx = prompt_ids.len() as u32 + steps + 4;
+        let (cos, sin) = build_rope_tables(&model.config, max_ctx as usize);
+        let cos_buf = engine.buf_f32(&cos, "rope_cos");
+        let sin_buf = engine.buf_f32(&sin, "rope_sin");
+        let params = SamplingParams { temperature: 0.7, top_k: 40, top_p, repetition_penalty: penalty, seed };
+
+        let mut cache = KvCache::new(&engine, &model.config, max_ctx);
+        let logits = pollster::block_on(forward_prefill(&engine, &model, &mut cache, &prompt_ids, &cos_buf, &sin_buf, None));
+        let mut history = prompt_ids.clone();
+        let got = pollster::block_on(decode_loop(&engine, &model, &mut cache, logits, &cos_buf, &sin_buf, None, steps, &params, &mut history, |_| {}, || false));
+
+        let mut cache = KvCache::new(&engine, &model.config, max_ctx);
+        let logits = pollster::block_on(forward_prefill(&engine, &model, &mut cache, &prompt_ids, &cos_buf, &sin_buf, None));
+        let mut history = prompt_ids.clone();
+        let mut rng = Rng64::new(params.seed);
+        let mut next = sample(&mut logits.clone(), &params, &history, &mut rng);
+        let mut want = Vec::new();
+        for _ in 0..steps {
+            if model.config.eos_token_ids.contains(&next) {
+                break;
+            }
+            want.push(next);
+            history.push(next);
+            let mut l = pollster::block_on(forward_decode_step(&engine, &model, &mut cache, next, &cos_buf, &sin_buf, None));
+            next = sample(&mut l, &params, &history, &mut rng);
+        }
+        assert_eq!(got, want, "prompt {prompt:?} seed {seed}");
+        total += got.len();
+    }
+    assert!(total > 150, "the comparison needs real replies, got {total} tokens");
 }
 
 #[test]

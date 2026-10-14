@@ -248,6 +248,11 @@ pub struct Engine {
     /// caller-supplied bitset, in place on the logits buffer, before
     /// argmax/readback - see `model.rs::mask_logits_gpu`.
     pub(crate) mask_logits: wgpu::ComputePipeline,
+    /// GPU top-k for sampling: `shaders/topk_hist.wgsl` takes the penalty
+    /// history out of the logits, `shaders/topk_stage.wgsl` is one stage of
+    /// the 1024-way bitonic selection - see `model.rs::topk_gpu`.
+    pub(crate) topk_hist: wgpu::ComputePipeline,
+    pub(crate) topk_stage: wgpu::ComputePipeline,
     /// Per-row absolute-position RoPE (`shaders/rope_positions.wgsl`) - the
     /// caller-supplied-position-ids mechanism (llm-life's per-cell RoPE
     /// restart), see `model.rs::rope_positions`.
@@ -479,6 +484,8 @@ impl Engine {
             silu_mul_fused: make_pipeline(&device, "silu_mul_fused", include_str!("shaders/silu_mul_fused.wgsl")),
             argmax: make_pipeline(&device, "argmax", include_str!("shaders/argmax.wgsl")),
             mask_logits: make_pipeline(&device, "mask_logits", include_str!("shaders/mask_logits.wgsl")),
+            topk_hist: make_pipeline(&device, "topk_hist", include_str!("shaders/topk_hist.wgsl")),
+            topk_stage: make_pipeline(&device, "topk_stage", include_str!("shaders/topk_stage.wgsl")),
             rope_positions: make_pipeline(&device, "rope_positions", include_str!("shaders/rope_positions.wgsl")),
             attn_chunk_masked: make_pipeline(&device, "attn_chunk_masked", include_str!("shaders/attn_chunk_masked.wgsl")),
             gather_dequant_q8_rows: make_pipeline(&device, "gather_dequant_q8_rows", include_str!("shaders/gather_dequant_q8_rows.wgsl")),

@@ -12,13 +12,17 @@
 //! submitted before the previous id is read back), with the same tokens
 //! as the step-by-step `forward_decode_step_argmax` loop - see
 //! `tests/streaming_sampling.rs::greedy_streaming_matches_whole_reply`.
-//! Non-greedy sampling reads back the full logits vector every step
-//! (`forward_decode_step`) and draws from it via `sampling::sample` - see
-//! `sampling.rs`'s doc comment for why that's an acceptable readback cost.
+//! Non-greedy sampling with `0 < top_k < 64` selects the top-k on the GPU
+//! (`forward_decode_step_topk`) and reads back only the candidates and the
+//! repetition-penalty history's logits; the penalty, temperature, top-p and
+//! the draw run on the CPU (`sampling::sample_candidates`) and give the
+//! token `sampling::sample` gives on the full logits. Other non-greedy
+//! settings (`top_k` 0 or 64 and up) read back the full logits vector every
+//! step (`forward_decode_step`) and draw via `sampling::sample`.
 
 use lean_core::engine::Engine;
-use lean_core::model::{argmax, decode_greedy_pipelined, forward_decode_step, GpuModel, KvCache};
-use crate::sampling::{sample, Rng64, SamplingParams};
+use lean_core::model::{argmax, decode_greedy_pipelined, forward_decode_step, forward_decode_step_topk, GpuModel, KvCache};
+use crate::sampling::{sample, sample_candidates, Candidates, HistoryCounts, Rng64, SamplingParams};
 
 /// Runs the decode loop starting from `first_logits` (the logits already
 /// computed at the last prefilled position - the caller has just run
@@ -62,6 +66,10 @@ pub async fn decode_loop(
         .0;
     }
     let mut rng = Rng64::new(params.seed);
+    let vocab = model.config.vocab_size;
+    // Top-k on the GPU when it applies: only the candidates come back.
+    let gpu_topk = params.gpu_topk() && (params.top_k as usize) < vocab;
+    let mut counts = HistoryCounts::new(vocab, history);
     let mut next_id = sample(&mut first_logits.clone(), params, history, &mut rng);
 
     let mut generated = Vec::with_capacity(max_new_tokens as usize);
@@ -71,9 +79,22 @@ pub async fn decode_loop(
         }
         generated.push(next_id);
         history.push(next_id);
+        counts.push(next_id);
         on_token(next_id);
-        let mut logits = forward_decode_step(engine, model, cache, next_id, cos, sin, mask).await;
-        next_id = sample(&mut logits, params, history, &mut rng);
+        if gpu_topk {
+            let step = forward_decode_step_topk(engine, model, cache, next_id, cos, sin, mask, &counts.ids).await;
+            let cands = Candidates { cands: &step.cands, hist_logits: &step.hist_logits };
+            next_id = match sample_candidates(&cands, &counts, vocab, params, &mut rng) {
+                Some(id) => id,
+                None => {
+                    let mut logits = step.read_logits(engine, model, &counts.ids).await;
+                    sample(&mut logits, params, history, &mut rng)
+                }
+            };
+        } else {
+            let mut logits = forward_decode_step(engine, model, cache, next_id, cos, sin, mask).await;
+            next_id = sample(&mut logits, params, history, &mut rng);
+        }
     }
     generated
 }
