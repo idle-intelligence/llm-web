@@ -186,7 +186,11 @@ fn read_gguf_value<R: Read + Seek>(reader: &mut R, value_type: u32) -> Result<Gg
 /// quantizer keeps the embedding/output tensors at higher precision even
 /// in a "Q4_0" quant run) - the same gap already flagged for
 /// SmolLM2-1.7B-Instruct's "Q4_0" GGUF (also Q6_K `token_embd.weight`),
-/// now closed for both. Any other K-quant is still rejected.
+/// now closed for both. `Q5_0` (6), `Q4_K` (12) and `BF16` (30) cover the
+/// "Q4_K_M" files llama.cpp writes (Q4_K for most matrices, Q6_K for part of
+/// `attn_v`/`ffn_down`, Q5_0 and Q8_0 in place of Q4_K and Q6_K when a row
+/// width is not a multiple of 256) and the BF16 releases. Any other type is
+/// rejected with its name and the tensor's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(non_camel_case_types)]
 pub enum GgmlDtype {
@@ -194,8 +198,44 @@ pub enum GgmlDtype {
     F16,
     Q4_0,
     Q4_1,
+    Q5_0,
     Q8_0,
+    Q4_K,
     Q6_K,
+    BF16,
+}
+
+/// ggml's name for a tensor type code, for error messages.
+fn ggml_type_name(code: u32) -> String {
+    let name = match code {
+        4 => "Q4_2",
+        5 => "Q4_3",
+        7 => "Q5_1",
+        9 => "Q8_1",
+        10 => "Q2_K",
+        11 => "Q3_K",
+        13 => "Q5_K",
+        15 => "Q8_K",
+        16 => "IQ2_XXS",
+        17 => "IQ2_XS",
+        18 => "IQ3_XXS",
+        19 => "IQ1_S",
+        20 => "IQ4_NL",
+        21 => "IQ3_S",
+        22 => "IQ2_S",
+        23 => "IQ4_XS",
+        24 => "I8",
+        25 => "I16",
+        26 => "I32",
+        27 => "I64",
+        28 => "F64",
+        29 => "IQ1_M",
+        34 => "TQ1_0",
+        35 => "TQ2_0",
+        39 => "MXFP4",
+        _ => return format!("#{code}"),
+    };
+    name.to_string()
 }
 
 impl GgmlDtype {
@@ -205,16 +245,19 @@ impl GgmlDtype {
             1 => Ok(Self::F16),
             2 => Ok(Self::Q4_0),
             3 => Ok(Self::Q4_1),
+            6 => Ok(Self::Q5_0),
             8 => Ok(Self::Q8_0),
+            12 => Ok(Self::Q4_K),
             14 => Ok(Self::Q6_K),
-            other => bail!("unsupported GGML dtype code: {other} (this crate only reads F32/F16/Q4_0/Q4_1/Q8_0/Q6_K)"),
+            30 => Ok(Self::BF16),
+            other => bail!("unsupported GGML tensor type {} (code {other}); lean reads F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q8_0, Q4_K and Q6_K", ggml_type_name(other)),
         }
     }
 
     pub fn byte_size(&self, num_elements: u64) -> Result<u64> {
         match self {
             Self::F32 => num_elements.checked_mul(4),
-            Self::F16 => num_elements.checked_mul(2),
+            Self::F16 | Self::BF16 => num_elements.checked_mul(2),
             Self::Q4_0 => {
                 let num_blocks = num_elements / 32;
                 num_blocks.checked_mul(18) // 2 (f16 scale) + 16 (nibbles)
@@ -223,9 +266,17 @@ impl GgmlDtype {
                 let num_blocks = num_elements / 32;
                 num_blocks.checked_mul(20) // 2 (f16 scale) + 2 (f16 min) + 16 (nibbles)
             }
+            Self::Q5_0 => {
+                let num_blocks = num_elements / 32;
+                num_blocks.checked_mul(22) // 2 (f16 scale) + 4 (high bits) + 16 (nibbles)
+            }
             Self::Q8_0 => {
                 let num_blocks = num_elements / 32;
                 num_blocks.checked_mul(34) // 2 (f16 scale) + 32 (i8)
+            }
+            Self::Q4_K => {
+                let num_blocks = num_elements / 256;
+                num_blocks.checked_mul(144) // 2 (f16 d) + 2 (f16 dmin) + 12 (6-bit scales and mins) + 128 (nibbles)
             }
             Self::Q6_K => {
                 let num_blocks = num_elements / 256;
@@ -315,7 +366,7 @@ impl<R: Read + Seek> GgufReader<R> {
             for d in 0..ndims {
                 dimensions.push(reader.read_u64::<LittleEndian>().with_context(|| format!("reading dim {d} for tensor {i}"))?);
             }
-            let dtype = GgmlDtype::from_u32(reader.read_u32::<LittleEndian>().with_context(|| format!("reading dtype for tensor {i}"))?)?;
+            let dtype = GgmlDtype::from_u32(reader.read_u32::<LittleEndian>().with_context(|| format!("reading dtype for tensor {i}"))?).with_context(|| format!("tensor '{name}'"))?;
             let offset = reader.read_u64::<LittleEndian>().with_context(|| format!("reading offset for tensor {i}"))?;
             ensure!(offset <= file_len, "tensor {i} ('{name}'): offset {offset} exceeds file length {file_len}");
             tensors.insert(name.clone(), GgufTensorInfo { name, dimensions, dtype, offset });
@@ -487,6 +538,71 @@ pub fn dequantize_q6_k(bytes: &[u8], n_elements: usize) -> Vec<f32> {
     out
 }
 
+/// Dequantize a Q5_0 block stream to f32. Block (llama.cpp `block_q5_0`,
+/// 32 values): f16 `d`, 4 bytes `qh` (the fifth bit of each value: bit `j`
+/// of the little-endian u32 belongs to value `j`), 16 bytes of paired nibbles
+/// (low nibble -> value j, high nibble -> value j + 16), `value = ((nibble |
+/// bit << 4) - 16) * d`.
+pub fn dequantize_q5_0(bytes: &[u8], n_elements: usize) -> Vec<f32> {
+    let mut out = vec![0f32; n_elements];
+    for (bi, block) in bytes.as_chunks::<22>().0.iter().enumerate() {
+        let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+        let qh = u32::from_le_bytes([block[2], block[3], block[4], block[5]]);
+        for j in 0..16 {
+            let byte = block[6 + j];
+            let x0 = ((byte & 0x0F) as u32 | (((qh >> j) & 1) << 4)) as i32 - 16;
+            let x1 = ((byte >> 4) as u32 | (((qh >> (j + 16)) & 1) << 4)) as i32 - 16;
+            out[bi * 32 + j] = x0 as f32 * d;
+            out[bi * 32 + 16 + j] = x1 as f32 * d;
+        }
+    }
+    out
+}
+
+/// `get_scale_min_k4` of ggml-quants.c: the 6-bit scale and min of sub-block
+/// `j` (0..8) from a Q4_K block's 12 packed `scales` bytes.
+pub fn q4_k_scale_min(j: usize, q: &[u8]) -> (u8, u8) {
+    if j < 4 {
+        (q[j] & 63, q[j + 4] & 63)
+    } else {
+        ((q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4), (q[j + 4] >> 4) | ((q[j] >> 6) << 4))
+    }
+}
+
+/// Dequantize a Q4_K block stream to f32. Block (llama.cpp `block_q4_K`,
+/// 256-value super-block of eight 32-value sub-blocks): f16 `d`, f16 `dmin`,
+/// 12 bytes holding eight 6-bit scales and eight 6-bit mins, 128 bytes of
+/// nibbles. The nibbles are consumed 32 bytes at a time: the low nibbles of
+/// those 32 bytes are sub-block `2i`, the high nibbles sub-block `2i + 1`.
+/// `value = d * sc * nibble - dmin * m`, evaluated as in
+/// `dequantize_row_q4_K` (`d1 = d * sc`, `m1 = dmin * m`, `d1 * q - m1`).
+pub fn dequantize_q4_k(bytes: &[u8], n_elements: usize) -> Vec<f32> {
+    let mut out = vec![0f32; n_elements];
+    for (bi, block) in bytes.as_chunks::<144>().0.iter().enumerate() {
+        let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+        let min = f16_to_f32(u16::from_le_bytes([block[2], block[3]]));
+        let scales = &block[4..16];
+        let qs = &block[16..144];
+        let y = &mut out[bi * 256..(bi + 1) * 256];
+        for g in 0..4 {
+            let (sc1, m1) = q4_k_scale_min(2 * g, scales);
+            let (sc2, m2) = q4_k_scale_min(2 * g + 1, scales);
+            let (d1, mm1) = (d * sc1 as f32, min * m1 as f32);
+            let (d2, mm2) = (d * sc2 as f32, min * m2 as f32);
+            for l in 0..32 {
+                let q = qs[g * 32 + l];
+                y[g * 64 + l] = d1 * (q & 0xF) as f32 - mm1;
+                y[g * 64 + 32 + l] = d2 * (q >> 4) as f32 - mm2;
+            }
+        }
+    }
+    out
+}
+
+pub fn dequantize_bf16(bytes: &[u8], n_elements: usize) -> Vec<f32> {
+    (0..n_elements).map(|i| f32::from_bits((u16::from_le_bytes([bytes[2 * i], bytes[2 * i + 1]]) as u32) << 16)).collect()
+}
+
 pub fn dequantize_f16(bytes: &[u8], n_elements: usize) -> Vec<f32> {
     (0..n_elements).map(|i| f16_to_f32(u16::from_le_bytes([bytes[2 * i], bytes[2 * i + 1]]))).collect()
 }
@@ -501,7 +617,10 @@ pub fn dequantize_for(dtype: GgmlDtype, bytes: &[u8], n_elements: usize) -> Vec<
         GgmlDtype::F16 => dequantize_f16(bytes, n_elements),
         GgmlDtype::Q4_0 => dequantize_q4_0(bytes, n_elements),
         GgmlDtype::Q4_1 => dequantize_q4_1(bytes, n_elements),
+        GgmlDtype::Q5_0 => dequantize_q5_0(bytes, n_elements),
         GgmlDtype::Q8_0 => dequantize_q8_0(bytes, n_elements),
+        GgmlDtype::Q4_K => dequantize_q4_k(bytes, n_elements),
         GgmlDtype::Q6_K => dequantize_q6_k(bytes, n_elements),
+        GgmlDtype::BF16 => dequantize_bf16(bytes, n_elements),
     }
 }

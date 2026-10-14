@@ -256,7 +256,8 @@ pub fn load_matmul_weight_gguf(engine: &Engine, label: &str, shape: &[usize], dt
             let chunks = chunk_rows_q6k(engine, label, bytes, out_dim, blocks_per_row, blocks_per_row * Q6K_BLOCK_BYTES)?;
             MatMulWeight::Q6_K { chunks, blocks_per_row: blocks_per_row as u32, out_dim: out_dim as u32 }
         }
-        GgmlDtype::F32 | GgmlDtype::F16 => {
+        GgmlDtype::Q5_0 | GgmlDtype::Q4_K => anyhow::bail!("{label}: {dtype:?} weights are not loadable on the GPU yet"),
+        GgmlDtype::F32 | GgmlDtype::F16 | GgmlDtype::BF16 => {
             let data = crate::gguf::dequantize_for(dtype, bytes, n_elements);
             MatMulWeight::F32 { w: engine.buf_f32(&data, label) }
         }
