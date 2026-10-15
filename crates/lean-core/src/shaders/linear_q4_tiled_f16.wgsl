@@ -1,17 +1,38 @@
-// f16 variant of linear_q4_tiled_rb.wgsl, used when the device grants
-// `shader-f16`. Same 64x64 tile, 16x16 threads, 4x4 register block, K step
-// of one 32-value block, same swizzle and the same bindings; what changes:
-// - both shared tiles hold vec4<f16> (8 KiB of workgroup storage instead of
-//   16 KiB): the dequantised weights (q - 8) * scale rounded once to f16,
-//   and the activations rounded to f16 when staged;
-// - the inner product of each 4-value slot is an f16 dot, and WINDOW slots
-//   (4 * WINDOW k values; 8 is one whole Q4_0 block) are summed in f16
-//   before they are widened and added to the f32 accumulators, so the
-//   accumulation across blocks, and thus across the K dimension, stays in
-//   f32. Window 4 changed the logit error by about 15% and was 4% slower.
-// Output, bias, activation and dispatch shape are identical to the f32
-// kernel.
-
+// Register-blocked tiled Q4_0 GEMM for prefill: out[m, n] = x[m, :] . W[n, :]
+// + b[n]. 64x64 output tile per workgroup, 16x8 = 128 threads, each thread
+// an 8x4 register block (rows 8ty..8ty+7, columns tx + 16j), one Q4_0 block
+// (K step 32) per shared-memory stage.
+//
+// Compared with a 16x16 thread layout with 4x4 blocks, a thread here
+// produces 32 outputs from 12 shared vec4 loads per 4 k (8 x rows shared by
+// the 16 threads of a row, 4 weight columns), against 16 outputs from 8
+// loads, and the workgroup has half the threads to synchronise at the two
+// barriers per stage. The accumulators stay at 32 floats per thread, the
+// same register footprint as linear_q4_small_m.wgsl.
+//
+// f16 variant, used when the device grants `shader-f16`: both shared tiles hold
+// vec4<f16> (the dequantised weights (q - 8) * scale rounded once to f16, and
+// the activations rounded to f16 when staged); the inner product of each
+// 4-value slot is an f16 dot, and WINDOW slots (4 * WINDOW k values; 8 is one
+// whole Q4_0 block) are summed in f16 before they are widened and added to the
+// f32 accumulators, so accumulation across blocks stays in f32.
+//
+// Shared tiles are [64][8] vec4s (a row's 32 k values), with the vec4 slot
+// XOR-swizzled by the row's low 3 bits, so the 16 threads along x read 16
+// different columns at the same k from 8 different bank groups. Staging
+// loops over the tile's vec4s with the workgroup as stride; every shared
+// store is a whole vec4 written by one thread. Each stage dequantises a
+// weight word (8 values) with one scale load.
+//
+// Q8 (pipeline override, `linear_q8_tiled_rb` in engine.rs): the same
+// kernel over Q8_0 blocks; a thread dequantises words pp and pp + 4 of its
+// column's block (4 signed bytes each, k4 slots pp and pp + 4).
+//
+// Sizes are fixed so the kernel is valid on every WebGPU device: 128
+// invocations and 8 KiB of workgroup storage are within the spec's
+// guaranteed minimums (maxComputeInvocationsPerWorkgroup = 256,
+// maxComputeWorkgroupStorageSize = 16384). Rows and columns past M/N are
+// zero-filled in the tiles and never written.
 enable f16;
 
 struct Dims {
@@ -48,7 +69,7 @@ override K4: bool = false;
 const TM: u32 = 64u;
 const TN: u32 = 64u;
 
-// [64 rows][8 vec4] each: x rows of the tile, dequantised weight columns.
+// [TM rows][8 vec4] each: x rows of the tile, dequantised weight columns.
 var<workgroup> xs: array<vec4<f16>, 512>;
 var<workgroup> ws: array<vec4<f16>, 512>;
 
@@ -56,64 +77,72 @@ fn sw(r: u32, k4: u32) -> u32 {
     return r * 8u + (k4 ^ (r & 7u));
 }
 
-@compute @workgroup_size(16, 16, 1)
+@compute @workgroup_size(TN / 4u, TM / 8u, 1)
 fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wg: vec3<u32>) {
     let tx = lid.x;
     let ty = lid.y;
-    let tid = ty * 16u + tx;
+    let nt = (TN / 4u) * (TM / 8u);
+    let tid = ty * (TN / 4u) + tx;
     let m0 = wg.y * TM;
     let n0 = wg.x * TN;
     let k4 = dims.k / 4u;
     let bpr = dims.blocks_per_row;
 
-    // Staging: thread -> (tile row/column l = tid % 64, part p = tid / 64).
-    // Weights: word p of column l's block (low nibbles are k4 slot p, high
-    // nibbles slot p + 4). x: vec4 slots p and p + 4 of row l.
-    let l = tid % 64u;
-    let p = tid / 64u;
-    let n_g = n0 + l;
-    let n_ok = n_g < dims.n;
-    let n_safe = select(0u, n_g, n_ok);
-    let m_g = m0 + l;
-    let m_ok = m_g < dims.m;
-    let x_row = select(0u, m_g, m_ok) * k4;
-
     var acc0 = vec4<f32>(0.0);
     var acc1 = vec4<f32>(0.0);
     var acc2 = vec4<f32>(0.0);
     var acc3 = vec4<f32>(0.0);
+    var acc4 = vec4<f32>(0.0);
+    var acc5 = vec4<f32>(0.0);
+    var acc6 = vec4<f32>(0.0);
+    var acc7 = vec4<f32>(0.0);
 
     for (var blk: u32 = 0u; blk < bpr; blk = blk + 1u) {
-        var scale = 0.0;
-        var mn = 0.0;
-        if (K4) {
-            let dm = k4_dm((n_safe * bpr + blk) >> 3u, blk & 7u);
-            scale = select(0.0, dm.x, n_ok);
-            mn = select(0.0, dm.y, n_ok);
-        } else {
-            scale = select(0.0, scales[n_safe * bpr + blk], n_ok);
+        // Weights: TN columns x 4 words (word pp = k4 slots pp and pp + 4).
+        for (var i: u32 = tid; i < TN * 4u; i = i + nt) {
+            let c = i / 4u;
+            let pp = i % 4u;
+            let n_g = n0 + c;
+            let n_ok = n_g < dims.n;
+            let n_safe = select(0u, n_g, n_ok);
+            var scale = 0.0;
+            var mn = 0.0;
+            if (K4) {
+                let dm = k4_dm((n_safe * bpr + blk) >> 3u, blk & 7u);
+                scale = select(0.0, dm.x, n_ok);
+                mn = select(0.0, dm.y, n_ok);
+            } else {
+                scale = select(0.0, scales[n_safe * bpr + blk], n_ok);
+            }
+            if (Q8) {
+                let w0 = qs[(n_safe * bpr + blk) * 8u + pp];
+                let w1 = qs[(n_safe * bpr + blk) * 8u + pp + 4u];
+                ws[sw(c, pp)] = vec4<f16>(vec4<f32>(bitcast<vec4<i32>>(vec4<u32>(w0 << 24u, w0 << 16u, w0 << 8u, w0)) >> vec4<u32>(24u)) * scale);
+                ws[sw(c, pp + 4u)] = vec4<f16>(vec4<f32>(bitcast<vec4<i32>>(vec4<u32>(w1 << 24u, w1 << 16u, w1 << 8u, w1)) >> vec4<u32>(24u)) * scale);
+            } else if (Q50) {
+                let word = qs[(n_safe * bpr + blk) * 4u + pp];
+                let qh = aux_at(n_safe * bpr + blk);
+                ws[sw(c, pp)] = vec4<f16>(q5_vals(word, false, pp, qh) * scale);
+                ws[sw(c, pp + 4u)] = vec4<f16>(q5_vals(word, true, pp, qh) * scale);
+            } else if (K4) {
+                let word = qs[(n_safe * bpr + blk) * 4u + pp];
+                ws[sw(c, pp)] = vec4<f16>(vec4<f32>(vec4<u32>(word, word >> 8u, word >> 16u, word >> 24u) & vec4<u32>(0xFu)) * scale + vec4<f32>(mn));
+                ws[sw(c, pp + 4u)] = vec4<f16>(vec4<f32>(vec4<u32>(word >> 4u, word >> 12u, word >> 20u, word >> 28u) & vec4<u32>(0xFu)) * scale + vec4<f32>(mn));
+            } else {
+                let word = qs[(n_safe * bpr + blk) * 4u + pp];
+                ws[sw(c, pp)] = vec4<f16>((vec4<f32>(vec4<u32>(word, word >> 8u, word >> 16u, word >> 24u) & vec4<u32>(0xFu)) - vec4<f32>(8.0)) * scale);
+                ws[sw(c, pp + 4u)] = vec4<f16>((vec4<f32>(vec4<u32>(word >> 4u, word >> 12u, word >> 20u, word >> 28u) & vec4<u32>(0xFu)) - vec4<f32>(8.0)) * scale);
+            }
         }
-        if (Q8) {
-            let w0 = qs[(n_safe * bpr + blk) * 8u + p];
-            let w1 = qs[(n_safe * bpr + blk) * 8u + p + 4u];
-            ws[sw(l, p)] = vec4<f16>(vec4<f32>(bitcast<vec4<i32>>(vec4<u32>(w0 << 24u, w0 << 16u, w0 << 8u, w0)) >> vec4<u32>(24u)) * scale);
-            ws[sw(l, p + 4u)] = vec4<f16>(vec4<f32>(bitcast<vec4<i32>>(vec4<u32>(w1 << 24u, w1 << 16u, w1 << 8u, w1)) >> vec4<u32>(24u)) * scale);
-        } else if (Q50) {
-            let word = qs[(n_safe * bpr + blk) * 4u + p];
-            let qh = aux_at(n_safe * bpr + blk);
-            ws[sw(l, p)] = vec4<f16>(q5_vals(word, false, p, qh) * scale);
-            ws[sw(l, p + 4u)] = vec4<f16>(q5_vals(word, true, p, qh) * scale);
-        } else if (K4) {
-            let word = qs[(n_safe * bpr + blk) * 4u + p];
-            ws[sw(l, p)] = vec4<f16>(vec4<f32>(vec4<u32>(word, word >> 8u, word >> 16u, word >> 24u) & vec4<u32>(0xFu)) * scale + vec4<f32>(mn));
-            ws[sw(l, p + 4u)] = vec4<f16>(vec4<f32>(vec4<u32>(word >> 4u, word >> 12u, word >> 20u, word >> 28u) & vec4<u32>(0xFu)) * scale + vec4<f32>(mn));
-        } else {
-            let word = qs[(n_safe * bpr + blk) * 4u + p];
-            ws[sw(l, p)] = vec4<f16>((vec4<f32>(vec4<u32>(word, word >> 8u, word >> 16u, word >> 24u) & vec4<u32>(0xFu)) - vec4<f32>(8.0)) * scale);
-            ws[sw(l, p + 4u)] = vec4<f16>((vec4<f32>(vec4<u32>(word >> 4u, word >> 12u, word >> 20u, word >> 28u) & vec4<u32>(0xFu)) - vec4<f32>(8.0)) * scale);
+        // x: TM rows x 8 vec4.
+        for (var i: u32 = tid; i < TM * 8u; i = i + nt) {
+            let r = i / 8u;
+            let s4 = i % 8u;
+            let m_g = m0 + r;
+            let m_ok = m_g < dims.m;
+            let x_row = select(0u, m_g, m_ok) * k4;
+            xs[sw(r, s4)] = vec4<f16>(select(vec4<f32>(0.0), x[x_row + blk * 8u + s4], m_ok));
         }
-        xs[sw(l, p)] = vec4<f16>(select(vec4<f32>(0.0), x[x_row + blk * 8u + p], m_ok));
-        xs[sw(l, p + 4u)] = vec4<f16>(select(vec4<f32>(0.0), x[x_row + blk * 8u + p + 4u], m_ok));
         workgroupBarrier();
 
         for (var q0: u32 = 0u; q0 < 8u; q0 = q0 + WINDOW) {
@@ -121,39 +150,55 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wg:
             var t1 = vec4<f16>(0.0);
             var t2 = vec4<f16>(0.0);
             var t3 = vec4<f16>(0.0);
+            var t4 = vec4<f16>(0.0);
+            var t5 = vec4<f16>(0.0);
+            var t6 = vec4<f16>(0.0);
+            var t7 = vec4<f16>(0.0);
             for (var q: u32 = q0; q < q0 + WINDOW; q = q + 1u) {
-                let a0 = xs[sw(ty * 4u, q)];
-                let a1 = xs[sw(ty * 4u + 1u, q)];
-                let a2 = xs[sw(ty * 4u + 2u, q)];
-                let a3 = xs[sw(ty * 4u + 3u, q)];
+                let a0 = xs[sw(ty * 8u + 0u, q)];
+                let a1 = xs[sw(ty * 8u + 1u, q)];
+                let a2 = xs[sw(ty * 8u + 2u, q)];
+                let a3 = xs[sw(ty * 8u + 3u, q)];
+                let a4 = xs[sw(ty * 8u + 4u, q)];
+                let a5 = xs[sw(ty * 8u + 5u, q)];
+                let a6 = xs[sw(ty * 8u + 6u, q)];
+                let a7 = xs[sw(ty * 8u + 7u, q)];
                 let w0 = ws[sw(tx, q)];
-                let w1 = ws[sw(tx + 16u, q)];
-                let w2 = ws[sw(tx + 32u, q)];
-                let w3 = ws[sw(tx + 48u, q)];
+                let w1 = ws[sw(tx + TN / 4u, q)];
+                let w2 = ws[sw(tx + TN / 2u, q)];
+                let w3 = ws[sw(tx + 3u * (TN / 4u), q)];
                 t0 += vec4<f16>(dot(a0, w0), dot(a0, w1), dot(a0, w2), dot(a0, w3));
                 t1 += vec4<f16>(dot(a1, w0), dot(a1, w1), dot(a1, w2), dot(a1, w3));
                 t2 += vec4<f16>(dot(a2, w0), dot(a2, w1), dot(a2, w2), dot(a2, w3));
                 t3 += vec4<f16>(dot(a3, w0), dot(a3, w1), dot(a3, w2), dot(a3, w3));
+                t4 += vec4<f16>(dot(a4, w0), dot(a4, w1), dot(a4, w2), dot(a4, w3));
+                t5 += vec4<f16>(dot(a5, w0), dot(a5, w1), dot(a5, w2), dot(a5, w3));
+                t6 += vec4<f16>(dot(a6, w0), dot(a6, w1), dot(a6, w2), dot(a6, w3));
+                t7 += vec4<f16>(dot(a7, w0), dot(a7, w1), dot(a7, w2), dot(a7, w3));
             }
             acc0 += vec4<f32>(t0);
             acc1 += vec4<f32>(t1);
             acc2 += vec4<f32>(t2);
             acc3 += vec4<f32>(t3);
+            acc4 += vec4<f32>(t4);
+            acc5 += vec4<f32>(t5);
+            acc6 += vec4<f32>(t6);
+            acc7 += vec4<f32>(t7);
         }
         workgroupBarrier();
     }
 
     let n_out = n0 + tx;
-    let m_out = m0 + ty * 4u;
-    let accs = array<vec4<f32>, 4>(acc0, acc1, acc2, acc3);
-    for (var i: u32 = 0u; i < 4u; i = i + 1u) {
+    let m_out = m0 + ty * 8u;
+    let accs = array<vec4<f32>, 8>(acc0, acc1, acc2, acc3, acc4, acc5, acc6, acc7);
+    for (var i: u32 = 0u; i < 8u; i = i + 1u) {
         let m = m_out + i;
         if (m >= dims.m) {
             break;
         }
         let v4 = accs[i];
         for (var j: u32 = 0u; j < 4u; j = j + 1u) {
-            let n = n_out + j * 16u;
+            let n = n_out + j * (TN / 4u);
             if (n < dims.n) {
                 var v = v4[j] + b[dims.n_offset + n];
                 if (dims.act == 1u) {

@@ -502,7 +502,7 @@ impl Engine {
         // whatever WebGPU's downlevel limits actually allow and split
         // large tensors across bindings if it doesn't.
         let adapter_limits = adapter.limits();
-        // The tiled prefill kernels use a 16x16 workgroup and 16 KiB of
+        // The tiled prefill kernels use a 16x8 workgroup and up to 16 KiB of
         // workgroup storage: the WebGPU spec's guaranteed minimums, so every
         // conforming adapter passes this.
         anyhow::ensure!(
