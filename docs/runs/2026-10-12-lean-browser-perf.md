@@ -425,3 +425,131 @@ On the Linux test machine the F32 path was re-measured with the same wasm pair (
 - The 1e-3 prefill logit gates in the fixture tests do not hold with f16 kernels; they need `LEAN_F16=0` or a looser gate for the top-20 values.
 - f16 on the RTX 3080 was not measured: neither native wgpu nor Chromium 153 offers shader-f16 on that machine and driver.
 - The small-M kernel (under 64 rows) and prefill attention still run in f32.
+
+## 2026-10-15: sampled decode (the chat page's sampler) on the GPU
+
+### Problem
+
+The chat page samples with temperature 0.7, top-k 40, top-p 0.9, repetition penalty 1.1, seed 0, and it read the whole logits vector back every token (Qwen vocabulary 151936, about 600 KB), then sorted the whole vocabulary on the CPU for top-k. Qwen2.5-0.5B decoded at about 70 tok/s sampled while greedy decodes at 130 to 170 tok/s on the same build. Every earlier speed measurement was greedy.
+
+### Parameters
+
+- Bench: `scripts/bench/bench.html` with `phases=decode,sampled` (new `sampled` phase: GEN_PARAMS of `web/lean-chat-worker.js`, seed 0, prompt "Write a long story about a lighthouse keeper.", 128 and 256 new tokens, 3 repetitions per load, rate over the whole run from the first to the last token, sha256 of the reply). Loads: 5 per cell for Qwen2.5-0.5B Q4_0 and SmolLM2-1.7B Q4_0, 3 for Qwen3-0.6B Q8_0 and SmolLM2-360M Q4_0. The base, step 2 and final builds alternate load by load (ABAB order). Values are the median over all repetitions, with min to max in brackets.
+- Browsers on the M2: Playwright Chromium 153 (`--use-angle=metal`, headless), Playwright WebKit (headless), Firefox Developer Edition 159 (headed, throwaway profile). Native: the ignored test `crates/lean/tests/sampled_native.rs` on wgpu Metal.
+- Builds compared: base is browser-perf at the reuse fix plus the bench phase; step 2 is the GPU top-k with a 64-candidate readback (sampling still finished on the CPU); final is the whole step on the GPU (this section's last commit). Served wasm bytes were checked against the built files by sha256 before each series.
+- The machine was shared with another worker's GPU runs through the lock script; one-minute load average between 1 and 4 during the runs. SmolLM2-1.7B runs in WebKit and Firefox show dips that hit all builds; read the medians with the spread.
+
+### Change
+
+1. CPU sampler: top-k by linear-time selection, softmax and top-p over the survivors only. Same tokens as the full-sort code for the same seed (unit test against the old implementation on random logits with ties).
+2. GPU top-k (tree of 1024-item bitonic sorts, 3 dispatches at Qwen vocabulary size), host-side penalty, top-p and draw over 64 candidates. Same tokens as step 1, with a fallback to the full readback when the candidates cannot rule out a tie at the k-th logit.
+3. The whole step on the GPU for top_k 1 to 63: penalty from a per-id count buffer, top-k, temperature, softmax, top-p and the draw in three kernels at the end of the decode step. The chosen id feeds the next step's embedding on the GPU and one id is read back per step, with two steps in flight, so every token streams as soon as its step resolves. The kernels use only multiplications and additions (no division, a polynomial exp) and a counter-based generator keyed by seed and token position. `lean_core::resident_sampling::sample_reference` is the same computation on the CPU: it chooses the first token (from the prefill logits) and serves the CPU backend, so the GPU and CPU backends give the same reply for the same seed. Step 2's candidate readback is removed. top_k 0 and 64 and up keep the full-logits path.
+4. Semantics that differ from before: the random stream is different (a seed gives a different reply than in earlier builds), and ties at the k-th logit are cut at exactly k, lower token id first, where the CPU sampler keeps every tied value.
+
+### Results: sampled decode, 128 new tokens, tok/s
+
+| model | browser | before (base) | step 2 (candidates) | after (final) | n loads b/s2/f |
+|---|---|---|---|---|---|
+| qwen25-05b | chromium | 75 (74-75) | 139 (110-147) | 165 (154-166) | 5 / 5 / 5 |
+| qwen25-05b | webkit | 66 (66-67) | 118 (95-119) | 126 (124-127) | 5 / 5 / 5 |
+| qwen25-05b | firefox | 64 (59-64) | 111 (67-118) | 144 (127-147) | 5 / 5 / 5 |
+| qwen3-06b | chromium | 55 (54-55) | 85 (78-86) | 92 (80-94) | 3 / 3 / 3 |
+| qwen3-06b | webkit | 49 (49-49) | 72 (63-73) | 75 (68-77) | 3 / 3 / 3 |
+| qwen3-06b | firefox | 49 (48-50) | 53 (52-63) | 87 (77-88) | 3 / 3 / 3 |
+| smol-360m | chromium | 119 (117-120) | 162 (142-164) | 186 (177-188) | 3 / 3 / 3 |
+| smol-360m | webkit | 101 (99-101) | 120 (98-132) | 143 (138-144) | 3 / 3 / 3 |
+| smol-360m | firefox | 81 (64-89) | 79 (62-117) | 157 (155-162) | 3 / 3 / 3 |
+| smol-17b | chromium | 57 (57-58) | 64 (61-66) | 69 (53-70) | 5 / 5 / 5 |
+| smol-17b | webkit | 51 (32-52) | 47 (43-50) | 49 (44-61) | 5 / 5 / 5 |
+| smol-17b | firefox | 52 (39-52) | 44 (42-51) | 55 (52-66) | 5 / 5 / 5 |
+
+### Results: sampled decode, 256 new tokens, tok/s
+
+| model | browser | before (base) | step 2 (candidates) | after (final) | n loads b/s2/f |
+|---|---|---|---|---|---|
+| qwen25-05b | chromium | 75 (75-75) | 132 (92-147) | 164 (147-165) | 5 / 5 / 5 |
+| qwen25-05b | webkit | 67 (66-67) | 107 (84-118) | 126 (123-126) | 5 / 5 / 5 |
+| qwen25-05b | firefox | 64 (62-65) | 69 (66-83) | 143 (131-145) | 5 / 5 / 5 |
+| qwen3-06b | chromium | 55 (55-55) | 86 (83-87) | 92 (80-96) | 3 / 3 / 3 |
+| qwen3-06b | webkit | 49 (49-49) | 72 (65-73) | 75 (66-77) | 3 / 3 / 3 |
+| qwen3-06b | firefox | 50 (49-50) | 53 (50-54) | 87 (78-88) | 3 / 3 / 3 |
+| smol-360m | chromium | 119 (118-119) | 162 (151-163) | 182 (167-187) | 3 / 3 / 3 |
+| smol-360m | webkit | 100 (100-101) | 125 (108-129) | 140 (139-143) | 3 / 3 / 3 |
+| smol-360m | firefox | 85 (66-88) | 67 (63-73) | 157 (132-161) | 3 / 3 / 3 |
+| smol-17b | chromium | 56 (56-57) | 64 (52-65) | 66 (54-69) | 5 / 5 / 5 |
+| smol-17b | webkit | 50 (32-50) | 45 (40-49) | 48 (45-59) | 5 / 5 / 5 |
+| smol-17b | firefox | 49 (42-50) | 46 (42-57) | 54 (53-65) | 5 / 5 / 5 |
+
+### Results: greedy decode in the same runs (96 tokens, tok/s, base against final)
+
+Unchanged by this work, within the spread: Qwen2.5-0.5B 168 / 169 (Chromium), 135 / 135 (WebKit), 154 / 154 (Firefox); Qwen3-0.6B 95 / 95, 80 / 80, 90 / 90; SmolLM2-360M 197 / 197, 154 / 153, 173 / 173; SmolLM2-1.7B 71 / 71, 63 / 56, 67 / 65.
+
+### Results: native wgpu on Metal, sampled tok/s (median of 6 repetitions, min to max)
+
+| Model | New tokens | base | step 2 | final |
+|---|---|---|---|---|
+| qwen25-05b | 128 | 70 (69-73) | 117 (104-124) | 124 (123-126) |
+| qwen25-05b | 256 | 72 (72-73) | 117 (106-121) | 125 (112-125) |
+| qwen3-06b | 128 | 54 (53-54) | 76 (75-77) | 75 (74-76) |
+| qwen3-06b | 256 | 54 (54-55) | 77 (76-78) | 75 (74-76) |
+| smol-360m | 128 | 90 (78-97) | 94 (92-114) | 94 (93-120) |
+| smol-360m | 256 | 92 (81-94) | 95 (85-98) | 100 (97-104) |
+| smol-17b | 128 | 56 (55-56) | 61 (61-62) | 59 (55-60) |
+| smol-17b | 256 | 54 (54-54) | 60 (60-60) | 58 (58-59) |
+
+### Results: one token per step against 8 per readback
+
+Two builds identical except for the number of steps per readback (1 against 8), Qwen2.5-0.5B and SmolLM2-1.7B, 5 loads each; sampled tok/s at 128 tokens:
+
+| Model | Browser | 8 per readback | 1 per readback |
+|---|---|---|---|
+| Qwen2.5-0.5B | Chromium | 157 (121-164) | 160 (130-166) |
+| Qwen2.5-0.5B | WebKit | 123 (103-126) | 125 (103-127) |
+| Qwen2.5-0.5B | Firefox | 146 (145-147) | 144 (141-149) |
+| SmolLM2-1.7B | Chromium | 68 (38-70) | 52 (44-70) |
+| SmolLM2-1.7B | WebKit | 50 (38-52) | 51 (45-53) |
+| SmolLM2-1.7B | Firefox | 54 (38-60) | 55 (38-60) |
+
+Greedy decode of 256 tokens, SmolLM2-1.7B, ABAB, 5 loads each, tok/s: Chromium 69.6 (69.2-69.7) with 8 per readback and 69.6 (69.3-69.9) with 1; Firefox 58.6 (57.2-59.8) and 59.8 (57.6-60.5); WebKit 59.3 (49.8-60.3) and 52.4 (49.1-59.5). Greedy Qwen2.5-0.5B in the 5-load series above: 168 (144-169) against 167 (160-170) in Chromium, 134 and 134 in WebKit, 154 and 155 in Firefox.
+
+### Results: determinism
+
+Reply hashes (first 8 bytes of sha256 of the reply text) for the 128 and 256 token budgets are identical in Chromium, WebKit, Firefox Developer Edition 159, native GPU (Metal) and, for Qwen2.5-0.5B, the native CPU backend:
+
+| Model | base and step 2 | final |
+|---|---|---|
+| Qwen2.5-0.5B | c9207b389a5307f3, 92a2127691969159 | 6be21500b4902e60, 6ca9499e057eec9c |
+| Qwen3-0.6B | edb8a4754f4f4871, 54281234dd4dccac | 48b4d208e2578ff2, 37c1686d60bdcfc3 |
+| SmolLM2-360M | e8b194b9b50b01fa, 150899e76dd89f53 | b3a375abc0f60f5f, 12de46ad620f0fd2 |
+| SmolLM2-1.7B | 41495f42a537a8b2, ad060b92b43c36f2 | 9c953cc07f554df1, c20fc6a649aa22ba |
+
+Base and step 2 give the same hash in every cell (step 1 and 2 keep the old stream). The final hashes are the same in each cell across the three browsers and native, and repeat across repetitions and loads.
+
+### Results: chat page end to end
+
+`web/index.html` served locally with the final wasm (SmolLM2-360M, the page's default; page's own sampling), story prompt, then a second question, then New chat, then a third question, in the three browsers: all steps completed, New chat emptied the conversation, and the three browsers produced the same text for the same turns (the page reports 242 tokens at 186, 140 and 160 tok/s for the story in Chromium, WebKit and Firefox). The second reply of this 360M model wanders off topic after one sentence, with the previous build as well (compared in Chromium).
+
+### Correctness
+
+- `sampling::tests::matches_full_sort_oracle_on_random_logits_and_ties`: 400 random cases (vocabulary 5 to 2000, ties, k at, below and above the vocabulary), 6 draws each, tokens equal to the previous implementation.
+- `lean_core::tests::resident_sampling::gpu_sampler_matches_reference`: 240 random cases (vocabulary 900, 3000, 49152, 151936; ties; masked logits; top-p, penalty counts, k from 1 to 63) on Metal, kernel token equal to `sample_reference` in every case and the chosen id's count incremented.
+- `resident_sampling_matches_cpu_reference` (ignored model test): 96-token decodes on four prompts with seeds, equal to the step-by-step CPU reference over the full logits; run on Qwen2.5-0.5B. `full_logits_sampling_is_reproducible` for top_k 0 and 64.
+- Ignored model tests run on this machine: lean unit tests (8), `engine_api` (17, GPU and CPU, reuse and overflow), `fixture_parity_generate` (Qwen2.5-0.5B, SmolLM2-360M and 1.7B), lean-core `fixture_parity` and `fixture_parity_qwen3`, `f16_parity`, `kv_snapshot`, `logit_mask`, `pool_reuse`: all pass. The Llama-3.2 and a few other fixture tests need files that are not on this machine and were not run.
+- The bench `reuse` phase passes (reply of a freshly loaded engine equals the reuse replies) for each browser, model and build (48 of 48 runs, one per browser, model and build).
+- clippy `-D warnings`: native all targets, wasm32 web, wasm32 web+diag, clean.
+
+### Observations
+
+- Sampled decode now runs at the greedy rate within 5 to 10% on Qwen2.5-0.5B (Chromium 165 against 169, WebKit 126 against 135, Firefox 144 against 154), from 75, 66 and 64 tok/s. The read-back of the 600 KB logits and the full-vocabulary sort account for the whole gap.
+- Step 2 already removes most of the CPU work, but its per-token round trip varies by browser: Firefox ranged 67 to 118 tok/s on Qwen2.5-0.5B (median 111, 69 at 256 tokens). Keeping the choice on the GPU removes that variation (final: 127 to 147).
+- Gain of final over step 2 on Qwen2.5-0.5B: Chromium +19% (165 against 139), WebKit +7%, Firefox +30%. On SmolLM2-1.7B the forward pass dominates; the median gain is +8% in Chromium (69 against 64) and +25% in Firefox, and WebKit shows no change (49 against 47).
+- Reading 8 tokens per readback gave no measurable gain over one token per step for sampled or greedy decode in any of the three browsers, so sampled decode streams one token at a time. The SmolLM2-1.7B Chromium line of the table above (68 against 52) comes from dips in single loads that hit both builds at different times; the later greedy ABAB series on the same model shows 69.6 against 69.6.
+- Native Metal does not need the GPU-resident step: step 2 and final measure within 6% of each other (native step 2 is slightly faster on Qwen3-0.6B and SmolLM2-1.7B, final on Qwen2.5-0.5B); both are 1.7 times the base on Qwen2.5-0.5B.
+- SmolLM2-1.7B WebKit and Firefox, where the forward pass leaves little to win, do not improve beyond the spread.
+
+### What is left
+
+- top_k 0 (pure temperature sampling over the whole vocabulary) and top_k of 64 and up still read the full logits and sort on the CPU; no GPU path for them.
+- The kernels' draw agrees with the CPU reference to the last bit unless a device fuses multiply-add differently in the polynomial exp; no mismatch in 240 kernel cases and none in any browser hash, but a draw within a few units of the last place of a cumulative-probability boundary could resolve differently on a device that does.
+- The Safari-only garbage output with Qwen2.5-0.5B was not reproduced in Playwright WebKit (sensible text, same hash as Chromium); not investigated here.
+- Real Safari, Android browsers and the RTX 3080 were not measured.
