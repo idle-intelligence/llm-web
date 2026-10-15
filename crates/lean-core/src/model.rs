@@ -45,6 +45,7 @@ use crate::config::{config_from_gguf, Architecture, Qwen2Config};
 use crate::engine::Engine;
 use crate::gguf::GgufReader;
 pub use crate::pool::Pool;
+use crate::resident_sampling::GpuSampling;
 use crate::quant::{load_embedding_table_gguf, load_matmul_weight_gguf, EmbeddingTable, MatMulWeight};
 use crate::gguf::GgmlDtype;
 
@@ -2299,6 +2300,74 @@ fn argmax_gpu(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, ke
     out
 }
 
+/// Candidates the GPU top-k returns: `TOPK_CANDS` (value bits, id) pairs,
+/// best first, in a result buffer of `2 * TOPK_CANDS` u32 words.
+pub const TOPK_CANDS: usize = 64;
+/// Items one `topk_stage.wgsl` workgroup sorts.
+const TOPK_GROUP: usize = 1024;
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct TopkStageDims {
+    n_in: u32,
+    mode: u32,
+    out_per_group: u32,
+    out_base: u32,
+}
+
+/// Top `TOPK_CANDS` logits of `logits`, best first (ties toward the lower
+/// id): `topk_stage.wgsl` runs as a tree of 1024-item sorts, a first level
+/// of vocab / 1024 workgroups each keeping its best 64, then a level over
+/// those, until one workgroup is left. Selection is exact and the values
+/// are copies of the logits, so nothing depends on how a device rounds
+/// arithmetic.
+fn topk_gpu(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &str, logits: &wgpu::Buffer, vocab: u32) -> wgpu::Buffer {
+    let res = pool.data(&format!("{key}.res"), 2 * TOPK_CANDS);
+    let mut groups = Vec::new();
+    let mut n_in = vocab as usize;
+    loop {
+        let ng = n_in.div_ceil(TOPK_GROUP);
+        groups.push((n_in, ng));
+        if ng == 1 {
+            break;
+        }
+        n_in = ng * TOPK_CANDS;
+    }
+    let a = pool.data(&format!("{key}.a"), 2 * groups[0].1 * TOPK_CANDS);
+    let b = pool.data(&format!("{key}.b"), 2 * groups.get(1).map_or(1, |g| g.1) * TOPK_CANDS);
+    let last = groups.len() - 1;
+    for (s, &(n_in, ng)) in groups.iter().enumerate() {
+        let out = if s == last { &res } else if s % 2 == 0 { &a } else { &b };
+        let inp = if s == 0 { if last == 0 { &a } else { &b } } else if s % 2 == 1 { &a } else { &b };
+        let dims = pool.uniform(&format!("{key}.s{s}.dims"), TopkStageDims { n_in: n_in as u32, mode: u32::from(s > 0), out_per_group: TOPK_CANDS as u32, out_base: 0 });
+        // The bind group depends on the plan (number of levels), which
+        // depends on the vocabulary size: the key says so.
+        let bg = pool.bind_group(
+            &format!("{key}.s{s}of{}", groups.len()),
+            &engine.topk_stage,
+            &[
+                BindGroupEntry { binding: 0, resource: logits.as_entire_binding() },
+                BindGroupEntry { binding: 1, resource: inp.as_entire_binding() },
+                BindGroupEntry { binding: 2, resource: out.as_entire_binding() },
+                BindGroupEntry { binding: 3, resource: dims.as_entire_binding() },
+            ],
+        );
+        engine.dispatch(pass, &engine.topk_stage, &bg, (ng as u32, 1, 1), &format!("{key}.s{s}"));
+    }
+    res
+}
+
+/// What a decode step appends after the lm head (see `decode_layers`).
+enum Head<'a> {
+    /// Nothing: the caller reads the logits.
+    Logits,
+    /// GPU argmax; the returned buffer holds the id.
+    Argmax,
+    /// GPU penalty, top-k and draw (`sample_gpu`); the returned buffer holds
+    /// the chosen id.
+    Sample(&'a SampleStep<'a>),
+}
+
 /// Records one decode step's whole layer stack (embed through the lm-head
 /// logits) into `encoder`, without submitting or reading anything back -
 /// shared by `forward_decode_step` (full-logits readback, for samplers) and
@@ -2310,7 +2379,7 @@ fn argmax_gpu(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, ke
 /// returned alongside the logits when requested, `None` otherwise (samplers
 /// that need the full vocab never pay for the extra dispatch).
 #[allow(clippy::too_many_arguments)]
-fn decode_layers(engine: &Engine, model: &GpuModel, encoder: &mut wgpu::CommandEncoder, cache: &mut KvCache, token_id: u32, token_src: Option<&wgpu::Buffer>, cos: &wgpu::Buffer, sin: &wgpu::Buffer, mask: Option<&wgpu::Buffer>, argmax: bool) -> (wgpu::Buffer, Option<wgpu::Buffer>) {
+fn decode_layers(engine: &Engine, model: &GpuModel, encoder: &mut wgpu::CommandEncoder, cache: &mut KvCache, token_id: u32, token_src: Option<&wgpu::Buffer>, cos: &wgpu::Buffer, sin: &wgpu::Buffer, mask: Option<&wgpu::Buffer>, head: Head<'_>) -> (wgpu::Buffer, Option<wgpu::Buffer>) {
     model.pool.use_kv_cache(cache.id);
     // `token_src`: the input token id is the first u32 of a GPU buffer (the
     // previous step's argmax), copied into the embedding's id buffer on
@@ -2406,10 +2475,18 @@ fn decode_layers(engine: &Engine, model: &GpuModel, encoder: &mut wgpu::CommandE
     if let Some(mask) = mask {
         mask_logits_gpu(engine, pool, &mut pass, "dec_mask", &logits, mask, cfg.vocab_size as u32, 0);
     }
-    if argmax {
-        seg!(engine, encoder, pass, "argmax");
-    }
-    let idx = argmax.then(|| argmax_gpu(engine, pool, &mut pass, "dec_argmax", &logits, cfg.vocab_size as u32));
+    let vocab = cfg.vocab_size as u32;
+    let idx = match head {
+        Head::Logits => None,
+        Head::Argmax => {
+            seg!(engine, encoder, pass, "argmax");
+            Some(argmax_gpu(engine, pool, &mut pass, "dec_argmax", &logits, vocab))
+        }
+        Head::Sample(step) => {
+            seg!(engine, encoder, pass, "sample");
+            Some(sample_gpu(engine, pool, &mut pass, &logits, vocab, step))
+        }
+    };
     drop(pass);
     (logits, idx)
 }
@@ -2425,7 +2502,7 @@ fn decode_layers(engine: &Engine, model: &GpuModel, encoder: &mut wgpu::CommandE
 /// applied.
 pub async fn forward_decode_step(engine: &Engine, model: &GpuModel, cache: &mut KvCache, token_id: u32, cos: &wgpu::Buffer, sin: &wgpu::Buffer, mask: Option<&wgpu::Buffer>) -> Vec<f32> {
     let mut encoder = engine.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("decode") });
-    let (logits, _) = decode_layers(engine, model, &mut encoder, cache, token_id, None, cos, sin, mask, false);
+    let (logits, _) = decode_layers(engine, model, &mut encoder, cache, token_id, None, cos, sin, mask, Head::Logits);
     engine.queue.submit(Some(encoder.finish()));
     cache.kv_len += 1;
     engine.read_buffer(&logits, model.config.vocab_size).await
@@ -2448,7 +2525,7 @@ pub async fn forward_decode_step_argmax(engine: &Engine, model: &GpuModel, cache
     if engine.profiling_enabled() {
         engine.reset_profile();
     }
-    let (_, idx) = decode_layers(engine, model, &mut encoder, cache, token_id, None, cos, sin, mask, true);
+    let (_, idx) = decode_layers(engine, model, &mut encoder, cache, token_id, None, cos, sin, mask, Head::Argmax);
     let idx = idx.expect("decode_layers(argmax=true) always returns Some");
     // Resolve on the same encoder as the profiled dispatches, before it's
     // finished/submitted - see `Engine::resolve_profile`'s doc comment.
@@ -2478,6 +2555,12 @@ pub async fn forward_decode_step_argmax(engine: &Engine, model: &GpuModel, cache
 /// once per `GREEDY_BLOCK` tokens. A fixed number, the same on every device.
 const GREEDY_BLOCK: u32 = 8;
 
+/// Sampled decode steps per readback. One: every token is read back and
+/// streamed as soon as its step resolves; the two steps in flight
+/// (`BLOCKS_IN_FLIGHT`) keep the GPU busy meanwhile. Reading 8 ids per
+/// block measured the same speed in Chromium, WebKit and Firefox.
+const SAMPLED_BLOCK: u32 = 1;
+
 /// Blocks kept submitted at once: while the host waits on one block's map
 /// the next block's steps are already queued, so the GPU does not idle.
 const BLOCKS_IN_FLIGHT: usize = 2;
@@ -2493,11 +2576,11 @@ struct PendingBlock {
 /// whole ring is then copied to `stage` for the host). The returned buffer
 /// holds the id for the next step's embedding (`token_src`).
 #[allow(clippy::too_many_arguments)]
-fn submit_greedy_step(engine: &Engine, model: &GpuModel, cache: &mut KvCache, token_id: u32, token_src: Option<&wgpu::Buffer>, ring: &wgpu::Buffer, slot: u32, stage: Option<(&wgpu::Buffer, u64)>, cos: &wgpu::Buffer, sin: &wgpu::Buffer, mask: Option<&wgpu::Buffer>) -> wgpu::Buffer {
+fn submit_greedy_step(engine: &Engine, model: &GpuModel, cache: &mut KvCache, token_id: u32, token_src: Option<&wgpu::Buffer>, ring: &wgpu::Buffer, slot: u32, stage: Option<(&wgpu::Buffer, u64)>, cos: &wgpu::Buffer, sin: &wgpu::Buffer, mask: Option<&wgpu::Buffer>, head: Head<'_>) -> wgpu::Buffer {
     let t_start = crate::engine::now_ms();
     let mut encoder = engine.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("decode_greedy") });
-    let (_, idx) = decode_layers(engine, model, &mut encoder, cache, token_id, token_src, cos, sin, mask, true);
-    let idx = idx.expect("decode_layers(argmax=true) always returns Some");
+    let (_, idx) = decode_layers(engine, model, &mut encoder, cache, token_id, token_src, cos, sin, mask, head);
+    let idx = idx.expect("a greedy or sampled head always returns the id buffer");
     encoder.copy_buffer_to_buffer(&idx, 0, ring, 4 * slot as u64, 4);
     if let Some((staging, bytes)) = stage {
         encoder.copy_buffer_to_buffer(ring, 0, staging, 0, bytes);
@@ -2564,7 +2647,7 @@ pub async fn decode_greedy_pipelined(engine: &Engine, model: &GpuModel, cache: &
             for slot in 0..n {
                 let stage = (slot + 1 == n).then_some((&staging, bytes));
                 let (token_id, src) = if submitted == 0 && slot == 0 { (first_id, None) } else { (0, prev.as_ref()) };
-                let idx = submit_greedy_step(engine, model, cache, token_id, src, &ring, slot, stage, cos, sin, mask);
+                let idx = submit_greedy_step(engine, model, cache, token_id, src, &ring, slot, stage, cos, sin, mask, Head::Argmax);
                 prev = Some(idx);
             }
             submitted += n;
@@ -2582,6 +2665,153 @@ pub async fn decode_greedy_pipelined(engine: &Engine, model: &GpuModel, cache: &
                 // The steps submitted past this one are discarded: their
                 // block buffers are dropped unread and later GPU work is
                 // queued after them.
+                cache.kv_len -= submitted - consumed;
+                return (out, Some(id));
+            }
+            out.push(id);
+        }
+    }
+}
+
+/// Per-step inputs of `sample_gpu`: the history counts buffer (one `u32` per
+/// vocabulary id, updated on the GPU as ids are chosen) and the settings.
+pub(crate) struct SampleStep<'a> {
+    pub(crate) counts: &'a wgpu::Buffer,
+    pub(crate) sampling: &'a GpuSampling,
+    /// Index of the token this step chooses within the reply (the first
+    /// token, chosen from the prefill logits, is 0).
+    pub(crate) position: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct SamplePenaltyDims {
+    n: u32,
+    penalty: f32,
+    inv_penalty: f32,
+    _p0: u32,
+}
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct SampleFinalDims {
+    k: u32,
+    top_p: f32,
+    inv_temp: f32,
+    seed_lo: u32,
+    seed_hi: u32,
+    position: u32,
+    vocab: u32,
+    _p0: u32,
+}
+
+/// Penalty, top-k and the draw on the GPU (see `resident_sampling.rs`); the
+/// returned one-word buffer holds the chosen id. Modifies `logits` and
+/// `step.counts`. The bind groups are built per call because `counts` is the
+/// caller's buffer, not a pooled one.
+pub(crate) fn sample_gpu(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, logits: &wgpu::Buffer, vocab: u32, step: &SampleStep<'_>) -> wgpu::Buffer {
+    let s = step.sampling;
+    if s.repetition_penalty != 1.0 {
+        let dims = pool.uniform("dec_sample.pen.dims", SamplePenaltyDims { n: vocab, penalty: s.repetition_penalty, inv_penalty: s.inv_penalty(), _p0: 0 });
+        let bg = engine.bind_group(
+            &engine.sample_penalty,
+            &[
+                BindGroupEntry { binding: 0, resource: logits.as_entire_binding() },
+                BindGroupEntry { binding: 1, resource: step.counts.as_entire_binding() },
+                BindGroupEntry { binding: 2, resource: dims.as_entire_binding() },
+            ],
+        );
+        engine.dispatch(pass, &engine.sample_penalty, &bg, (vocab.div_ceil(256), 1, 1), "sample_penalty");
+    }
+    let cands = topk_gpu(engine, pool, pass, "dec_sample.topk", logits, vocab);
+    let out = pool.data("dec_sample.out", 1);
+    let dims = pool.uniform(
+        "dec_sample.dims",
+        SampleFinalDims { k: s.top_k, top_p: s.top_p, inv_temp: s.inv_temp(), seed_lo: s.seed as u32, seed_hi: (s.seed >> 32) as u32, position: step.position, vocab, _p0: 0 },
+    );
+    let bg = engine.bind_group(
+        &engine.sample_final,
+        &[
+            BindGroupEntry { binding: 0, resource: cands.as_entire_binding() },
+            BindGroupEntry { binding: 1, resource: step.counts.as_entire_binding() },
+            BindGroupEntry { binding: 2, resource: out.as_entire_binding() },
+            BindGroupEntry { binding: 3, resource: dims.as_entire_binding() },
+        ],
+    );
+    engine.dispatch(pass, &engine.sample_final, &bg, (1, 1, 1), "sample_final");
+    out
+}
+
+/// Sampled decode with the choice made on the GPU: the same block pipeline
+/// as `decode_greedy_pipelined` (each step's chosen id feeds the next
+/// step's embedding on the GPU, ids are read back in blocks, steps past a
+/// stop are discarded and `cache.kv_len` is rolled back), with
+/// `sample_gpu` in place of the argmax. `first_id` is the token already
+/// chosen from the prefill logits (position 0, see
+/// `resident_sampling::sample_reference`); `history` is every id in the
+/// cache plus `first_id`, for the repetition penalty. `sampling.top_k` must
+/// be in `1..=63`. The random stream is `resident_sampling`'s, not the CPU
+/// sampler's.
+#[allow(clippy::too_many_arguments)]
+pub async fn decode_sampled_pipelined(engine: &Engine, model: &GpuModel, cache: &mut KvCache, first_id: u32, history: &[u32], max_steps: u32, sampling: &GpuSampling, cos: &wgpu::Buffer, sin: &wgpu::Buffer, mask: Option<&wgpu::Buffer>, mut on_token: impl FnMut(u32) -> bool) -> (Vec<u32>, Option<u32>) {
+    let is_stop = |id: u32| model.config.eos_token_ids.contains(&id);
+    let mut out = Vec::new();
+    if max_steps == 0 || is_stop(first_id) || !on_token(first_id) {
+        return (out, None);
+    }
+    out.push(first_id);
+    let vocab = model.config.vocab_size;
+    let mut counts_host = vec![0u32; vocab];
+    for &id in history {
+        if let Some(c) = counts_host.get_mut(id as usize) {
+            *c += 1;
+        }
+    }
+    let counts = engine.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("sample_counts"),
+        size: 4 * vocab as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    engine.queue.write_buffer(&counts, 0, bytemuck::cast_slice(&counts_host));
+    let mut blocks: VecDeque<PendingBlock> = VecDeque::new();
+    let mut prev: Option<wgpu::Buffer> = None;
+    let mut submitted = 0u32;
+    let mut consumed = 0u32;
+    loop {
+        while blocks.len() < BLOCKS_IN_FLIGHT && submitted < max_steps {
+            let n = SAMPLED_BLOCK.min(max_steps - submitted);
+            let bytes = 4 * n as u64;
+            let ring = engine.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("sample_ring"),
+                size: bytes,
+                usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let staging = engine.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("sample_staging"),
+                size: bytes,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            for slot in 0..n {
+                let stage = (slot + 1 == n).then_some((&staging, bytes));
+                let (token_id, src) = if submitted == 0 && slot == 0 { (first_id, None) } else { (0, prev.as_ref()) };
+                let step = SampleStep { counts: &counts, sampling, position: submitted + slot + 1 };
+                let idx = submit_greedy_step(engine, model, cache, token_id, src, &ring, slot, stage, cos, sin, mask, Head::Sample(&step));
+                prev = Some(idx);
+            }
+            submitted += n;
+            let rx = engine.start_map_u32(&staging);
+            blocks.push_back(PendingBlock { staging, rx });
+        }
+        let block = blocks.pop_front().expect("a block is in flight");
+        let ids = engine.finish_map_u32s(&block.staging, block.rx).await;
+        for id in ids {
+            consumed += 1;
+            if consumed == max_steps {
+                return (out, Some(id));
+            }
+            if is_stop(id) || !on_token(id) {
                 cache.kv_len -= submitted - consumed;
                 return (out, Some(id));
             }
@@ -2624,12 +2854,12 @@ pub async fn forward_prefill_suffix(engine: &Engine, model: &GpuModel, cache: &m
     let (last, rest) = token_ids.split_last().expect("forward_prefill_suffix needs at least one token");
     for &tok in rest {
         let mut encoder = engine.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("prefill_suffix_step") });
-        let _ = decode_layers(engine, model, &mut encoder, cache, tok, None, cos, sin, None, false);
+        let _ = decode_layers(engine, model, &mut encoder, cache, tok, None, cos, sin, None, Head::Logits);
         engine.queue.submit(Some(encoder.finish()));
         cache.kv_len += 1;
     }
     let mut encoder = engine.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("prefill_suffix_last") });
-    let (logits, _) = decode_layers(engine, model, &mut encoder, cache, *last, None, cos, sin, mask, false);
+    let (logits, _) = decode_layers(engine, model, &mut encoder, cache, *last, None, cos, sin, mask, Head::Logits);
     engine.queue.submit(Some(encoder.finish()));
     cache.kv_len += 1;
     engine.read_buffer(&logits, model.config.vocab_size).await

@@ -3,6 +3,9 @@
 //   suffix prefill the same prompt with ~N/4 more tokens appended (prefix reused)
 //   decode         greedy 64 tokens from a short prompt, ms per token after the first
 //   exact          hash of a fixed 48-token greedy reply (same on every browser and backend)
+//   sampled        the chat page's sampler (temperature 0.7, top-k 40, top-p 0.9, repetition
+//                  penalty 1.1) with a fixed seed: decode tok/s and a hash of the reply for each
+//                  token budget in `sampledN`; the hash is the same on every browser and backend
 // phases=reuse: prompt-reuse sequences. On one engine, a story prompt is
 //   generated once or more with short replies (the repeat finds all of the
 //   prompt cached but its last token), then a different question; the reply
@@ -71,7 +74,7 @@ async function timeFirstToken(lean, text, maxNew) {
   return { ttft: first - t0, total: performance.now() - t0, n, reply };
 }
 
-async function run({ backend, build, prompts, reps, decode, mini, phases, sampling }) {
+async function run({ backend, build, prompts, reps, decode, mini, phases, sampling, sampledN }) {
   status("fetching");
   const [gguf, tokenizer, tokenizerCfg] = await Promise.all([
     fetch("./model.gguf").then((r) => r.arrayBuffer()).then((b) => new Uint8Array(b)),
@@ -185,6 +188,21 @@ async function run({ backend, build, prompts, reps, decode, mini, phases, sampli
   }
   result.exactHash = await sha(exact);
   result.exactText = exact;
+  if (phases.includes("sampled")) {
+    // Same parameters as the chat page (web/lean-chat-worker.js GEN_PARAMS), fixed seed.
+    result.sampled = [];
+    for (const n of sampledN) {
+      const runs = [];
+      for (let r = 0; r < reps; r++) {
+        status(`sampled ${n} rep ${r}`);
+        const st = [];
+        const rep = await lean.generate(chat("Write a long story about a lighthouse keeper."), { maxNewTokens: n, temperature: 0.7, topK: 40, topP: 0.9, repetitionPenalty: 1.1, seed: 0 }, () => st.push(performance.now()));
+        const msPerTok = st.length > 1 ? (st[st.length - 1] - st[0]) / (st.length - 1) : NaN;
+        runs.push({ tokens: st.length, msPerTok, tokPerSec: 1000 / msPerTok, hash: await sha(rep), head: rep.slice(0, 80) });
+      }
+      result.sampled.push({ maxNewTokens: n, tokPerSec: median(runs.map((x) => x.tokPerSec)), runs });
+    }
+  }
   lean.free();
   if (phases.includes("fresh")) {
     // The same questions, each on a freshly loaded engine (nothing reused from
