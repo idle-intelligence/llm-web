@@ -668,3 +668,46 @@ Each hash is identical in the three browsers. The reuse phase passes (reuse repl
 ### Correctness
 
 Non-ignored tests, the ignored model tests that have their files on this machine (engine_api 17, fixture_parity_generate for Qwen2.5-0.5B and both SmolLM2 sizes, fixture_parity, fixture_parity_gguf for Qwen3-0.6B Q4_K_M on GPU and CPU, f16_parity, kernel_parity, kv_snapshot, pool_reuse, sampled_native) pass; clippy `-D warnings` is clean for native, wasm32 web and wasm32 web+diag.
+
+## Tiled prefill kernel E1 (128 threads, 8x4 block per thread) 2026-10-15
+
+Build tag 2026-10-15-e1-01 (wasm md5 73e81bfa39c2282539e55557a77d8870). Kernel lab page: one prefill matmul dispatch, Q8_0 weights, gate_up shape of Qwen3-0.6B (N 6144, K 1024), random weights and inputs, median of 5 timed reps per load. Variants: small_m (the M <= 8 per workgroup kernel), old tiled (16x16 threads, 4x4 block), E1. M2 laptop: Chromium (Playwright, ANGLE Metal), WebKit (Playwright), Firefox Developer Edition 159; 3 page loads per browser, load average 1.0 to 3.5. Phone: Adreno 6xx, Chrome 155 on Android 10, one load.
+
+### Results: M2, ms per dispatch (median of 3 loads, min to max)
+
+| Browser | M | small_m | old tiled f32 | E1 f32 | old tiled f16 | E1 f16 |
+|---|---|---|---|---|---|---|
+| Chromium | 24 | 0.44 (0.43-0.59) | 0.93 (0.93-1.25) | 0.91 (0.90-1.05) | 0.74 (0.74-0.89) | 0.77 (0.77-0.84) |
+| Chromium | 100 | 1.82 (1.82-2.13) | 1.93 (1.93-2.28) | 1.76 (1.76-2.02) | 1.50 (1.50-1.75) | 1.48 (1.48-1.63) |
+| WebKit | 24 | 0.60 (0.60-0.60) | 1.09 (1.09-1.10) | 1.08 (1.08-1.08) | 0.78 (0.78-0.79) | 0.82 (0.82-0.82) |
+| WebKit | 100 | 2.51 (2.51-2.53) | 2.23 (2.23-2.32) | 2.12 (2.11-2.16) | 1.54 (1.53-1.63) | 1.60 (1.60-1.62) |
+| Firefox | 24 | 0.61 (0.61-0.70) | 1.23 (1.23-1.24) | 1.15 (1.06-1.23) | 1.22 (1.21-1.23) | 1.07 (1.06-1.17) |
+| Firefox | 100 | 3.12 (2.40-3.16) | 2.46 (2.46-3.16) | 2.46 (2.08-2.46) | 1.85 (1.85-2.10) | 1.85 (1.85-1.86) |
+
+### Results: phone (Adreno 6xx), ms per dispatch
+
+| M | small_m | old tiled f32 | E1 f32 | old tiled f16 | E1 f16 |
+|---|---|---|---|---|---|
+| 24 | 4.22 | 32.75 | 20.67 | 34.04 | 19.60 |
+| 100 | 17.73 | 66.24 | 42.20 | 68.14 | 40.17 |
+
+### Results: chat page end to end
+
+`web/index.html` with the page's own sampling, two questions in one chat ("What is the tallest mountain in the world, and how tall is it?", then "Which country is it in?"). Time to first token as shown by the page, tokens / decode tok/s.
+
+| Model | Browser | Turn 1 (prompt tokens, first token, tokens at tok/s) | Turn 2 |
+|---|---|---|---|
+| Qwen2.5-0.5B Q4_0 | Chromium | 37, 0.08 s, 39 at 152 | 92, 0.03 s, 120 at 162 |
+| Qwen2.5-0.5B Q4_0 | WebKit | 37, 0.08 s, 39 at 121 | 92, 0.04 s, 120 at 124 |
+| Qwen2.5-0.5B Q4_0 | Firefox | 37, 0.07 s, 39 at 139 | 92, 0.03 s, 120 at 144 |
+| SmolLM2-360M Q4_0 | Chromium | 38, 0.09 s, 47 at 178 | 102, 0.03 s, 256 at 184 |
+| SmolLM2-360M Q4_0 | WebKit | 38, 0.08 s, 47 at 140 | 102, 0.05 s, 256 at 135 |
+| SmolLM2-360M Q4_0 | Firefox | 38, 0.07 s, 47 at 159 | 102, 0.04 s, 256 at 157 |
+
+### Observations
+
+- E1 matches the old tiled kernel's output to the same maximum difference against small_m in every cell (f32 5.4e-07 to 1.7e-06, f16 6.0e-04 to 1.0e-03).
+- On the Adreno phone E1 takes 0.63x (f32) and 0.58x (f16) of the old tiled time at M 24, and 0.64x and 0.59x at M 100; small_m stays fastest there at both sizes (4.22 and 17.73 ms).
+- On the M2, E1 minus old tiled ranges from -0.17 ms (Chromium f32, M 100) to +0.06 ms (WebKit f16, M 100); E1 is slower only in the f16 column of Chromium M 24 (+0.03) and WebKit (+0.04, +0.06). small_m is fastest at M 24 in every browser and slower than both tiled kernels at M 100 in WebKit and Firefox.
+- The chat replies are the same text in the three browsers for each model. Prefill throughput on the chat path was not measured separately; the prompts are 37 to 102 tokens and the page reports 0.03 to 0.09 s to first token.
+- Native ignored tests on this build pass: pool_reuse (1), kernel_parity (1), engine_api (17), sampled_native (1).
