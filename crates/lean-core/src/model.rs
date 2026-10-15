@@ -2552,8 +2552,9 @@ pub async fn forward_decode_step_argmax(engine: &Engine, model: &GpuModel, cache
 /// to a GPU-side block buffer; the host maps that buffer once per block
 /// instead of once per token. Browsers resolve a buffer map on their own
 /// schedule (tens of milliseconds on some), so the cost of a map is paid
-/// once per `GREEDY_BLOCK` tokens. A fixed number, the same on every device.
-const GREEDY_BLOCK: u32 = 8;
+/// once per `GREEDY_BLOCK` tokens. A fixed number, the same on every device;
+/// 1 streams token by token: blocks of 8 measured no faster in any browser.
+const GREEDY_BLOCK: u32 = 1;
 
 /// Sampled decode steps per readback. One: every token is read back and
 /// streamed as soon as its step resolves; the two steps in flight
