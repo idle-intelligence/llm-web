@@ -39,12 +39,15 @@ Tensor types (`src/gguf.rs`, `src/quant.rs`, `src/cpu.rs`):
 | type | how it runs |
 |---|---|
 | Q4_0 | kept quantized, dequantized in the kernels (GPU and CPU) |
-| Q8_0 | kept quantized, dequantized in the kernels (GPU and CPU) |
-| Q6_K | kept quantized, dequantized in the kernels (GPU and CPU); usually the embedding and output tensors of a "Q4_0" GGUF |
 | Q4_1 | kept quantized on the GPU (`value = nibble * d + m`; a few `ffn_down` tensors of the SmolLM2 "Q4_0" GGUFs), dequantized to F32 on the CPU path |
-| F16, F32 | F32 at load (norms, biases) |
+| Q5_0 | kept quantized (GPU and CPU); the fifth bit of each value is read from a per-block word. llama.cpp writes it in place of Q4_K for models whose row width is not a multiple of 256 (SmolLM2-135M/360M, Qwen2.5-0.5B, Gemma-3-1B) |
+| Q8_0 | kept quantized, dequantized in the kernels (GPU and CPU) |
+| Q4_K | kept quantized (GPU and CPU), 4.5 bits per value; the nibbles are repacked at load into 32-value blocks laid out like Q4_0's, and the 6-bit scales and mins of a 256-value super-block are unpacked in the kernels. Most matrices of a "Q4_K_M" GGUF |
+| Q6_K | kept quantized, dequantized in the kernels (GPU and CPU); the embedding and output tensors of a "Q4_0" GGUF, and half of `attn_v` and `ffn_down` in a "Q4_K_M" one |
+| F16, BF16 | kept at two bytes per value (GPU and CPU). On the GPU two values are packed per u32 and widened with the core WGSL `unpack2x16float` (F16) or a shift (BF16), so no browser needs `shader-f16` for them |
+| F32 | F32 (norms, biases) |
 
-Any other type is rejected at load with an error naming it.
+Any other type (Q5_1, Q5_K, Q3_K, Q2_K, the IQ types, ...) is rejected when the file is opened, with an error naming the type and the tensor. A "Q4_K_M" file is a mix of these types: Q4_K for most matrices, Q6_K for part of `attn_v` and `ffn_down`, and for a model whose row width is not a multiple of 256, Q5_0 and Q8_0 in place of Q4_K and Q6_K.
 
 ## Parity gates
 
@@ -58,6 +61,7 @@ The parity tests compare lean against fixtures written by HF transformers (`refe
 | `fixture_parity_qwen3_1_7b` | Qwen3-1.7B Q8_0 | `LEAN_GGUF_QWEN3_1_7B`, `LEAN_TOKENIZER_DIR_QWEN3_1_7B` |
 | `fixture_parity_llama_360m` | SmolLM2-360M Q4_0 and Q8_0, GPU | `LEAN_GGUF_LLAMA_360M_Q4_0`, `LEAN_GGUF_LLAMA_360M_Q8_0`, `LEAN_TOKENIZER_DIR_LLAMA_360M` |
 | `fixture_parity_llama_360m_cpu` | the same on the CPU path (run with and without `--features threads`) | same as above |
+| `fixture_parity_gguf`, `fixture_parity_gguf_cpu` | any GGUF against a fixture from `reference/gen_fixture_llama.py` (used for the Q4_K_M, F16 and BF16 files: `fixture_llama_360m_q4_k_m.json`, `fixture_qwen3_0_6b_q4_k_m.json`, `fixture_qwen25_0_5b_q4_k_m.json`, `fixture_qwen3_0_6b_f16.json`, `fixture_qwen3_0_6b_bf16.json`); the GPU test runs the naive and the fast f32 kernels | `LEAN_GGUF`, `LEAN_FIXTURE`, `LEAN_TOKENIZER_DIR` |
 | `fixture_parity_llama_1_7b` | SmolLM2-1.7B Q8_0 | `LEAN_GGUF_LLAMA_1_7B_Q8_0`, `LEAN_TOKENIZER_DIR_LLAMA_1_7B` |
 | `fixture_parity_llama32` | Llama-3.2-1B and 3B, Q4_0 and Q8_0, GPU, including a 9044-token prompt (past the 8192 positions of the original context); the prompt is the fixture's HF-rendered chat text | `LEAN_GGUF_LLAMA32_1B_Q4_0`, `LEAN_GGUF_LLAMA32_1B_Q8_0`, `LEAN_TOKENIZER_DIR_LLAMA32_1B`, and the same with `3B` |
 | `fixture_parity_llama32_cpu` | the same on the CPU path; the 9044-token case only with `LEAN_LLAMA32_CPU_LONG=1` | same as above |
@@ -81,5 +85,5 @@ LEAN_GGUF_LLAMA_360M_Q4_0=<gguf> LEAN_GGUF_LLAMA_360M_Q8_0=<gguf> LEAN_TOKENIZER
   cargo test -p lean-core --release --features threads --test fixture_parity_llama_360m_cpu -- --ignored
 ```
 
-`cargo test -p lean-core` without `--ignored` runs the tests that need no model file (dequantization against gguf-py's reference blocks, LoRA parsing, kernel unit tests). `embed_head_sliced`, `stop_ids_match_generation_config` and the Q6_K reference test are unit tests in `src/tests/`, since they check private modules. Release gate logs are under `docs/runs/`.
+`cargo test -p lean-core` without `--ignored` runs the tests that need no model file (dequantization against gguf-py's reference blocks, LoRA parsing, kernel unit tests). `quantized_kernels_match_cpu_reference` (ignored, needs a GPU adapter, no model file) runs every matmul kernel of the quantized formats against a CPU reference on synthetic weights. `embed_head_sliced`, `stop_ids_match_generation_config` and the Q6_K reference test are unit tests in `src/tests/`, since they check private modules. Release gate logs are under `docs/runs/`.
 

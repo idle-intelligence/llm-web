@@ -20,7 +20,7 @@ Natively the same code runs through `wgpu` (tested on Metal and Vulkan), and the
 
 ## Supported models
 
-The forward pass is the [`lean-core`](../lean-core/README.md) crate; its README lists the architectures (Qwen2/Qwen2.5, Qwen3, Llama) and tensor types (Q4_0, Q4_1, Q8_0, Q6_K kept quantized; F16, F32 converted at load). With the `Auto` backend, a model the WebGPU kernels cannot run (a head dimension other than 64 or 128) loads on the CPU.
+The forward pass is the [`lean-core`](../lean-core/README.md) crate; its README lists the architectures (Qwen2/Qwen2.5, Qwen3, Llama) and tensor types (Q4_0, Q4_1, Q5_0, Q8_0, Q4_K, Q6_K kept quantized; F16 and BF16 kept at two bytes per value; F32). With the `Auto` backend, a model the WebGPU kernels cannot run (a head dimension other than 64 or 128) loads on the CPU.
 
 ## The engine: text in, text out
 
