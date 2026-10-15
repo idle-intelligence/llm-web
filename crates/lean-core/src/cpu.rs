@@ -21,7 +21,7 @@ use anyhow::{Context, Result};
 use std::io::{Read, Seek};
 
 use crate::config::{config_from_gguf, Architecture, Qwen2Config};
-use crate::cpu_kernels::{dot_bf16, dot_f16, dot_q4_0, dot_q4_k, dot_q5_0, dot_q6_k, dot_q8_0, F4};
+use crate::cpu_kernels::{dot_bf16, dot_f16, dot_q4_0, dot_q4_k, dot_q5_0, dot_q6_k, dot_q8_0, matvec_q, F4};
 use crate::gguf::{dequantize_for, GgmlDtype, GgufReader};
 use crate::model::{rope_inv_freq, unpermute_rope_rows};
 
@@ -96,6 +96,21 @@ impl CpuWeight {
 }
 
 impl CpuWeight {
+    /// Rows `cols` dotted against `x` into `out` (`out.len() == cols.len()`),
+    /// each element bit for bit `dot_row` of its row. Q4_0 and Q8_0 go
+    /// through `matvec_q`, four rows per pass.
+    fn dot_cols(&self, cols: std::ops::Range<usize>, x: &[f32], out: &mut [f32]) {
+        match self {
+            CpuWeight::Q4_0 { bytes, blocks_per_row, .. } => matvec_q::<true>(bytes, blocks_per_row * 18, x, cols, out),
+            CpuWeight::Q8_0 { bytes, blocks_per_row, .. } => matvec_q::<false>(bytes, blocks_per_row * 34, x, cols, out),
+            _ => {
+                for (o, c) in out.iter_mut().zip(cols) {
+                    *o = self.dot_row(c, x);
+                }
+            }
+        }
+    }
+
     /// Output row `row`'s weights as f32 into `out` (`out.len() == in_dim`),
     /// the same per-element values as `gguf::dequantize_for` (`(q - 8) *
     /// scale` for Q4_0, `q * scale` for Q8_0).
@@ -304,10 +319,10 @@ fn linear_serial(x: &[f32], rows: usize, in_dim: usize, w: &CpuWeight, b: &[f32]
     debug_assert_eq!(w_out, out_dim);
     debug_assert_eq!(w_in, in_dim);
     let mut out = vec![0f32; rows * out_dim];
-    for r in 0..rows {
-        let xr = &x[r * in_dim..(r + 1) * in_dim];
-        for c in 0..out_dim {
-            out[r * out_dim + c] = w.dot_row(c, xr) + b[c];
+    for (xr, o) in x.chunks_exact(in_dim).zip(out.chunks_exact_mut(out_dim)) {
+        w.dot_cols(0..out_dim, xr, o);
+        for (o, bc) in o.iter_mut().zip(b) {
+            *o += bc;
         }
     }
     out
@@ -352,10 +367,12 @@ fn linear_threads(x: &[f32], rows: usize, in_dim: usize, w: &CpuWeight, b: &[f32
         let mut out = vec![0f32; out_dim];
         let ptr = OutPtr(out.as_mut_ptr());
         let item = |i: usize| {
-            let c0 = i * TEAM_ITEM;
-            for (c, bc) in b.iter().enumerate().take(((i + 1) * TEAM_ITEM).min(out_dim)).skip(c0) {
-                // SAFETY: `c < out_dim`, and each `c` belongs to one item.
-                unsafe { *ptr.get().add(c) = w.dot_row(c, x) + bc };
+            let (c0, c1) = (i * TEAM_ITEM, ((i + 1) * TEAM_ITEM).min(out_dim));
+            // SAFETY: `c0..c1` lies inside `out`, and each column belongs to one item.
+            let o = unsafe { std::slice::from_raw_parts_mut(ptr.get().add(c0), c1 - c0) };
+            w.dot_cols(c0..c1, x, o);
+            for (o, bc) in o.iter_mut().zip(&b[c0..c1]) {
+                *o += bc;
             }
         };
         if crate::cpu_team::team_for(out_dim.div_ceil(TEAM_ITEM), &item) {
@@ -1083,6 +1100,26 @@ mod threads_tests {
         let single = linear_with_pool(1, &x, 1, in_dim, &w, &b, out_dim);
         let threaded = linear_with_pool(8, &x, 1, in_dim, &w, &b, out_dim);
         assert_eq!(single, threaded, "Q4_0 decode-shaped linear diverged under threads");
+    }
+
+    #[test]
+    fn q8_0_odd_width_threads_match_single_thread() {
+        // 4 * 32 + 7 columns: four-row groups plus a three-row tail, split
+        // differently by the serial and the threaded paths.
+        let (out_dim, in_dim) = (135, 256);
+        let blocks_per_row = in_dim / 32;
+        let mut bytes: Vec<u8> = (0..out_dim * blocks_per_row * 34).map(|i| ((i as u32 * 13 + 7) % 256) as u8).collect();
+        for blk in 0..out_dim * blocks_per_row {
+            bytes[blk * 34..blk * 34 + 2].copy_from_slice(&half::f16::from_f32(0.01 + (blk % 3) as f32 * 0.005).to_le_bytes());
+        }
+        let w = CpuWeight::Q8_0 { bytes, out_dim, in_dim, blocks_per_row };
+        let b: Vec<f32> = (0..out_dim).map(|c| c as f32 * 0.001).collect();
+        let x = synth_x(in_dim, 5);
+        let single = linear_with_pool(1, &x, 1, in_dim, &w, &b, out_dim);
+        for n in [2usize, 3, 8] {
+            let threaded = linear_with_pool(n, &x, 1, in_dim, &w, &b, out_dim);
+            assert_eq!(single, threaded, "n_threads={n}: Q8_0 odd-width decode-shaped linear diverged under threads");
+        }
     }
 
     #[test]
