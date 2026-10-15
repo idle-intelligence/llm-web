@@ -125,7 +125,7 @@ GGUF headers read by HTTP range request (first 24 MB; metadata and tensor-info t
 | Qwen3-4B UD-Q2_K_XL (unsloth) | 2560 | Q2_K 104, Q3_K 93, IQ3_S 15, IQ3_XXS 10, IQ2_XS 10, IQ2_S 10, Q4_K 5, IQ4_XS 5, Q6_K 1 |
 | Gemma 4 E2B QAT q4_0 (Google) | 1536 | Q4_0 x275, Q6_K x2, F16 x1, F32 |
 
-Reading: the 16 Q6_K + 16 Q4_K in TC's SmolLM2-360M file are the ffn_down split of 32 layers (4 + 4 + 8 = 16 layers satisfy `use_more_bits`); the 176 Q5_0 are every 960-wide-input matrix that fell back from Q4_K; the 16 Q8_0 attn_v are the Q6_K layers that fell back.
+Reading: the 16 Q6_K + 16 Q4_K in the bartowski SmolLM2-360M Q4_K_M file are the ffn_down split of 32 layers (4 + 4 + 8 = 16 layers satisfy `use_more_bits`); the 176 Q5_0 are every 960-wide-input matrix that fell back from Q4_K; the 16 Q8_0 attn_v are the Q6_K layers that fell back.
 
 ### 2.3 Kernel requirement per variant (from the above; "odd dims" = hidden not divisible by 256)
 | Variant | Needs, hidden % 256 == 0 | Needs, odd dims |
@@ -157,7 +157,7 @@ Hidden sizes checked from headers: not divisible by 256: SmolLM2-360M (960), Qwe
 
 Which llama.cpp revision wllama's bundled wasm uses was not checked (unknown; would need the submodule pointer in wllama).
 
-## 4. Options for lean (facts, then trade-offs; the choice is TC's)
+## 4. Options for lean (facts, then trade-offs)
 
 ### 4.1 Coverage by added kernel
 Computed over the 2,939 (repo, variant) pairs in the 237 ladder repos. A pair counts as loadable when every tensor type in its requirement set (table 2.3, hidden % 256 == 0 column) is in lean's kernel set. 663 pairs (22.6%) are variants I did not model (IQ1/IQ2/IQ3, UD-*, BF16, MXFP4, Q4_0_x_x), which stay in the denominator as not loadable. First figure is unweighted share of pairs, second is weighted by repo downloads.
@@ -180,7 +180,7 @@ Skip candidates by the evidence: IQ* (wllama itself recommends against; shipped 
 
 ### 4.2 Alternative: publish lean-friendly GGUFs on the idle-intelligence HF org
 Facts for the comparison:
-- Demo models are few and TC controls them. Existing community files already match lean for several: ggml-org/Qwen3-0.6B-GGUF has Q4_0 and Q8_0; Qwen3-0.6B/1.7B official are Q8_0 only; Google's Gemma 4 QAT q4_0 is Q4_0 + Q6_K + F16.
+- Demo models are few and chosen by the demo pages. Existing community files already match lean for several: ggml-org/Qwen3-0.6B-GGUF has Q4_0 and Q8_0; Qwen3-0.6B/1.7B official are Q8_0 only; Google's Gemma 4 QAT q4_0 is Q4_0 + Q6_K + F16.
 - A pure Q4_0 produced by llama.cpp still contains a few Q4_1 and one Q6_K or Q8_0 embedding (section 2.2), all of which lean already loads. `llama-quantize` with `--pure` or `--tensor-type` overrides can force a single type per file (options exist in the source at lines 723-780; the exact CLI use was not tested).
 - Pros: no new kernels, smaller wasm/WGSL surface, exact control of file layout and shard sizes for the 2 GB ArrayBuffer limit, tokenizer and chat template checked once, files hosted with the demo.
 - Cons: users cannot drop in an arbitrary community GGUF (the most popular file, Q4_K_M, is rejected); Q4_0 is lower quality than Q4_K_M at similar size, and a Q8_0 file is about 1.9x larger than Q4_K_M; the org must keep re-publishing as new model families appear; a published file is a separate artifact to maintain and license-check per model.
