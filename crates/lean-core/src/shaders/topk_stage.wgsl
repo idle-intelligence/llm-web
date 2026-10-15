@@ -4,7 +4,7 @@
 // later stages read the previous stage's output; the last stage has one
 // workgroup and writes the final 64. Order is value descending, ties toward
 // the lower id, so the result does not depend on the reduction order.
-// Padding and excluded entries carry the lowest f32 and sort last.
+// Padding carries the lowest f32 and sorts last.
 // Integer-valued output: [value bits, id] pairs, 2 u32 per item.
 struct Dims {
     n_in: u32,

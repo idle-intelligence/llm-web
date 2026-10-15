@@ -3,4 +3,5 @@
 
 mod embed_head_sliced;
 mod q6k_reference_dequant;
+mod resident_sampling;
 mod stop_tokens;

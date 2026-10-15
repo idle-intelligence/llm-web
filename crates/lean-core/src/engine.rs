@@ -248,11 +248,13 @@ pub struct Engine {
     /// caller-supplied bitset, in place on the logits buffer, before
     /// argmax/readback - see `model.rs::mask_logits_gpu`.
     pub(crate) mask_logits: wgpu::ComputePipeline,
-    /// GPU top-k for sampling: `shaders/topk_hist.wgsl` takes the penalty
-    /// history out of the logits, `shaders/topk_stage.wgsl` is one stage of
-    /// the 1024-way bitonic selection - see `model.rs::topk_gpu`.
-    pub(crate) topk_hist: wgpu::ComputePipeline,
+    /// GPU top-k for sampling: one stage of the 1024-way bitonic selection
+    /// (`shaders/topk_stage.wgsl`) - see `model.rs::topk_gpu`.
     pub(crate) topk_stage: wgpu::ComputePipeline,
+    /// GPU-resident sampling (`resident_sampling.rs`): the repetition
+    /// penalty over the history counts, and the draw from the top-k.
+    pub(crate) sample_penalty: wgpu::ComputePipeline,
+    pub(crate) sample_final: wgpu::ComputePipeline,
     /// Per-row absolute-position RoPE (`shaders/rope_positions.wgsl`) - the
     /// caller-supplied-position-ids mechanism (llm-life's per-cell RoPE
     /// restart), see `model.rs::rope_positions`.
@@ -484,8 +486,9 @@ impl Engine {
             silu_mul_fused: make_pipeline(&device, "silu_mul_fused", include_str!("shaders/silu_mul_fused.wgsl")),
             argmax: make_pipeline(&device, "argmax", include_str!("shaders/argmax.wgsl")),
             mask_logits: make_pipeline(&device, "mask_logits", include_str!("shaders/mask_logits.wgsl")),
-            topk_hist: make_pipeline(&device, "topk_hist", include_str!("shaders/topk_hist.wgsl")),
             topk_stage: make_pipeline(&device, "topk_stage", include_str!("shaders/topk_stage.wgsl")),
+            sample_penalty: make_pipeline(&device, "sample_penalty", include_str!("shaders/sample_penalty.wgsl")),
+            sample_final: make_pipeline(&device, "sample_final", include_str!("shaders/sample_final.wgsl")),
             rope_positions: make_pipeline(&device, "rope_positions", include_str!("shaders/rope_positions.wgsl")),
             attn_chunk_masked: make_pipeline(&device, "attn_chunk_masked", include_str!("shaders/attn_chunk_masked.wgsl")),
             gather_dequant_q8_rows: make_pipeline(&device, "gather_dequant_q8_rows", include_str!("shaders/gather_dequant_q8_rows.wgsl")),

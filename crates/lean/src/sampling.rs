@@ -1,15 +1,16 @@
 //! Sampling over a decode step's logits. `sample` works on the full logits
-//! vector (`vocab_size * 4` bytes read back per step); for `0 < top_k < 64`
-//! the top-k runs on the GPU instead and `sample_candidates` finishes the
-//! step from the 64 best logits plus the repetition-penalty history's
-//! logits (`generate.rs::decode_loop`), returning the same token. Greedy
-//! decoding (`SamplingParams::is_greedy`) takes `forward_decode_step_argmax`
-//! and never gets here.
+//! vector (`vocab_size * 4` bytes read back per step); it serves `top_k` 0
+//! and 64 and up. For `1 <= top_k <= 63` the whole step runs in
+//! `lean_core::resident_sampling` instead (`SamplingParams::resident`), on
+//! the GPU or the CPU. Greedy decoding (`SamplingParams::is_greedy`) takes
+//! `forward_decode_step_argmax` and never gets here.
 //!
 //! `Rng64` is a small splitmix64 generator (no external `rand` dependency -
 //! this crate has none, and a PRNG this simple needs none) used only for
 //! reproducible sampling given a seed; it is not cryptographically strong
 //! and is not meant to be.
+
+use lean_core::resident_sampling::GpuSampling;
 
 /// temperature <= 0.0 means greedy (argmax, matching `model::argmax`'s
 /// lowest-index tie-break). `top_k == 0` disables top-k filtering.
@@ -117,111 +118,32 @@ pub fn sample(logits: &mut [f32], params: &SamplingParams, history: &[u32], rng:
     draw_from(&mut cands, vocab, params.top_p, rng)
 }
 
-/// Largest `top_k` the GPU top-k path serves: it returns
-/// `lean_core::model::TOPK_CANDS` candidates and needs `top_k` below that so
-/// a tie with the k-th value shows up as a tie inside the candidates.
-pub(crate) const GPU_TOPK_MAX: u32 = lean_core::model::TOPK_CANDS as u32 - 1;
-
 impl SamplingParams {
-    /// Whether a sampling step can run its top-k on the GPU and read back
-    /// only the candidates: `0 < top_k <= GPU_TOPK_MAX` (top_k below the
-    /// vocabulary size is checked by the caller).
-    pub(crate) fn gpu_topk(&self) -> bool {
-        !self.is_greedy() && self.top_k > 0 && self.top_k <= GPU_TOPK_MAX
+    /// The settings of the resident sampler (`lean_core::resident_sampling`,
+    /// used on every backend) when these parameters qualify: non-greedy with
+    /// `1 <= top_k <= 63` and `top_k` below the vocabulary size. Its random
+    /// stream and its tie rule at the k-th logit differ from `sample`'s.
+    pub(crate) fn resident(&self, vocab: usize) -> Option<GpuSampling> {
+        let k = self.top_k;
+        if self.is_greedy() || k == 0 || k as usize > MAX_RESIDENT_TOP_K || k as usize >= vocab {
+            return None;
+        }
+        Some(GpuSampling { temperature: self.temperature, top_k: k, top_p: self.top_p, repetition_penalty: self.repetition_penalty, seed: self.seed })
     }
 }
 
-/// The repetition-penalty history as distinct ids with their occurrence
-/// counts, in first-occurrence order. The penalty is applied once per
-/// occurrence, so a count is how many times to apply it to that id.
-pub(crate) struct HistoryCounts {
-    vocab: usize,
-    slot: std::collections::HashMap<u32, usize>,
-    pub ids: Vec<u32>,
-    pub counts: Vec<u32>,
-}
+const MAX_RESIDENT_TOP_K: usize = lean_core::model::TOPK_CANDS - 1;
 
-impl HistoryCounts {
-    pub fn new(vocab: usize, history: &[u32]) -> Self {
-        let mut h = HistoryCounts { vocab, slot: Default::default(), ids: Vec::new(), counts: Vec::new() };
-        for &id in history {
-            h.push(id);
-        }
-        h
-    }
-
-    /// Ids outside the vocabulary are ignored, as `sample` ignores them.
-    pub fn push(&mut self, id: u32) {
-        if id as usize >= self.vocab {
-            return;
-        }
-        match self.slot.get(&id) {
-            Some(&i) => self.counts[i] += 1,
-            None => {
-                self.slot.insert(id, self.ids.len());
-                self.ids.push(id);
-                self.counts.push(1);
-            }
+/// Occurrences of each vocabulary id in `history` (ids outside the
+/// vocabulary are ignored).
+pub(crate) fn id_counts(vocab: usize, history: &[u32]) -> Vec<u32> {
+    let mut counts = vec![0u32; vocab];
+    for &id in history {
+        if let Some(c) = counts.get_mut(id as usize) {
+            *c += 1;
         }
     }
-}
-
-/// What the GPU returns for one sampling step (see
-/// `lean_core::model::TopkStep`), as plain data.
-pub(crate) struct Candidates<'a> {
-    /// Best logits among the ids not in the history, best first.
-    pub cands: &'a [(u32, f32)],
-    /// Raw logit of each id in `HistoryCounts::ids`, same order.
-    pub hist_logits: &'a [f32],
-}
-
-/// `sample` for a step whose top-k was selected on the GPU. Gives the token
-/// `sample` gives on the full logits, or `None` when the candidates cannot
-/// prove they hold every logit `sample` would keep (the caller then reads
-/// the full logits and calls `sample`). The penalty, temperature scaling,
-/// softmax, top-p and the draw all run here on copies of the GPU's values,
-/// in the same order and arithmetic as `sample`, so the result does not
-/// depend on how the GPU rounds. `params.top_k` must satisfy `gpu_topk` and
-/// be below `vocab`.
-///
-/// The k-th largest scaled logit is taken over the candidates plus the
-/// penalised history values. A logit outside the candidates is at most the
-/// last candidate's, so it is below that k-th value, hence correctly
-/// dropped, unless the two are equal (a tie with the boundary that the
-/// candidates cannot see) and the tied entries have a non-zero softmax
-/// weight; that case returns `None`. When fewer than `TOPK_CANDS` real
-/// candidates came back, every non-history logit is among them.
-pub(crate) fn sample_candidates(c: &Candidates, hist: &HistoryCounts, vocab: usize, params: &SamplingParams, rng: &mut Rng64) -> Option<u32> {
-    let temp = params.temperature.max(1e-5);
-    let mut merged: Vec<(u32, f32)> = Vec::with_capacity(c.cands.len() + hist.ids.len());
-    for ((&id, &count), &raw) in hist.ids.iter().zip(&hist.counts).zip(c.hist_logits) {
-        let mut v = raw;
-        if params.repetition_penalty != 1.0 {
-            for _ in 0..count {
-                v = penalize(v, params.repetition_penalty);
-            }
-        }
-        merged.push((id, v / temp));
-    }
-    for &(id, raw) in c.cands {
-        merged.push((id, raw / temp));
-    }
-    let k = params.top_k as usize;
-    let values: Vec<f32> = merged.iter().map(|m| m.1).collect();
-    let threshold = kth_largest(&values, k);
-    let complete = c.cands.len() < lean_core::model::TOPK_CANDS;
-    if !complete {
-        let last = c.cands[c.cands.len() - 1].1 / temp;
-        if threshold <= last {
-            let max_logit = values.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            if (threshold - max_logit).exp() > 0.0 {
-                return None;
-            }
-        }
-    }
-    let mut surv: Vec<(u32, f32)> = merged.into_iter().filter(|m| m.1 >= threshold).collect();
-    surv.sort_by_key(|m| m.0);
-    Some(draw_from(&mut surv, vocab, params.top_p, rng))
+    counts
 }
 
 /// One application of the repetition penalty to one logit.
@@ -449,62 +371,5 @@ mod tests {
                 assert_eq!(ta, tb, "case {case} step {step} vocab {vocab} params {params:?}");
             }
         }
-    }
-
-    /// The GPU's selection, on the CPU: the best 64 non-history logits
-    /// (value descending, lower id first), plus the history's raw logits.
-    fn gpu_view(base: &[f32], hist: &HistoryCounts) -> (Vec<(u32, f32)>, Vec<f32>) {
-        let mut rest: Vec<(u32, f32)> = base.iter().enumerate().filter(|(i, _)| !hist.ids.contains(&(*i as u32))).map(|(i, &v)| (i as u32, v)).collect();
-        rest.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap().then(a.0.cmp(&b.0)));
-        rest.truncate(lean_core::model::TOPK_CANDS);
-        (rest, hist.ids.iter().map(|&i| base[i as usize]).collect())
-    }
-
-    /// `sample_candidates` returns the token `sample` returns on the full
-    /// logits whenever it returns one, and returns one in the common case.
-    #[test]
-    fn candidates_match_full_sample_on_random_logits_and_ties() {
-        let mut st = 777u64;
-        let (mut some, mut none) = (0, 0);
-        for case in 0..600u64 {
-            let vocab = [70usize, 100, 300, 2000, 5000][(lcg(&mut st) % 5) as usize];
-            let coarse = case % 4 == 0;
-            let base: Vec<f32> = (0..vocab)
-                .map(|_| {
-                    let r = (lcg(&mut st) % 20001) as f32 / 1000.0 - 10.0;
-                    if coarse { (r * 2.0).round() / 2.0 } else { r }
-                })
-                .collect();
-            let history: Vec<u32> = (0..(lcg(&mut st) % 80)).map(|_| (lcg(&mut st) % (vocab as u64 + 3)) as u32).collect();
-            let params = SamplingParams {
-                temperature: [0.3f32, 0.7, 1.0, 1.7][(lcg(&mut st) % 4) as usize],
-                top_k: [1u32, 2, 5, 40, 63][(lcg(&mut st) % 5) as usize],
-                top_p: [1.0f32, 0.9, 0.5][(lcg(&mut st) % 3) as usize],
-                repetition_penalty: [1.0f32, 1.1, 1.3][(lcg(&mut st) % 3) as usize],
-                seed: lcg(&mut st),
-            };
-            let hc = HistoryCounts::new(vocab, &history);
-            let (cands, hist_logits) = gpu_view(&base, &hc);
-            let mut rng_a = Rng64::new(params.seed);
-            let mut rng_b = Rng64::new(params.seed);
-            for step in 0..5 {
-                let mut full = base.clone();
-                let want = sample(&mut full, &params, &history, &mut rng_a);
-                match sample_candidates(&Candidates { cands: &cands, hist_logits: &hist_logits }, &hc, vocab, &params, &mut rng_b) {
-                    Some(got) => {
-                        some += 1;
-                        assert_eq!(want, got, "case {case} step {step} vocab {vocab} params {params:?}");
-                    }
-                    None => {
-                        none += 1;
-                        // The caller falls back to the full sample, which draws once.
-                        let mut again = base.clone();
-                        let fb = sample(&mut again, &params, &history, &mut rng_b);
-                        assert_eq!(want, fb);
-                    }
-                }
-            }
-        }
-        assert!(some > 2000, "the candidate path should serve most steps: {some} served, {none} fell back");
     }
 }

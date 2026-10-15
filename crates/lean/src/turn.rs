@@ -23,7 +23,8 @@ use lean_core::engine::Engine;
 use crate::error::LeanError;
 use crate::generate::decode_loop;
 use lean_core::model::{argmax, forward_prefill, forward_prefill_suffix, GpuModel, KvCache};
-use crate::sampling::{sample, Rng64, SamplingParams};
+use crate::sampling::{id_counts, sample, Rng64, SamplingParams};
+use lean_core::resident_sampling::sample_reference;
 
 /// Everything one `generate` call needs beyond its text: how many tokens
 /// to produce and how to pick them. `temperature <= 0` is greedy.
@@ -197,16 +198,28 @@ async fn cpu_decode_loop<F: Future<Output = ()>>(
 ) -> Vec<u32> {
     let greedy = params.is_greedy();
     let mut rng = Rng64::new(params.seed);
+    let vocab = model.config.vocab_size;
+    // The same sampler as the GPU's for the settings it serves, so both
+    // backends give the same reply for the same seed.
+    let resident = params.resident(vocab);
+    let mut counts = if resident.is_some() { id_counts(vocab, history) } else { Vec::new() };
     apply_mask_cpu(&mut first_logits, mask_bits);
-    let mut next_id = if greedy { argmax(&first_logits) } else { sample(&mut first_logits, params, history, &mut rng) };
+    let mut next_id = match &resident {
+        Some(s) => sample_reference(&first_logits, &counts, s, 0),
+        None if greedy => argmax(&first_logits),
+        None => sample(&mut first_logits, params, history, &mut rng),
+    };
 
     let mut generated = Vec::with_capacity(max_new_tokens as usize);
-    for _ in 0..max_new_tokens {
+    for step in 0..max_new_tokens {
         if model.config.eos_token_ids.contains(&next_id) || should_stop() {
             break;
         }
         generated.push(next_id);
         history.push(next_id);
+        if let Some(c) = counts.get_mut(next_id as usize) {
+            *c += 1;
+        }
         on_token(next_id);
         yield_now().await;
         if should_stop() {
@@ -214,7 +227,11 @@ async fn cpu_decode_loop<F: Future<Output = ()>>(
         }
         let mut logits = cpu_forward_decode_step(model, cache, next_id);
         apply_mask_cpu(&mut logits, mask_bits);
-        next_id = if greedy { argmax(&logits) } else { sample(&mut logits, params, history, &mut rng) };
+        next_id = match &resident {
+            Some(s) => sample_reference(&logits, &counts, s, step + 1),
+            None if greedy => argmax(&logits),
+            None => sample(&mut logits, params, history, &mut rng),
+        };
     }
     generated
 }
