@@ -490,6 +490,7 @@ On the Linux test machine the F32 path was re-measured with the same wasm pair (
 - Regression: `fixture_parity_llama_360m` (Q4_0 and Q8_0) and `fixture_parity_qwen3` (Q8_0) pass. SmolLM2-1.7B Q4_0 in the three browsers: exactness hash efa85acfe7945318, decode hashes 941622dd5a82970f (128) and 9731a7102ed3b8d7 (512), unchanged.
 - Every model gives the same decode and exactness hashes in Chromium, WebKit and Firefox. F16 and BF16 of Qwen3-0.6B give the same decode hashes (61e2f026bf6e7eef at 128, 3b8f0e093f4659b5 at 512).
 - `reuse` phase (repeated prompts, different questions, against fresh-engine replies) on Qwen2.5-0.5B Q4_K_M and SmolLM2-360M Q4_K_M in the three browsers: every sequence equals the fresh-engine reply.
+- Chat page (`web/index.html` from `_site`, build 2026-10-15-quant-formats-01) with the Qwen2.5-0.5B-Instruct Q4_K_M file seeded into the page's model cache under the Q4_0 model's URLs: the story prompt, a question, and the same question after New chat all answer in Chromium, WebKit and Firefox Developer Edition, with identical text in the three browsers (the questions name Paris), and the status line reads Ready.
 - clippy `-D warnings`: native all targets, wasm32 web, wasm32 web+diag, clean; `wasm-pack build` through `scripts/build.sh` green with +simd128.
 
 ### Observations
