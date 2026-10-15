@@ -3,13 +3,13 @@
 //   suffix prefill the same prompt with ~N/4 more tokens appended (prefix reused)
 //   decode         greedy 64 tokens from a short prompt, ms per token after the first
 //   exact          hash of a fixed 48-token greedy reply (same on every browser and backend)
+//   sampled        the chat page's sampler (temperature 0.7, top-k 40, top-p 0.9, repetition
+//                  penalty 1.1) with a fixed seed: decode tok/s and a hash of the reply for each
+//                  token budget in `sampledN`; the hash is the same on every browser and backend
 // phases=reuse: prompt-reuse sequences. On one engine, a story prompt is
 //   generated once or more with short replies (the repeat finds all of the
 //   prompt cached but its last token), then a different question; the reply
 //   to the question must equal the reply of a freshly loaded engine.
-//   sampled        the chat page's sampler (temperature 0.7, top-k 40, top-p 0.9, repetition
-//                  penalty 1.1) with a fixed seed: decode tok/s and a hash of the reply for each
-//                  token budget in `sampledN`; the hash is the same on every browser and backend
 // phases=loads: `reps` loads and frees of the engine, `decode` ms pause after each (see run()).
 // Expects ../lean/pkg (built wasm), model.gguf, tokenizer.json and
 // tokenizer_config.json next to the page.
