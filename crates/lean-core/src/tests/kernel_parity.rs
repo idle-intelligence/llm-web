@@ -10,14 +10,14 @@ use crate::gguf::{dequantize_for, GgmlDtype};
 use crate::model::{gate_up_swiglu_decode, linear, Pool};
 use crate::quant::load_matmul_weight_gguf;
 
-struct Rng(u32);
+pub(super) struct Rng(pub(super) u32);
 
 impl Rng {
-    fn next(&mut self) -> u32 {
+    pub(super) fn next(&mut self) -> u32 {
         self.0 = self.0.wrapping_mul(1664525).wrapping_add(1013904223);
         self.0 >> 8
     }
-    fn unit(&mut self) -> f32 {
+    pub(super) fn unit(&mut self) -> f32 {
         (self.next() % 20001) as f32 / 10000.0 - 1.0
     }
 }
@@ -27,7 +27,7 @@ fn f16_bytes(v: f32) -> [u8; 2] {
 }
 
 /// Random bytes for `n_elements` values of `dtype` with sane scale fields.
-fn synth(dtype: GgmlDtype, n_elements: usize, rng: &mut Rng) -> Vec<u8> {
+pub(super) fn synth(dtype: GgmlDtype, n_elements: usize, rng: &mut Rng) -> Vec<u8> {
     let mut out = Vec::new();
     match dtype {
         GgmlDtype::Q4_0 => {
@@ -47,6 +47,12 @@ fn synth(dtype: GgmlDtype, n_elements: usize, rng: &mut Rng) -> Vec<u8> {
                 out.extend(f16_bytes(0.002 + (rng.next() % 30) as f32 * 0.0002));
                 out.extend(f16_bytes(0.001 + (rng.next() % 30) as f32 * 0.0002));
                 out.extend((0..140).map(|_| rng.next() as u8));
+            }
+        }
+        GgmlDtype::Q8_0 => {
+            for _ in 0..n_elements / 32 {
+                out.extend(f16_bytes(0.01 + (rng.next() % 50) as f32 * 0.001));
+                out.extend((0..32).map(|_| rng.next() as u8));
             }
         }
         GgmlDtype::Q6_K => {

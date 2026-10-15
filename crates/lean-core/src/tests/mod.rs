@@ -4,5 +4,6 @@
 mod dequant_reference;
 mod embed_head_sliced;
 mod kernel_parity;
+mod matvec_bandwidth;
 mod q6k_reference_dequant;
 mod stop_tokens;
