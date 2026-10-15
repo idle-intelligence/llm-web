@@ -425,3 +425,83 @@ On the Linux test machine the F32 path was re-measured with the same wasm pair (
 - The 1e-3 prefill logit gates in the fixture tests do not hold with f16 kernels; they need `LEAN_F16=0` or a looser gate for the top-20 values.
 - f16 on the RTX 3080 was not measured: neither native wgpu nor Chromium 153 offers shader-f16 on that machine and driver.
 - The small-M kernel (under 64 rows) and prefill attention still run in f32.
+
+
+## 2026-10-15: Q4_K_M, Q5_0, F16 and BF16 files
+
+### Parameters
+
+- Change: lean now keeps Q4_K and Q5_0 weights quantized on the GPU (decode matvec with one and four rows per lane, fused gate/up, short and long prefill, the f16 tile when shader-f16 is granted), keeps F16 and BF16 weights at two bytes per value (two per u32, widened with the core WGSL `unpack2x16float` or a shift), tiles the Q6_K prefill matmul, and accepts Q4_K, Q5_0, F16 and BF16 as embedding tables. The CPU path reads the same types. Any other tensor type is rejected at open with its name and the tensor's name.
+- Q4_K layout on the device: nibbles repacked into 32-value blocks with Q4_0's layout (16 bytes), plus 20 bytes per 256 values of metadata (d and dmin as f16 in one word, eight 6-bit scales and eight 6-bit mins one per byte): 148 bytes per 256 values, 4.625 bits per value. Q5_0: Q4_0 layout plus a 4-byte word of fifth bits and an f32 scale per block, 6 bits per value.
+- A "Q4_K_M" file is a mix. Tensor types measured from the files: Qwen3-0.6B Q4_K_M (unsloth) Q4_K and Q6_K (token_embd, 14 attn_v, 14 ffn_down); SmolLM2-360M Q4_K_M 176 Q5_0, 16 Q4_K, 16 Q6_K, 17 Q8_0; Qwen2.5-0.5B-Instruct Q4_K_M (Qwen) mostly Q5_0 with Q8_0, Q6_K and 12 Q4_K.
+- Files: Qwen3-0.6B Q4_K_M from unsloth/Qwen3-0.6B-GGUF, Q4_0, F16 and BF16 from ggml-org/Qwen3-0.6B-GGUF, Q8_0 from Qwen/Qwen3-0.6B-GGUF (all Apache 2.0); Qwen2.5-0.5B-Instruct Q4_K_M and Q4_0 from Qwen/Qwen2.5-0.5B-Instruct-GGUF (Apache 2.0); SmolLM2-360M-Instruct Q4_K_M, Q4_0 and Q8_0 are the GGUF files of the SmolLM2 runs above (Apache 2.0 model).
+- Machine: M2 laptop, 16 GB, read ceiling 91.4 GB/s. Native numbers are from `decode_ctx` (pipelined greedy decode, 5 repetitions per context, median) and `profile_roofline prefill` (3 repetitions, median), each model measured in 3 rounds with the model order reversed between rounds; the table shows the median of the 3 round medians. The 1-minute load average was 1.1 to 1.9 during the rounds and no rustc ran at their start. Other workers' GPU jobs were serialized with this one by the lock.
+- Browsers: Chromium 153 (`--use-angle=metal`), WebKit (Playwright build), Firefox Developer Edition 159 headed with a throwaway profile, harness `scripts/bench` (phases cold with 500-token prompts and 3 repetitions, decode 128 and 512 tokens, exact), one load per cell. wasm md5 51c3bb5fe8d85f28d9d63bf219ed51fe, equal for the file in `crates/lean/pkg`, the copy in the bench root and the bytes fetched from the bench server; build tag 2026-10-15-quant-formats-01 on every loading URL.
+
+### Results: matvec read bandwidth (`matvec_bandwidth`, 16 distinct weights per format, decode rows == 1, M2)
+
+| Format | in 2048, out 8192: us per matvec | GB/s | % of 91.4 | in 2048, out 2048: us | GB/s | % of 91.4 |
+|---|---:|---:|---:|---:|---:|---:|
+| Q4_0 | 143 | 73.2 | 80 | 48 | 54.9 | 60 |
+| Q4_K, first layout (packed 6-bit scales unpacked in the kernel) | 166 | 58.3 | 64 | 71 | 34.0 | 37 |
+| Q4_K, final layout | 143 | 68.0 | 74 | 48 | 50.8 | 56 |
+| Q5_0 | 190 | 66.3 | 73 | 71 | 44.1 | 48 |
+| Q8_0 | 214 | 88.2 | 96 | 71 | 66.2 | 72 |
+| Q6_K | 166 | 83.6 | 91 | 72 | 48.5 | 53 |
+| F16 | 379 | 88.6 | 97 | 119 | 70.7 | 77 |
+
+### Results: native Metal (wgpu 26)
+
+| Model | File | GPU weights MB | Decode tok/s, ctx 128 | Decode tok/s, ctx 512 | Prefill 500 tokens, ms |
+|---|---|---:|---:|---:|---:|
+| Qwen3-0.6B | Q4_K_M | 529 | 106.2 | 92.5 | 820.5 |
+| Qwen3-0.6B | Q4_0 | 472 | 127.4 | 108.4 | 770.7 |
+| Qwen3-0.6B | Q8_0 | 848 | 88.7 | 78.9 | 771.3 |
+| Qwen3-0.6B | F16 | 1505 | 64.3 | 59.1 | 941.6 |
+| Qwen3-0.6B | BF16 | 1505 | 63.4 | 59.1 | 941.1 |
+| SmolLM2-360M-Instruct | Q4_K_M | 342 | 133.1 | 117.6 | 658.3 |
+| SmolLM2-360M-Instruct | Q4_0 | 306 | 170.5 | 144.1 | 553.9 |
+| SmolLM2-360M-Instruct | Q8_0 | 462 | 127.7 | 113.1 | 576.5 |
+| Qwen2.5-0.5B-Instruct | Q4_K_M | 521 | 124.3 | 115.3 | 645.4 |
+| Qwen2.5-0.5B-Instruct | Q4_0 | 464 | 152.5 | 137.6 | 552.4 |
+
+### Results: browsers, decode tok/s at 128 tokens / decode tok/s at 512 tokens / cold prefill of 500 tokens in ms
+
+| Model | File | Chromium 153 | WebKit | Firefox Dev 159 |
+|---|---|---|---|---|
+| SmolLM2-1.7B | Q4_0 | 70.1 / 66.8 / 1676 | 61.5 / 56.6 / 2108 | 66.6 / 62.1 / 1986 |
+| Qwen3-0.6B | Q4_K_M | 115.7 / 114.8 / 629 | 91.3 / 88.6 / 830 | 106.3 / 102.6 / 802 |
+| Qwen3-0.6B | Q4_0 | 136.5 / 135.8 / 589 | 113.8 / 110.3 / 826 | 126.1 / 122.2 / 757 |
+| Qwen3-0.6B | Q8_0 | 95.2 / 95.2 / 597 | - | - |
+| Qwen3-0.6B | F16 | 66.6 / 66.1 / 713 | - | - |
+| Qwen3-0.6B | BF16 | 65.7 / 66.4 / 710 | - | - |
+| SmolLM2-360M-Instruct | Q4_K_M | 158.7 / 153.0 / 463 | 125.0 / 116.0 / 613 | 137.3 / 129.9 / 620 |
+| SmolLM2-360M-Instruct | Q4_0 | 196.6 / 190.3 / 404 | - | - |
+| SmolLM2-360M-Instruct | Q8_0 | 148.1 / 144.0 / 405 | - | - |
+| Qwen2.5-0.5B-Instruct | Q4_K_M | 137.2 / 135.5 / 496 | 114.0 / 109.0 / 600 | 125.6 / 121.8 / 632 |
+| Qwen2.5-0.5B-Instruct | Q4_0 | 169.4 / 167.4 / 424 | - | - |
+
+### Correctness
+
+- Dequantization of Q4_K, Q5_0, F16 and BF16 against gguf-py's `dequantize`: bit-identical on real blocks (`src/tests/dequant_reference.rs`) and on a whole tensor of each type (Qwen3-0.6B `blk.3.ffn_down.weight` Q4_K, SmolLM2-360M `blk.5.attn_q.weight` Q5_0, Qwen3-0.6B `blk.2.attn_q.weight` F16 and BF16).
+- `quantized_kernels_match_cpu_reference` (every matmul kernel of Q4_0, Q5_0, Q4_K, Q6_K, F16, BF16 on synthetic weights: naive, decode with 1 and 4 rows per lane, fused gate/up, short and long prefill, f16 tile): all within 1e-3 of the CPU reference (4e-2 for the f16 tile).
+- `fixture_parity_gguf` against transformers (the GGUF dequantized on load), top-20 prefill logits within 1e-3 and the 32-token greedy continuation identical, on the naive kernels, the fast F32 kernels and the CPU path: SmolLM2-360M Q4_K_M, Qwen3-0.6B Q4_K_M, Qwen2.5-0.5B-Instruct Q4_K_M, Qwen3-0.6B F16, Qwen3-0.6B BF16. Largest top-20 difference over the GPU runs 7.6e-5, over the CPU runs 8.2e-5.
+- `f16_parity` on the same five files: greedy tokens of the f16 path identical to the F32 path and to transformers, top-5 cross-membership without a miss in every case. Largest last-position logit difference f16 against F32: 0.0455 (Qwen3-0.6B Q4_K_M, 65 tokens); the F16 and BF16 files use no f16 tile and differ by 0.
+- Regression: `fixture_parity_llama_360m` (Q4_0 and Q8_0) and `fixture_parity_qwen3` (Q8_0) pass. SmolLM2-1.7B Q4_0 in the three browsers: exactness hash efa85acfe7945318, decode hashes 941622dd5a82970f (128) and 9731a7102ed3b8d7 (512), unchanged.
+- Every model gives the same decode and exactness hashes in Chromium, WebKit and Firefox. F16 and BF16 of Qwen3-0.6B give the same decode hashes (61e2f026bf6e7eef at 128, 3b8f0e093f4659b5 at 512).
+- `reuse` phase (repeated prompts, different questions, against fresh-engine replies) on Qwen2.5-0.5B Q4_K_M and SmolLM2-360M Q4_K_M in the three browsers: every sequence equals the fresh-engine reply.
+- clippy `-D warnings`: native all targets, wasm32 web, wasm32 web+diag, clean; `wasm-pack build` through `scripts/build.sh` green with +simd128.
+
+### Observations
+
+- The first Q4_K layout, with the 12 packed scale bytes unpacked per block in the kernel, read at 64% of the ceiling against Q4_0's 80% (166 us against 143 us per 2048 x 8192 matvec). Unpacking the scales once at load, at the same 148 bytes per 256 values, brought the matvec to 143 us, the time of the Q4_0 kernel with 8% fewer bytes. Both formats stay below Q8_0 and F16 (96 to 97%) at this size because the Q4 kernels do more arithmetic per byte read.
+- Qwen3-0.6B Q4_K_M decodes 17% slower than Q4_0 at context 128 (106.2 against 127.4 tok/s) and prefills 6% slower, with 12% more bytes on the device: the file keeps 29 tensors at Q6_K (the tied embedding, 14 attn_v, 14 ffn_down), the Q6_K attn_v prevents the fused q/k/v matvec in those layers, and the Q6_K kernels read at 53 to 91% of the ceiling.
+- On the two models whose row width is not a multiple of 256, the Q4_K_M files are larger on the device than their Q4_0 files (SmolLM2-360M 342 MB against 306 MB, Qwen2.5-0.5B 521 MB against 464 MB), because llama.cpp stores most of their matrices as Q5_0 (6 bits per value here) and they decode 22% and 18% slower.
+- F16 and BF16 decode at the same speed, 64 tok/s on Qwen3-0.6B (1505 MB per step, 97% of the ceiling at the matvec level), against 89 tok/s for Q8_0. The F16 path no longer expands to F32 at load.
+- Qwen3-0.6B Q4_K_M decodes at 116, 91 and 106 tok/s in Chromium, WebKit and Firefox at 128 tokens; the ratio to Q4_0 is 0.85, 0.80 and 0.84.
+
+### What is left
+
+- Q5_0 reads at 73% (wide) and 48% (narrow) of the ceiling; a kernel that reads the fifth-bit word with the block's vec4 would save a load per block.
+- Q4_K_M files of models with the fused q/k/v blocked by a mixed attn_v could fuse q and k only.
+- Measured on the M2 only; the Linux test machine (RTX 3080) was not used for these formats.
