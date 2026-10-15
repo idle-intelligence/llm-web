@@ -634,3 +634,37 @@ Base and step 2 give the same hash in every cell (step 1 and 2 keep the old stre
 - The kernels' draw agrees with the CPU reference to the last bit unless a device fuses multiply-add differently in the polynomial exp; no mismatch in 240 kernel cases and none in any browser hash, but a draw within a few units of the last place of a cumulative-probability boundary could resolve differently on a device that does.
 - The Safari-only garbage output with Qwen2.5-0.5B was not reproduced in Playwright WebKit (sensible text, same hash as Chromium); not investigated here.
 - Real Safari, Android browsers and the RTX 3080 were not measured.
+
+## Merged result 2026-10-15
+
+Build: prefix-reuse fix, quant formats (Q4_K, Q5_0, F16, BF16), GPU-resident sampling, and greedy decode reading back one token per step; build tag 2026-10-15-sampling-merge-01 (wasm md5 cf38ce631d205ffc3ffae5fb50c0462f). Chromium (Playwright, ANGLE Metal), WebKit (Playwright) and Firefox Developer Edition 159, one load per cell, 128 new tokens, M2 laptop shared with other jobs.
+
+### Results: hashes
+
+| Model | Exactness | Greedy 128 | Sampled 128 | Sampled 256 |
+|---|---|---|---|---|
+| SmolLM2-1.7B Q4_0 | efa85acfe7945318 | 941622dd5a82970f | 9c953cc07f554df1 | c20fc6a649aa22ba |
+| Qwen2.5-0.5B Q4_0 | 29a934d304c7e868 | fdcf35d7e2636db1 | 6be21500b4902e60 | 6ca9499e057eec9c |
+| SmolLM2-360M Q4_0 | d908b4954ae69f95 | 3fda34ebd775825a | b3a375abc0f60f5f | 12de46ad620f0fd2 |
+| Qwen3-0.6B Q8_0 | b222e3caf4f106d1 | 1480f1d6e12739de | 48b4d208e2578ff2 | 37c1686d60bdcfc3 |
+| Qwen3-0.6B Q4_K_M | 27be37370d80b447 | dacb5473c7a6474e | b242b043dd3ee72d | c28dae5edde01ab4 |
+
+Each hash is identical in the three browsers. The reuse phase passes (reuse replies equal fresh-engine replies) for all 15 browser and model cells.
+
+### Results: tok/s at 128 tokens (greedy / sampled)
+
+| Model | Chromium | WebKit | Firefox |
+|---|---|---|---|
+| SmolLM2-1.7B Q4_0 | 69 / 68 | 61 / 60 | 67 / 66 |
+| Qwen2.5-0.5B Q4_0 | 171 / 166 | 134 / 126 | 155 / 144 |
+| SmolLM2-360M Q4_0 | 188 / 177 | 146 / 137 | 171 / 158 |
+| Qwen3-0.6B Q8_0 | 87 / 88 | 75 / 73 | 90 / 87 |
+| Qwen3-0.6B Q4_K_M | 117 / 114 | 92 / 88 | 107 / 103 |
+
+### Results: chat page end to end
+
+`web/index.html` with the page's own sampling, Qwen2.5-0.5B Q4_0 and Qwen3-0.6B Q8_0, in the three browsers: story prompt, a second question in the same chat, New chat (conversation emptied), a third question. All steps completed in every cell. Replies are the same text in the three browsers for a given model. Qwen2.5-0.5B answers the story prompt off topic (171 tokens) and runs on in the second answer; Qwen3-0.6B opens with its reasoning block.
+
+### Correctness
+
+Non-ignored tests, the ignored model tests that have their files on this machine (engine_api 17, fixture_parity_generate for Qwen2.5-0.5B and both SmolLM2 sizes, fixture_parity, fixture_parity_gguf for Qwen3-0.6B Q4_K_M on GPU and CPU, f16_parity, kernel_parity, kv_snapshot, pool_reuse, sampled_native) pass; clippy `-D warnings` is clean for native, wasm32 web and wasm32 web+diag.
