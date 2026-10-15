@@ -53,7 +53,7 @@ pub fn exp_det(x: f32) -> f32 {
     if x < -80.0 {
         return 0.0;
     }
-    let t = x * 1.4426950408889634_f32;
+    let t = x * std::f32::consts::LOG2_E;
     let n = t.floor();
     let f = t - n;
     let mut p = 1.525273e-5_f32;
