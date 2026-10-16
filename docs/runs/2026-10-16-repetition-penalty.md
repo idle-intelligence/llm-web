@@ -106,3 +106,54 @@ Change: lean applied the repetition penalty once per occurrence of an id in the 
 - llama.cpp also penalizes each distinct id once, but only over the last `penalty_last_n` ids (64 by default), prompt included; transformers and lean use the whole sequence.
 - With penalty 1.0 the native sampled replies are unchanged (md5 equal before and after, five model and backend pairs); greedy hashes are unchanged for all five models in the three browsers. With penalty 1.1 every sampled hash changes, and the new hashes are the same on WebGPU and on the single CPU thread, in all three browsers and natively.
 - The SmolLM2-1.7B reply at penalty 1.1 starts identically before and after ("Once upon a time in the quaint town of Ravenswood, there stood an ancient beacon known as the Lighthouse of Ravenswood. This magnificent structure was not just a") and diverges after about 30 words.
+
+## Chat page, end to end
+
+### Parameters
+
+- Page: `web/index.html` as `scripts/build.sh` assembles it into `_site`, served by `scripts/serve.py`, driven like a user: pick the model, wait for Ready, type the question into the message box, press Send, wait for the turn's stats line, screenshot, then the follow-up in the same conversation. Questions: "What is the tallest mountain in the world, and how tall is it?", then "Which country is it in?". The page's own generation settings (`GEN_PARAMS` in `web/lean-chat-worker.js`: 256 new tokens, temperature 0.7, top-k 40, top-p 0.9, repetition penalty 1.1, seed 0), backend Auto. Model files were put in the page's model cache from local copies before the reload, so the page did not download them.
+- Builds: before = 2f381ca, ENGINE_BUILD `2026-10-16-rp-e2e-base`; after = this branch at 6c00854, ENGINE_BUILD `2026-10-16-rp-e2e-fix`. The tag is the one on every loading URL of the assembled site (page, worker, `lean.js`, `lean_bg.wasm`); each run's request log shows only the tagged URLs. The `lean_bg.wasm` fetched back from each server has md5 649569c777ec820eb906947495b2e27d (before) and 7b772b0d856fcab8c8095b8f8c3a5132 (after), equal to the built files and to the builds above.
+- Browsers: Playwright bundled Chromium and WebKit (headless), Firefox Developer Edition 159.0b1 (headed, throwaway profile, `dom.webgpu.enabled`). All twelve runs reported "Ready, WebGPU". 1-minute load average 2.7 to 3.4.
+
+### Results: replies (identical in Chromium, WebKit and Firefox Dev 159 for each build and model)
+
+| Model | Build | Reply to the first question | Reply to the follow-up | Tokens (1st, 2nd) |
+|---|---|---|---|---|
+| Qwen2.5-0.5B Q4_0 | before | "The tallest mountain in the world by height is Mount Everest, a peak located on Earth's highest point at an elevation of 29,029 feet (8.84 meters)." | "It's located on Earth's highest point at an elevation of 29,035 feet above sea level (as measured from sea level) for reference purposes. It consists of Nepal and India as its neighboring countries. I'm sorry for any confusion; ... Is there anything else I can help with? Please let me know!" | 39, 120 |
+| Qwen2.5-0.5B Q4_0 | after | "The tallest mountain in the world by height is Mount Everest, a peak located in the Himalayas, with its summit reaching an elevation of 29,029 feet (8,848 meters)." | "It is in Nepal." | 43, 5 |
+| SmolLM2-360M Q4_0 | before | "The highest mountain on Earth is Mount Everest, which stands at 29,035 feet (8848 meters) above sea level. It has a height of approximately 67 miles (107 kilometers)." | "Mount Everest belongs to Nepal and therefore cannot be located anywhere else on Earth as it's situated within its borders. Therefore "it" refers to Mount Everest when ... However I must correct my previous statement ..." (runs to the 256-token limit) | 47, 256 |
+| SmolLM2-360M Q4_0 | after | "The highest mountain in the world is Mount Everest, reaching 29,035 feet (8,816 meters) above sea level." | "Mount Everest is located in Nepal." | 31, 7 |
+
+### Observations
+
+- The after build gives the same reply in the three browsers for each model and question, as the before build does; each build's replies are the same text in Chromium, WebKit and Firefox.
+- Before, both models drift on the follow-up: Qwen2.5-0.5B writes 120 tokens that never settle on one country and apologizes, SmolLM2-360M runs to the 256-token limit with a rambling self-correction. Before, the first replies also show the penalty pushing the model off repeated tokens: Qwen2.5-0.5B writes "8.84 meters" where it writes "8,848 meters" after, and SmolLM2-360M adds "approximately 67 miles (107 kilometers)".
+- After, the follow-ups are one short sentence (5 and 7 tokens) naming Nepal. SmolLM2-360M still states a wrong height in meters (8,816); this is the model's own error at this sampling, not a format problem.
+- One seed per model and question (the page's fixed seed 0): this is a sample of two conversations per build, not a quality measurement.
+
+## Archivist format with the page's sampling
+
+### Parameters
+
+- Task: the Hive archivist turns one question and its answer into two tags (F-tags, max 10 tokens) or into two tags and a one-line summary (F-both, max 80 tokens); variant F puts one worked example before the pair. 20 fixed question/answer pairs, seeds 1, 2 and 3 (60 calls per variant), the page's sampling (temperature 0.7, top-k 40, top-p 0.9, repetition penalty 1.1). SmolLM2-1.7B-Instruct Q4_0 (and SmolLM2-360M-Instruct Q4_0 for F-tags), native lean, WebGPU on Metal, one engine per variant, calls in sequence.
+- Strict format: F-both, two tags and an explicit `summary:` line; F-tags, one line of exactly two comma-separated items of one or two words. Tag hit: at least one tag whose words all appear in the pair's fixed follow-up question.
+- Before: 2f381ca. Scratch: 2f381ca with the penalty applied once per id in a scratch copy (an earlier experiment). After: this branch at 6c00854. Same prompts, pairs, seeds and scorer for all three.
+
+### Results
+
+| Model | Variant | Engine | Strict format | Usable | Tag hit (follow-up) | Out tokens (median) |
+|---|---|---|---|---|---|---|
+| SmolLM2-1.7B | F-both | before | 1/60 | 1/60 | 1/60 | 60 |
+| SmolLM2-1.7B | F-both | scratch, once per id | 54/60 | 54/60 | 32/60 | 39.5 |
+| SmolLM2-1.7B | F-both | after | 57/60 | 57/60 | 36/60 | 35.5 |
+| SmolLM2-1.7B | F-tags | before | 18/60 | 25/60 | 19/60 | 5 |
+| SmolLM2-1.7B | F-tags | scratch, once per id | 51/60 | 51/60 | 35/60 | 4 |
+| SmolLM2-1.7B | F-tags | after | 51/60 | 51/60 | 35/60 | 4 |
+| SmolLM2-360M | F-tags | before | 6/60 | 7/60 | 14/60 | 6 |
+| SmolLM2-360M | F-tags | scratch, once per id | 34/60 | 35/60 | 32/60 | 3 |
+| SmolLM2-360M | F-tags | after | 34/60 | 35/60 | 32/60 | 3 |
+
+### Observations
+
+- With the page's sampling, format compliance goes from 1/60 to 57/60 (F-both) and from 18/60 to 51/60 (F-tags) on SmolLM2-1.7B, and from 6/60 to 34/60 on SmolLM2-360M F-tags.
+- The F-tags replies on this branch are the same text as the scratch experiment's in all 60 calls for SmolLM2-1.7B. F-both matches it in 21 of 60 calls and differs in the rest; the WGSL penalty is the same arithmetic in both, and the cause of the difference in the longer replies was not investigated.
