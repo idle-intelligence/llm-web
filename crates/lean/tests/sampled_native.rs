@@ -9,7 +9,8 @@
 //! LEAN_TOKENIZER_DIR=/path/to/Qwen2.5-0.5B-Instruct \
 //! cargo test -p lean --release --test sampled_native -- --ignored --nocapture
 //! ```
-//! `LEAN_BACKEND=cpu` runs the CPU backend.
+//! `LEAN_BACKEND=cpu` runs the CPU backend. `LEAN_PENALTY` overrides the
+//! repetition penalty (default 1.1, the chat page's).
 
 use std::time::Instant;
 
@@ -26,9 +27,10 @@ fn sampled_decode_speed_and_determinism() {
     let mut lean = pollster::block_on(Lean::load(opts)).expect("loading lean");
     let template = read_chat_template(&format!("{dir}/tokenizer_config.json")).expect("chat template");
     let text = lean_chat::render(&template, &[Message::user("Write a long story about a lighthouse keeper.")], None, true).unwrap();
+    let penalty: f32 = std::env::var("LEAN_PENALTY").map(|v| v.parse().expect("LEAN_PENALTY is a number")).unwrap_or(1.1);
     let mut out = String::new();
     for n in [128u32, 256] {
-        let params = GenParams { max_new_tokens: n, temperature: 0.7, top_k: 40, top_p: 0.9, repetition_penalty: 1.1, seed: 0, mask_bits: None };
+        let params = GenParams { max_new_tokens: n, temperature: 0.7, top_k: 40, top_p: 0.9, repetition_penalty: penalty, seed: 0, mask_bits: None };
         let mut replies = Vec::new();
         for rep in 0..3 {
             let mut stamps: Vec<Instant> = Vec::new();
