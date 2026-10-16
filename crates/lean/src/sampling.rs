@@ -80,7 +80,8 @@ fn argmax(logits: &[f32]) -> u32 {
 /// Samples one token id from `logits` (mutated in place: penalty and
 /// temperature scaling happen in place). `history` is every token id fed
 /// into the KV cache so far (prompt + generated), used only by the
-/// repetition penalty, which is applied once per occurrence. Order
+/// repetition penalty, which is applied once to each distinct id of it, as
+/// HF `transformers`' `RepetitionPenaltyLogitsProcessor` does. Order
 /// (matching HF `transformers`' default `LogitsProcessorList` construction
 /// order): repetition penalty -> temperature -> top-k -> top-p ->
 /// categorical draw.
@@ -95,7 +96,10 @@ pub fn sample(logits: &mut [f32], params: &SamplingParams, history: &[u32], rng:
     }
 
     if params.repetition_penalty != 1.0 {
-        for &id in history {
+        let mut ids = history.to_vec();
+        ids.sort_unstable();
+        ids.dedup();
+        for id in ids {
             if let Some(v) = logits.get_mut(id as usize) {
                 *v = penalize(*v, params.repetition_penalty);
             }
@@ -146,7 +150,7 @@ pub(crate) fn id_counts(vocab: usize, history: &[u32]) -> Vec<u32> {
     counts
 }
 
-/// One application of the repetition penalty to one logit.
+/// The repetition penalty of one logit.
 pub(crate) fn penalize(v: f32, penalty: f32) -> f32 {
     if v > 0.0 {
         v / penalty
@@ -262,7 +266,10 @@ mod tests {
             }
 
             if params.repetition_penalty != 1.0 {
-                for &id in history {
+                let mut ids = history.to_vec();
+                ids.sort_unstable();
+                ids.dedup();
+                for id in ids {
                     if let Some(v) = logits.get_mut(id as usize) {
                         *v = if *v > 0.0 { *v / params.repetition_penalty } else { *v * params.repetition_penalty };
                     }

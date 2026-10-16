@@ -1,5 +1,6 @@
-// Repetition penalty on the GPU: for every vocabulary id that occurs `n`
-// times in the history, applies the penalty n times to its logit, in place.
+// Repetition penalty on the GPU: for every vocabulary id that occurs in the
+// history (nonzero count), applies the penalty once to its logit, in place,
+// whatever the count, as transformers' RepetitionPenaltyLogitsProcessor does.
 // Multiplications only (the host passes 1 / penalty), so the result is the
 // same on every device. Positive logits shrink, negative ones grow (kept
 // finite: a masked logit is -3.4e38).
@@ -20,21 +21,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (i >= dims.n) {
         return;
     }
-    var c = counts[i];
-    if (c == 0u) {
+    if (counts[i] == 0u) {
         return;
     }
-    var v = logits[i];
-    loop {
-        if (c == 0u) {
-            break;
-        }
-        if (v > 0.0) {
-            v = v * dims.inv_penalty;
-        } else {
-            v = max(v * dims.penalty, -3.4e38);
-        }
-        c = c - 1u;
+    let v = logits[i];
+    if (v > 0.0) {
+        logits[i] = v * dims.inv_penalty;
+    } else {
+        logits[i] = max(v * dims.penalty, -3.4e38);
     }
-    logits[i] = v;
 }

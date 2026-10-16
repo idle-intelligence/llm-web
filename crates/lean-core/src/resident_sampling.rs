@@ -13,7 +13,7 @@
 //! all being kept.
 
 /// Sampling settings of a resident decode. `top_k` is in `1..=63`; the
-/// repetition penalty counts every occurrence of an id in the history.
+/// repetition penalty applies once to every id that occurs in the history.
 #[derive(Debug, Clone, Copy)]
 pub struct GpuSampling {
     pub temperature: f32,
@@ -63,8 +63,9 @@ pub fn exp_det(x: f32) -> f32 {
     p * f32::from_bits(((n as i32 + 127) as u32) << 23)
 }
 
-/// The whole step on the CPU: penalty (once per occurrence in `counts`, a
-/// count per vocabulary id), top-k, temperature, softmax, top-p, draw.
+/// The whole step on the CPU: penalty (once for each id whose count in
+/// `counts`, a count per vocabulary id, is nonzero), top-k, temperature,
+/// softmax, top-p, draw.
 pub fn sample_reference(logits: &[f32], counts: &[u32], p: &GpuSampling, position: u32) -> u32 {
     let inv_penalty = p.inv_penalty();
     let mut cands: Vec<(f32, u32)> = logits
@@ -72,10 +73,8 @@ pub fn sample_reference(logits: &[f32], counts: &[u32], p: &GpuSampling, positio
         .enumerate()
         .map(|(i, &v)| {
             let mut v = v;
-            if p.repetition_penalty != 1.0 {
-                for _ in 0..counts.get(i).copied().unwrap_or(0) {
-                    v = if v > 0.0 { v * inv_penalty } else { (v * p.repetition_penalty).max(-3.4e38) };
-                }
+            if p.repetition_penalty != 1.0 && counts.get(i).copied().unwrap_or(0) > 0 {
+                v = if v > 0.0 { v * inv_penalty } else { (v * p.repetition_penalty).max(-3.4e38) };
             }
             (v, i as u32)
         })

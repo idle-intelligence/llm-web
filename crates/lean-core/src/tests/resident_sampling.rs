@@ -81,3 +81,74 @@ fn gpu_sampler_matches_reference() {
     }
     assert_eq!(mismatches, 0, "{mismatches} of {total}");
 }
+
+#[derive(serde::Deserialize)]
+struct PenaltyCase {
+    model: String,
+    penalty: f32,
+    vocab: usize,
+    input_ids: Vec<u32>,
+    distinct: Vec<(u32, u32, u32)>,
+}
+
+#[derive(serde::Deserialize)]
+struct PenaltyFixture {
+    cases: Vec<PenaltyCase>,
+}
+
+/// The GPU penalty (`sample_penalty.wgsl`) against transformers'
+/// `RepetitionPenaltyLogitsProcessor` on real logits
+/// (`reference/fixture_rep_penalty.json`): each distinct id of the history is
+/// penalized once, every other logit is untouched. The kernel multiplies by
+/// the host's `1 / penalty` where transformers divides, so a positive logit
+/// may differ by one unit in the last place; nothing else may differ.
+#[test]
+fn gpu_penalty_matches_transformers() {
+    let Ok(engine) = Engine::new() else {
+        eprintln!("no wgpu adapter, skipping");
+        return;
+    };
+    let pool = Pool::new(engine.device.clone(), engine.queue.clone());
+    let s = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/reference/fixture_rep_penalty.json")).unwrap();
+    let fx: PenaltyFixture = serde_json::from_str(&s).unwrap();
+    assert!(!fx.cases.is_empty());
+    let mut failed = Vec::new();
+    for case in &fx.cases {
+        let vocab = case.vocab;
+        let mut logits: Vec<f32> = (0..vocab).map(|i| ((i * 7919) % 2001) as f32 / 100.0 - 10.0).collect();
+        let mut want = logits.clone();
+        for &(id, raw, hf) in &case.distinct {
+            logits[id as usize] = f32::from_bits(raw);
+            want[id as usize] = f32::from_bits(hf);
+        }
+        // The counts buffer as `decode_sampled_pipelined` fills it.
+        let mut counts = vec![0u32; vocab];
+        for &id in &case.input_ids {
+            counts[id as usize] += 1;
+        }
+        let p = GpuSampling { temperature: 1.0, top_k: 1, top_p: 1.0, repetition_penalty: case.penalty, seed: 1 };
+        let logits_buf = pool.data("test_logits", vocab);
+        engine.queue.write_buffer(&logits_buf, 0, bytemuck::cast_slice(&logits));
+        let counts_buf = engine.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("test_counts"),
+            size: 4 * vocab as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        engine.queue.write_buffer(&counts_buf, 0, bytemuck::cast_slice(&counts));
+        let mut encoder = engine.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("test") });
+        let mut pass = engine.begin_pass(&mut encoder, "test");
+        let step = SampleStep { counts: &counts_buf, sampling: &p, position: 0 };
+        sample_gpu(&engine, &pool, &mut pass, &logits_buf, vocab as u32, &step);
+        drop(pass);
+        engine.queue.submit(Some(encoder.finish()));
+        let got = pollster::block_on(engine.read_buffer(&logits_buf, vocab));
+        let max_diff = got.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        let max_ulp = got.iter().zip(&want).map(|(a, b)| (a.to_bits() as i64 - b.to_bits() as i64).unsigned_abs()).max().unwrap();
+        eprintln!("gpu {} penalty {}: max abs diff {max_diff:e}, max ulp {max_ulp}", case.model, case.penalty);
+        if max_ulp > 1 {
+            failed.push(format!("{} penalty {}", case.model, case.penalty));
+        }
+    }
+    assert!(failed.is_empty(), "{failed:?}");
+}
