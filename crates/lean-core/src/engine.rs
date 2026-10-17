@@ -585,6 +585,13 @@ impl Engine {
         let t_device = now_ms();
         let adapter_report = adapter_report(&adapter, &device);
 
+        // Every pipeline below is checked before the engine is handed out:
+        // an implementation that rejects one of them (a shader it cannot
+        // compile, a pipeline it cannot create) makes this call fail, so the
+        // backend ladder moves on to the CPU instead of running a forward
+        // pass with invalid pipelines.
+        device.push_error_scope(wgpu::ErrorFilter::Validation);
+        device.push_error_scope(wgpu::ErrorFilter::Internal);
         let mut engine = Engine {
             query_set,
             timestamp_period,
@@ -668,6 +675,11 @@ impl Engine {
             queue,
             dispatch_count: Cell::new(0),
         };
+        let internal = engine.device.pop_error_scope().await;
+        let validation = engine.device.pop_error_scope().await;
+        if let Some(e) = validation.or(internal) {
+            anyhow::bail!("WebGPU pipeline creation failed, not using this device: {e}");
+        }
         engine.diag_init_ms = (t_device - t_start, now_ms() - t_device);
         Ok(engine)
     }
