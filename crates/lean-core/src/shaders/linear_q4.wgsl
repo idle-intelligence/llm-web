@@ -27,13 +27,13 @@ struct Dims {
 @group(0) @binding(4) var<storage, read_write> out: array<f32>;
 @group(0) @binding(5) var<uniform> dims: Dims;
 
-// Q41 (pipeline override, `linear_q41` in engine.rs): Q4_1 blocks, value =
+// Q41 (build constant, `linear_q41` in engine.rs): Q4_1 blocks, value =
 // nibble * d + m. Same `qs` layout; `scales` holds [d, m] f32 pairs.
-override Q41: bool = false;
-// Q50 and K4 (pipeline overrides, `linear_q50`, `linear_k4` in engine.rs):
+const Q41: bool = false;
+// Q50 and K4 (build constants, `linear_q50`, `linear_k4` in engine.rs):
 // Q5_0 and Q4_K blocks; see aux_common.wgsl for their buffers.
-override Q50: bool = false;
-override K4: bool = false;
+const Q50: bool = false;
+const K4: bool = false;
 
 //@AUX
 

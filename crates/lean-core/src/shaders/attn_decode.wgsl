@@ -19,24 +19,23 @@
 // of one key at a time (attn_prefill.wgsl's per-thread version, which has no
 // shared memory to batch into, updates one key at a time instead).
 //
-// `HEAD_DIM` is a pipeline-overridable constant (WGSL `override`), not a
-// compile-time literal: engine.rs creates one pipeline per model head_dim
-// (64 for Qwen2.5, 128 for Qwen3) from this single shader source, setting
-// `HEAD_DIM` via `PipelineCompilationOptions::constants` at pipeline
-// creation, and `@workgroup_size(HEAD_DIM)` picks up the same override. The
+// `HEAD_DIM` is a build constant, not a runtime value: engine.rs creates
+// one pipeline per model head_dim (64 for Qwen2.5, 128 for Qwen3) from this
+// single shader source, writing the value into the `const HEAD_DIM`
+// declaration before the module is created (`specialize` in engine.rs), and
+// `@workgroup_size(HEAD_DIM)` picks up the same constant. The
 // per-thread-owns-one-output-dim design requires workgroup width to equal
 // head_dim exactly (one thread per dim, one tile-of-keys per workgroup pass
 // wide), which is why this can't just be a runtime uniform.
 //
-// Shared arrays are still sized at compile time (WGSL array lengths must be
-// const, not override, expressions) at `SHARED_CAP`, a fixed upper bound
+// Shared arrays are sized at `SHARED_CAP`, a fixed upper bound
 // independent of which model is loaded; only the *active* `0..HEAD_DIM`
 // prefix of each is ever touched. `SHARED_CAP == 256` matches WebGPU's
 // browser-mandated max workgroup invocation count, so this kernel already
 // covers every head_dim a workgroup could dispatch with one thread per dim.
 // 3 arrays * 256 * 4 bytes = 3KB, far under WebGPU's guaranteed minimum
 // 16KB workgroup storage limit - no adapter-limit check needed.
-override HEAD_DIM: u32 = 64u;
+const HEAD_DIM: u32 = 64u;
 const SHARED_CAP: u32 = 256u;
 var<workgroup> q_shared: array<f32, SHARED_CAP>;
 var<workgroup> tile_scores: array<f32, SHARED_CAP>; // this tile's raw/exp'd scores, reused per tile
@@ -62,7 +61,7 @@ fn main(@builtin(workgroup_id) wg_id: vec3<u32>, @builtin(local_invocation_id) l
     let n_rep = dims.n_heads / dims.n_kv_heads;
     let kv_head = h / n_rep;
     let tid = local_id.x;
-    let hd = dims.head_dim; // must equal HEAD_DIM at dispatch time - the override picks the pipeline, this is the runtime cross-check value used for indexing
+    let hd = dims.head_dim; // must equal HEAD_DIM at dispatch time - the build constant picks the pipeline, this is the runtime cross-check value used for indexing
 
     q_shared[tid] = q[h * hd + tid];
     workgroupBarrier();

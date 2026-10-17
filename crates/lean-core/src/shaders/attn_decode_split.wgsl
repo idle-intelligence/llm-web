@@ -32,9 +32,9 @@
 // no subgroup/wave ops, no vendor-specific tile size.
 //
 // Dispatch: `(n_heads, num_splits, 1)`, `workgroup_size(HEAD_DIM)` (same
-// per-thread-owns-one-output-dim design and `HEAD_DIM` override constant as
+// per-thread-owns-one-output-dim design and `HEAD_DIM` build constant as
 // `attn_decode.wgsl` - see that file's doc comment).
-override HEAD_DIM: u32 = 64u;
+const HEAD_DIM: u32 = 64u;
 const MAX_SPLITS: u32 = 32u;
 // Each key's dot product is shared by LANES adjacent threads, each reading a
 // contiguous slice of the key row as vec4 loads (adjacent threads read

@@ -14,7 +14,7 @@
 // weights it moves 2x the x bytes, not 8x. 64 threads = 8 row groups = 32
 // rows per workgroup.
 //
-// GATE_UP (pipeline override, `linear_q4_decode_swiglu_r4` in engine.rs): the
+// GATE_UP (build constant, `linear_q4_decode_swiglu_r4` in engine.rs): the
 // weight is the fused [gate; up] matrix (dims.n = 2 * inter). A row group
 // takes gate rows j, j+1 and up rows inter+j, inter+j+1 and writes
 // silu(gate) * up for those 2 j into `out` (inter long), the same
@@ -44,19 +44,19 @@ const WG_SIZE: u32 = 64u;
 const LANES: u32 = 8u;
 const GROUPS: u32 = 8u; // WG_SIZE / LANES, 4 rows each
 
-override GATE_UP: bool = false;
-// Q41 (pipeline override, `linear_q41_decode_r4` in engine.rs): Q4_1 blocks,
+const GATE_UP: bool = false;
+// Q41 (build constant, `linear_q41_decode_r4` in engine.rs): Q4_1 blocks,
 // value = nibble * d + m, `scales` holds [d, m] f32 pairs. Not combined with
 // GATE_UP.
-override Q41: bool = false;
-// Q50 and K4 (pipeline overrides, `linear_q50_decode_r4`, `linear_k4_decode_r4`
+const Q41: bool = false;
+// Q50 and K4 (build constants, `linear_q50_decode_r4`, `linear_k4_decode_r4`
 // and their GATE_UP builds in engine.rs): Q5_0 and Q4_K blocks; see
 // aux_common.wgsl. K4 runs the Q4_1 arithmetic with the block's
 // (d * sc, -dmin * m) in place of its (d, m); with 8 lanes per row and blocks
 // taken lane, lane + 8, ... a lane always handles the same sub-block of a
 // super-block.
-override Q50: bool = false;
-override K4: bool = false;
+const Q50: bool = false;
+const K4: bool = false;
 
 //@AUX
 

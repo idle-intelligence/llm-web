@@ -28,7 +28,7 @@
 // other and the repeated weight reads (one per row group) can hit in cache.
 // Rows past M read zeros and are never written.
 //
-// Q8 (pipeline override, `linear_q8_small_m` in engine.rs): the same
+// Q8 (build constant, `linear_q8_small_m` in engine.rs): the same
 // kernel over Q8_0 blocks, two vec4<u32> per column per block (8 words of
 // 4 signed bytes, word s = k4 slot s) instead of one (4 words of 8
 // nibbles, low nibbles of word s = slot s, high nibbles = slot s + 4).
@@ -56,15 +56,15 @@ struct Dims {
 @group(0) @binding(4) var<storage, read_write> out: array<f32>;
 @group(0) @binding(5) var<uniform> dims: Dims;
 
-override Q8: bool = false;
-// Q41 (pipeline override, `linear_q41_small_m` in engine.rs): Q4_1 blocks,
+const Q8: bool = false;
+// Q41 (build constant, `linear_q41_small_m` in engine.rs): Q4_1 blocks,
 // value = nibble * d + m; `scales` holds [d, m] f32 pairs.
-override Q41: bool = false;
-// Q50 and K4 (pipeline overrides, `linear_q50_small_m`, `linear_k4_small_m` in
+const Q41: bool = false;
+// Q50 and K4 (build constants, `linear_q50_small_m`, `linear_k4_small_m` in
 // engine.rs): Q5_0 and Q4_K blocks; see aux_common.wgsl. K4 runs the Q4_1
 // arithmetic with the block's (d * sc, -dmin * m) in place of its (d, m).
-override Q50: bool = false;
-override K4: bool = false;
+const Q50: bool = false;
+const K4: bool = false;
 
 //@AUX
 

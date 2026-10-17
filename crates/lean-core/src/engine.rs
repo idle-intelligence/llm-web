@@ -406,22 +406,53 @@ fn make_pipeline(device: &wgpu::Device, label: &str, src: &str) -> wgpu::Compute
     make_pipeline_with_constants(device, label, src, &[])
 }
 
-/// Like `make_pipeline`, but sets WGSL `override` constants
-/// (`shaders/attn_decode.wgsl`'s `HEAD_DIM`) at pipeline-creation time via
-/// `PipelineCompilationOptions`, so one shader source compiles to a
-/// different fixed `@workgroup_size` per model.
+/// Writes build constants into a shader's source: each `(name, value)`
+/// replaces the initializer of the shader's `const NAME: bool = ...;` or
+/// `const NAME: u32 = ...;` declaration, so one source compiles to a
+/// different fixed kernel per model (`HEAD_DIM`, which also sets
+/// `@workgroup_size`) or per block format (`Q8`, `Q41`, `GATE_UP`, ...).
+/// The values are plain WGSL `const`s rather than pipeline-overridable
+/// `override` constants, so no pipeline depends on the browser evaluating
+/// override expressions at pipeline creation.
+pub(crate) fn specialize<'a>(src: &'a str, constants: &[(&str, f64)]) -> Cow<'a, str> {
+    if constants.is_empty() {
+        return Cow::Borrowed(src);
+    }
+    let mut out = src.to_owned();
+    for &(name, value) in constants {
+        let head = format!("const {name}: ");
+        let start = out
+            .match_indices(&head)
+            .map(|(i, _)| i)
+            .find(|&i| i == 0 || out.as_bytes()[i - 1] == b'\n')
+            .unwrap_or_else(|| panic!("shader has no `const {name}` declaration"));
+        let ty_start = start + head.len();
+        let eq = ty_start + out[ty_start..].find(" = ").expect("const declaration without an initializer");
+        let end = eq + out[eq..].find(';').expect("const declaration without `;`");
+        let literal = match &out[ty_start..eq] {
+            "bool" => (value != 0.0).to_string(),
+            "u32" => format!("{}u", value as u32),
+            ty => panic!("build constant {name} has unsupported type {ty}"),
+        };
+        out.replace_range(eq + 3..end, &literal);
+    }
+    Cow::Owned(out)
+}
+
+/// Like `make_pipeline`, with build constants written into the source
+/// (`specialize`) before the module is created.
 fn make_pipeline_with_constants(device: &wgpu::Device, label: &str, src: &str, constants: &[(&str, f64)]) -> wgpu::ComputePipeline {
     let src: Cow<str> = if src.contains(AUX_MARKER) { Cow::Owned(compose_aux(src, false)) } else { Cow::Borrowed(src) };
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some(label),
-        source: wgpu::ShaderSource::Wgsl(src),
+        source: wgpu::ShaderSource::Wgsl(specialize(&src, constants)),
     });
     device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
         label: Some(label),
         layout: None,
         module: &module,
         entry_point: Some("main"),
-        compilation_options: wgpu::PipelineCompilationOptions { constants, ..Default::default() },
+        compilation_options: Default::default(),
         cache: None,
     })
 }

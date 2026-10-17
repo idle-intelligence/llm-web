@@ -24,7 +24,7 @@
 // store is a whole vec4 written by one thread. Each stage dequantises a
 // weight word (8 values) with one scale load.
 //
-// Q8 (pipeline override, `linear_q8_tiled_rb` in engine.rs): the same
+// Q8 (build constant, `linear_q8_tiled_rb` in engine.rs): the same
 // kernel over Q8_0 blocks; a thread dequantises words pp and pp + 4 of its
 // column's block (4 signed bytes each, k4 slots pp and pp + 4).
 //
@@ -55,14 +55,14 @@ struct Dims {
 @group(0) @binding(4) var<storage, read_write> out: array<f32>;
 @group(0) @binding(5) var<uniform> dims: Dims;
 
-override Q8: bool = false;
-override WINDOW: u32 = 8u;
-// Q50 and K4 (pipeline overrides, `linear_q50_tiled_f16`, `linear_k4_tiled_f16`
+const Q8: bool = false;
+const WINDOW: u32 = 8u;
+// Q50 and K4 (build constants, `linear_q50_tiled_f16`, `linear_k4_tiled_f16`
 // in engine.rs): Q5_0 and Q4_K blocks; see aux_common.wgsl. K4 dequantises as
 // nibble * (d * sc) - dmin * m, the weight rounded once to f16 like the other
 // formats.
-override Q50: bool = false;
-override K4: bool = false;
+const Q50: bool = false;
+const K4: bool = false;
 
 //@AUX
 

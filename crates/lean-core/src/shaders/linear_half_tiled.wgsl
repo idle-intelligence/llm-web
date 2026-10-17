@@ -23,7 +23,7 @@ struct Dims {
 @group(0) @binding(3) var<storage, read_write> out: array<f32>;
 @group(0) @binding(4) var<uniform> dims: Dims;
 
-override BF16: bool = false;
+const BF16: bool = false;
 
 const TM: u32 = 64u;
 const TN: u32 = 64u;

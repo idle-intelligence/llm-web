@@ -17,10 +17,10 @@
 // store is a whole vec4 written by one thread. Each stage dequantises a
 // weight word (8 values) with one scale load.
 //
-// Q41 (pipeline override, `linear_q41_tiled_rb` in engine.rs): Q4_1 blocks,
+// Q41 (build constant, `linear_q41_tiled_rb` in engine.rs): Q4_1 blocks,
 // value = nibble * d + m, with `scales` holding [d, m] f32 pairs.
 //
-// Q8 (pipeline override, `linear_q8_tiled_rb` in engine.rs): the same
+// Q8 (build constant, `linear_q8_tiled_rb` in engine.rs): the same
 // kernel over Q8_0 blocks; a thread dequantises words pp and pp + 4 of its
 // column's block (4 signed bytes each, k4 slots pp and pp + 4).
 //
@@ -49,15 +49,15 @@ struct Dims {
 @group(0) @binding(4) var<storage, read_write> out: array<f32>;
 @group(0) @binding(5) var<uniform> dims: Dims;
 
-override Q8: bool = false;
-// Q41 (pipeline override, `linear_q41_tiled_rb` in engine.rs): Q4_1 blocks,
+const Q8: bool = false;
+// Q41 (build constant, `linear_q41_tiled_rb` in engine.rs): Q4_1 blocks,
 // value = nibble * d + m; `scales` holds [d, m] f32 pairs.
-override Q41: bool = false;
-// Q50 and K4 (pipeline overrides, `linear_q50_tiled_rb`, `linear_k4_tiled_rb`
+const Q41: bool = false;
+// Q50 and K4 (build constants, `linear_q50_tiled_rb`, `linear_k4_tiled_rb`
 // in engine.rs): Q5_0 and Q4_K blocks; see aux_common.wgsl. K4 runs the Q4_1
 // arithmetic with the block's (d * sc, -dmin * m) in place of its (d, m).
-override Q50: bool = false;
-override K4: bool = false;
+const Q50: bool = false;
+const K4: bool = false;
 
 //@AUX
 

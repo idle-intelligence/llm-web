@@ -7,4 +7,5 @@ mod kernel_parity;
 mod matvec_bandwidth;
 mod q6k_reference_dequant;
 mod resident_sampling;
+mod specialize;
 mod stop_tokens;

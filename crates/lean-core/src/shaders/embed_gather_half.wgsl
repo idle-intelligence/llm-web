@@ -9,7 +9,7 @@ struct Dims { rows: u32, hidden: u32, blocks_per_row: u32, stride_x: u32 };
 @group(0) @binding(2) var<storage, read_write> out: array<f32>;
 @group(0) @binding(3) var<uniform> dims: Dims;
 
-override BF16: bool = false;
+const BF16: bool = false;
 
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {

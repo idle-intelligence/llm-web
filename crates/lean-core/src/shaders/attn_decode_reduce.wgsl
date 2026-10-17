@@ -10,7 +10,7 @@
 // (how many of those `MAX_SPLITS` slots this decode step actually wrote) is
 // a per-dispatch uniform, since `kv_len` - and so the split count - grows
 // every decode step.
-override HEAD_DIM: u32 = 64u;
+const HEAD_DIM: u32 = 64u;
 const MAX_SPLITS: u32 = 32u;
 
 struct Dims { n_heads: u32, head_dim: u32, num_splits: u32, _p0: u32 };

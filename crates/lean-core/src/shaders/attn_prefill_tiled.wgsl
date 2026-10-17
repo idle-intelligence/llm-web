@@ -1,5 +1,5 @@
 // Causal GQA prefill attention in 8-query x 8-key tiles, for head_dim 64
-// or 128 (`HEAD_DIM` override, the same two values and the same
+// or 128 (`HEAD_DIM` build constant, the same two values and the same
 // shape-based choice as attn_decode_split.wgsl; model.rs falls back to
 // attn_prefill.wgsl for any other head_dim).
 //
@@ -24,20 +24,20 @@
 // Layouts as attn_prefill.wgsl: q [seq, n_heads, head_dim], k/v [seq,
 // n_kv_heads, head_dim], out [seq, n_heads, head_dim]; kv_head = head /
 // (n_heads / n_kv_heads). Dispatch: (n_heads, ceil(seq / 8), 1).
-override HEAD_DIM: u32 = 64u;
+const HEAD_DIM: u32 = 64u;
 
 const QT: u32 = 8u;
 const KT: u32 = 8u;
-override DV: u32 = HEAD_DIM / 4u; // vec4s per row
-override RS: u32 = HEAD_DIM / 4u + 1u; // padded row stride in vec4s
-override UPL: u32 = HEAD_DIM / 32u; // output vec4s per lane (2 or 4)
+const DV: u32 = HEAD_DIM / 4u; // vec4s per row
+const RS: u32 = HEAD_DIM / 4u + 1u; // padded row stride in vec4s
+const UPL: u32 = HEAD_DIM / 32u; // output vec4s per lane (2 or 4)
 
 // CACHE build (suffix prefill after a resident prefix): k and v are the KV
 // cache buffers ([kv_head, max_ctx, head_dim]) already holding the prefix
 // and this call's own rows at positions [prefix, prefix + seq); query row i
 // sits at absolute position prefix + i. prefix = 0 and CACHE = false is the
 // plain prefill over freshly computed k/v.
-override CACHE: bool = false;
+const CACHE: bool = false;
 
 struct Dims { seq: u32, n_heads: u32, n_kv_heads: u32, head_dim: u32, scale: f32, prefix: u32, max_ctx: u32, _p2: u32 };
 

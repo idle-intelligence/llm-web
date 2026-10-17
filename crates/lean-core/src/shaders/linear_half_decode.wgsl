@@ -1,7 +1,7 @@
 // Matvec for decode (M = 1) over F16 or BF16 weights kept at two bytes per
 // value, packed two per u32 (value 2i in the low half). F16 widens with the
 // core WGSL unpack2x16float, so no browser needs shader-f16 for it; BF16
-// (override BF16) shifts the 16 bits into the top of an f32.
+// (build constant BF16) shifts the 16 bits into the top of an f32.
 //
 // Lane layout as linear_q4_decode.wgsl: 8 lanes share an output row and take
 // units of 8 weights (one 16-byte vec4<u32> load, 8 consecutive units = 128
@@ -31,7 +31,7 @@ const WG_SIZE: u32 = 128u;
 const LANES: u32 = 8u;
 const ROWS_PER_WG: u32 = 16u; // WG_SIZE / LANES
 
-override BF16: bool = false;
+const BF16: bool = false;
 
 var<workgroup> partial_sums: array<f32, WG_SIZE>;
 
