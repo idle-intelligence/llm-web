@@ -34,6 +34,7 @@
 //! includes the current position).
 
 use anyhow::{Context, Result};
+use std::collections::VecDeque;
 #[cfg(not(target_arch = "wasm32"))]
 use std::fs::File;
 #[cfg(not(target_arch = "wasm32"))]
@@ -44,6 +45,7 @@ use crate::config::{config_from_gguf, Architecture, Qwen2Config};
 use crate::engine::Engine;
 use crate::gguf::GgufReader;
 pub use crate::pool::Pool;
+use crate::resident_sampling::GpuSampling;
 use crate::quant::{load_embedding_table_gguf, load_matmul_weight_gguf, EmbeddingTable, MatMulWeight};
 use crate::gguf::GgmlDtype;
 
@@ -199,8 +201,8 @@ struct AttnPrefillDims {
     n_kv_heads: u32,
     head_dim: u32,
     scale: f32,
-    _p0: u32,
-    _p1: u32,
+    prefix: u32,
+    max_ctx: u32,
     _p2: u32,
 }
 #[repr(C)]
@@ -781,8 +783,8 @@ impl GpuModel {
         let embed_shape = embed_info.shape();
         let embed_dtype = embed_info.dtype();
         anyhow::ensure!(
-            matches!(embed_dtype, GgmlDtype::Q4_0 | GgmlDtype::Q8_0 | GgmlDtype::Q6_K),
-            "expected token_embd.weight to be Q4_0, Q8_0 or Q6_K, got {embed_dtype:?}"
+            matches!(embed_dtype, GgmlDtype::Q4_0 | GgmlDtype::Q5_0 | GgmlDtype::Q8_0 | GgmlDtype::Q4_K | GgmlDtype::Q6_K | GgmlDtype::F16 | GgmlDtype::BF16),
+            "token_embd.weight: {embed_dtype:?} is not supported as an embedding table (Q4_0, Q5_0, Q8_0, Q4_K, Q6_K, F16 and BF16 are)"
         );
         let embed_bytes = reader.tensor_data("token_embd.weight")?;
         // Tied embeddings (`config.tied_embeddings`, e.g. Qwen3-0.6B/1.7B):
@@ -794,7 +796,7 @@ impl GpuModel {
         // it's still resident, then it's dropped once, not read twice from
         // disk.
         let tied_lm_head = config.tied_embeddings.then(|| load_matmul_weight_gguf(engine, "token_embd(lm_head)", &embed_shape, embed_dtype, &embed_bytes)).transpose()?;
-        let embed = load_embedding_table_gguf(engine, "token_embd", &embed_shape, embed_dtype, &embed_bytes);
+        let embed = load_embedding_table_gguf(engine, "token_embd", &embed_shape, embed_dtype, &embed_bytes)?;
         drop(embed_bytes);
 
         let mut layers = Vec::with_capacity(config.num_layers);
@@ -1060,7 +1062,7 @@ fn scratch_key(key: &str) -> std::borrow::Cow<'_, str> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn linear(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &str, x: &wgpu::Buffer, rows: u32, in_dim: u32, w: &MatMulWeight, b: &wgpu::Buffer, out_dim: u32, fast: bool) -> wgpu::Buffer {
+pub(crate) fn linear(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &str, x: &wgpu::Buffer, rows: u32, in_dim: u32, w: &MatMulWeight, b: &wgpu::Buffer, out_dim: u32, fast: bool) -> wgpu::Buffer {
     let skey = scratch_key(key);
     let out = pool.data(&format!("{skey}.out"), (rows * out_dim) as usize);
     let wgs = (out_dim.div_ceil(16), rows.div_ceil(16), 1);
@@ -1081,9 +1083,43 @@ fn linear(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &
                 // previously hit the naive per-output-element kernel below.
                 let bg = pool.bind_group(&format!("{key}.decode"), &engine.linear_f32_decode, &entries);
                 engine.dispatch(pass, &engine.linear_f32_decode, &bg, (out_dim.div_ceil(4), 1, 1), key);
+            } else if fast && in_dim.is_multiple_of(32) {
+                // Prefill over F32 weights: the 64x64 register-blocked tile
+                // (linear_f32_tiled.wgsl) instead of one scalar loop per
+                // output.
+                let bg = pool.bind_group(&format!("{key}.tiled"), &engine.linear_f32_tiled, &entries);
+                engine.dispatch(pass, &engine.linear_f32_tiled, &bg, (out_dim.div_ceil(64), rows.div_ceil(64), 1), key);
             } else {
                 let bg = pool.bind_group(key, &engine.linear, &entries);
                 engine.dispatch(pass, &engine.linear, &bg, wgs, key);
+            }
+        }
+        MatMulWeight::F16 { chunks, out_dim: n_total } | MatMulWeight::BF16 { chunks, out_dim: n_total } => {
+            let kernels = if matches!(w, MatMulWeight::BF16 { .. }) { &engine.half_bf16 } else { &engine.half_f16 };
+            for chunk in chunks {
+                let ckey = format!("{key}.{}", chunk.row_start);
+                let sckey = scratch_key(&ckey);
+                let dims = pool.uniform(&format!("{sckey}.dims"), LinearQDims { m: rows, k: in_dim, n: chunk.rows, act: 0, blocks_per_row: in_dim / 32, n_offset: chunk.row_start, n_total: *n_total, _p2: 0 });
+                let entries = [
+                    BindGroupEntry { binding: 0, resource: x.as_entire_binding() },
+                    BindGroupEntry { binding: 1, resource: chunk.w.as_entire_binding() },
+                    BindGroupEntry { binding: 2, resource: b.as_entire_binding() },
+                    BindGroupEntry { binding: 3, resource: out.as_entire_binding() },
+                    BindGroupEntry { binding: 4, resource: dims.as_entire_binding() },
+                ];
+                if fast && rows == 1 && in_dim.is_multiple_of(8) {
+                    let pipeline = engine.pipe(&kernels.decode);
+                    let bg = pool.bind_group(&format!("{ckey}.decode"), pipeline, &entries);
+                    engine.dispatch(pass, pipeline, &bg, (chunk.rows.div_ceil(DECODE_ROWS_PER_WG), 1, 1), &ckey);
+                } else if fast && rows > 1 && in_dim.is_multiple_of(32) {
+                    let pipeline = engine.pipe(&kernels.tiled);
+                    let bg = pool.bind_group(&format!("{ckey}.tiled"), pipeline, &entries);
+                    engine.dispatch(pass, pipeline, &bg, (chunk.rows.div_ceil(64), rows.div_ceil(64), 1), &ckey);
+                } else {
+                    let pipeline = engine.pipe(&kernels.naive);
+                    let bg = pool.bind_group(&ckey, pipeline, &entries);
+                    engine.dispatch(pass, pipeline, &bg, (chunk.rows.div_ceil(16), rows.div_ceil(16), 1), &ckey);
+                }
             }
         }
         MatMulWeight::Q8_0 { chunks, blocks_per_row, out_dim: n_total } => {
@@ -1122,8 +1158,9 @@ fn linear(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &
                 } else if fast {
                     // Prefill, M >= SMALL_M_MAX_ROWS: the 64x64 tiled kernel
                     // (linear_q4_tiled_rb.wgsl with its Q8 override).
-                    let bg = pool.bind_group(&format!("{ckey}.tiled_rb"), &engine.linear_q8_tiled_rb, &entries);
-                    engine.dispatch(pass, &engine.linear_q8_tiled_rb, &bg, (chunk.rows.div_ceil(64), rows.div_ceil(64), 1), &ckey);
+                    let pipeline = engine.linear_q8_tiled_f16.as_ref().unwrap_or(&engine.linear_q8_tiled_rb);
+                    let bg = pool.bind_group(&format!("{ckey}.tiled_rb"), pipeline, &entries);
+                    engine.dispatch(pass, pipeline, &bg, (chunk.rows.div_ceil(64), rows.div_ceil(64), 1), &ckey);
                 } else {
                     let bg = pool.bind_group(&ckey, &engine.linear_q8, &entries);
                     engine.dispatch(pass, &engine.linear_q8, &bg, (chunk.rows.div_ceil(16), rows.div_ceil(16), 1), &ckey);
@@ -1140,7 +1177,11 @@ fn linear(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &
             for chunk in chunks {
                 let ckey = format!("{key}.{}", chunk.row_start);
                 let sckey = scratch_key(&ckey);
-                let dims = pool.uniform(&format!("{sckey}.dims"), LinearQDims { m: rows, k: in_dim, n: chunk.rows, act: 0, blocks_per_row: *blocks_per_row, n_offset: chunk.row_start, n_total: *n_total, _p2: 0 });
+                // Its own key: `blocks_per_row` counts 256-value blocks here, 32-value
+                // blocks for every other format, and layers of one model can mix both
+                // (Q4_K_M files keep half of attn_v and ffn_down at Q6_K) while sharing
+                // this scratch key, so one value would be written over the other.
+                let dims = pool.uniform(&format!("{sckey}.dims_q6k"), LinearQDims { m: rows, k: in_dim, n: chunk.rows, act: 0, blocks_per_row: *blocks_per_row, n_offset: chunk.row_start, n_total: *n_total, _p2: 0 });
                 let entries = [
                     BindGroupEntry { binding: 0, resource: x.as_entire_binding() },
                     BindGroupEntry { binding: 1, resource: chunk.ql.as_entire_binding() },
@@ -1153,19 +1194,38 @@ fn linear(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &
                 ];
                 if fast && rows == 1 {
                     let bg = pool.bind_group(&format!("{ckey}.decode"), &engine.linear_q6k_decode, &entries);
-                    engine.dispatch(pass, &engine.linear_q6k_decode, &bg, (chunk.rows.div_ceil(4), 1, 1), &ckey);
+                    engine.dispatch(pass, &engine.linear_q6k_decode, &bg, (chunk.rows.div_ceil(16), 1, 1), &ckey);
+                } else if fast && rows > 1 {
+                    // Prefill: 64x64 tile (see linear_q6k_tiled.wgsl). The
+                    // half of attn_v/ffn_down that Q4_K_M files keep at Q6_K
+                    // runs here in every layer.
+                    let pipeline = engine.pipe(&engine.linear_q6k_tiled);
+                    let bg = pool.bind_group(&format!("{ckey}.tiled"), pipeline, &entries);
+                    engine.dispatch(pass, pipeline, &bg, (chunk.rows.div_ceil(64), rows.div_ceil(64), 1), &ckey);
                 } else {
                     let bg = pool.bind_group(&ckey, &engine.linear_q6k, &entries);
                     engine.dispatch(pass, &engine.linear_q6k, &bg, (chunk.rows.div_ceil(16), rows.div_ceil(16), 1), &ckey);
                 }
             }
         }
-        MatMulWeight::Q4_0 { chunks, blocks_per_row, out_dim: n_total } => {
+        MatMulWeight::Q4_0 { chunks, blocks_per_row, out_dim: n_total }
+        | MatMulWeight::Q4_1 { chunks, blocks_per_row, out_dim: n_total }
+        | MatMulWeight::Q5_0 { chunks, blocks_per_row, out_dim: n_total }
+        | MatMulWeight::Q4_K { chunks, blocks_per_row, out_dim: n_total } => {
+            // Q4_1 runs the same kernels as Q4_0 through their `Q41` builds;
+            // Q5_0 and Q4_K through their `Q4Family` builds, which also bind
+            // the chunk's `aux` buffer.
+            let q41 = matches!(w, MatMulWeight::Q4_1 { .. });
+            let family = match w {
+                MatMulWeight::Q5_0 { .. } => Some(&engine.q50),
+                MatMulWeight::Q4_K { .. } => Some(&engine.k4),
+                _ => None,
+            };
             for chunk in chunks {
                 let ckey = format!("{key}.{}", chunk.row_start);
                 let sckey = scratch_key(&ckey);
                 let dims = pool.uniform(&format!("{sckey}.dims"), LinearQDims { m: rows, k: in_dim, n: chunk.rows, act: 0, blocks_per_row: *blocks_per_row, n_offset: chunk.row_start, n_total: *n_total, _p2: 0 });
-                let entries = [
+                let mut entries = vec![
                     BindGroupEntry { binding: 0, resource: x.as_entire_binding() },
                     BindGroupEntry { binding: 1, resource: chunk.qs.as_entire_binding() },
                     BindGroupEntry { binding: 2, resource: chunk.scales.as_entire_binding() },
@@ -1173,27 +1233,54 @@ fn linear(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &
                     BindGroupEntry { binding: 4, resource: out.as_entire_binding() },
                     BindGroupEntry { binding: 5, resource: dims.as_entire_binding() },
                 ];
+                if let Some(aux) = &chunk.aux {
+                    entries.push(BindGroupEntry { binding: 6, resource: aux.as_entire_binding() });
+                }
                 if !fast {
                     // Reference/naive path - always linear_q4.wgsl regardless
                     // of `rows`, kept for the fixture-parity gate and as the
                     // fallback when a fast kernel's correctness is in doubt.
-                    let bg = pool.bind_group(&ckey, &engine.linear_q4, &entries);
-                    engine.dispatch(pass, &engine.linear_q4, &bg, (chunk.rows.div_ceil(16), rows.div_ceil(16), 1), &ckey);
+                    let pipeline = match family {
+                        Some(f) => engine.pipe(&f.naive),
+                        None if q41 => &engine.linear_q41,
+                        None => &engine.linear_q4,
+                    };
+                    let bg = pool.bind_group(&ckey, pipeline, &entries);
+                    engine.dispatch(pass, pipeline, &bg, (chunk.rows.div_ceil(16), rows.div_ceil(16), 1), &ckey);
                 } else if rows == 1 {
                     // Decode: coalesced matvec (llm-wasm's shader_q4_matvec_coalesced.wgsl port).
-                    let (pipeline, rows_per_wg) = if chunk.rows >= DECODE_R4_MIN_ROWS { (&engine.linear_q4_decode_r4, DECODE_R4_ROWS_PER_WG) } else { (&engine.linear_q4_decode, DECODE_ROWS_PER_WG) };
+                    let wide = chunk.rows >= DECODE_R4_MIN_ROWS;
+                    let rows_per_wg = if wide { DECODE_R4_ROWS_PER_WG } else { DECODE_ROWS_PER_WG };
+                    let pipeline = match (family, wide, q41) {
+                        (Some(f), true, _) => engine.pipe(&f.decode_r4),
+                        (Some(f), false, _) => engine.pipe(&f.decode),
+                        (None, true, false) => &engine.linear_q4_decode_r4,
+                        (None, true, true) => &engine.linear_q41_decode_r4,
+                        (None, false, false) => &engine.linear_q4_decode,
+                        (None, false, true) => &engine.linear_q41_decode,
+                    };
                     let bg = pool.bind_group(&format!("{ckey}.decode"), pipeline, &entries);
                     engine.dispatch(pass, pipeline, &bg, (chunk.rows.div_ceil(rows_per_wg), 1, 1), &ckey);
                 } else if rows < SMALL_M_MAX_ROWS {
                     // Short prefill: weight words read and dequantised once
                     // per group of 8 query rows (see linear_q4_small_m.wgsl).
-                    let bg = pool.bind_group(&format!("{ckey}.small_m"), &engine.linear_q4_small_m, &entries);
-                    engine.dispatch(pass, &engine.linear_q4_small_m, &bg, (rows.div_ceil(SMALL_M_ROWS), chunk.rows.div_ceil(SMALL_M_COLS), 1), &ckey);
+                    let pipeline = match family {
+                        Some(f) => engine.pipe(&f.small_m),
+                        None if q41 => &engine.linear_q41_small_m,
+                        None => &engine.linear_q4_small_m,
+                    };
+                    let bg = pool.bind_group(&format!("{ckey}.small_m"), pipeline, &entries);
+                    engine.dispatch(pass, pipeline, &bg, (rows.div_ceil(SMALL_M_ROWS), chunk.rows.div_ceil(SMALL_M_COLS), 1), &ckey);
                 } else {
                     // Prefill, M >= SMALL_M_MAX_ROWS: 64x64 register-blocked
                     // tiled kernel (see linear_q4_tiled_rb.wgsl's header).
-                    let bg = pool.bind_group(&format!("{ckey}.tiled_rb"), &engine.linear_q4_tiled_rb, &entries);
-                    engine.dispatch(pass, &engine.linear_q4_tiled_rb, &bg, (chunk.rows.div_ceil(64), rows.div_ceil(64), 1), &ckey);
+                    let pipeline = match family {
+                        Some(f) => f.tiled_f16.as_ref().map_or_else(|| engine.pipe(&f.tiled_rb), |p| engine.pipe(p)),
+                        None if q41 => &engine.linear_q41_tiled_rb,
+                        None => engine.linear_q4_tiled_f16.as_ref().unwrap_or(&engine.linear_q4_tiled_rb),
+                    };
+                    let bg = pool.bind_group(&format!("{ckey}.tiled_rb"), pipeline, &entries);
+                    engine.dispatch(pass, pipeline, &bg, (chunk.rows.div_ceil(64), rows.div_ceil(64), 1), &ckey);
                 }
             }
         }
@@ -1208,9 +1295,13 @@ fn linear(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &
 /// Q8_0 binding (or fast
 /// kernels are off): the caller then runs `linear` + `silu_mul_fused`.
 #[allow(clippy::too_many_arguments)]
-fn gate_up_swiglu_decode(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &str, x: &wgpu::Buffer, in_dim: u32, w: &MatMulWeight, b: &wgpu::Buffer, inter: u32, fast: bool) -> Option<wgpu::Buffer> {
+pub(crate) fn gate_up_swiglu_decode(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &str, x: &wgpu::Buffer, in_dim: u32, w: &MatMulWeight, b: &wgpu::Buffer, inter: u32, fast: bool) -> Option<wgpu::Buffer> {
     let wide = 2 * inter >= DECODE_R4_MIN_ROWS;
     let (chunks, blocks_per_row, out_dim, pipeline, outs_per_wg) = match w {
+        MatMulWeight::Q5_0 { chunks, blocks_per_row, out_dim } if wide => (chunks, blocks_per_row, out_dim, engine.pipe(&engine.q50.swiglu_r4), DECODE_R4_ROWS_PER_WG / 2),
+        MatMulWeight::Q5_0 { chunks, blocks_per_row, out_dim } => (chunks, blocks_per_row, out_dim, engine.pipe(&engine.q50.swiglu), DECODE_ROWS_PER_WG / 2),
+        MatMulWeight::Q4_K { chunks, blocks_per_row, out_dim } if wide => (chunks, blocks_per_row, out_dim, engine.pipe(&engine.k4.swiglu_r4), DECODE_R4_ROWS_PER_WG / 2),
+        MatMulWeight::Q4_K { chunks, blocks_per_row, out_dim } => (chunks, blocks_per_row, out_dim, engine.pipe(&engine.k4.swiglu), DECODE_ROWS_PER_WG / 2),
         MatMulWeight::Q4_0 { chunks, blocks_per_row, out_dim } if wide => (chunks, blocks_per_row, out_dim, &engine.linear_q4_decode_swiglu_r4, DECODE_R4_ROWS_PER_WG / 2),
         MatMulWeight::Q4_0 { chunks, blocks_per_row, out_dim } => (chunks, blocks_per_row, out_dim, &engine.linear_q4_decode_swiglu, DECODE_ROWS_PER_WG / 2),
         MatMulWeight::Q8_0 { chunks, blocks_per_row, out_dim } if wide => (chunks, blocks_per_row, out_dim, &engine.linear_q8_decode_swiglu_r4, DECODE_R4_ROWS_PER_WG / 2),
@@ -1223,18 +1314,18 @@ fn gate_up_swiglu_decode(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputeP
     let skey = scratch_key(key);
     let out = pool.data(&format!("{skey}.swiglu"), inter as usize);
     let dims = pool.uniform(&format!("{skey}.swiglu_dims"), LinearQDims { m: 1, k: in_dim, n: 2 * inter, act: 0, blocks_per_row: *blocks_per_row, n_offset: 0, n_total: 2 * inter, _p2: 0 });
-    let bg = pool.bind_group(
-        &format!("{key}.swiglu"),
-        pipeline,
-        &[
-            BindGroupEntry { binding: 0, resource: x.as_entire_binding() },
-            BindGroupEntry { binding: 1, resource: chunk.qs.as_entire_binding() },
-            BindGroupEntry { binding: 2, resource: chunk.scales.as_entire_binding() },
-            BindGroupEntry { binding: 3, resource: b.as_entire_binding() },
-            BindGroupEntry { binding: 4, resource: out.as_entire_binding() },
-            BindGroupEntry { binding: 5, resource: dims.as_entire_binding() },
-        ],
-    );
+    let mut entries = vec![
+        BindGroupEntry { binding: 0, resource: x.as_entire_binding() },
+        BindGroupEntry { binding: 1, resource: chunk.qs.as_entire_binding() },
+        BindGroupEntry { binding: 2, resource: chunk.scales.as_entire_binding() },
+        BindGroupEntry { binding: 3, resource: b.as_entire_binding() },
+        BindGroupEntry { binding: 4, resource: out.as_entire_binding() },
+        BindGroupEntry { binding: 5, resource: dims.as_entire_binding() },
+    ];
+    if let Some(aux) = &chunk.aux {
+        entries.push(BindGroupEntry { binding: 6, resource: aux.as_entire_binding() });
+    }
+    let bg = pool.bind_group(&format!("{key}.swiglu"), pipeline, &entries);
     engine.dispatch(pass, pipeline, &bg, (inter.div_ceil(outs_per_wg), 1, 1), key);
     Some(out)
 }
@@ -1517,7 +1608,12 @@ fn silu_mul_fused(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>
 /// of three, and returns `q`/`k`/`v` as `BufView`s into that single output
 /// buffer (`QkvSlot::View`, offsets `0` / `q_dim` / `q_dim+kv_dim`) - no copy,
 /// downstream (`rope`/`scatter_kv_gpu`/`attn_decode`) read the fused buffer
-/// directly through those offsets. Every other case (`rows > 1` - prefill and
+/// directly through those offsets. `decode` is true only for the decode
+/// step: the pool caches bind groups by call-site key, so a call site whose
+/// q/k/v buffers differ between calls (a fused view at one row, separate
+/// buffers at more) would be handed the first call's bind group on the
+/// second; a prefill or chunk of one row must take the separate-buffer path
+/// like any other length. Every other case (`rows > 1` - prefill and
 /// the chunked/masked forward path, which need q/k/v as separately
 /// addressable `[rows, dim]` buffers and can't safely read a fused *strided*
 /// per-row layout back with a plain offset+size binding; LoRA active; or
@@ -1536,12 +1632,13 @@ fn qkv_proj(
     layer: &LayerWeights,
     fast: bool,
     lora: Option<&crate::lora::LoraLayer>,
+    decode: bool,
 ) -> (QkvSlot, QkvSlot, QkvSlot) {
     let hidden = cfg.hidden_size as u32;
     let q_dim = (cfg.num_heads * cfg.head_dim) as u32;
     let kv_dim = (cfg.num_kv_heads * cfg.head_dim) as u32;
 
-    let (q, k, v) = if rows == 1 && lora.is_none() {
+    let (q, k, v) = if decode && rows == 1 && lora.is_none() {
         if let (Some(qkv_w), Some(qkv_b)) = (&layer.qkv_w, &layer.qkv_b) {
             let qkv_out = linear(engine, pool, pass, &format!("{key}.qkv_fused"), x, rows, hidden, qkv_w, qkv_b, q_dim + 2 * kv_dim, fast);
             let q = QkvSlot::View { buf: qkv_out.clone(), elem_offset: 0, elem_len: q_dim };
@@ -1618,23 +1715,69 @@ fn embed_gather(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, 
         engine.dispatch(pass, &engine.embed_gather_q6k, &bg, (gx, gy, 1), "embed");
         return out;
     }
+    if let EmbeddingTable::F16(t) | EmbeddingTable::BF16(t) = &model.embed {
+        let pipeline = engine.pipe(if matches!(model.embed, EmbeddingTable::BF16(_)) { &engine.embed_gather_bf16 } else { &engine.embed_gather_f16 });
+        let dims = pool.uniform("embed.dims", GatherDims { rows, hidden, blocks_per_row: 0, stride_x });
+        let bg = pool.bind_group(
+            "embed",
+            pipeline,
+            &[
+                BindGroupEntry { binding: 0, resource: ids_buf.as_entire_binding() },
+                BindGroupEntry { binding: 1, resource: t.w.as_entire_binding() },
+                BindGroupEntry { binding: 2, resource: out.as_entire_binding() },
+                BindGroupEntry { binding: 3, resource: dims.as_entire_binding() },
+            ],
+        );
+        engine.dispatch(pass, pipeline, &bg, (gx, gy, 1), "embed");
+        return out;
+    }
     let (pipeline, table) = match &model.embed {
         EmbeddingTable::Q4_0(t) => (&engine.embed_gather_q4, t),
         EmbeddingTable::Q8_0(t) => (&engine.embed_gather_q8, t),
-        EmbeddingTable::Q6_K(_) => unreachable!("handled above"),
+        EmbeddingTable::Q5_0(t) => (engine.pipe(&engine.embed_gather_q5), t),
+        EmbeddingTable::Q4_K(t) => (engine.pipe(&engine.embed_gather_q4k), t),
+        EmbeddingTable::Q6_K(_) | EmbeddingTable::F16(_) | EmbeddingTable::BF16(_) => unreachable!("handled above"),
     };
     let dims = pool.uniform("embed.dims", GatherDims { rows, hidden, blocks_per_row: table.blocks_per_row, stride_x });
-    let bg = pool.bind_group(
-        "embed",
-        pipeline,
-        &[
-            BindGroupEntry { binding: 0, resource: ids_buf.as_entire_binding() },
-            BindGroupEntry { binding: 1, resource: table.qs.as_entire_binding() },
-            BindGroupEntry { binding: 2, resource: table.scales.as_entire_binding() },
-            BindGroupEntry { binding: 3, resource: out.as_entire_binding() },
-            BindGroupEntry { binding: 4, resource: dims.as_entire_binding() },
-        ],
-    );
+    let bg = if let (Some(aux), true) = (&table.aux, matches!(model.embed, EmbeddingTable::Q4_K(_))) {
+        // Q4_K keeps everything but the nibbles in `aux` (no `scales` binding).
+        pool.bind_group(
+            "embed",
+            pipeline,
+            &[
+                BindGroupEntry { binding: 0, resource: ids_buf.as_entire_binding() },
+                BindGroupEntry { binding: 1, resource: table.qs.as_entire_binding() },
+                BindGroupEntry { binding: 2, resource: aux.as_entire_binding() },
+                BindGroupEntry { binding: 3, resource: out.as_entire_binding() },
+                BindGroupEntry { binding: 4, resource: dims.as_entire_binding() },
+            ],
+        )
+    } else if let Some(aux) = &table.aux {
+        pool.bind_group(
+            "embed",
+            pipeline,
+            &[
+                BindGroupEntry { binding: 0, resource: ids_buf.as_entire_binding() },
+                BindGroupEntry { binding: 1, resource: table.qs.as_entire_binding() },
+                BindGroupEntry { binding: 2, resource: table.scales.as_entire_binding() },
+                BindGroupEntry { binding: 3, resource: aux.as_entire_binding() },
+                BindGroupEntry { binding: 4, resource: out.as_entire_binding() },
+                BindGroupEntry { binding: 5, resource: dims.as_entire_binding() },
+            ],
+        )
+    } else {
+        pool.bind_group(
+            "embed",
+            pipeline,
+            &[
+                BindGroupEntry { binding: 0, resource: ids_buf.as_entire_binding() },
+                BindGroupEntry { binding: 1, resource: table.qs.as_entire_binding() },
+                BindGroupEntry { binding: 2, resource: table.scales.as_entire_binding() },
+                BindGroupEntry { binding: 3, resource: out.as_entire_binding() },
+                BindGroupEntry { binding: 4, resource: dims.as_entire_binding() },
+            ],
+        )
+    };
     engine.dispatch(pass, pipeline, &bg, (gx, gy, 1), "embed");
     out
 }
@@ -1678,8 +1821,12 @@ fn scatter_kv_kernel<'a>(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputeP
     engine.dispatch(pass, &engine.kv_scatter, &bg, (gx, gy, 1), key);
 }
 
+/// Prefill attention over this call's own q/k/v (`resident = None`), or, for
+/// a suffix prefill, over a KV cache that already holds `prefix` positions
+/// and this call's rows after them (`resident = Some((k_cache, v_cache,
+/// prefix, max_ctx))`; head_dim 64 and 128 only, see `suffix_batched`).
 #[allow(clippy::too_many_arguments)]
-fn attn_prefill<'a>(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &str, q: impl Into<BufView<'a>>, k: impl Into<BufView<'a>>, v: impl Into<BufView<'a>>, seq: u32, cfg: &Qwen2Config) -> wgpu::Buffer {
+fn attn_prefill<'a>(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &str, q: impl Into<BufView<'a>>, k: impl Into<BufView<'a>>, v: impl Into<BufView<'a>>, seq: u32, cfg: &Qwen2Config, resident: Option<(&wgpu::Buffer, &wgpu::Buffer, u32, u32)>) -> wgpu::Buffer {
     let (q, k, v) = (q.into(), k.into(), v.into());
     // Concatenated-heads width (`num_heads * head_dim`): equal to
     // `cfg.hidden_size` for Qwen2 (head_dim is derived that way) but *not*
@@ -1689,26 +1836,36 @@ fn attn_prefill<'a>(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'
     let skey = scratch_key(key);
     let out = pool.data(&format!("{skey}.out"), (seq * hidden) as usize);
     let scale = 1.0 / (cfg.head_dim as f32).sqrt();
+    let (prefix, max_ctx) = resident.map_or((0, 0), |r| (r.2, r.3));
     let dims = pool.uniform(
         &format!("{skey}.dims"),
-        AttnPrefillDims { seq, n_heads: cfg.num_heads as u32, n_kv_heads: cfg.num_kv_heads as u32, head_dim: cfg.head_dim as u32, scale, _p0: 0, _p1: 0, _p2: 0 },
+        AttnPrefillDims { seq, n_heads: cfg.num_heads as u32, n_kv_heads: cfg.num_kv_heads as u32, head_dim: cfg.head_dim as u32, scale, prefix, max_ctx, _p2: 0 },
     );
     // head_dim 64 and 128: the tiled kernel (attn_prefill_tiled.wgsl); any
     // other head_dim: the one-thread-per-row kernel.
-    let (pipeline, wgs) = match cfg.head_dim {
-        64 => (&engine.attn_prefill_tiled, (cfg.num_heads as u32, seq.div_ceil(8), 1)),
-        128 => (&engine.attn_prefill_tiled_128, (cfg.num_heads as u32, seq.div_ceil(8), 1)),
+    let (pipeline, wgs) = match (cfg.head_dim, resident.is_some()) {
+        (64, false) => (&engine.attn_prefill_tiled, (cfg.num_heads as u32, seq.div_ceil(8), 1)),
+        (128, false) => (&engine.attn_prefill_tiled_128, (cfg.num_heads as u32, seq.div_ceil(8), 1)),
+        (64, true) => (&engine.attn_prefill_cache, (cfg.num_heads as u32, seq.div_ceil(8), 1)),
+        (128, true) => (&engine.attn_prefill_cache_128, (cfg.num_heads as u32, seq.div_ceil(8), 1)),
         // wg.y = query tile index (256 rows/tile, see attn_prefill.wgsl's doc
         // comment on why this scales with `seq` instead of a fixed dispatch).
         _ => (&engine.attn_prefill, (cfg.num_heads as u32, seq.div_ceil(256), 1)),
     };
+    let (kb, vb) = match resident {
+        Some((kc, vc, _, _)) => (kc.as_entire_binding(), vc.as_entire_binding()),
+        None => (k.binding(), v.binding()),
+    };
+    // The pool caches bind groups by key, and the two pipelines have
+    // different layouts: they need different keys.
+    let bg_key = if resident.is_some() { format!("{key}.cache") } else { key.to_string() };
     let bg = pool.bind_group(
-        key,
+        &bg_key,
         pipeline,
         &[
             BindGroupEntry { binding: 0, resource: q.binding() },
-            BindGroupEntry { binding: 1, resource: k.binding() },
-            BindGroupEntry { binding: 2, resource: v.binding() },
+            BindGroupEntry { binding: 1, resource: kb },
+            BindGroupEntry { binding: 2, resource: vb },
             BindGroupEntry { binding: 3, resource: out.as_entire_binding() },
             BindGroupEntry { binding: 4, resource: dims.as_entire_binding() },
         ],
@@ -1952,13 +2109,27 @@ macro_rules! tap {
 /// GPU-scatters every position's K/V into `cache`, and returns the last
 /// position's logits ([vocab]).
 pub async fn forward_prefill(engine: &Engine, model: &GpuModel, cache: &mut KvCache, token_ids: &[u32], cos: &wgpu::Buffer, sin: &wgpu::Buffer, mask: Option<&wgpu::Buffer>) -> Vec<f32> {
+    cache.kv_len = 0;
+    prefill_batched(engine, model, cache, token_ids, cos, sin, mask).await
+}
+
+/// Batched prefill of `token_ids` after the `cache.kv_len` positions already
+/// resident (0 for a plain prefill): the same tiled matmuls as a cold
+/// prefill, RoPE and the K/V scatter offset by the prefix, attention reading
+/// the cache. Leaves `cache.kv_len` at prefix + `token_ids.len()`.
+async fn prefill_batched(engine: &Engine, model: &GpuModel, cache: &mut KvCache, token_ids: &[u32], cos: &wgpu::Buffer, sin: &wgpu::Buffer, mask: Option<&wgpu::Buffer>) -> Vec<f32> {
     model.pool.use_kv_cache(cache.id);
+    let prefix = cache.kv_len;
     let cfg = &model.config;
     let seq = token_ids.len() as u32;
+    assert!(prefix + seq <= cache.max_ctx, "prefill: prefix {prefix} + {seq} tokens exceeds max_ctx {}", cache.max_ctx);
     let hidden = cfg.hidden_size as u32;
     let pool = &model.pool;
     let t_start = crate::engine::now_ms();
     engine.diag_begin();
+    if engine.profiling_enabled() {
+        engine.reset_profile();
+    }
 
     let mut encoder = engine.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("prefill") });
     // One open ComputePass for the whole prefill outside the per-layer
@@ -1978,21 +2149,22 @@ pub async fn forward_prefill(engine: &Engine, model: &GpuModel, cache: &mut KvCa
         tap!(engine, &mut encoder, pass, format!("{key}.norm"), &normed, seq * hidden);
         let lora_layer = model.lora.as_ref().map(|l| &l.layers[i]);
         seg!(engine, &mut encoder, pass, "qkv");
-        let (q, k, v) = qkv_proj(engine, pool, &mut pass, &format!("{key}.qkv"), &normed, seq, cfg, layer, model.fast_kernels, lora_layer);
+        let (q, k, v) = qkv_proj(engine, pool, &mut pass, &format!("{key}.qkv"), &normed, seq, cfg, layer, model.fast_kernels, lora_layer, false);
         tap!(engine, &mut encoder, pass, format!("{key}.q"), &q, seq * q_dim);
         tap!(engine, &mut encoder, pass, format!("{key}.k"), &k, seq * kv_dim);
         tap!(engine, &mut encoder, pass, format!("{key}.v"), &v, seq * kv_dim);
         seg!(engine, &mut encoder, pass, "rope");
-        rope(engine, pool, &mut pass, &format!("{key}.ropeq"), &q, cos, sin, seq, cfg.num_heads as u32, cfg.head_dim as u32, 0);
-        rope(engine, pool, &mut pass, &format!("{key}.ropek"), &k, cos, sin, seq, cfg.num_kv_heads as u32, cfg.head_dim as u32, 0);
+        rope(engine, pool, &mut pass, &format!("{key}.ropeq"), &q, cos, sin, seq, cfg.num_heads as u32, cfg.head_dim as u32, prefix);
+        rope(engine, pool, &mut pass, &format!("{key}.ropek"), &k, cos, sin, seq, cfg.num_kv_heads as u32, cfg.head_dim as u32, prefix);
         tap!(engine, &mut encoder, pass, format!("{key}.ropeq"), &q, seq * q_dim);
         tap!(engine, &mut encoder, pass, format!("{key}.ropek"), &k, seq * kv_dim);
-        seg!(engine, &mut encoder, pass, "attn");
-        let attn_out = attn_prefill(engine, pool, &mut pass, &format!("{key}.attn"), &q, &k, &v, seq, cfg);
-        tap!(engine, &mut encoder, pass, format!("{key}.attn"), &attn_out, seq * q_dim);
         seg!(engine, &mut encoder, pass, "kv");
-        scatter_kv_kernel(engine, pool, &mut pass, &format!("{key}.kscatter"), &cache.k[i], &k, seq, cfg, 0, cache.max_ctx);
-        scatter_kv_kernel(engine, pool, &mut pass, &format!("{key}.vscatter"), &cache.v[i], &v, seq, cfg, 0, cache.max_ctx);
+        scatter_kv_kernel(engine, pool, &mut pass, &format!("{key}.kscatter"), &cache.k[i], &k, seq, cfg, prefix, cache.max_ctx);
+        scatter_kv_kernel(engine, pool, &mut pass, &format!("{key}.vscatter"), &cache.v[i], &v, seq, cfg, prefix, cache.max_ctx);
+        seg!(engine, &mut encoder, pass, "attn");
+        let resident = (prefix > 0).then(|| (&cache.k[i], &cache.v[i], prefix, cache.max_ctx));
+        let attn_out = attn_prefill(engine, pool, &mut pass, &format!("{key}.attn"), &q, &k, &v, seq, cfg, resident);
+        tap!(engine, &mut encoder, pass, format!("{key}.attn"), &attn_out, seq * q_dim);
         seg!(engine, &mut encoder, pass, "o_proj");
 
         let attn_dim = (cfg.num_heads * cfg.head_dim) as u32;
@@ -2063,6 +2235,7 @@ pub async fn forward_prefill(engine: &Engine, model: &GpuModel, cache: &mut KvCa
     }
     drop(pass);
 
+    let profile = engine.resolve_profile(&mut encoder);
     let diag = engine.diag_resolve(&mut encoder);
     engine.queue.submit(Some(encoder.finish()));
     let t_submitted = crate::engine::now_ms();
@@ -2073,7 +2246,11 @@ pub async fn forward_prefill(engine: &Engine, model: &GpuModel, cache: &mut KvCa
     if let Some((buf, count)) = diag {
         engine.diag_collect(&buf, count).await;
     }
-    cache.kv_len = seq;
+    if let Some((buf, count)) = profile {
+        let data = engine.read_profile(&buf, count).await;
+        crate::profile_report::record_step(&data);
+    }
+    cache.kv_len = prefix + seq;
     all_logits
 }
 
@@ -2123,6 +2300,74 @@ fn argmax_gpu(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, ke
     out
 }
 
+/// Candidates the GPU top-k returns: `TOPK_CANDS` (value bits, id) pairs,
+/// best first, in a result buffer of `2 * TOPK_CANDS` u32 words.
+pub const TOPK_CANDS: usize = 64;
+/// Items one `topk_stage.wgsl` workgroup sorts.
+const TOPK_GROUP: usize = 1024;
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct TopkStageDims {
+    n_in: u32,
+    mode: u32,
+    out_per_group: u32,
+    out_base: u32,
+}
+
+/// Top `TOPK_CANDS` logits of `logits`, best first (ties toward the lower
+/// id): `topk_stage.wgsl` runs as a tree of 1024-item sorts, a first level
+/// of vocab / 1024 workgroups each keeping its best 64, then a level over
+/// those, until one workgroup is left. Selection is exact and the values
+/// are copies of the logits, so nothing depends on how a device rounds
+/// arithmetic.
+fn topk_gpu(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, key: &str, logits: &wgpu::Buffer, vocab: u32) -> wgpu::Buffer {
+    let res = pool.data(&format!("{key}.res"), 2 * TOPK_CANDS);
+    let mut groups = Vec::new();
+    let mut n_in = vocab as usize;
+    loop {
+        let ng = n_in.div_ceil(TOPK_GROUP);
+        groups.push((n_in, ng));
+        if ng == 1 {
+            break;
+        }
+        n_in = ng * TOPK_CANDS;
+    }
+    let a = pool.data(&format!("{key}.a"), 2 * groups[0].1 * TOPK_CANDS);
+    let b = pool.data(&format!("{key}.b"), 2 * groups.get(1).map_or(1, |g| g.1) * TOPK_CANDS);
+    let last = groups.len() - 1;
+    for (s, &(n_in, ng)) in groups.iter().enumerate() {
+        let out = if s == last { &res } else if s % 2 == 0 { &a } else { &b };
+        let inp = if s == 0 { if last == 0 { &a } else { &b } } else if s % 2 == 1 { &a } else { &b };
+        let dims = pool.uniform(&format!("{key}.s{s}.dims"), TopkStageDims { n_in: n_in as u32, mode: u32::from(s > 0), out_per_group: TOPK_CANDS as u32, out_base: 0 });
+        // The bind group depends on the plan (number of levels), which
+        // depends on the vocabulary size: the key says so.
+        let bg = pool.bind_group(
+            &format!("{key}.s{s}of{}", groups.len()),
+            &engine.topk_stage,
+            &[
+                BindGroupEntry { binding: 0, resource: logits.as_entire_binding() },
+                BindGroupEntry { binding: 1, resource: inp.as_entire_binding() },
+                BindGroupEntry { binding: 2, resource: out.as_entire_binding() },
+                BindGroupEntry { binding: 3, resource: dims.as_entire_binding() },
+            ],
+        );
+        engine.dispatch(pass, &engine.topk_stage, &bg, (ng as u32, 1, 1), &format!("{key}.s{s}"));
+    }
+    res
+}
+
+/// What a decode step appends after the lm head (see `decode_layers`).
+enum Head<'a> {
+    /// Nothing: the caller reads the logits.
+    Logits,
+    /// GPU argmax; the returned buffer holds the id.
+    Argmax,
+    /// GPU penalty, top-k and draw (`sample_gpu`); the returned buffer holds
+    /// the chosen id.
+    Sample(&'a SampleStep<'a>),
+}
+
 /// Records one decode step's whole layer stack (embed through the lm-head
 /// logits) into `encoder`, without submitting or reading anything back -
 /// shared by `forward_decode_step` (full-logits readback, for samplers) and
@@ -2134,7 +2379,7 @@ fn argmax_gpu(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, ke
 /// returned alongside the logits when requested, `None` otherwise (samplers
 /// that need the full vocab never pay for the extra dispatch).
 #[allow(clippy::too_many_arguments)]
-fn decode_layers(engine: &Engine, model: &GpuModel, encoder: &mut wgpu::CommandEncoder, cache: &mut KvCache, token_id: u32, token_src: Option<&wgpu::Buffer>, cos: &wgpu::Buffer, sin: &wgpu::Buffer, mask: Option<&wgpu::Buffer>, argmax: bool) -> (wgpu::Buffer, Option<wgpu::Buffer>) {
+fn decode_layers(engine: &Engine, model: &GpuModel, encoder: &mut wgpu::CommandEncoder, cache: &mut KvCache, token_id: u32, token_src: Option<&wgpu::Buffer>, cos: &wgpu::Buffer, sin: &wgpu::Buffer, mask: Option<&wgpu::Buffer>, head: Head<'_>) -> (wgpu::Buffer, Option<wgpu::Buffer>) {
     model.pool.use_kv_cache(cache.id);
     // `token_src`: the input token id is the first u32 of a GPU buffer (the
     // previous step's argmax), copied into the embedding's id buffer on
@@ -2174,7 +2419,7 @@ fn decode_layers(engine: &Engine, model: &GpuModel, encoder: &mut wgpu::CommandE
         let key = format!("dec_layer{i}");
         let lora_layer = model.lora.as_ref().map(|l| &l.layers[i]);
         seg!(engine, encoder, pass, "qkv");
-        let (q, k, v) = qkv_proj(engine, pool, &mut pass, &format!("{key}.qkv"), &normed, 1, cfg, layer, model.fast_kernels, lora_layer);
+        let (q, k, v) = qkv_proj(engine, pool, &mut pass, &format!("{key}.qkv"), &normed, 1, cfg, layer, model.fast_kernels, lora_layer, true);
         seg!(engine, encoder, pass, "rope");
         let q = rope_kv_decode(engine, pool, &mut pass, &format!("{key}.ropekv"), &q, &k, &v, cos, sin, &cache.k[i], &cache.v[i], pos, cache.max_ctx, cfg);
         seg!(engine, encoder, pass, "attn");
@@ -2230,10 +2475,18 @@ fn decode_layers(engine: &Engine, model: &GpuModel, encoder: &mut wgpu::CommandE
     if let Some(mask) = mask {
         mask_logits_gpu(engine, pool, &mut pass, "dec_mask", &logits, mask, cfg.vocab_size as u32, 0);
     }
-    if argmax {
-        seg!(engine, encoder, pass, "argmax");
-    }
-    let idx = argmax.then(|| argmax_gpu(engine, pool, &mut pass, "dec_argmax", &logits, cfg.vocab_size as u32));
+    let vocab = cfg.vocab_size as u32;
+    let idx = match head {
+        Head::Logits => None,
+        Head::Argmax => {
+            seg!(engine, encoder, pass, "argmax");
+            Some(argmax_gpu(engine, pool, &mut pass, "dec_argmax", &logits, vocab))
+        }
+        Head::Sample(step) => {
+            seg!(engine, encoder, pass, "sample");
+            Some(sample_gpu(engine, pool, &mut pass, &logits, vocab, step))
+        }
+    };
     drop(pass);
     (logits, idx)
 }
@@ -2249,7 +2502,7 @@ fn decode_layers(engine: &Engine, model: &GpuModel, encoder: &mut wgpu::CommandE
 /// applied.
 pub async fn forward_decode_step(engine: &Engine, model: &GpuModel, cache: &mut KvCache, token_id: u32, cos: &wgpu::Buffer, sin: &wgpu::Buffer, mask: Option<&wgpu::Buffer>) -> Vec<f32> {
     let mut encoder = engine.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("decode") });
-    let (logits, _) = decode_layers(engine, model, &mut encoder, cache, token_id, None, cos, sin, mask, false);
+    let (logits, _) = decode_layers(engine, model, &mut encoder, cache, token_id, None, cos, sin, mask, Head::Logits);
     engine.queue.submit(Some(encoder.finish()));
     cache.kv_len += 1;
     engine.read_buffer(&logits, model.config.vocab_size).await
@@ -2272,7 +2525,7 @@ pub async fn forward_decode_step_argmax(engine: &Engine, model: &GpuModel, cache
     if engine.profiling_enabled() {
         engine.reset_profile();
     }
-    let (_, idx) = decode_layers(engine, model, &mut encoder, cache, token_id, None, cos, sin, mask, true);
+    let (_, idx) = decode_layers(engine, model, &mut encoder, cache, token_id, None, cos, sin, mask, Head::Argmax);
     let idx = idx.expect("decode_layers(argmax=true) always returns Some");
     // Resolve on the same encoder as the profiled dispatches, before it's
     // finished/submitted - see `Engine::resolve_profile`'s doc comment.
@@ -2295,24 +2548,48 @@ pub async fn forward_decode_step_argmax(engine: &Engine, model: &GpuModel, cache
     result
 }
 
-/// One submitted greedy decode step: its argmax id on the GPU (`idx`) and
-/// the 4-byte staging copy of it that `read` maps.
-struct PendingToken {
-    idx: wgpu::Buffer,
+/// Greedy decode steps per readback block. Every step appends its argmax id
+/// to a GPU-side block buffer; the host maps that buffer once per block
+/// instead of once per token. Browsers resolve a buffer map on their own
+/// schedule (tens of milliseconds on some), so the cost of a map is paid
+/// once per `GREEDY_BLOCK` tokens. A fixed number, the same on every device;
+/// 1 streams token by token: blocks of 8 measured no faster in any browser.
+const GREEDY_BLOCK: u32 = 1;
+
+/// Sampled decode steps per readback. One: every token is read back and
+/// streamed as soon as its step resolves; the two steps in flight
+/// (`BLOCKS_IN_FLIGHT`) keep the GPU busy meanwhile. Reading 8 ids per
+/// block measured the same speed in Chromium, WebKit and Firefox.
+const SAMPLED_BLOCK: u32 = 1;
+
+/// Blocks kept submitted at once: while the host waits on one block's map
+/// the next block's steps are already queued, so the GPU does not idle.
+const BLOCKS_IN_FLIGHT: usize = 2;
+
+/// One submitted block of greedy steps and the mappable copy of its ids.
+struct PendingBlock {
     staging: wgpu::Buffer,
+    rx: futures_channel::oneshot::Receiver<Result<(), wgpu::BufferAsyncError>>,
 }
 
+/// Submits one greedy decode step. Its argmax id stays on the GPU: it is
+/// copied into `ring` at element `slot` (and, when `stage` is given, the
+/// whole ring is then copied to `stage` for the host). The returned buffer
+/// holds the id for the next step's embedding (`token_src`).
 #[allow(clippy::too_many_arguments)]
-fn submit_greedy_step(engine: &Engine, model: &GpuModel, cache: &mut KvCache, token_id: u32, token_src: Option<&wgpu::Buffer>, cos: &wgpu::Buffer, sin: &wgpu::Buffer, mask: Option<&wgpu::Buffer>) -> PendingToken {
+fn submit_greedy_step(engine: &Engine, model: &GpuModel, cache: &mut KvCache, token_id: u32, token_src: Option<&wgpu::Buffer>, ring: &wgpu::Buffer, slot: u32, stage: Option<(&wgpu::Buffer, u64)>, cos: &wgpu::Buffer, sin: &wgpu::Buffer, mask: Option<&wgpu::Buffer>, head: Head<'_>) -> wgpu::Buffer {
     let t_start = crate::engine::now_ms();
     let mut encoder = engine.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("decode_greedy") });
-    let (_, idx) = decode_layers(engine, model, &mut encoder, cache, token_id, token_src, cos, sin, mask, true);
-    let idx = idx.expect("decode_layers(argmax=true) always returns Some");
-    let staging = engine.stage_u32(&mut encoder, &idx);
+    let (_, idx) = decode_layers(engine, model, &mut encoder, cache, token_id, token_src, cos, sin, mask, head);
+    let idx = idx.expect("a greedy or sampled head always returns the id buffer");
+    encoder.copy_buffer_to_buffer(&idx, 0, ring, 4 * slot as u64, 4);
+    if let Some((staging, bytes)) = stage {
+        encoder.copy_buffer_to_buffer(ring, 0, staging, 0, bytes);
+    }
     engine.queue.submit(Some(encoder.finish()));
     engine.diag_encode_ms.set(crate::engine::now_ms() - t_start);
     cache.kv_len += 1;
-    PendingToken { idx, staging }
+    idx
 }
 
 /// Greedy decode of up to `max_steps` forward steps from `first_id`, with
@@ -2325,18 +2602,21 @@ fn submit_greedy_step(engine: &Engine, model: &GpuModel, cache: &mut KvCache, to
 ///     on_token(next) returns false; next = decode(next)
 /// ```
 ///
-/// but each step is submitted before the previous step's id is read back:
-/// its embedding reads that id from the GPU buffer the previous argmax
-/// wrote (`decode_layers`'s `token_src`). The CPU encodes step t+1 and the
-/// readback latency of step t overlaps the GPU work instead of adding to
-/// it. When the loop stops, the one step submitted ahead is discarded
-/// (its K/V row lies past `cache.kv_len` and is overwritten by the next
-/// write). The pool's uniforms are rewritten between the two submits with
-/// `queue.write_buffer`, which the queue orders after the earlier submit,
-/// so each step sees its own positions. `mask` stays the same for every
-/// step. Returns the tokens passed to `on_token`, in order, and the last id
-/// read back that was not passed to it (the output of the last step run;
-/// `None` when no step ran).
+/// but the loop stays on the GPU: each step's embedding reads the id the
+/// previous step's argmax wrote (`decode_layers`'s `token_src`), and each
+/// id is appended to a block buffer on the GPU. Steps are submitted in
+/// blocks of `GREEDY_BLOCK`; the host maps one block's ids at a time, with
+/// `BLOCKS_IN_FLIGHT` blocks queued so the GPU keeps working while a map
+/// resolves. The ids of a block reach `on_token` together, in order. When
+/// the loop stops inside a block (EOS, or `on_token` returning false), the
+/// steps submitted past the stopping one are discarded: `cache.kv_len` is
+/// rolled back to what the step-by-step loop would have, and their K/V
+/// rows lie past it and are overwritten by the next write. The pool's
+/// uniforms are rewritten between submits with `queue.write_buffer`, which
+/// the queue orders after the earlier submit, so each step sees its own
+/// positions. `mask` stays the same for every step. Returns the tokens
+/// passed to `on_token`, in order, and the last id read back that was not
+/// passed to it (the output of the last step run; `None` when no step ran).
 #[allow(clippy::too_many_arguments)]
 pub async fn decode_greedy_pipelined(engine: &Engine, model: &GpuModel, cache: &mut KvCache, first_id: u32, max_steps: u32, stop_at_eos: bool, cos: &wgpu::Buffer, sin: &wgpu::Buffer, mask: Option<&wgpu::Buffer>, mut on_token: impl FnMut(u32) -> bool) -> (Vec<u32>, Option<u32>) {
     let is_stop = |id: u32| stop_at_eos && model.config.eos_token_ids.contains(&id);
@@ -2345,36 +2625,215 @@ pub async fn decode_greedy_pipelined(engine: &Engine, model: &GpuModel, cache: &
         return (out, None);
     }
     out.push(first_id);
-    let mut pending = submit_greedy_step(engine, model, cache, first_id, None, cos, sin, mask);
-    let mut steps = 1;
+    let mut blocks: VecDeque<PendingBlock> = VecDeque::new();
+    let mut prev: Option<wgpu::Buffer> = None;
+    let mut submitted = 0u32;
+    let mut consumed = 0u32;
     loop {
-        let ahead = (steps < max_steps).then(|| submit_greedy_step(engine, model, cache, 0, Some(&pending.idx), cos, sin, mask));
-        let id = engine.map_u32(&pending.staging).await;
-        let Some(ahead) = ahead else { return (out, Some(id)) };
-        if is_stop(id) || !on_token(id) {
-            // The discarded step's staging buffer is dropped unread; any
-            // later GPU work is queued after it.
-            drop(ahead);
-            cache.kv_len -= 1;
-            return (out, Some(id));
+        while blocks.len() < BLOCKS_IN_FLIGHT && submitted < max_steps {
+            let n = GREEDY_BLOCK.min(max_steps - submitted);
+            let bytes = 4 * n as u64;
+            let ring = engine.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("greedy_ring"),
+                size: bytes,
+                usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let staging = engine.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("greedy_staging"),
+                size: bytes,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            for slot in 0..n {
+                let stage = (slot + 1 == n).then_some((&staging, bytes));
+                let (token_id, src) = if submitted == 0 && slot == 0 { (first_id, None) } else { (0, prev.as_ref()) };
+                let idx = submit_greedy_step(engine, model, cache, token_id, src, &ring, slot, stage, cos, sin, mask, Head::Argmax);
+                prev = Some(idx);
+            }
+            submitted += n;
+            let rx = engine.start_map_u32(&staging);
+            blocks.push_back(PendingBlock { staging, rx });
         }
-        out.push(id);
-        steps += 1;
-        pending = ahead;
+        let block = blocks.pop_front().expect("a block is in flight");
+        let ids = engine.finish_map_u32s(&block.staging, block.rx).await;
+        for id in ids {
+            consumed += 1;
+            if consumed == max_steps {
+                return (out, Some(id));
+            }
+            if is_stop(id) || !on_token(id) {
+                // The steps submitted past this one are discarded: their
+                // block buffers are dropped unread and later GPU work is
+                // queued after them.
+                cache.kv_len -= submitted - consumed;
+                return (out, Some(id));
+            }
+            out.push(id);
+        }
+    }
+}
+
+/// Per-step inputs of `sample_gpu`: the history counts buffer (one `u32` per
+/// vocabulary id, updated on the GPU as ids are chosen) and the settings.
+pub(crate) struct SampleStep<'a> {
+    pub(crate) counts: &'a wgpu::Buffer,
+    pub(crate) sampling: &'a GpuSampling,
+    /// Index of the token this step chooses within the reply (the first
+    /// token, chosen from the prefill logits, is 0).
+    pub(crate) position: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct SamplePenaltyDims {
+    n: u32,
+    penalty: f32,
+    inv_penalty: f32,
+    _p0: u32,
+}
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct SampleFinalDims {
+    k: u32,
+    top_p: f32,
+    inv_temp: f32,
+    seed_lo: u32,
+    seed_hi: u32,
+    position: u32,
+    vocab: u32,
+    _p0: u32,
+}
+
+/// Penalty, top-k and the draw on the GPU (see `resident_sampling.rs`); the
+/// returned one-word buffer holds the chosen id. Modifies `logits` and
+/// `step.counts`. The bind groups are built per call because `counts` is the
+/// caller's buffer, not a pooled one.
+pub(crate) fn sample_gpu(engine: &Engine, pool: &Pool, pass: &mut wgpu::ComputePass<'_>, logits: &wgpu::Buffer, vocab: u32, step: &SampleStep<'_>) -> wgpu::Buffer {
+    let s = step.sampling;
+    if s.repetition_penalty != 1.0 {
+        let dims = pool.uniform("dec_sample.pen.dims", SamplePenaltyDims { n: vocab, penalty: s.repetition_penalty, inv_penalty: s.inv_penalty(), _p0: 0 });
+        let bg = engine.bind_group(
+            &engine.sample_penalty,
+            &[
+                BindGroupEntry { binding: 0, resource: logits.as_entire_binding() },
+                BindGroupEntry { binding: 1, resource: step.counts.as_entire_binding() },
+                BindGroupEntry { binding: 2, resource: dims.as_entire_binding() },
+            ],
+        );
+        engine.dispatch(pass, &engine.sample_penalty, &bg, (vocab.div_ceil(256), 1, 1), "sample_penalty");
+    }
+    let cands = topk_gpu(engine, pool, pass, "dec_sample.topk", logits, vocab);
+    let out = pool.data("dec_sample.out", 1);
+    let dims = pool.uniform(
+        "dec_sample.dims",
+        SampleFinalDims { k: s.top_k, top_p: s.top_p, inv_temp: s.inv_temp(), seed_lo: s.seed as u32, seed_hi: (s.seed >> 32) as u32, position: step.position, vocab, _p0: 0 },
+    );
+    let bg = engine.bind_group(
+        &engine.sample_final,
+        &[
+            BindGroupEntry { binding: 0, resource: cands.as_entire_binding() },
+            BindGroupEntry { binding: 1, resource: step.counts.as_entire_binding() },
+            BindGroupEntry { binding: 2, resource: out.as_entire_binding() },
+            BindGroupEntry { binding: 3, resource: dims.as_entire_binding() },
+        ],
+    );
+    engine.dispatch(pass, &engine.sample_final, &bg, (1, 1, 1), "sample_final");
+    out
+}
+
+/// Sampled decode with the choice made on the GPU: the same block pipeline
+/// as `decode_greedy_pipelined` (each step's chosen id feeds the next
+/// step's embedding on the GPU, ids are read back in blocks, steps past a
+/// stop are discarded and `cache.kv_len` is rolled back), with
+/// `sample_gpu` in place of the argmax. `first_id` is the token already
+/// chosen from the prefill logits (position 0, see
+/// `resident_sampling::sample_reference`); `history` is every id in the
+/// cache plus `first_id`, for the repetition penalty. `sampling.top_k` must
+/// be in `1..=63`. The random stream is `resident_sampling`'s, not the CPU
+/// sampler's.
+#[allow(clippy::too_many_arguments)]
+pub async fn decode_sampled_pipelined(engine: &Engine, model: &GpuModel, cache: &mut KvCache, first_id: u32, history: &[u32], max_steps: u32, sampling: &GpuSampling, cos: &wgpu::Buffer, sin: &wgpu::Buffer, mask: Option<&wgpu::Buffer>, mut on_token: impl FnMut(u32) -> bool) -> (Vec<u32>, Option<u32>) {
+    let is_stop = |id: u32| model.config.eos_token_ids.contains(&id);
+    let mut out = Vec::new();
+    if max_steps == 0 || is_stop(first_id) || !on_token(first_id) {
+        return (out, None);
+    }
+    out.push(first_id);
+    let vocab = model.config.vocab_size;
+    let mut counts_host = vec![0u32; vocab];
+    for &id in history {
+        if let Some(c) = counts_host.get_mut(id as usize) {
+            *c += 1;
+        }
+    }
+    let counts = engine.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("sample_counts"),
+        size: 4 * vocab as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    engine.queue.write_buffer(&counts, 0, bytemuck::cast_slice(&counts_host));
+    let mut blocks: VecDeque<PendingBlock> = VecDeque::new();
+    let mut prev: Option<wgpu::Buffer> = None;
+    let mut submitted = 0u32;
+    let mut consumed = 0u32;
+    loop {
+        while blocks.len() < BLOCKS_IN_FLIGHT && submitted < max_steps {
+            let n = SAMPLED_BLOCK.min(max_steps - submitted);
+            let bytes = 4 * n as u64;
+            let ring = engine.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("sample_ring"),
+                size: bytes,
+                usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let staging = engine.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("sample_staging"),
+                size: bytes,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            for slot in 0..n {
+                let stage = (slot + 1 == n).then_some((&staging, bytes));
+                let (token_id, src) = if submitted == 0 && slot == 0 { (first_id, None) } else { (0, prev.as_ref()) };
+                let step = SampleStep { counts: &counts, sampling, position: submitted + slot + 1 };
+                let idx = submit_greedy_step(engine, model, cache, token_id, src, &ring, slot, stage, cos, sin, mask, Head::Sample(&step));
+                prev = Some(idx);
+            }
+            submitted += n;
+            let rx = engine.start_map_u32(&staging);
+            blocks.push_back(PendingBlock { staging, rx });
+        }
+        let block = blocks.pop_front().expect("a block is in flight");
+        let ids = engine.finish_map_u32s(&block.staging, block.rx).await;
+        for id in ids {
+            consumed += 1;
+            if consumed == max_steps {
+                return (out, Some(id));
+            }
+            if is_stop(id) || !on_token(id) {
+                cache.kv_len -= submitted - consumed;
+                return (out, Some(id));
+            }
+            out.push(id);
+        }
     }
 }
 
 /// Appends `token_ids` onto a cache already populated up to `cache.kv_len`
 /// (typically just after `KvCache::restore` from a resident-prefix
-/// snapshot) - the "prefill(suffix)" half of KV snapshot/restore. Each token
+/// snapshot) - the "prefill(suffix)" half of KV snapshot/restore. With
+/// head_dim 64 or 128 the suffix runs as one batched prefill (`prefill_batched`:
+/// tiled matmuls, attention over the resident prefix). Otherwise each token
 /// is forced (no argmax - these are known tokens, not generated ones)
 /// through its own `decode_layers` call/submit, exactly `forward_decode_step`'s
 /// shape, except intermediate tokens' logits are never read back (nothing
 /// needs them) - only the *last* token's logits are, matching
 /// `forward_prefill`'s "returns the last position's logits" contract.
 ///
-/// **Deliberately one submit per token, not one encoder/submit for the
-/// whole suffix.** An earlier version of this function batched every
+/// **In that fallback, deliberately one submit per token, not one
+/// encoder/submit for the whole suffix.** An earlier version of this function batched every
 /// token's `decode_layers` call into a single encoder before one submit, to
 /// save dispatch/submit overhead. That hung on native (Metal) with no CPU
 /// spin and no error: `Pool`'s per-call-site uniform buffers (`RopeDims`'s
@@ -2390,15 +2849,18 @@ pub async fn decode_greedy_pipelined(engine: &Engine, model: &GpuModel, cache: &
 /// dispatches that depend on it run, at the cost of `token_ids.len()`
 /// submits instead of 1 (still zero *readbacks* except the last).
 pub async fn forward_prefill_suffix(engine: &Engine, model: &GpuModel, cache: &mut KvCache, token_ids: &[u32], cos: &wgpu::Buffer, sin: &wgpu::Buffer, mask: Option<&wgpu::Buffer>) -> Vec<f32> {
+    if matches!(model.config.head_dim, 64 | 128) {
+        return prefill_batched(engine, model, cache, token_ids, cos, sin, mask).await;
+    }
     let (last, rest) = token_ids.split_last().expect("forward_prefill_suffix needs at least one token");
     for &tok in rest {
         let mut encoder = engine.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("prefill_suffix_step") });
-        let _ = decode_layers(engine, model, &mut encoder, cache, tok, None, cos, sin, None, false);
+        let _ = decode_layers(engine, model, &mut encoder, cache, tok, None, cos, sin, None, Head::Logits);
         engine.queue.submit(Some(encoder.finish()));
         cache.kv_len += 1;
     }
     let mut encoder = engine.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("prefill_suffix_last") });
-    let (logits, _) = decode_layers(engine, model, &mut encoder, cache, *last, None, cos, sin, mask, false);
+    let (logits, _) = decode_layers(engine, model, &mut encoder, cache, *last, None, cos, sin, mask, Head::Logits);
     engine.queue.submit(Some(encoder.finish()));
     cache.kv_len += 1;
     engine.read_buffer(&logits, model.config.vocab_size).await
@@ -2463,7 +2925,7 @@ pub async fn forward_chunk_spec(engine: &Engine, model: &GpuModel, cache: &mut K
         let key = format!("chunk_layer{i}");
         let lora_layer = model.lora.as_ref().map(|l| &l.layers[i]);
         let normed = rmsnorm(engine, pool, &mut pass, &format!("{key}.norm"), &x, &layer.attn_norm, t, hidden, cfg.rms_norm_eps);
-        let (q, k, v) = qkv_proj(engine, pool, &mut pass, &format!("{key}.qkv"), &normed, t, cfg, layer, model.fast_kernels, lora_layer);
+        let (q, k, v) = qkv_proj(engine, pool, &mut pass, &format!("{key}.qkv"), &normed, t, cfg, layer, model.fast_kernels, lora_layer, false);
         rope_positions(engine, pool, &mut pass, &format!("{key}.ropeq"), &q, cos, sin, &pos_buf, t, cfg.num_heads as u32, cfg.head_dim as u32);
         rope_positions(engine, pool, &mut pass, &format!("{key}.ropek"), &k, cos, sin, &pos_buf, t, cfg.num_kv_heads as u32, cfg.head_dim as u32);
 

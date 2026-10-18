@@ -32,6 +32,7 @@ mod gguf;
 mod lora;
 pub mod model;
 mod pool;
+pub mod resident_sampling;
 pub mod profile_report;
 mod quant;
 

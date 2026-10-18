@@ -13,6 +13,7 @@
 //!
 //! ```sh
 //! LEAN_GGUF_LLAMA_1_7B_Q8_0=/path/to/SmolLM2-1.7B-Instruct-Q8_0.gguf \
+//! LEAN_GGUF_LLAMA_1_7B_Q4_0=/path/to/SmolLM2-1.7B-Instruct-Q4_0.gguf \
 //! LEAN_TOKENIZER_DIR_LLAMA_1_7B=/path/to/SmolLM2-1.7B-Instruct \
 //! cargo test -p lean-core --release -- --ignored fixture_parity_llama_1_7b
 //! ```
@@ -58,7 +59,14 @@ fn argmax(logits: &[f32]) -> u32 {
 
 fn run_fixture(engine: &Engine, gguf_path: &str, fixture_json: &str, tokenizer: &Tokenizer, chat_template: &lean_chat::ChatTemplate) {
     let fixture: Fixture = serde_json::from_str(fixture_json).expect("parsing fixture json");
-    let model = GpuModel::load(engine, gguf_path, false).expect("loading model");
+    for fast in [false, true] {
+        run_fixture_with(engine, gguf_path, &fixture, tokenizer, chat_template, fast);
+    }
+}
+
+fn run_fixture_with(engine: &Engine, gguf_path: &str, fixture: &Fixture, tokenizer: &Tokenizer, chat_template: &lean_chat::ChatTemplate, fast: bool) {
+    let model = GpuModel::load(engine, gguf_path, fast).expect("loading model");
+    let mut max_diff = 0f32;
 
     for case in &fixture.cases {
         if !case.no_retokenize {
@@ -83,7 +91,8 @@ fn run_fixture(engine: &Engine, gguf_path: &str, fixture_json: &str, tokenizer: 
         assert_eq!(top20[0].0, case.prefill_top20.ids[0], "[gguf={gguf_path} case={}] prefill top1 mismatch", case.name);
         for (i, &id) in case.prefill_top20.ids.iter().enumerate() {
             let diff = (logits[id as usize] - case.prefill_top20.values[i]).abs();
-            assert!(diff < 1e-3, "[gguf={gguf_path} case={}] top20 id {id} diff {diff} >= 1e-3", case.name);
+            max_diff = max_diff.max(diff);
+            assert!(diff < 1e-3, "[gguf={gguf_path} fast={fast} case={}] top20 id {id} diff {diff} >= 1e-3", case.name);
         }
 
         let mut got_tokens = Vec::with_capacity(case.greedy_continuation.len());
@@ -92,8 +101,9 @@ fn run_fixture(engine: &Engine, gguf_path: &str, fixture_json: &str, tokenizer: 
             got_tokens.push(next_id);
             logits = pollster::block_on(forward_decode_step(engine, &model, &mut cache, next_id, &cos_buf, &sin_buf, None));
         }
-        assert_eq!(got_tokens, case.greedy_continuation, "[gguf={gguf_path} case={}] greedy continuation mismatch", case.name);
+        assert_eq!(got_tokens, case.greedy_continuation, "[gguf={gguf_path} fast={fast} case={}] greedy continuation mismatch", case.name);
     }
+    println!("[gguf={gguf_path} fast={fast}] max |prefill top-20 logit - HF| = {max_diff:.3e}");
 }
 
 #[test]
@@ -102,9 +112,18 @@ fn fixture_parity_llama_1_7b() {
     let tokenizer_dir = std::env::var("LEAN_TOKENIZER_DIR_LLAMA_1_7B").expect("set LEAN_TOKENIZER_DIR_LLAMA_1_7B to run this test");
     let tokenizer = Tokenizer::from_file(format!("{tokenizer_dir}/tokenizer.json")).expect("loading tokenizer.json");
     let chat_template = read_chat_template(&format!("{tokenizer_dir}/tokenizer_config.json")).expect("reading chat_template");
+    // The reference path: F32 kernels only, whatever the adapter grants.
+    std::env::set_var("LEAN_F16", "0");
     let engine = Engine::new().expect("wgpu engine init");
 
     let q8_gguf = std::env::var("LEAN_GGUF_LLAMA_1_7B_Q8_0").expect("set LEAN_GGUF_LLAMA_1_7B_Q8_0 to run this test");
     let q8_fixture = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/reference/fixture_llama_1_7b_q8_0.json")).expect("reading fixture_llama_1_7b_q8_0.json");
     run_fixture(&engine, &q8_gguf, &q8_fixture, &tokenizer, &chat_template);
+
+    // The "Q4_0" file mixes Q4_0 with 3 Q4_1 `ffn_down` tensors and a Q6_K
+    // tied embedding / output tensor.
+    if let Ok(q4_gguf) = std::env::var("LEAN_GGUF_LLAMA_1_7B_Q4_0") {
+        let q4_fixture = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/reference/fixture_llama_1_7b_q4_0.json")).expect("reading fixture_llama_1_7b_q4_0.json");
+        run_fixture(&engine, &q4_gguf, &q4_fixture, &tokenizer, &chat_template);
+    }
 }

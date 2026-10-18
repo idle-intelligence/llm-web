@@ -5,7 +5,7 @@
 // values packed 4 per u32 (8 words, two vec4<u32> loads per block), one
 // scale per block. Same bindings/Dims contract as linear_q8.wgsl.
 //
-// GATE_UP (pipeline override, `linear_q8_decode_swiglu_r4` in engine.rs): as
+// GATE_UP (build constant, `linear_q8_decode_swiglu_r4` in engine.rs): as
 // in linear_q4_decode_r4.wgsl, a group takes gate rows j, j+1 and up rows
 // inter+j, inter+j+1 and writes silu(gate) * up for those 2 j.
 struct Dims {
@@ -32,7 +32,7 @@ const WG_SIZE: u32 = 64u;
 const LANES: u32 = 8u;
 const GROUPS: u32 = 8u; // WG_SIZE / LANES, 4 rows each
 
-override GATE_UP: bool = false;
+const GATE_UP: bool = false;
 
 var<workgroup> partial_sums: array<vec4<f32>, WG_SIZE>;
 

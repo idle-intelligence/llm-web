@@ -21,7 +21,7 @@ use anyhow::{Context, Result};
 use std::io::{Read, Seek};
 
 use crate::config::{config_from_gguf, Architecture, Qwen2Config};
-use crate::cpu_kernels::{dot_q4_0, dot_q6_k, dot_q8_0, F4};
+use crate::cpu_kernels::{dot_bf16, dot_f16, dot_q4_0, dot_q4_k, dot_q5_0, dot_q6_k, dot_q8_0, matvec_q, F4};
 use crate::gguf::{dequantize_for, GgmlDtype, GgufReader};
 use crate::model::{rope_inv_freq, unpermute_rope_rows};
 
@@ -37,6 +37,11 @@ pub(crate) enum CpuWeight {
     Q4_0 { bytes: Vec<u8>, out_dim: usize, in_dim: usize, blocks_per_row: usize },
     Q8_0 { bytes: Vec<u8>, out_dim: usize, in_dim: usize, blocks_per_row: usize },
     Q6_K { bytes: Vec<u8>, out_dim: usize, in_dim: usize, blocks_per_row: usize },
+    Q5_0 { bytes: Vec<u8>, out_dim: usize, in_dim: usize, blocks_per_row: usize },
+    Q4_K { bytes: Vec<u8>, out_dim: usize, in_dim: usize, blocks_per_row: usize },
+    /// F16 and BF16 rows stay at two bytes per value.
+    F16 { bytes: Vec<u8>, out_dim: usize, in_dim: usize },
+    BF16 { bytes: Vec<u8>, out_dim: usize, in_dim: usize },
 }
 
 impl CpuWeight {
@@ -45,7 +50,11 @@ impl CpuWeight {
             CpuWeight::F32 { out_dim, in_dim, .. } => (*out_dim, *in_dim),
             CpuWeight::Q4_0 { out_dim, in_dim, .. } => (*out_dim, *in_dim),
             CpuWeight::Q8_0 { out_dim, in_dim, .. } => (*out_dim, *in_dim),
-            CpuWeight::Q6_K { out_dim, in_dim, .. } => (*out_dim, *in_dim),
+            CpuWeight::Q6_K { out_dim, in_dim, .. }
+            | CpuWeight::Q5_0 { out_dim, in_dim, .. }
+            | CpuWeight::Q4_K { out_dim, in_dim, .. }
+            | CpuWeight::F16 { out_dim, in_dim, .. }
+            | CpuWeight::BF16 { out_dim, in_dim, .. } => (*out_dim, *in_dim),
         }
     }
 
@@ -72,11 +81,36 @@ impl CpuWeight {
                 let bytes_per_row = blocks_per_row * 210;
                 dot_q6_k(&bytes[row * bytes_per_row..(row + 1) * bytes_per_row], x)
             }
+            CpuWeight::Q5_0 { bytes, blocks_per_row, .. } => {
+                let bytes_per_row = blocks_per_row * 22;
+                dot_q5_0(&bytes[row * bytes_per_row..(row + 1) * bytes_per_row], x)
+            }
+            CpuWeight::Q4_K { bytes, blocks_per_row, .. } => {
+                let bytes_per_row = blocks_per_row * 144;
+                dot_q4_k(&bytes[row * bytes_per_row..(row + 1) * bytes_per_row], x)
+            }
+            CpuWeight::F16 { bytes, in_dim, .. } => dot_f16(&bytes[row * in_dim * 2..(row + 1) * in_dim * 2], x),
+            CpuWeight::BF16 { bytes, in_dim, .. } => dot_bf16(&bytes[row * in_dim * 2..(row + 1) * in_dim * 2], x),
         }
     }
 }
 
 impl CpuWeight {
+    /// Rows `cols` dotted against `x` into `out` (`out.len() == cols.len()`),
+    /// each element bit for bit `dot_row` of its row. Q4_0 and Q8_0 go
+    /// through `matvec_q`, four rows per pass.
+    fn dot_cols(&self, cols: std::ops::Range<usize>, x: &[f32], out: &mut [f32]) {
+        match self {
+            CpuWeight::Q4_0 { bytes, blocks_per_row, .. } => matvec_q::<true>(bytes, blocks_per_row * 18, x, cols, out),
+            CpuWeight::Q8_0 { bytes, blocks_per_row, .. } => matvec_q::<false>(bytes, blocks_per_row * 34, x, cols, out),
+            _ => {
+                for (o, c) in out.iter_mut().zip(cols) {
+                    *o = self.dot_row(c, x);
+                }
+            }
+        }
+    }
+
     /// Output row `row`'s weights as f32 into `out` (`out.len() == in_dim`),
     /// the same per-element values as `gguf::dequantize_for` (`(q - 8) *
     /// scale` for Q4_0, `q * scale` for Q8_0).
@@ -107,6 +141,16 @@ impl CpuWeight {
                 let n = blocks_per_row * 210;
                 out.copy_from_slice(&crate::gguf::dequantize_q6_k(&bytes[row * n..(row + 1) * n], out.len()));
             }
+            CpuWeight::Q5_0 { bytes, blocks_per_row, .. } => {
+                let n = blocks_per_row * 22;
+                out.copy_from_slice(&crate::gguf::dequantize_q5_0(&bytes[row * n..(row + 1) * n], out.len()));
+            }
+            CpuWeight::Q4_K { bytes, blocks_per_row, .. } => {
+                let n = blocks_per_row * 144;
+                out.copy_from_slice(&crate::gguf::dequantize_q4_k(&bytes[row * n..(row + 1) * n], out.len()));
+            }
+            CpuWeight::F16 { bytes, in_dim, .. } => out.copy_from_slice(&crate::gguf::dequantize_f16(&bytes[row * in_dim * 2..(row + 1) * in_dim * 2], *in_dim)),
+            CpuWeight::BF16 { bytes, in_dim, .. } => out.copy_from_slice(&crate::gguf::dequantize_bf16(&bytes[row * in_dim * 2..(row + 1) * in_dim * 2], *in_dim)),
         }
     }
 }
@@ -275,10 +319,10 @@ fn linear_serial(x: &[f32], rows: usize, in_dim: usize, w: &CpuWeight, b: &[f32]
     debug_assert_eq!(w_out, out_dim);
     debug_assert_eq!(w_in, in_dim);
     let mut out = vec![0f32; rows * out_dim];
-    for r in 0..rows {
-        let xr = &x[r * in_dim..(r + 1) * in_dim];
-        for c in 0..out_dim {
-            out[r * out_dim + c] = w.dot_row(c, xr) + b[c];
+    for (xr, o) in x.chunks_exact(in_dim).zip(out.chunks_exact_mut(out_dim)) {
+        w.dot_cols(0..out_dim, xr, o);
+        for (o, bc) in o.iter_mut().zip(b) {
+            *o += bc;
         }
     }
     out
@@ -323,10 +367,12 @@ fn linear_threads(x: &[f32], rows: usize, in_dim: usize, w: &CpuWeight, b: &[f32
         let mut out = vec![0f32; out_dim];
         let ptr = OutPtr(out.as_mut_ptr());
         let item = |i: usize| {
-            let c0 = i * TEAM_ITEM;
-            for (c, bc) in b.iter().enumerate().take(((i + 1) * TEAM_ITEM).min(out_dim)).skip(c0) {
-                // SAFETY: `c < out_dim`, and each `c` belongs to one item.
-                unsafe { *ptr.get().add(c) = w.dot_row(c, x) + bc };
+            let (c0, c1) = (i * TEAM_ITEM, ((i + 1) * TEAM_ITEM).min(out_dim));
+            // SAFETY: `c0..c1` lies inside `out`, and each column belongs to one item.
+            let o = unsafe { std::slice::from_raw_parts_mut(ptr.get().add(c0), c1 - c0) };
+            w.dot_cols(c0..c1, x, o);
+            for (o, bc) in o.iter_mut().zip(&b[c0..c1]) {
+                *o += bc;
             }
         };
         if crate::cpu_team::team_for(out_dim.div_ceil(TEAM_ITEM), &item) {
@@ -427,6 +473,10 @@ enum CpuEmbed {
     Q4_0 { bytes: Vec<u8>, blocks_per_row: usize, hidden: usize },
     Q8_0 { bytes: Vec<u8>, blocks_per_row: usize, hidden: usize },
     Q6_K { bytes: Vec<u8>, blocks_per_row: usize, hidden: usize },
+    Q5_0 { bytes: Vec<u8>, blocks_per_row: usize, hidden: usize },
+    Q4_K { bytes: Vec<u8>, blocks_per_row: usize, hidden: usize },
+    F16 { bytes: Vec<u8>, hidden: usize },
+    BF16 { bytes: Vec<u8>, hidden: usize },
 }
 
 impl CpuEmbed {
@@ -449,6 +499,24 @@ impl CpuEmbed {
                 let bytes_per_row = blocks_per_row * 210;
                 let start = token_id as usize * bytes_per_row;
                 crate::gguf::dequantize_q6_k(&bytes[start..start + bytes_per_row], *hidden)
+            }
+            CpuEmbed::Q5_0 { bytes, blocks_per_row, hidden } => {
+                let bytes_per_row = blocks_per_row * 22;
+                let start = token_id as usize * bytes_per_row;
+                crate::gguf::dequantize_q5_0(&bytes[start..start + bytes_per_row], *hidden)
+            }
+            CpuEmbed::Q4_K { bytes, blocks_per_row, hidden } => {
+                let bytes_per_row = blocks_per_row * 144;
+                let start = token_id as usize * bytes_per_row;
+                crate::gguf::dequantize_q4_k(&bytes[start..start + bytes_per_row], *hidden)
+            }
+            CpuEmbed::F16 { bytes, hidden } => {
+                let start = token_id as usize * hidden * 2;
+                crate::gguf::dequantize_f16(&bytes[start..start + hidden * 2], *hidden)
+            }
+            CpuEmbed::BF16 { bytes, hidden } => {
+                let start = token_id as usize * hidden * 2;
+                crate::gguf::dequantize_bf16(&bytes[start..start + hidden * 2], *hidden)
             }
         }
     }
@@ -494,6 +562,10 @@ fn weight_from_bytes(bytes: Vec<u8>, dtype: GgmlDtype, out_dim: usize, in_dim: u
         GgmlDtype::Q4_0 => CpuWeight::Q4_0 { bytes, out_dim, in_dim, blocks_per_row: in_dim / 32 },
         GgmlDtype::Q8_0 => CpuWeight::Q8_0 { bytes, out_dim, in_dim, blocks_per_row: in_dim / 32 },
         GgmlDtype::Q6_K => CpuWeight::Q6_K { bytes, out_dim, in_dim, blocks_per_row: in_dim / 256 },
+        GgmlDtype::Q5_0 => CpuWeight::Q5_0 { bytes, out_dim, in_dim, blocks_per_row: in_dim / 32 },
+        GgmlDtype::Q4_K => CpuWeight::Q4_K { bytes, out_dim, in_dim, blocks_per_row: in_dim / 256 },
+        GgmlDtype::F16 if in_dim.is_multiple_of(4) => CpuWeight::F16 { bytes, out_dim, in_dim },
+        GgmlDtype::BF16 if in_dim.is_multiple_of(4) => CpuWeight::BF16 { bytes, out_dim, in_dim },
         other => CpuWeight::F32 { data: dequantize_for(other, &bytes, out_dim * in_dim), out_dim, in_dim },
     }
 }
@@ -548,21 +620,20 @@ impl CpuModel {
         let embed_shape = embed_info.shape();
         let embed_dtype = embed_info.dtype();
         anyhow::ensure!(
-            matches!(embed_dtype, GgmlDtype::Q4_0 | GgmlDtype::Q8_0 | GgmlDtype::Q6_K),
-            "expected token_embd.weight to be Q4_0, Q8_0 or Q6_K, got {embed_dtype:?}"
+            matches!(embed_dtype, GgmlDtype::Q4_0 | GgmlDtype::Q5_0 | GgmlDtype::Q8_0 | GgmlDtype::Q4_K | GgmlDtype::Q6_K | GgmlDtype::F16 | GgmlDtype::BF16),
+            "token_embd.weight: {embed_dtype:?} is not supported as an embedding table (Q4_0, Q5_0, Q8_0, Q4_K, Q6_K, F16 and BF16 are)"
         );
         let hidden = embed_shape[1];
         let embed_bytes = reader.tensor_data("token_embd.weight")?;
-        let tied_lm_head = config.tied_embeddings.then(|| match embed_dtype {
-            GgmlDtype::Q4_0 => CpuWeight::Q4_0 { bytes: embed_bytes.clone(), out_dim: embed_shape[0], in_dim: hidden, blocks_per_row: hidden / 32 },
-            GgmlDtype::Q8_0 => CpuWeight::Q8_0 { bytes: embed_bytes.clone(), out_dim: embed_shape[0], in_dim: hidden, blocks_per_row: hidden / 32 },
-            GgmlDtype::Q6_K => CpuWeight::Q6_K { bytes: embed_bytes.clone(), out_dim: embed_shape[0], in_dim: hidden, blocks_per_row: hidden / 256 },
-            _ => unreachable!(),
-        });
+        let tied_lm_head = config.tied_embeddings.then(|| weight_from_bytes(embed_bytes.clone(), embed_dtype, embed_shape[0], hidden));
         let embed = match embed_dtype {
             GgmlDtype::Q4_0 => CpuEmbed::Q4_0 { bytes: embed_bytes, blocks_per_row: hidden / 32, hidden },
+            GgmlDtype::Q5_0 => CpuEmbed::Q5_0 { bytes: embed_bytes, blocks_per_row: hidden / 32, hidden },
             GgmlDtype::Q8_0 => CpuEmbed::Q8_0 { bytes: embed_bytes, blocks_per_row: hidden / 32, hidden },
+            GgmlDtype::Q4_K => CpuEmbed::Q4_K { bytes: embed_bytes, blocks_per_row: hidden / 256, hidden },
             GgmlDtype::Q6_K => CpuEmbed::Q6_K { bytes: embed_bytes, blocks_per_row: hidden / 256, hidden },
+            GgmlDtype::F16 => CpuEmbed::F16 { bytes: embed_bytes, hidden },
+            GgmlDtype::BF16 => CpuEmbed::BF16 { bytes: embed_bytes, hidden },
             _ => unreachable!(),
         };
 
@@ -1029,6 +1100,26 @@ mod threads_tests {
         let single = linear_with_pool(1, &x, 1, in_dim, &w, &b, out_dim);
         let threaded = linear_with_pool(8, &x, 1, in_dim, &w, &b, out_dim);
         assert_eq!(single, threaded, "Q4_0 decode-shaped linear diverged under threads");
+    }
+
+    #[test]
+    fn q8_0_odd_width_threads_match_single_thread() {
+        // 4 * 32 + 7 columns: four-row groups plus a three-row tail, split
+        // differently by the serial and the threaded paths.
+        let (out_dim, in_dim) = (135, 256);
+        let blocks_per_row = in_dim / 32;
+        let mut bytes: Vec<u8> = (0..out_dim * blocks_per_row * 34).map(|i| ((i as u32 * 13 + 7) % 256) as u8).collect();
+        for blk in 0..out_dim * blocks_per_row {
+            bytes[blk * 34..blk * 34 + 2].copy_from_slice(&half::f16::from_f32(0.01 + (blk % 3) as f32 * 0.005).to_le_bytes());
+        }
+        let w = CpuWeight::Q8_0 { bytes, out_dim, in_dim, blocks_per_row };
+        let b: Vec<f32> = (0..out_dim).map(|c| c as f32 * 0.001).collect();
+        let x = synth_x(in_dim, 5);
+        let single = linear_with_pool(1, &x, 1, in_dim, &w, &b, out_dim);
+        for n in [2usize, 3, 8] {
+            let threaded = linear_with_pool(n, &x, 1, in_dim, &w, &b, out_dim);
+            assert_eq!(single, threaded, "n_threads={n}: Q8_0 odd-width decode-shaped linear diverged under threads");
+        }
     }
 
     #[test]

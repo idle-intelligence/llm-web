@@ -1,4 +1,4 @@
-//! GPU residency for Q4_0/Q8_0/Q6_K/F32 matmul weights, ported from
+//! GPU residency for Q4_0/Q4_1/Q8_0/Q6_K/F32 matmul weights, ported from
 //! `t0-web/crates/t0-fast/src/quant.rs`: the block's f16 scale is decoded to
 //! f32 once host-side into its own buffer, and the quantized nibbles/bytes
 //! are packed 4/u32 so WGSL reads them as `array<u32>` without a
@@ -16,6 +16,9 @@ const QK: usize = 32;
 /// comment for the block layout this repacks.
 const QK6K: usize = 256;
 const Q6K_BLOCK_BYTES: usize = 210;
+/// Q4_K's super-block width and size in bytes.
+const QK4K: usize = 256;
+const Q4K_BLOCK_BYTES: usize = 144;
 
 /// One row-range of a matmul weight, GPU-resident. `row_start`/`rows` are in
 /// units of the weight's `out_dim` (GGUF/PyTorch `shape[0]`) - the same axis
@@ -25,6 +28,11 @@ const Q6K_BLOCK_BYTES: usize = 210;
 pub struct QChunk {
     pub qs: wgpu::Buffer,
     pub scales: wgpu::Buffer,
+    /// Block metadata for Q5_0 (the high bit word of each block) and Q4_K
+    /// (the packed 6-bit scales and mins of each super-block); `None` for
+    /// the other formats. Bound as the `aux` binding of the Q4_0-family
+    /// kernels.
+    pub aux: Option<wgpu::Buffer>,
     pub row_start: u32,
     pub rows: u32,
 }
@@ -42,24 +50,55 @@ pub struct QChunk6K {
     pub rows: u32,
 }
 
+/// One row-range of an F16 or BF16 weight kept at two bytes per value, packed
+/// two per u32 (the on-disk bytes as little-endian words).
+pub struct QChunkHalf {
+    pub w: wgpu::Buffer,
+    pub row_start: u32,
+    pub rows: u32,
+}
+
 #[allow(non_camel_case_types)]
 pub enum MatMulWeight {
     F32 { w: wgpu::Buffer },
     Q8_0 { chunks: Vec<QChunk>, blocks_per_row: u32, out_dim: u32 },
     Q4_0 { chunks: Vec<QChunk>, blocks_per_row: u32, out_dim: u32 },
+    /// Same nibble layout as Q4_0; each chunk's `scales` holds `[d, m]` f32
+    /// pairs per block (2 floats per block), and a value is `nibble * d + m`.
+    Q4_1 { chunks: Vec<QChunk>, blocks_per_row: u32, out_dim: u32 },
     Q6_K { chunks: Vec<QChunk6K>, blocks_per_row: u32, out_dim: u32 },
+    /// Q4_0's nibble layout plus one high-bit word per block in `aux`;
+    /// `scales` holds d per block.
+    Q5_0 { chunks: Vec<QChunk>, blocks_per_row: u32, out_dim: u32 },
+    /// 32-value blocks with Q4_0's nibble layout (`blocks_per_row` counts
+    /// those, 8 per super-block); `scales` holds `[d, dmin]` per super-block
+    /// and `aux` its 12 packed scale bytes as 3 u32.
+    Q4_K { chunks: Vec<QChunk>, blocks_per_row: u32, out_dim: u32 },
+    /// F16 weights, resident at two bytes per value. `in_dim` is a multiple of 32.
+    F16 { chunks: Vec<QChunkHalf>, out_dim: u32 },
+    /// BF16 weights, resident at two bytes per value. `in_dim` is a multiple of 32.
+    BF16 { chunks: Vec<QChunkHalf>, out_dim: u32 },
 }
 
 impl MatMulWeight {
     pub fn gpu_bytes(&self) -> u64 {
         match self {
             MatMulWeight::F32 { w } => w.size(),
-            MatMulWeight::Q8_0 { chunks, .. } | MatMulWeight::Q4_0 { chunks, .. } => {
-                chunks.iter().map(|c| c.qs.size() + c.scales.size()).sum()
-            }
+            MatMulWeight::Q8_0 { chunks, .. }
+            | MatMulWeight::Q4_0 { chunks, .. }
+            | MatMulWeight::Q4_1 { chunks, .. }
+            | MatMulWeight::Q5_0 { chunks, .. }
+            | MatMulWeight::Q4_K { chunks, .. } => chunks.iter().map(|c| c.qs.size() + c.scales.size() + c.aux.as_ref().map_or(0, |a| a.size())).sum(),
+            MatMulWeight::F16 { chunks, .. } | MatMulWeight::BF16 { chunks, .. } => chunks.iter().map(|c| c.w.size()).sum(),
             MatMulWeight::Q6_K { chunks, .. } => chunks.iter().map(|c| c.ql.size() + c.qh.size() + c.scales.size() + c.d.size()).sum(),
         }
     }
+}
+
+/// Packs a stream of 16-bit values (F16 or BF16 weights) two per u32, the
+/// first in the low half: the on-disk bytes as little-endian words.
+fn pack_halves(bytes: &[u8]) -> Vec<u32> {
+    bytes.chunks(4).map(|c| u32::from_le_bytes([c[0], c[1], c.get(2).copied().unwrap_or(0), c.get(3).copied().unwrap_or(0)])).collect()
 }
 
 fn split_q8_blocks(bytes: &[u8], n_elements: usize) -> (Vec<u32>, Vec<f32>) {
@@ -94,13 +133,96 @@ fn split_q4_blocks(bytes: &[u8], n_elements: usize) -> (Vec<u32>, Vec<f32>) {
     (qs, scales)
 }
 
-/// Splits `bytes` (row-major, block-contiguous Q4_0/Q8_0 data for a
+/// Q5_0 block (f16 `d`, 4 high-bit bytes, 16 nibble bytes): the nibbles
+/// repack exactly as in `split_q4_blocks`, `d` is decoded to f32, and the
+/// block's high-bit bytes become one little-endian u32 (bit j is value j's
+/// fifth bit).
+fn split_q5_0_blocks(bytes: &[u8], n_elements: usize) -> (Vec<u32>, Vec<f32>, Vec<u32>) {
+    let n_blocks = n_elements / QK;
+    let mut qs = vec![0u32; n_blocks * 4];
+    let mut scales = vec![0f32; n_blocks];
+    let mut qh = vec![0u32; n_blocks];
+    for (bi, block) in bytes.as_chunks::<22>().0.iter().enumerate() {
+        scales[bi] = half::f16::from_le_bytes([block[0], block[1]]).to_f32();
+        qh[bi] = u32::from_le_bytes([block[2], block[3], block[4], block[5]]);
+        for byte_i in 0..QK / 2 {
+            qs[bi * 4 + byte_i / 4] |= (block[6 + byte_i] as u32) << ((byte_i % 4) * 8);
+        }
+    }
+    (qs, scales, qh)
+}
+
+/// Q4_K super-block (f16 `d`, f16 `dmin`, 12 scale bytes, 128 nibble bytes):
+/// each of its eight 32-value sub-blocks is rewritten as a Q4_0-layout block
+/// (low nibble j -> value j, high nibble j -> value j + 16; on disk the 32
+/// bytes of a sub-block pair hold sub-block `2i` in their low nibbles and
+/// `2i + 1` in their high nibbles). `aux` gets 5 u32 per super-block: the f16
+/// bits of d and dmin in one word, then the eight 6-bit scales and the eight
+/// 6-bit mins (unpacked from the 12 bytes, ggml's `get_scale_min_k4`) as
+/// bytes, 4 per word. That is 148 bytes per 256 values with nothing left to
+/// unpack in the shader but a shift and a mask. `scales` is a one-element
+/// placeholder for the shared binding layout.
+fn split_q4_k_blocks(bytes: &[u8], n_elements: usize) -> (Vec<u32>, Vec<f32>, Vec<u32>) {
+    let n_super = n_elements / QK4K;
+    let mut qs = vec![0u32; n_super * 32];
+    let mut aux = vec![0u32; n_super * 5];
+    for (si, block) in bytes.as_chunks::<Q4K_BLOCK_BYTES>().0.iter().enumerate() {
+        aux[5 * si] = u32::from_le_bytes([block[0], block[1], block[2], block[3]]);
+        let packed = &block[4..16];
+        for sub in 0..8 {
+            let (sc, mn) = crate::gguf::q4_k_scale_min(sub, packed);
+            aux[5 * si + 1 + sub / 4] |= (sc as u32) << (8 * (sub % 4));
+            aux[5 * si + 3 + sub / 4] |= (mn as u32) << (8 * (sub % 4));
+        }
+        let nibbles = &block[16..144];
+        for sub in 0..8 {
+            let group = &nibbles[(sub / 2) * 32..(sub / 2) * 32 + 32];
+            let shift = 4 * (sub % 2);
+            let nib = |j: usize| ((group[j] >> shift) & 0xF) as u32;
+            for byte_i in 0..16 {
+                let byte = nib(byte_i) | (nib(byte_i + 16) << 4);
+                qs[(si * 8 + sub) * 4 + byte_i / 4] |= byte << ((byte_i % 4) * 8);
+            }
+        }
+    }
+    (qs, vec![0f32], aux)
+}
+
+#[derive(Clone, Copy)]
+#[allow(non_camel_case_types)]
+enum ChunkKind {
+    Q8_0,
+    Q4_0,
+    Q4_1,
+    Q5_0,
+    Q4_K,
+}
+
+/// Q4_1 block (2 f16 `d`, `m` + 16 nibble bytes): the nibbles repack exactly
+/// as in `split_q4_blocks`; `d` and `m` are decoded to f32 and stored
+/// interleaved, `scales[2 * block] = d`, `scales[2 * block + 1] = m`.
+fn split_q4_1_blocks(bytes: &[u8], n_elements: usize) -> (Vec<u32>, Vec<f32>) {
+    let n_blocks = n_elements / QK;
+    let mut qs = vec![0u32; n_blocks * 4];
+    let mut scales = vec![0f32; n_blocks * 2];
+    for (bi, block) in bytes.as_chunks::<20>().0.iter().enumerate() {
+        scales[2 * bi] = half::f16::from_le_bytes([block[0], block[1]]).to_f32();
+        scales[2 * bi + 1] = half::f16::from_le_bytes([block[2], block[3]]).to_f32();
+        for byte_i in 0..QK / 2 {
+            let byte = block[4 + byte_i] as u32;
+            qs[bi * 4 + byte_i / 4] |= byte << ((byte_i % 4) * 8);
+        }
+    }
+    (qs, scales)
+}
+
+/// Splits `bytes` (row-major, block-contiguous Q4_0/Q4_1/Q8_0 data for a
 /// `[out_dim, in_dim]` weight) into row-aligned chunks no larger than the
 /// device's `max_storage_buffer_binding_size`, uploading each chunk's `qs`/
 /// `scales` as its own pair of buffers. General mechanism (not special-cased
 /// to any one tensor) - a weight that already fits in one binding gets
 /// exactly one chunk, identical to the pre-chunking layout.
-fn chunk_rows(engine: &Engine, label: &str, bytes: &[u8], out_dim: usize, blocks_per_row: usize, bytes_per_row: usize, is_q8: bool) -> anyhow::Result<Vec<QChunk>> {
+fn chunk_rows(engine: &Engine, label: &str, bytes: &[u8], out_dim: usize, blocks_per_row: usize, bytes_per_row: usize, kind: ChunkKind) -> anyhow::Result<Vec<QChunk>> {
     let limit = engine.max_storage_buffer_binding_size() as usize;
     anyhow::ensure!(
         bytes_per_row <= limit,
@@ -114,17 +236,57 @@ fn chunk_rows(engine: &Engine, label: &str, bytes: &[u8], out_dim: usize, blocks
         let byte_start = row_start * bytes_per_row;
         let byte_end = byte_start + rows * bytes_per_row;
         let n_elements = rows * blocks_per_row * QK;
-        let (qs, scales) = if is_q8 {
-            split_q8_blocks(&bytes[byte_start..byte_end], n_elements)
-        } else {
-            split_q4_blocks(&bytes[byte_start..byte_end], n_elements)
+        let src = &bytes[byte_start..byte_end];
+        let (qs, scales, aux) = match kind {
+            ChunkKind::Q8_0 => {
+                let (qs, scales) = split_q8_blocks(src, n_elements);
+                (qs, scales, None)
+            }
+            ChunkKind::Q4_0 => {
+                let (qs, scales) = split_q4_blocks(src, n_elements);
+                (qs, scales, None)
+            }
+            ChunkKind::Q4_1 => {
+                let (qs, scales) = split_q4_1_blocks(src, n_elements);
+                (qs, scales, None)
+            }
+            ChunkKind::Q5_0 => {
+                let (qs, scales, aux) = split_q5_0_blocks(src, n_elements);
+                (qs, scales, Some(aux))
+            }
+            ChunkKind::Q4_K => {
+                let (qs, scales, aux) = split_q4_k_blocks(src, n_elements);
+                (qs, scales, Some(aux))
+            }
         };
         chunks.push(QChunk {
             qs: engine.buf_u32(&qs, &format!("{label}.qs[{row_start}]")),
             scales: engine.buf_f32(&scales, &format!("{label}.scales[{row_start}]")),
+            aux: aux.map(|a| engine.buf_u32(&a, &format!("{label}.aux[{row_start}]"))),
             row_start: row_start as u32,
             rows: rows as u32,
         });
+        row_start += rows;
+    }
+    Ok(chunks)
+}
+
+/// Half-precision counterpart of `chunk_rows`: row-aligned chunks of the
+/// on-disk 2-byte values under the device's `max_storage_buffer_binding_size`.
+fn chunk_rows_half(engine: &Engine, label: &str, bytes: &[u8], out_dim: usize, in_dim: usize) -> anyhow::Result<Vec<QChunkHalf>> {
+    let limit = engine.max_storage_buffer_binding_size() as usize;
+    let bytes_per_row = in_dim * 2;
+    anyhow::ensure!(
+        bytes_per_row <= limit,
+        "{label}: one row ({bytes_per_row} bytes) exceeds this device's max_storage_buffer_binding_size ({limit} bytes); this weight cannot be chunked to fit"
+    );
+    let rows_per_chunk = (limit / bytes_per_row).clamp(1, out_dim);
+    let mut chunks = Vec::with_capacity(out_dim.div_ceil(rows_per_chunk));
+    let mut row_start = 0usize;
+    while row_start < out_dim {
+        let rows = rows_per_chunk.min(out_dim - row_start);
+        let words = pack_halves(&bytes[row_start * bytes_per_row..(row_start + rows) * bytes_per_row]);
+        chunks.push(QChunkHalf { w: engine.buf_u32(&words, &format!("{label}[{row_start}]")), row_start: row_start as u32, rows: rows as u32 });
         row_start += rows;
     }
     Ok(chunks)
@@ -208,25 +370,43 @@ pub fn load_matmul_weight_gguf(engine: &Engine, label: &str, shape: &[usize], dt
     Ok(match dtype {
         GgmlDtype::Q8_0 => {
             let blocks_per_row = in_dim / QK;
-            let chunks = chunk_rows(engine, label, bytes, out_dim, blocks_per_row, blocks_per_row * 34, true)?;
+            let chunks = chunk_rows(engine, label, bytes, out_dim, blocks_per_row, blocks_per_row * 34, ChunkKind::Q8_0)?;
             MatMulWeight::Q8_0 { chunks, blocks_per_row: blocks_per_row as u32, out_dim: out_dim as u32 }
         }
         GgmlDtype::Q4_0 => {
             let blocks_per_row = in_dim / QK;
-            let chunks = chunk_rows(engine, label, bytes, out_dim, blocks_per_row, blocks_per_row * 18, false)?;
+            let chunks = chunk_rows(engine, label, bytes, out_dim, blocks_per_row, blocks_per_row * 18, ChunkKind::Q4_0)?;
             MatMulWeight::Q4_0 { chunks, blocks_per_row: blocks_per_row as u32, out_dim: out_dim as u32 }
+        }
+        GgmlDtype::Q4_1 => {
+            let blocks_per_row = in_dim / QK;
+            let chunks = chunk_rows(engine, label, bytes, out_dim, blocks_per_row, blocks_per_row * 20, ChunkKind::Q4_1)?;
+            MatMulWeight::Q4_1 { chunks, blocks_per_row: blocks_per_row as u32, out_dim: out_dim as u32 }
         }
         GgmlDtype::Q6_K => {
             let blocks_per_row = in_dim / QK6K;
             let chunks = chunk_rows_q6k(engine, label, bytes, out_dim, blocks_per_row, blocks_per_row * Q6K_BLOCK_BYTES)?;
             MatMulWeight::Q6_K { chunks, blocks_per_row: blocks_per_row as u32, out_dim: out_dim as u32 }
         }
-        // Q4_1 is dequantized host-side straight to F32 rather than given
-        // its own GPU-resident block kernel (see `gguf.rs::dequantize_q4_1`'s
-        // doc comment): only a handful of tensors (some of SmolLM2's
-        // `ffn_down.weight`s) are ever Q4_1, not worth a third quantized
-        // matmul kernel for.
-        GgmlDtype::F32 | GgmlDtype::F16 | GgmlDtype::Q4_1 => {
+        GgmlDtype::Q5_0 => {
+            let blocks_per_row = in_dim / QK;
+            let chunks = chunk_rows(engine, label, bytes, out_dim, blocks_per_row, blocks_per_row * 22, ChunkKind::Q5_0)?;
+            MatMulWeight::Q5_0 { chunks, blocks_per_row: blocks_per_row as u32, out_dim: out_dim as u32 }
+        }
+        GgmlDtype::Q4_K => {
+            anyhow::ensure!(in_dim.is_multiple_of(QK4K), "{label}: Q4_K rows must be a multiple of 256 values, got {in_dim}");
+            let chunks = chunk_rows(engine, label, bytes, out_dim, in_dim / QK, in_dim / QK4K * Q4K_BLOCK_BYTES, ChunkKind::Q4_K)?;
+            MatMulWeight::Q4_K { chunks, blocks_per_row: (in_dim / QK) as u32, out_dim: out_dim as u32 }
+        }
+        GgmlDtype::F16 | GgmlDtype::BF16 if in_dim.is_multiple_of(32) => {
+            let chunks = chunk_rows_half(engine, label, bytes, out_dim, in_dim)?;
+            if dtype == GgmlDtype::F16 {
+                MatMulWeight::F16 { chunks, out_dim: out_dim as u32 }
+            } else {
+                MatMulWeight::BF16 { chunks, out_dim: out_dim as u32 }
+            }
+        }
+        GgmlDtype::F32 | GgmlDtype::F16 | GgmlDtype::BF16 => {
             let data = crate::gguf::dequantize_for(dtype, bytes, n_elements);
             MatMulWeight::F32 { w: engine.buf_f32(&data, label) }
         }
@@ -241,7 +421,14 @@ pub fn load_matmul_weight_gguf(engine: &Engine, label: &str, shape: &[usize], dt
 pub struct QEmbeddingTable {
     pub qs: wgpu::Buffer,
     pub scales: wgpu::Buffer,
+    /// The `aux` buffer of Q5_0 and Q4_K tables (see `QChunk::aux`).
+    pub aux: Option<wgpu::Buffer>,
     pub blocks_per_row: u32,
+}
+
+/// F16 or BF16 embedding table: two values per u32.
+pub struct QEmbeddingHalf {
+    pub w: wgpu::Buffer,
 }
 
 /// Q6_K counterpart of `QEmbeddingTable` - four buffers instead of two, same
@@ -259,6 +446,10 @@ pub enum EmbeddingTable {
     Q4_0(QEmbeddingTable),
     Q8_0(QEmbeddingTable),
     Q6_K(QEmbeddingTable6K),
+    Q5_0(QEmbeddingTable),
+    Q4_K(QEmbeddingTable),
+    F16(QEmbeddingHalf),
+    BF16(QEmbeddingHalf),
 }
 
 impl EmbeddingTable {
@@ -268,7 +459,8 @@ impl EmbeddingTable {
     /// scratch).
     pub fn gpu_bytes(&self) -> u64 {
         match self {
-            EmbeddingTable::Q4_0(t) | EmbeddingTable::Q8_0(t) => t.qs.size() + t.scales.size(),
+            EmbeddingTable::Q4_0(t) | EmbeddingTable::Q8_0(t) | EmbeddingTable::Q5_0(t) | EmbeddingTable::Q4_K(t) => t.qs.size() + t.scales.size() + t.aux.as_ref().map_or(0, |a| a.size()),
+            EmbeddingTable::F16(t) | EmbeddingTable::BF16(t) => t.w.size(),
             EmbeddingTable::Q6_K(t) => t.ql.size() + t.qh.size() + t.scales.size() + t.d.size(),
         }
     }
@@ -281,16 +473,17 @@ impl EmbeddingTable {
 /// `max_storage_buffer_binding_size`, `embed_gather_q4.wgsl`/
 /// `embed_gather_q8.wgsl` would need the same chunk-dispatch treatment
 /// `linear()` gets for `MatMulWeight`.
-pub fn load_embedding_table_gguf(engine: &Engine, label: &str, shape: &[usize], dtype: GgmlDtype, bytes: &[u8]) -> EmbeddingTable {
+pub fn load_embedding_table_gguf(engine: &Engine, label: &str, shape: &[usize], dtype: GgmlDtype, bytes: &[u8]) -> anyhow::Result<EmbeddingTable> {
     let vocab = shape[0];
     let hidden = shape[1];
     let n_elements = vocab * hidden;
-    match dtype {
+    Ok(match dtype {
         GgmlDtype::Q4_0 => {
             let (qs, scales) = split_q4_blocks(bytes, n_elements);
             EmbeddingTable::Q4_0(QEmbeddingTable {
                 qs: engine.buf_u32(&qs, &format!("{label}.qs")),
                 scales: engine.buf_f32(&scales, &format!("{label}.scales")),
+                aux: None,
                 blocks_per_row: (hidden / QK) as u32,
             })
         }
@@ -299,8 +492,37 @@ pub fn load_embedding_table_gguf(engine: &Engine, label: &str, shape: &[usize], 
             EmbeddingTable::Q8_0(QEmbeddingTable {
                 qs: engine.buf_u32(&qs, &format!("{label}.qs")),
                 scales: engine.buf_f32(&scales, &format!("{label}.scales")),
+                aux: None,
                 blocks_per_row: (hidden / QK) as u32,
             })
+        }
+        GgmlDtype::Q5_0 => {
+            let (qs, scales, qh) = split_q5_0_blocks(bytes, n_elements);
+            EmbeddingTable::Q5_0(QEmbeddingTable {
+                qs: engine.buf_u32(&qs, &format!("{label}.qs")),
+                scales: engine.buf_f32(&scales, &format!("{label}.scales")),
+                aux: Some(engine.buf_u32(&qh, &format!("{label}.qh"))),
+                blocks_per_row: (hidden / QK) as u32,
+            })
+        }
+        GgmlDtype::Q4_K => {
+            anyhow::ensure!(hidden.is_multiple_of(QK4K), "{label}: Q4_K rows must be a multiple of 256 values, got {hidden}");
+            let (qs, scales, aux) = split_q4_k_blocks(bytes, n_elements);
+            EmbeddingTable::Q4_K(QEmbeddingTable {
+                qs: engine.buf_u32(&qs, &format!("{label}.qs")),
+                scales: engine.buf_f32(&scales, &format!("{label}.scales")),
+                aux: Some(engine.buf_u32(&aux, &format!("{label}.aux"))),
+                blocks_per_row: (hidden / QK) as u32,
+            })
+        }
+        GgmlDtype::F16 | GgmlDtype::BF16 => {
+            let words = pack_halves(bytes);
+            let t = QEmbeddingHalf { w: engine.buf_u32(&words, label) };
+            if dtype == GgmlDtype::F16 {
+                EmbeddingTable::F16(t)
+            } else {
+                EmbeddingTable::BF16(t)
+            }
         }
         GgmlDtype::Q6_K => {
             let (ql, qh, scales, d) = split_q6k_blocks(bytes, n_elements);
@@ -312,8 +534,8 @@ pub fn load_embedding_table_gguf(engine: &Engine, label: &str, shape: &[usize], 
                 blocks_per_row: (hidden / QK6K) as u32,
             })
         }
-        other => panic!("load_embedding_table_gguf: unsupported embedding dtype {other:?} (only Q4_0/Q8_0/Q6_K embedding tables are implemented)"),
-    }
+        other => anyhow::bail!("{label}: {other:?} is not supported as an embedding table (Q4_0, Q5_0, Q8_0, Q4_K, Q6_K, F16 and BF16 are)"),
+    })
 }
 
 #[cfg(test)]
@@ -350,6 +572,29 @@ mod tests {
         }
         for i in 0..64 {
             assert!((deq[i] - out[i]).abs() < 1e-6, "i={i}: deq={} out={}", deq[i], out[i]);
+        }
+    }
+
+    #[test]
+    fn q4_1_split_matches_reference_dequant() {
+        use crate::gguf::dequantize_q4_1;
+        let mut bytes = vec![0u8; 60];
+        for (bi, block) in bytes.as_chunks_mut::<20>().0.iter_mut().enumerate() {
+            block[0..2].copy_from_slice(&half::f16::from_f32(0.1 + bi as f32 * 0.05).to_le_bytes());
+            block[2..4].copy_from_slice(&half::f16::from_f32(-0.7 + bi as f32 * 0.3).to_le_bytes());
+            for (i, b) in block[4..20].iter_mut().enumerate() {
+                *b = ((i * 11 + bi * 5) % 256) as u8;
+            }
+        }
+        let deq = dequantize_q4_1(&bytes, 96);
+        let (qs, scales) = split_q4_1_blocks(&bytes, 96);
+        for (col, &want) in deq.iter().enumerate() {
+            let blk = col / 32;
+            let j = col % 32;
+            let byte = (qs[blk * 4 + (j % 16) / 4] >> (((j % 16) % 4) * 8)) & 0xFF;
+            let nibble = if j < 16 { byte & 0xF } else { byte >> 4 };
+            let v = nibble as f32 * scales[2 * blk] + scales[2 * blk + 1];
+            assert_eq!(want, v, "col={col}");
         }
     }
 

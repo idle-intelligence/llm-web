@@ -103,6 +103,8 @@ fn cpu_lora_matches_gpu_and_hf_peft() {
     let _ = cpu_chunk(&cpu, &mut cpu_cache, &cfg.prefix_ids, &ForwardSpec::default());
     assert_eq!(cpu_cache.kv_len, p);
 
+    // The reference path: F32 kernels only, whatever the adapter grants.
+    std::env::set_var("LEAN_F16", "0");
     let engine = Engine::new().expect("wgpu engine init");
     let mut gpu = GpuModel::load(&engine, &gguf, true).expect("load GPU model");
     gpu.apply_lora(&engine, &lora).expect("GPU apply_lora");

@@ -38,6 +38,10 @@ extern "C" {
     fn performance_now() -> f64;
 }
 
+/// Largest single `write_buffer` and the pending bytes that trigger a flush
+/// submit; see `Engine::buf_upload`.
+const UPLOAD_PIECE: usize = 8 << 20;
+
 /// Wall clock in milliseconds for the diagnostics timings: `performance.now()`
 /// in the browser (window or worker), a process-relative `Instant` natively.
 pub fn now_ms() -> f64 {
@@ -115,6 +119,8 @@ pub struct Engine {
     /// the bytes handed to the GPU, so `debug_verify_uploads` can read each
     /// buffer back and say whether the device holds what was uploaded.
     debug_uploads: RefCell<Option<Vec<(String, wgpu::Buffer, u64)>>>,
+    /// Bytes handed to `queue.write_buffer` since the last submit (see `buf_upload`).
+    pending_upload_bytes: Cell<usize>,
     /// Adapter name/backend, features and the limits kernel selection or
     /// buffer chunking depends on, as seen at device creation (JSON).
     pub adapter_report: String,
@@ -131,7 +137,7 @@ pub struct Engine {
     pub(crate) rope: wgpu::ComputePipeline,
     pub(crate) linear: wgpu::ComputePipeline,
     /// Coalesced F32 matvec (decode, M=1): same 128-thread,
-    /// rows-per-workgroup structure as `linear_q4_decode`/`linear_q8_decode`,
+    /// vec4 loads and word-wide unpacking,
     /// adapted to a plain (undequantized) f32 weight row - see
     /// `shaders/linear_f32_decode.wgsl`'s header for why a F32-resident
     /// tensor shows up at all in an otherwise-quantized GGUF.
@@ -147,15 +153,23 @@ pub struct Engine {
     /// Naive Q6_K matmul/matvec (`shaders/linear_q6k.wgsl`) - used for
     /// prefill (M>1); decode (M=1) uses `linear_q6k_decode` below.
     pub(crate) linear_q6k: wgpu::ComputePipeline,
-    /// Coalesced Q6_K matvec (decode, M=1): same 128-thread,
-    /// rows-per-workgroup structure as `linear_q4_decode`/`linear_q8_decode`,
-    /// see `shaders/linear_q6k_decode.wgsl`'s header for the per-block split.
+    /// Q6_K matvec (decode, M=1): 128 threads, 16 rows per workgroup, vec4
+    /// loads and word-wide unpacking; see `shaders/linear_q6k_decode.wgsl`'s
+    /// header.
     pub(crate) linear_q6k_decode: wgpu::ComputePipeline,
     /// See `linear_q4_tiled_rb.wgsl`'s header: 64x64 register-blocked tiled
     /// Q4_0 matmul, prefill at `SMALL_M_MAX_ROWS` rows and above.
     pub(crate) linear_q4_tiled_rb: wgpu::ComputePipeline,
+    /// `linear_f32_tiled.wgsl`: the same tile over F32 weights (prefill).
+    pub(crate) linear_f32_tiled: wgpu::ComputePipeline,
     /// `linear_q4_tiled_rb.wgsl` with its `Q8` override: Q8_0 prefill.
     pub(crate) linear_q8_tiled_rb: wgpu::ComputePipeline,
+    /// `linear_q4_tiled_f16.wgsl` (and its `Q8` override): the prefill tile
+    /// with f16 shared tiles and f16 partial sums. `Some` only when the
+    /// device was granted `shader-f16`, which is requested whenever the
+    /// adapter offers it; the F32 pipelines above are used otherwise.
+    pub(crate) linear_q4_tiled_f16: Option<wgpu::ComputePipeline>,
+    pub(crate) linear_q8_tiled_f16: Option<wgpu::ComputePipeline>,
     /// Coalesced Q4_0 matvec (decode, M=1): ported from llm-wasm's
     /// shader_q4_matvec_coalesced.wgsl. The fast decode kernel; it uses no
     /// cooperative-group extension, so it runs on any WebGPU adapter.
@@ -175,10 +189,33 @@ pub struct Engine {
     pub(crate) linear_q4_small_m: wgpu::ComputePipeline,
     /// `linear_q4_small_m.wgsl` with its `Q8` override: Q8_0 short prefill.
     pub(crate) linear_q8_small_m: wgpu::ComputePipeline,
+    /// Q4_1 builds (`Q41` override) of the Q4_0 matmul shaders: naive,
+    /// decode (one row per lane and four rows per lane), short and long prefill.
+    pub(crate) linear_q41: wgpu::ComputePipeline,
+    pub(crate) linear_q41_decode: wgpu::ComputePipeline,
+    pub(crate) linear_q41_decode_r4: wgpu::ComputePipeline,
+    pub(crate) linear_q41_small_m: wgpu::ComputePipeline,
+    pub(crate) linear_q41_tiled_rb: wgpu::ComputePipeline,
+    /// Q5_0 and Q4_K builds of the Q4_0-family kernels, compiled on first use.
+    pub(crate) q50: Q4Family,
+    pub(crate) k4: Q4Family,
+    /// F16 and BF16 weights kept at two bytes per value: naive, decode
+    /// matvec and the prefill tile (`linear_half*.wgsl`).
+    pub(crate) half_f16: HalfKernels,
+    pub(crate) half_bf16: HalfKernels,
+    /// `linear_q6k_tiled.wgsl`: Q6_K prefill tile.
+    pub(crate) linear_q6k_tiled: LazyPipeline,
+    pub(crate) embed_gather_q5: LazyPipeline,
+    pub(crate) embed_gather_q4k: LazyPipeline,
+    pub(crate) embed_gather_f16: LazyPipeline,
+    pub(crate) embed_gather_bf16: LazyPipeline,
     pub(crate) attn_prefill: wgpu::ComputePipeline,
     /// `attn_prefill_tiled.wgsl` (head_dim 64) and its HEAD_DIM = 128 build.
     pub(crate) attn_prefill_tiled: wgpu::ComputePipeline,
     pub(crate) attn_prefill_tiled_128: wgpu::ComputePipeline,
+    /// The same kernels reading K/V from the cache (suffix prefill).
+    pub(crate) attn_prefill_cache: wgpu::ComputePipeline,
+    pub(crate) attn_prefill_cache_128: wgpu::ComputePipeline,
     /// `shaders/attn_decode.wgsl` compiled with its `HEAD_DIM` override
     /// constant set to 64 (Qwen2.5). One thread owns one output dim, so
     /// workgroup width must equal head_dim exactly - see the shader's doc
@@ -224,6 +261,13 @@ pub struct Engine {
     /// caller-supplied bitset, in place on the logits buffer, before
     /// argmax/readback - see `model.rs::mask_logits_gpu`.
     pub(crate) mask_logits: wgpu::ComputePipeline,
+    /// GPU top-k for sampling: one stage of the 1024-way bitonic selection
+    /// (`shaders/topk_stage.wgsl`) - see `model.rs::topk_gpu`.
+    pub(crate) topk_stage: wgpu::ComputePipeline,
+    /// GPU-resident sampling (`resident_sampling.rs`): the repetition
+    /// penalty over the history counts, and the draw from the top-k.
+    pub(crate) sample_penalty: wgpu::ComputePipeline,
+    pub(crate) sample_final: wgpu::ComputePipeline,
     /// Per-row absolute-position RoPE (`shaders/rope_positions.wgsl`) - the
     /// caller-supplied-position-ids mechanism (llm-life's per-cell RoPE
     /// restart), see `model.rs::rope_positions`.
@@ -237,25 +281,178 @@ pub struct Engine {
     pub(crate) gather_dequant_q8_rows: wgpu::ComputePipeline,
 }
 
+/// Set to `0` to leave `shader-f16` ungranted even when the adapter has it.
+const F16_ENV_VAR: &str = "LEAN_F16";
+
+/// Where the Q4_0-family shaders (`linear_q4*.wgsl`) take their block-metadata
+/// declarations: `compose_aux` replaces this comment with `aux_with.wgsl`
+/// (a seventh binding, `aux`, for the Q5_0 and Q4_K builds) or `aux_none.wgsl`
+/// (no binding, so the Q4_0, Q4_1 and Q8_0 builds keep the six-binding layout
+/// they always had), then `aux_common.wgsl`.
+const AUX_MARKER: &str = "//@AUX";
+/// Where a shader that declares its own `aux` and `scales` bindings
+/// (`embed_gather_q4k.wgsl`) takes the shared block-metadata helpers.
+const K4_DM_MARKER: &str = "//@K4_DM";
+
+fn compose_aux(src: &str, with_binding: bool) -> String {
+    let decl = if with_binding { include_str!("shaders/aux_with.wgsl") } else { include_str!("shaders/aux_none.wgsl") };
+    src.replace(AUX_MARKER, &format!("{decl}\n{}", include_str!("shaders/aux_common.wgsl")))
+}
+
+/// A pipeline compiled on first use: formats a model does not contain never
+/// pay for their shaders at engine start.
+pub(crate) struct LazyPipeline {
+    cell: std::cell::OnceCell<wgpu::ComputePipeline>,
+    label: &'static str,
+    src: &'static str,
+    constants: &'static [(&'static str, f64)],
+    with_aux: bool,
+}
+
+impl LazyPipeline {
+    pub(crate) const fn new(label: &'static str, src: &'static str, constants: &'static [(&'static str, f64)], with_aux: bool) -> Self {
+        Self { cell: std::cell::OnceCell::new(), label, src, constants, with_aux }
+    }
+
+    fn get(&self, device: &wgpu::Device) -> &wgpu::ComputePipeline {
+        self.cell.get_or_init(|| {
+            let mut src = if self.with_aux { Cow::Owned(compose_aux(self.src, true)) } else { Cow::Borrowed(self.src) };
+            if src.contains(K4_DM_MARKER) {
+                src = Cow::Owned(src.replace(K4_DM_MARKER, include_str!("shaders/aux_common.wgsl")));
+            }
+            make_pipeline_with_constants(device, self.label, &src, self.constants)
+        })
+    }
+}
+
+/// The Q4_0-family kernels built for one block format that needs the `aux`
+/// binding (Q5_0 or Q4_K): naive reference, decode matvec (one and four rows
+/// per lane), their fused gate/up builds, short and long prefill, and the f16
+/// prefill tile when the device grants `shader-f16`.
+pub(crate) struct Q4Family {
+    pub(crate) naive: LazyPipeline,
+    pub(crate) decode: LazyPipeline,
+    pub(crate) decode_r4: LazyPipeline,
+    pub(crate) swiglu: LazyPipeline,
+    pub(crate) swiglu_r4: LazyPipeline,
+    pub(crate) small_m: LazyPipeline,
+    pub(crate) tiled_rb: LazyPipeline,
+    pub(crate) tiled_f16: Option<LazyPipeline>,
+}
+
+/// Kernels over F16 or BF16 weights, compiled on first use.
+pub(crate) struct HalfKernels {
+    pub(crate) naive: LazyPipeline,
+    pub(crate) decode: LazyPipeline,
+    pub(crate) tiled: LazyPipeline,
+}
+
+impl HalfKernels {
+    fn new(bf16: bool) -> Self {
+        const F16: &[(&str, f64)] = &[];
+        const BF16: &[(&str, f64)] = &[("BF16", 1.0)];
+        let c = if bf16 { BF16 } else { F16 };
+        let tag = |f16: &'static str, bf16_label: &'static str| if bf16 { bf16_label } else { f16 };
+        Self {
+            naive: LazyPipeline::new(tag("linear_f16", "linear_bf16"), include_str!("shaders/linear_half.wgsl"), c, false),
+            decode: LazyPipeline::new(tag("linear_f16_decode", "linear_bf16_decode"), include_str!("shaders/linear_half_decode.wgsl"), c, false),
+            tiled: LazyPipeline::new(tag("linear_f16_tiled", "linear_bf16_tiled"), include_str!("shaders/linear_half_tiled.wgsl"), c, false),
+        }
+    }
+}
+
+const EMBED_GATHER_Q4K: &str = include_str!("shaders/embed_gather_q4k.wgsl");
+
+const SRC_Q4_NAIVE: &str = include_str!("shaders/linear_q4.wgsl");
+const SRC_Q4_DECODE: &str = include_str!("shaders/linear_q4_decode.wgsl");
+const SRC_Q4_DECODE_R4: &str = include_str!("shaders/linear_q4_decode_r4.wgsl");
+const SRC_Q4_SMALL_M: &str = include_str!("shaders/linear_q4_small_m.wgsl");
+const SRC_Q4_TILED_RB: &str = include_str!("shaders/linear_q4_tiled_rb.wgsl");
+const SRC_Q4_TILED_F16: &str = include_str!("shaders/linear_q4_tiled_f16.wgsl");
+
+impl Q4Family {
+    fn q50(grant_f16: bool) -> Self {
+        const C: &[(&str, f64)] = &[("Q50", 1.0)];
+        const C_GATE_UP: &[(&str, f64)] = &[("Q50", 1.0), ("GATE_UP", 1.0)];
+        Self {
+            naive: LazyPipeline::new("linear_q50", SRC_Q4_NAIVE, C, true),
+            decode: LazyPipeline::new("linear_q50_decode", SRC_Q4_DECODE, C, true),
+            decode_r4: LazyPipeline::new("linear_q50_decode_r4", SRC_Q4_DECODE_R4, C, true),
+            swiglu: LazyPipeline::new("linear_q50_decode_swiglu", SRC_Q4_DECODE, C_GATE_UP, true),
+            swiglu_r4: LazyPipeline::new("linear_q50_decode_swiglu_r4", SRC_Q4_DECODE_R4, C_GATE_UP, true),
+            small_m: LazyPipeline::new("linear_q50_small_m", SRC_Q4_SMALL_M, C, true),
+            tiled_rb: LazyPipeline::new("linear_q50_tiled_rb", SRC_Q4_TILED_RB, C, true),
+            tiled_f16: grant_f16.then(|| LazyPipeline::new("linear_q50_tiled_f16", SRC_Q4_TILED_F16, C, true)),
+        }
+    }
+
+    fn k4(grant_f16: bool) -> Self {
+        const C: &[(&str, f64)] = &[("K4", 1.0)];
+        const C_GATE_UP: &[(&str, f64)] = &[("K4", 1.0), ("GATE_UP", 1.0)];
+        Self {
+            naive: LazyPipeline::new("linear_k4", SRC_Q4_NAIVE, C, true),
+            decode: LazyPipeline::new("linear_k4_decode", SRC_Q4_DECODE, C, true),
+            decode_r4: LazyPipeline::new("linear_k4_decode_r4", SRC_Q4_DECODE_R4, C, true),
+            swiglu: LazyPipeline::new("linear_k4_decode_swiglu", SRC_Q4_DECODE, C_GATE_UP, true),
+            swiglu_r4: LazyPipeline::new("linear_k4_decode_swiglu_r4", SRC_Q4_DECODE_R4, C_GATE_UP, true),
+            small_m: LazyPipeline::new("linear_k4_small_m", SRC_Q4_SMALL_M, C, true),
+            tiled_rb: LazyPipeline::new("linear_k4_tiled_rb", SRC_Q4_TILED_RB, C, true),
+            tiled_f16: grant_f16.then(|| LazyPipeline::new("linear_k4_tiled_f16", SRC_Q4_TILED_F16, C, true)),
+        }
+    }
+}
+
 fn make_pipeline(device: &wgpu::Device, label: &str, src: &str) -> wgpu::ComputePipeline {
     make_pipeline_with_constants(device, label, src, &[])
 }
 
-/// Like `make_pipeline`, but sets WGSL `override` constants
-/// (`shaders/attn_decode.wgsl`'s `HEAD_DIM`) at pipeline-creation time via
-/// `PipelineCompilationOptions`, so one shader source compiles to a
-/// different fixed `@workgroup_size` per model.
+/// Writes build constants into a shader's source: each `(name, value)`
+/// replaces the initializer of the shader's `const NAME: bool = ...;` or
+/// `const NAME: u32 = ...;` declaration, so one source compiles to a
+/// different fixed kernel per model (`HEAD_DIM`, which also sets
+/// `@workgroup_size`) or per block format (`Q8`, `Q41`, `GATE_UP`, ...).
+/// The values are plain WGSL `const`s rather than pipeline-overridable
+/// `override` constants, so no pipeline depends on the browser evaluating
+/// override expressions at pipeline creation.
+pub(crate) fn specialize<'a>(src: &'a str, constants: &[(&str, f64)]) -> Cow<'a, str> {
+    if constants.is_empty() {
+        return Cow::Borrowed(src);
+    }
+    let mut out = src.to_owned();
+    for &(name, value) in constants {
+        let head = format!("const {name}: ");
+        let start = out
+            .match_indices(&head)
+            .map(|(i, _)| i)
+            .find(|&i| i == 0 || out.as_bytes()[i - 1] == b'\n')
+            .unwrap_or_else(|| panic!("shader has no `const {name}` declaration"));
+        let ty_start = start + head.len();
+        let eq = ty_start + out[ty_start..].find(" = ").expect("const declaration without an initializer");
+        let end = eq + out[eq..].find(';').expect("const declaration without `;`");
+        let literal = match &out[ty_start..eq] {
+            "bool" => (value != 0.0).to_string(),
+            "u32" => format!("{}u", value as u32),
+            ty => panic!("build constant {name} has unsupported type {ty}"),
+        };
+        out.replace_range(eq + 3..end, &literal);
+    }
+    Cow::Owned(out)
+}
+
+/// Like `make_pipeline`, with build constants written into the source
+/// (`specialize`) before the module is created.
 fn make_pipeline_with_constants(device: &wgpu::Device, label: &str, src: &str, constants: &[(&str, f64)]) -> wgpu::ComputePipeline {
+    let src: Cow<str> = if src.contains(AUX_MARKER) { Cow::Owned(compose_aux(src, false)) } else { Cow::Borrowed(src) };
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some(label),
-        source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(src)),
+        source: wgpu::ShaderSource::Wgsl(specialize(&src, constants)),
     });
     device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
         label: Some(label),
         layout: None,
         module: &module,
         entry_point: Some("main"),
-        compilation_options: wgpu::PipelineCompilationOptions { constants, ..Default::default() },
+        compilation_options: Default::default(),
         cache: None,
     })
 }
@@ -298,6 +495,17 @@ fn adapter_report(adapter: &wgpu::Adapter, device: &wgpu::Device) -> String {
     )
 }
 
+/// Every engine owns its device, so dropping the engine destroys the device
+/// and with it every buffer, texture and bind group made from it. Without
+/// this, a browser frees GPU memory only when the JS wrapper objects are
+/// garbage collected (Firefox does so late), and a page that loads several
+/// engines in a row runs the GPU out of memory.
+impl Drop for Engine {
+    fn drop(&mut self) {
+        self.device.destroy();
+    }
+}
+
 impl Engine {
     pub async fn new_async() -> anyhow::Result<Self> {
         Self::new_async_with(false).await
@@ -325,7 +533,7 @@ impl Engine {
         // whatever WebGPU's downlevel limits actually allow and split
         // large tensors across bindings if it doesn't.
         let adapter_limits = adapter.limits();
-        // The tiled prefill kernels use a 16x16 workgroup and 16 KiB of
+        // The tiled prefill kernels use a 16x8 workgroup and up to 16 KiB of
         // workgroup storage: the WebGPU spec's guaranteed minimums, so every
         // conforming adapter passes this.
         anyhow::ensure!(
@@ -341,6 +549,12 @@ impl Engine {
         let grant_pass_timestamps = want_pass_timestamps && adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY);
         if grant_pass_timestamps {
             required_features |= wgpu::Features::TIMESTAMP_QUERY;
+        }
+        // shader-f16 is requested whenever the adapter has it. LEAN_F16=0
+        // keeps the F32 prefill kernels on such an adapter (native A/B runs).
+        let grant_f16 = adapter.features().contains(wgpu::Features::SHADER_F16) && std::env::var(F16_ENV_VAR).as_deref() != Ok("0");
+        if grant_f16 {
+            required_features |= wgpu::Features::SHADER_F16;
         }
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
@@ -371,6 +585,13 @@ impl Engine {
         let t_device = now_ms();
         let adapter_report = adapter_report(&adapter, &device);
 
+        // Every pipeline below is checked before the engine is handed out:
+        // an implementation that rejects one of them (a shader it cannot
+        // compile, a pipeline it cannot create) makes this call fail, so the
+        // backend ladder moves on to the CPU instead of running a forward
+        // pass with invalid pipelines.
+        device.push_error_scope(wgpu::ErrorFilter::Validation);
+        device.push_error_scope(wgpu::ErrorFilter::Internal);
         let mut engine = Engine {
             query_set,
             timestamp_period,
@@ -385,6 +606,7 @@ impl Engine {
             diag_init_ms: (0.0, 0.0),
             debug_taps: RefCell::new(None),
             debug_uploads: RefCell::new(None),
+            pending_upload_bytes: Cell::new(0),
             adapter_report,
             embed_gather_q4: make_pipeline(&device, "embed_gather_q4", include_str!("shaders/embed_gather_q4.wgsl")),
             embed_gather_q8: make_pipeline(&device, "embed_gather_q8", include_str!("shaders/embed_gather_q8.wgsl")),
@@ -399,7 +621,10 @@ impl Engine {
             linear_q6k: make_pipeline(&device, "linear_q6k", include_str!("shaders/linear_q6k.wgsl")),
             linear_q6k_decode: make_pipeline(&device, "linear_q6k_decode", include_str!("shaders/linear_q6k_decode.wgsl")),
             linear_q4_tiled_rb: make_pipeline(&device, "linear_q4_tiled_rb", include_str!("shaders/linear_q4_tiled_rb.wgsl")),
+            linear_f32_tiled: make_pipeline(&device, "linear_f32_tiled", include_str!("shaders/linear_f32_tiled.wgsl")),
             linear_q8_tiled_rb: make_pipeline_with_constants(&device, "linear_q8_tiled_rb", include_str!("shaders/linear_q4_tiled_rb.wgsl"), &[("Q8", 1.0)]),
+            linear_q4_tiled_f16: grant_f16.then(|| make_pipeline(&device, "linear_q4_tiled_f16", include_str!("shaders/linear_q4_tiled_f16.wgsl"))),
+            linear_q8_tiled_f16: grant_f16.then(|| make_pipeline_with_constants(&device, "linear_q8_tiled_f16", include_str!("shaders/linear_q4_tiled_f16.wgsl"), &[("Q8", 1.0)])),
             linear_q4_decode: make_pipeline(&device, "linear_q4_decode", include_str!("shaders/linear_q4_decode.wgsl")),
             linear_q4_decode_swiglu: make_pipeline_with_constants(&device, "linear_q4_decode_swiglu", include_str!("shaders/linear_q4_decode.wgsl"), &[("GATE_UP", 1.0)]),
             linear_q4_decode_r4: make_pipeline(&device, "linear_q4_decode_r4", include_str!("shaders/linear_q4_decode_r4.wgsl")),
@@ -408,9 +633,25 @@ impl Engine {
             linear_q8_decode_swiglu_r4: make_pipeline_with_constants(&device, "linear_q8_decode_swiglu_r4", include_str!("shaders/linear_q8_decode_r4.wgsl"), &[("GATE_UP", 1.0)]),
             linear_q4_small_m: make_pipeline(&device, "linear_q4_small_m", include_str!("shaders/linear_q4_small_m.wgsl")),
             linear_q8_small_m: make_pipeline_with_constants(&device, "linear_q8_small_m", include_str!("shaders/linear_q4_small_m.wgsl"), &[("Q8", 1.0)]),
+            linear_q41: make_pipeline_with_constants(&device, "linear_q41", include_str!("shaders/linear_q4.wgsl"), &[("Q41", 1.0)]),
+            linear_q41_decode: make_pipeline_with_constants(&device, "linear_q41_decode", include_str!("shaders/linear_q4_decode.wgsl"), &[("Q41", 1.0)]),
+            linear_q41_decode_r4: make_pipeline_with_constants(&device, "linear_q41_decode_r4", include_str!("shaders/linear_q4_decode_r4.wgsl"), &[("Q41", 1.0)]),
+            linear_q41_small_m: make_pipeline_with_constants(&device, "linear_q41_small_m", include_str!("shaders/linear_q4_small_m.wgsl"), &[("Q41", 1.0)]),
+            linear_q41_tiled_rb: make_pipeline_with_constants(&device, "linear_q41_tiled_rb", include_str!("shaders/linear_q4_tiled_rb.wgsl"), &[("Q41", 1.0)]),
+            half_f16: HalfKernels::new(false),
+            half_bf16: HalfKernels::new(true),
+            linear_q6k_tiled: LazyPipeline::new("linear_q6k_tiled", include_str!("shaders/linear_q6k_tiled.wgsl"), &[], false),
+            embed_gather_q5: LazyPipeline::new("embed_gather_q5", include_str!("shaders/embed_gather_q5.wgsl"), &[], false),
+            embed_gather_q4k: LazyPipeline::new("embed_gather_q4k", EMBED_GATHER_Q4K, &[], false),
+            embed_gather_f16: LazyPipeline::new("embed_gather_f16", include_str!("shaders/embed_gather_half.wgsl"), &[], false),
+            embed_gather_bf16: LazyPipeline::new("embed_gather_bf16", include_str!("shaders/embed_gather_half.wgsl"), &[("BF16", 1.0)], false),
+            q50: Q4Family::q50(grant_f16),
+            k4: Q4Family::k4(grant_f16),
             attn_prefill: make_pipeline(&device, "attn_prefill", include_str!("shaders/attn_prefill.wgsl")),
             attn_prefill_tiled: make_pipeline(&device, "attn_prefill_tiled", include_str!("shaders/attn_prefill_tiled.wgsl")),
             attn_prefill_tiled_128: make_pipeline_with_constants(&device, "attn_prefill_tiled_128", include_str!("shaders/attn_prefill_tiled.wgsl"), &[("HEAD_DIM", 128.0)]),
+            attn_prefill_cache: make_pipeline_with_constants(&device, "attn_prefill_cache", include_str!("shaders/attn_prefill_tiled.wgsl"), &[("CACHE", 1.0)]),
+            attn_prefill_cache_128: make_pipeline_with_constants(&device, "attn_prefill_cache_128", include_str!("shaders/attn_prefill_tiled.wgsl"), &[("HEAD_DIM", 128.0), ("CACHE", 1.0)]),
             attn_decode: make_pipeline_with_constants(&device, "attn_decode", include_str!("shaders/attn_decode.wgsl"), &[("HEAD_DIM", 64.0)]),
             attn_decode_128: make_pipeline_with_constants(&device, "attn_decode_128", include_str!("shaders/attn_decode.wgsl"), &[("HEAD_DIM", 128.0)]),
             attn_decode_split: make_pipeline_with_constants(&device, "attn_decode_split", include_str!("shaders/attn_decode_split.wgsl"), &[("HEAD_DIM", 64.0)]),
@@ -424,6 +665,9 @@ impl Engine {
             silu_mul_fused: make_pipeline(&device, "silu_mul_fused", include_str!("shaders/silu_mul_fused.wgsl")),
             argmax: make_pipeline(&device, "argmax", include_str!("shaders/argmax.wgsl")),
             mask_logits: make_pipeline(&device, "mask_logits", include_str!("shaders/mask_logits.wgsl")),
+            topk_stage: make_pipeline(&device, "topk_stage", include_str!("shaders/topk_stage.wgsl")),
+            sample_penalty: make_pipeline(&device, "sample_penalty", include_str!("shaders/sample_penalty.wgsl")),
+            sample_final: make_pipeline(&device, "sample_final", include_str!("shaders/sample_final.wgsl")),
             rope_positions: make_pipeline(&device, "rope_positions", include_str!("shaders/rope_positions.wgsl")),
             attn_chunk_masked: make_pipeline(&device, "attn_chunk_masked", include_str!("shaders/attn_chunk_masked.wgsl")),
             gather_dequant_q8_rows: make_pipeline(&device, "gather_dequant_q8_rows", include_str!("shaders/gather_dequant_q8_rows.wgsl")),
@@ -431,6 +675,11 @@ impl Engine {
             queue,
             dispatch_count: Cell::new(0),
         };
+        let internal = engine.device.pop_error_scope().await;
+        let validation = engine.device.pop_error_scope().await;
+        if let Some(e) = validation.or(internal) {
+            anyhow::bail!("WebGPU pipeline creation failed, not using this device: {e}");
+        }
         engine.diag_init_ms = (t_device - t_start, now_ms() - t_device);
         Ok(engine)
     }
@@ -477,10 +726,24 @@ impl Engine {
     /// which made greedy output vary from load to load. `write_buffer` is the
     /// plain WebGPU upload every backend supports, so this is the path on
     /// every device, not a per-device choice.
+    ///
+    /// A `write_buffer` stays staged until the next submit. A browser can
+    /// hold only so much staged data (Firefox on Linux loses the device with
+    /// "Not enough memory left" once about 100 MB are staged, which a ~1 GB model
+    /// reaches), so uploads go in pieces of at most `UPLOAD_PIECE` bytes and
+    /// an empty submit flushes them once `UPLOAD_PIECE` bytes are pending.
+    /// The same on every device.
     pub(crate) fn buf_upload(&self, label: &str, bytes: &[u8], usage: wgpu::BufferUsages) -> wgpu::Buffer {
         let buf = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size: (bytes.len() as u64).max(4), usage, mapped_at_creation: false });
-        if !bytes.is_empty() {
-            self.queue.write_buffer(&buf, 0, bytes);
+        for (i, piece) in bytes.chunks(UPLOAD_PIECE).enumerate() {
+            self.queue.write_buffer(&buf, (i * UPLOAD_PIECE) as u64, piece);
+            let pending = self.pending_upload_bytes.get() + piece.len();
+            if pending >= UPLOAD_PIECE {
+                self.queue.submit([]);
+                self.pending_upload_bytes.set(0);
+            } else {
+                self.pending_upload_bytes.set(pending);
+            }
         }
         buf
     }
@@ -540,6 +803,11 @@ impl Engine {
     /// A `label` is still accepted for call-site readability but no longer
     /// used to name a pass (the caller's `begin_compute_pass` call names the
     /// batch instead).
+    /// The compiled pipeline of a lazily created kernel.
+    pub(crate) fn pipe<'a>(&'a self, p: &'a LazyPipeline) -> &'a wgpu::ComputePipeline {
+        p.get(&self.device)
+    }
+
     pub(crate) fn dispatch(&self, pass: &mut wgpu::ComputePass, pipeline: &wgpu::ComputePipeline, bind_group: &wgpu::BindGroup, wgs: (u32, u32, u32), _label: &str) {
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, bind_group, &[]);
@@ -613,9 +881,7 @@ impl Engine {
         slice.map_async(wgpu::MapMode::Read, move |res| {
             let _ = tx.send(res);
         });
-        #[cfg(not(target_arch = "wasm32"))]
-        self.device.poll(wgpu::PollType::Wait).expect("device poll failed");
-        rx.await.expect("map_async channel dropped").expect("buffer map failed");
+        self.map_done(rx).await;
         let data = slice.get_mapped_range();
         let raw: &[u64] = bytemuck::cast_slice(&data);
         let labels = self.profile_labels.borrow();
@@ -714,9 +980,7 @@ impl Engine {
         slice.map_async(wgpu::MapMode::Read, move |res| {
             let _ = tx.send(res);
         });
-        #[cfg(not(target_arch = "wasm32"))]
-        self.device.poll(wgpu::PollType::Wait).expect("device poll failed");
-        rx.await.expect("map_async channel dropped").expect("buffer map failed");
+        self.map_done(rx).await;
         let data = slice.get_mapped_range();
         let raw: &[u64] = bytemuck::cast_slice(&data);
         let period = f64::from(self.timestamp_period);
@@ -858,6 +1122,48 @@ impl Engine {
         self.dispatch_count.get()
     }
 
+    /// Waits until a `map_async` request resolved. Natively that is one
+    /// blocking device poll. In the browser nothing here drives the
+    /// resolution, and Firefox only resolves a map when a queue submission
+    /// wakes its poll: left alone, a map takes about 100 ms to resolve there
+    /// (against well under a millisecond in Chromium), so every token read
+    /// back cost 100 ms. While the map is pending, an empty submit goes out
+    /// every timer tick (about 4 ms), which gets it resolved within one tick
+    /// of the GPU finishing; the wait ends the moment the map resolves, so
+    /// browsers that resolve on their own lose nothing.
+    async fn map_done(&self, rx: futures_channel::oneshot::Receiver<Result<(), wgpu::BufferAsyncError>>) {
+        #[cfg(not(target_arch = "wasm32"))]
+        self.device.poll(wgpu::PollType::Wait).expect("device poll failed");
+        #[cfg(all(target_arch = "wasm32", feature = "web"))]
+        let mut rx = rx;
+        #[cfg(all(target_arch = "wasm32", feature = "web"))]
+        let res = loop {
+            use std::future::Future;
+            use std::pin::Pin;
+            use std::task::Poll;
+            let mut tick = timer::Tick::new();
+            let ready = std::future::poll_fn(|cx| {
+                if let Poll::Ready(v) = Pin::new(&mut rx).poll(cx) {
+                    return Poll::Ready(Some(v));
+                }
+                if Pin::new(&mut tick).poll(cx).is_ready() {
+                    return Poll::Ready(None);
+                }
+                Poll::Pending
+            })
+            .await;
+            match ready {
+                Some(v) => break v,
+                None => {
+                    self.queue.submit([]);
+                }
+            }
+        };
+        #[cfg(not(all(target_arch = "wasm32", feature = "web")))]
+        let res = rx.await;
+        res.expect("map_async channel dropped").expect("buffer map failed");
+    }
+
     /// One copy-to-staging + map + read. NEVER call this crate's equivalent
     /// of `.into_data()` synchronously in WASM (deadlocks the browser) :
     /// this is the only readback path, always awaited.
@@ -878,9 +1184,7 @@ impl Engine {
         slice.map_async(wgpu::MapMode::Read, move |res| {
             let _ = tx.send(res);
         });
-        #[cfg(not(target_arch = "wasm32"))]
-        self.device.poll(wgpu::PollType::Wait).expect("device poll failed");
-        rx.await.expect("map_async channel dropped").expect("buffer map failed");
+        self.map_done(rx).await;
         let data = slice.get_mapped_range();
         let result: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
         drop(data);
@@ -914,18 +1218,98 @@ impl Engine {
     }
 
     pub(crate) async fn map_u32(&self, staging: &wgpu::Buffer) -> u32 {
-        let slice = staging.slice(..);
+        let rx = self.start_map_u32(staging);
+        self.finish_map_u32(staging, rx).await
+    }
+
+    /// Requests the map of a `stage_u32` buffer right away, without waiting
+    /// for it. A pipeline that keeps several steps in flight asks for every
+    /// step's map when it submits the step, so the browser has all of them
+    /// outstanding at once and can resolve them together, instead of
+    /// starting each map only after the previous one resolved.
+    pub(crate) fn start_map_u32(&self, staging: &wgpu::Buffer) -> futures_channel::oneshot::Receiver<Result<(), wgpu::BufferAsyncError>> {
         let (tx, rx) = futures_channel::oneshot::channel();
-        slice.map_async(wgpu::MapMode::Read, move |res| {
+        staging.slice(..).map_async(wgpu::MapMode::Read, move |res| {
             let _ = tx.send(res);
         });
-        #[cfg(not(target_arch = "wasm32"))]
-        self.device.poll(wgpu::PollType::Wait).expect("device poll failed");
-        rx.await.expect("map_async channel dropped").expect("buffer map failed");
+        rx
+    }
+
+    pub(crate) async fn finish_map_u32(&self, staging: &wgpu::Buffer, rx: futures_channel::oneshot::Receiver<Result<(), wgpu::BufferAsyncError>>) -> u32 {
+        self.map_done(rx).await;
+        let slice = staging.slice(..);
         let data = slice.get_mapped_range();
         let result: u32 = bytemuck::cast_slice(&data)[0];
         drop(data);
         staging.unmap();
         result
+    }
+
+    /// Reads every `u32` of a mapped block buffer made by `start_map_u32`.
+    pub(crate) async fn finish_map_u32s(&self, staging: &wgpu::Buffer, rx: futures_channel::oneshot::Receiver<Result<(), wgpu::BufferAsyncError>>) -> Vec<u32> {
+        self.map_done(rx).await;
+        let slice = staging.slice(..);
+        let data = slice.get_mapped_range();
+        let result: Vec<u32> = bytemuck::cast_slice(&data).to_vec();
+        drop(data);
+        staging.unmap();
+        result
+    }
+}
+
+/// A timer tick for `Engine::map_done`: resolves after one `setTimeout(0)`.
+#[cfg(all(target_arch = "wasm32", feature = "web"))]
+mod timer {
+    use std::cell::RefCell;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::rc::Rc;
+    use std::task::{Context, Poll, Waker};
+    use wasm_bindgen::prelude::*;
+
+    #[wasm_bindgen]
+    extern "C" {
+        #[wasm_bindgen(js_name = setTimeout)]
+        fn set_timeout(handler: JsValue, ms: i32) -> i32;
+    }
+
+    #[derive(Default)]
+    struct State {
+        fired: bool,
+        waker: Option<Waker>,
+    }
+
+    pub(super) struct Tick {
+        state: Rc<RefCell<State>>,
+        started: bool,
+    }
+
+    impl Tick {
+        pub(super) fn new() -> Self {
+            Tick { state: Rc::default(), started: false }
+        }
+    }
+
+    impl Future for Tick {
+        type Output = ();
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            if self.state.borrow().fired {
+                return Poll::Ready(());
+            }
+            self.state.borrow_mut().waker = Some(cx.waker().clone());
+            if !self.started {
+                self.started = true;
+                let state = self.state.clone();
+                let fire = Closure::once_into_js(move || {
+                    let mut s = state.borrow_mut();
+                    s.fired = true;
+                    if let Some(w) = s.waker.take() {
+                        w.wake();
+                    }
+                });
+                set_timeout(fire, 0);
+            }
+            Poll::Pending
+        }
     }
 }

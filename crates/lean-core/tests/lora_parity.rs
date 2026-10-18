@@ -47,6 +47,8 @@ fn lora_and_sliced_head_match_reference() {
         std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/reference/fixture_lora.json")).expect("reading fixture_lora.json (run gen_fixture_lora.py first)");
     let fixture: Fixture = serde_json::from_str(&fixture_json).expect("parsing fixture_lora.json");
 
+    // The reference path: F32 kernels only, whatever the adapter grants.
+    std::env::set_var("LEAN_F16", "0");
     let engine = Engine::new().expect("wgpu engine init");
     let mut model = GpuModel::load(&engine, &gguf_path, true).expect("loading model");
     let max_ctx = fixture.input_ids.len() as u32 + 4;
@@ -135,6 +137,8 @@ fn packed_block_diagonal_matches_per_cell_forward() {
     let alive_id = tokenizer.encode("1", false).unwrap().get_ids()[0];
     let ids = [dead_id, alive_id];
 
+    // The reference path: F32 kernels only, whatever the adapter grants.
+    std::env::set_var("LEAN_F16", "0");
     let engine = Engine::new().expect("wgpu engine init");
     let model = GpuModel::load(&engine, &gguf_path, true).expect("loading model");
     let max_ctx = (prefix_ids.len() + cell_a.len().max(cell_b.len()) * 2 + 8) as u32;

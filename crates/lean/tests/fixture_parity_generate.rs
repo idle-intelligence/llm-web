@@ -29,6 +29,10 @@
 //! LEAN_TOKENIZER_DIR_LLAMA_360M=/path/to/SmolLM2-360M-Instruct \
 //! cargo test -p lean --release --test fixture_parity_generate -- --ignored smollm2_360m
 //!
+//! LEAN_GGUF_LLAMA_1_7B_Q4_0=/path/to/SmolLM2-1.7B-Instruct-Q4_0.gguf \
+//! LEAN_TOKENIZER_DIR_LLAMA_1_7B=/path/to/SmolLM2-1.7B-Instruct \
+//! cargo test -p lean --release --test fixture_parity_generate -- --ignored smollm2_1_7b
+//!
 //! LEAN_GGUF_LLAMA32_1B_Q4_0=/path/to/Llama-3.2-1B-Instruct-Q4_0.gguf \
 //! LEAN_TOKENIZER_DIR_LLAMA32_1B=/path/to/Llama-3.2-1B-Instruct \
 //! cargo test -p lean --release --test fixture_parity_generate -- --ignored llama32_1b
@@ -70,6 +74,8 @@ fn load(gguf: &str, tokenizer_dir: &str, backend: Backend) -> Lean {
 }
 
 fn check_generate_matches_fixture(gguf: &str, tokenizer_dir: &str, fixture_path: &str) {
+    // The reference path: F32 kernels only, whatever the adapter grants.
+    std::env::set_var("LEAN_F16", "0");
     let tokenizer = Tokenizer::from_file(format!("{tokenizer_dir}/tokenizer.json")).expect("loading tokenizer.json");
     let chat_template = read_chat_template(&format!("{tokenizer_dir}/tokenizer_config.json")).expect("reading chat_template");
     let fixture = load_fixture(fixture_path);
@@ -127,4 +133,12 @@ fn generate_matches_hf_fixture_llama32_1b() {
     let gguf = std::env::var("LEAN_GGUF_LLAMA32_1B_Q4_0").expect("set LEAN_GGUF_LLAMA32_1B_Q4_0 to run this test");
     let tokenizer_dir = std::env::var("LEAN_TOKENIZER_DIR_LLAMA32_1B").expect("set LEAN_TOKENIZER_DIR_LLAMA32_1B to run this test");
     check_generate_matches_fixture(&gguf, &tokenizer_dir, concat!(env!("CARGO_MANIFEST_DIR"), "/../lean-core/reference/fixture_llama32_1b_q4_0.json"));
+}
+
+#[test]
+#[ignore = "needs LEAN_GGUF_LLAMA_1_7B_Q4_0 and LEAN_TOKENIZER_DIR_LLAMA_1_7B on disk; never committed to this repo"]
+fn generate_matches_hf_fixture_smollm2_1_7b() {
+    let gguf = std::env::var("LEAN_GGUF_LLAMA_1_7B_Q4_0").expect("set LEAN_GGUF_LLAMA_1_7B_Q4_0 to run this test");
+    let tokenizer_dir = std::env::var("LEAN_TOKENIZER_DIR_LLAMA_1_7B").expect("set LEAN_TOKENIZER_DIR_LLAMA_1_7B to run this test");
+    check_generate_matches_fixture(&gguf, &tokenizer_dir, concat!(env!("CARGO_MANIFEST_DIR"), "/../lean-core/reference/fixture_llama_1_7b_q4_0.json"));
 }

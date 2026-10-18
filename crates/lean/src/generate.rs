@@ -12,13 +12,18 @@
 //! submitted before the previous id is read back), with the same tokens
 //! as the step-by-step `forward_decode_step_argmax` loop - see
 //! `tests/streaming_sampling.rs::greedy_streaming_matches_whole_reply`.
-//! Non-greedy sampling reads back the full logits vector every step
-//! (`forward_decode_step`) and draws from it via `sampling::sample` - see
-//! `sampling.rs`'s doc comment for why that's an acceptable readback cost.
+//! Non-greedy sampling with `1 <= top_k <= 63` runs entirely on the GPU
+//! (`model::decode_sampled_pipelined`: repetition penalty, top-k,
+//! temperature, top-p and the draw), one token read back per step; the first
+//! token, chosen from the prefill logits, uses the same algorithm on the
+//! CPU (`resident_sampling::sample_reference`). Other non-greedy settings
+//! (`top_k` 0 or 64 and up) read back the full logits vector every step
+//! (`forward_decode_step`) and draw via `sampling::sample`.
 
 use lean_core::engine::Engine;
-use lean_core::model::{argmax, decode_greedy_pipelined, forward_decode_step, GpuModel, KvCache};
-use crate::sampling::{sample, Rng64, SamplingParams};
+use lean_core::model::{argmax, decode_greedy_pipelined, decode_sampled_pipelined, forward_decode_step, GpuModel, KvCache};
+use lean_core::resident_sampling::sample_reference;
+use crate::sampling::{id_counts, sample, Rng64, SamplingParams};
 
 /// Runs the decode loop starting from `first_logits` (the logits already
 /// computed at the last prefilled position - the caller has just run
@@ -51,6 +56,24 @@ pub async fn decode_loop(
     if params.is_greedy() {
         let first = argmax(&first_logits);
         return decode_greedy_pipelined(engine, model, cache, first, max_new_tokens, true, cos, sin, mask, |id| {
+            if should_stop() {
+                return false;
+            }
+            history.push(id);
+            on_token(id);
+            true
+        })
+        .await
+        .0;
+    }
+    let vocab = model.config.vocab_size;
+    if let Some(sampling) = params.resident(vocab) {
+        // The whole choice on the GPU, one token read back per step.
+        let counts = id_counts(vocab, history);
+        let first = sample_reference(&first_logits, &counts, &sampling, 0);
+        let mut snapshot = history.clone();
+        snapshot.push(first);
+        return decode_sampled_pipelined(engine, model, cache, first, &snapshot, max_new_tokens, &sampling, cos, sin, mask, |id| {
             if should_stop() {
                 return false;
             }

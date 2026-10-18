@@ -146,81 +146,53 @@ mod neon {
     use super::{f16_to_f32, QK};
     use std::arch::aarch64::*;
 
-    /// One block's 16 nibble-pair bytes -> two `int32x4_t` quads (elements
-    /// `[0,4)`/`[4,8)` of either the lo or hi half) converted to f32 and
-    /// dotted against `x`. `nibble_mask`/`shift` pick low (`0x0F`, 0) or
-    /// high (`0xF0`... done via `vshrq_n_u8`, so mask is always applied
-    /// after an optional shift) nibbles - see the call sites below.
-    // SAFETY: caller must guarantee `x.len() >= 16` - this function reads
-    // `x[0..16]` via four unchecked `vld1q_f32` loads (4 lanes each) with no
-    // bounds check of its own.
-    #[inline]
-    #[target_feature(enable = "neon")]
-    unsafe fn dot16_signed(vals_u8: uint8x16_t, x: &[f32]) -> f32 {
-        debug_assert!(x.len() >= 16, "dot16_signed: x.len()={} < 16", x.len());
-        // vals_u8 lanes are already in [0, 15] (nibble value); subtract 8 to
-        // get the signed weight, same as `(nibble as f32) - 8.0` above.
-        let signed = vsubq_s8(vreinterpretq_s8_u8(vals_u8), vdupq_n_s8(8));
-        let lo16 = vmovl_s8(vget_low_s8(signed)); // elements 0..8
-        let hi16 = vmovl_s8(vget_high_s8(signed)); // elements 8..16
-        let lo32a = vmovl_s16(vget_low_s16(lo16)); // 0..4
-        let lo32b = vmovl_s16(vget_high_s16(lo16)); // 4..8
-        let hi32a = vmovl_s16(vget_low_s16(hi16)); // 8..12
-        let hi32b = vmovl_s16(vget_high_s16(hi16)); // 12..16
-        let fa = vcvtq_f32_s32(lo32a);
-        let fb = vcvtq_f32_s32(lo32b);
-        let fc = vcvtq_f32_s32(hi32a);
-        let fd = vcvtq_f32_s32(hi32b);
-        let xa = vld1q_f32(x.as_ptr());
-        let xb = vld1q_f32(x.as_ptr().add(4));
-        let xc = vld1q_f32(x.as_ptr().add(8));
-        let xd = vld1q_f32(x.as_ptr().add(12));
-        let mut acc = vmulq_f32(fa, xa);
-        acc = vfmaq_f32(acc, fb, xb);
-        acc = vfmaq_f32(acc, fc, xc);
-        acc = vfmaq_f32(acc, fd, xd);
-        vaddvq_f32(acc)
-    }
-
-    // SAFETY: caller must guarantee `block.len() >= 18` (2-byte f16 scale +
-    // 16 packed nibble bytes) and `x.len() >= 32`; `block[2..18]` is sliced
-    // (panics on a short block) but the `vld1q_u8` load itself trusts that
-    // slice's length, and `dot16_signed` below trusts `x`'s length.
-    #[target_feature(enable = "neon")]
-    unsafe fn dot_q4_0_block(block: &[u8], x: &[f32]) -> f32 {
-        debug_assert!(block.len() >= 18, "dot_q4_0_block: block.len()={} < 18", block.len());
-        debug_assert!(x.len() >= 32, "dot_q4_0_block: x.len()={} < 32", x.len());
-        let raw = vld1q_u8(block[2..18].as_ptr());
-        let lo = vandq_u8(raw, vdupq_n_u8(0x0F));
-        let hi = vshrq_n_u8(raw, 4);
-        dot16_signed(lo, &x[0..16]) + dot16_signed(hi, &x[16..32])
-    }
-
-    pub(super) fn dot_q4_0(bytes: &[u8], x: &[f32]) -> f32 {
-        let mut acc = 0f32;
-        for (bi, block) in bytes.as_chunks::<18>().0.iter().enumerate() {
-            let scale = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
-            let base = bi * QK;
-            let s = unsafe { dot_q4_0_block(block, &x[base..base + QK]) };
-            acc += s * scale;
+    /// `R` weight rows (each `x.len() / 32` Q4_0 or Q8_0 blocks) dotted
+    /// against `x`, sharing the activation loads. Per row and block: the 32
+    /// weights widened to f32, multiplied lane-wise with `x` into two
+    /// four-lane partial sums (elements `8i..8i+4` into the first, `8i+4..8i+8`
+    /// into the second), their sum times the block scale accumulated into a
+    /// four-lane total, one horizontal sum per row at the end. Each row's
+    /// operations do not depend on `R` or on the other rows, so a row gives
+    /// the same bits whichever group it is computed in.
+    #[inline(always)]
+    pub(super) fn dot_rows<const R: usize, const Q4: bool>(rows: [&[u8]; R], x: &[f32]) -> [f32; R] {
+        let bb = if Q4 { 18 } else { 34 };
+        let nb = x.len() / QK;
+        assert!(x.len() == nb * QK && rows.iter().all(|r| r.len() == nb * bb));
+        // SAFETY: NEON is baseline on aarch64. Every load reads inside one
+        // 32-float block of `x` or one `bb`-byte block of a row, both
+        // bounds-checked by the assert above.
+        unsafe {
+            let mut acc = [vdupq_n_f32(0.0); R];
+            for b in 0..nb {
+                let xp = x.as_ptr().add(b * QK);
+                let xv: [float32x4_t; 8] = core::array::from_fn(|i| vld1q_f32(xp.add(4 * i)));
+                for r in 0..R {
+                    let blk = rows[r].as_ptr().add(b * bb);
+                    let d = f16_to_f32(u16::from_le_bytes([*blk, *blk.add(1)]));
+                    let (q0, q1) = if Q4 {
+                        let raw = vld1q_u8(blk.add(2));
+                        let eight = vdupq_n_s8(8);
+                        (vsubq_s8(vreinterpretq_s8_u8(vandq_u8(raw, vdupq_n_u8(0x0F))), eight), vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8::<4>(raw)), eight))
+                    } else {
+                        (vld1q_s8(blk.add(2) as *const i8), vld1q_s8(blk.add(18) as *const i8))
+                    };
+                    let a = [vmovl_s8(vget_low_s8(q0)), vmovl_high_s8(q0), vmovl_s8(vget_low_s8(q1)), vmovl_high_s8(q1)];
+                    let mut p = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(a[0]))), xv[0]);
+                    let mut p2 = vmulq_f32(vcvtq_f32_s32(vmovl_high_s16(a[0])), xv[1]);
+                    for i in 1..4 {
+                        p = vfmaq_f32(p, vcvtq_f32_s32(vmovl_s16(vget_low_s16(a[i]))), xv[2 * i]);
+                        p2 = vfmaq_f32(p2, vcvtq_f32_s32(vmovl_high_s16(a[i])), xv[2 * i + 1]);
+                    }
+                    acc[r] = vfmaq_n_f32(acc[r], vaddq_f32(p, p2), d);
+                }
+            }
+            core::array::from_fn(|r| vaddvq_f32(acc[r]))
         }
-        acc
     }
 
-    // SAFETY: caller must guarantee `qs.len() >= 32` (this reads two
-    // unchecked 16-byte NEON loads at offsets 0 and 16) and `x.len() >= 32`
-    // (sliced into two 16-element halves passed to `dot16_signed_i8`).
-    #[target_feature(enable = "neon")]
-    unsafe fn dot_q8_0_block(qs: &[u8], x: &[f32]) -> f32 {
-        debug_assert!(qs.len() >= 32, "dot_q8_0_block: qs.len()={} < 32", qs.len());
-        debug_assert!(x.len() >= 32, "dot_q8_0_block: x.len()={} < 32", x.len());
-        let a = vld1q_s8(qs.as_ptr() as *const i8);
-        let b = vld1q_s8(qs.as_ptr().add(16) as *const i8);
-        dot16_signed_i8(a, &x[0..16]) + dot16_signed_i8(b, &x[16..32])
-    }
-
-    // SAFETY: caller must guarantee `x.len() >= 16`, same contract as
-    // `dot16_signed` above (four unchecked 4-lane `vld1q_f32` loads).
+    // SAFETY: caller must guarantee `x.len() >= 16` - this function reads
+    // `x[0..16]` via four unchecked 4-lane `vld1q_f32` loads.
     #[inline]
     #[target_feature(enable = "neon")]
     unsafe fn dot16_signed_i8(vals: int8x16_t, x: &[f32]) -> f32 {
@@ -244,17 +216,6 @@ mod neon {
         acc = vfmaq_f32(acc, fc, xc);
         acc = vfmaq_f32(acc, fd, xd);
         vaddvq_f32(acc)
-    }
-
-    pub(super) fn dot_q8_0(bytes: &[u8], x: &[f32]) -> f32 {
-        let mut acc = 0f32;
-        for (bi, block) in bytes.as_chunks::<34>().0.iter().enumerate() {
-            let scale = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
-            let base = bi * QK;
-            let s = unsafe { dot_q8_0_block(&block[2..34], &x[base..base + QK]) };
-            acc += s * scale;
-        }
-        acc
     }
 
     /// One Q6_K super-block dotted against 256 activations: scalar bit
@@ -329,66 +290,43 @@ mod simd128 {
         f32x4_extract_lane::<0>(acc) + f32x4_extract_lane::<1>(acc) + f32x4_extract_lane::<2>(acc) + f32x4_extract_lane::<3>(acc)
     }
 
-    /// `vals`' 16 lanes, each an unsigned nibble value `[0, 15]` (Q4_0's
-    /// packed weights), offset by `-8` to the signed weight range before
-    /// converting to f32 - the bug this comment guards against: reusing
-    /// `dot16_signed_i8`'s already-signed path here (or its own path for
-    /// Q8_0) silently corrupts one or the other, since only Q4_0's nibbles
-    /// need the offset (caught by `tests::q8_dispatch_matches_scalar_reference`
-    /// on a real wasm32+simd128 run under wasmtime - this file's dispatch
-    /// wrapper looked identical for both dtypes in an earlier version and
-    /// wasn't).
-    // SAFETY: delegates to `dot16_signed_i8`, same `x.len() >= 16` contract.
-    #[inline]
-    unsafe fn dot16_unsigned_nibbles(vals: v128, x: &[f32]) -> f32 {
-        debug_assert!(x.len() >= 16, "dot16_unsigned_nibbles: x.len()={} < 16", x.len());
-        dot16_signed_i8(i8x16_sub(vals, i8x16_splat(8)), x)
-    }
-
-    // SAFETY: `block.len() >= 18` (2-byte f16 scale + 16 packed nibble
-    // bytes; `block[2..18]` is sliced first and panics if too short, but the
-    // `v128_load` itself trusts the slice) and `x.len() >= 32`.
-    fn dot_q4_0_block(block: &[u8], x: &[f32]) -> f32 {
-        debug_assert!(block.len() >= 18, "dot_q4_0_block: block.len()={} < 18", block.len());
-        debug_assert!(x.len() >= 32, "dot_q4_0_block: x.len()={} < 32", x.len());
+    /// wasm simd128 mirror of `neon::dot_rows`, with a separate multiply
+    /// and add where NEON fuses them (simd128 has no fused multiply-add).
+    #[inline(always)]
+    pub(super) fn dot_rows<const R: usize, const Q4: bool>(rows: [&[u8]; R], x: &[f32]) -> [f32; R] {
+        let bb = if Q4 { 18 } else { 34 };
+        let nb = x.len() / QK;
+        assert!(x.len() == nb * QK && rows.iter().all(|r| r.len() == nb * bb));
+        // SAFETY: simd128 is enabled at compile time. Every load reads
+        // inside one 32-float block of `x` or one `bb`-byte block of a row,
+        // both bounds-checked by the assert above.
         unsafe {
-            let raw = v128_load(block[2..18].as_ptr() as *const v128);
-            let lo = v128_and(raw, u8x16_splat(0x0F));
-            let hi = u8x16_shr(raw, 4);
-            dot16_unsigned_nibbles(lo, &x[0..16]) + dot16_unsigned_nibbles(hi, &x[16..32])
+            let mut acc = [f32x4_splat(0.0); R];
+            for b in 0..nb {
+                let xp = x.as_ptr().add(b * QK);
+                let xv: [v128; 8] = core::array::from_fn(|i| v128_load(xp.add(4 * i) as *const v128));
+                for r in 0..R {
+                    let blk = rows[r].as_ptr().add(b * bb);
+                    let d = f32x4_splat(f16_to_f32(u16::from_le_bytes([*blk, *blk.add(1)])));
+                    let (q0, q1) = if Q4 {
+                        let raw = v128_load(blk.add(2) as *const v128);
+                        let eight = i8x16_splat(8);
+                        (i8x16_sub(v128_and(raw, u8x16_splat(0x0F)), eight), i8x16_sub(u8x16_shr(raw, 4), eight))
+                    } else {
+                        (v128_load(blk.add(2) as *const v128), v128_load(blk.add(18) as *const v128))
+                    };
+                    let a = [i16x8_extend_low_i8x16(q0), i16x8_extend_high_i8x16(q0), i16x8_extend_low_i8x16(q1), i16x8_extend_high_i8x16(q1)];
+                    let mut p = f32x4_mul(f32x4_convert_i32x4(i32x4_extend_low_i16x8(a[0])), xv[0]);
+                    let mut p2 = f32x4_mul(f32x4_convert_i32x4(i32x4_extend_high_i16x8(a[0])), xv[1]);
+                    for i in 1..4 {
+                        p = f32x4_add(p, f32x4_mul(f32x4_convert_i32x4(i32x4_extend_low_i16x8(a[i])), xv[2 * i]));
+                        p2 = f32x4_add(p2, f32x4_mul(f32x4_convert_i32x4(i32x4_extend_high_i16x8(a[i])), xv[2 * i + 1]));
+                    }
+                    acc[r] = f32x4_add(acc[r], f32x4_mul(f32x4_add(p, p2), d));
+                }
+            }
+            core::array::from_fn(|r| f32x4_extract_lane::<0>(acc[r]) + f32x4_extract_lane::<1>(acc[r]) + f32x4_extract_lane::<2>(acc[r]) + f32x4_extract_lane::<3>(acc[r]))
         }
-    }
-
-    pub(super) fn dot_q4_0(bytes: &[u8], x: &[f32]) -> f32 {
-        let mut acc = 0f32;
-        for (bi, block) in bytes.as_chunks::<18>().0.iter().enumerate() {
-            let scale = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
-            let base = bi * QK;
-            acc += dot_q4_0_block(block, &x[base..base + QK]) * scale;
-        }
-        acc
-    }
-
-    // SAFETY: `qs.len() >= 32` (two unchecked 16-byte `v128_load`s at
-    // offsets 0 and 16) and `x.len() >= 32`.
-    fn dot_q8_0_block(qs: &[u8], x: &[f32]) -> f32 {
-        debug_assert!(qs.len() >= 32, "dot_q8_0_block: qs.len()={} < 32", qs.len());
-        debug_assert!(x.len() >= 32, "dot_q8_0_block: x.len()={} < 32", x.len());
-        unsafe {
-            let a = v128_load(qs.as_ptr() as *const v128);
-            let b = v128_load(qs.as_ptr().add(16) as *const v128);
-            dot16_signed_i8(a, &x[0..16]) + dot16_signed_i8(b, &x[16..32])
-        }
-    }
-
-    pub(super) fn dot_q8_0(bytes: &[u8], x: &[f32]) -> f32 {
-        let mut acc = 0f32;
-        for (bi, block) in bytes.as_chunks::<34>().0.iter().enumerate() {
-            let scale = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
-            let base = bi * QK;
-            acc += dot_q8_0_block(&block[2..34], &x[base..base + QK]) * scale;
-        }
-        acc
     }
 
     /// wasm simd128 mirror of `neon::dot_q6_k`: scalar bit unpack
@@ -492,50 +430,68 @@ impl F4 {
     }
 }
 
+#[cfg(all(target_arch = "aarch64", not(feature = "force_scalar")))]
+use neon::dot_rows;
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+use simd128::dot_rows;
+
+/// Four Q4_0 (`Q4 = true`) or Q8_0 rows dotted against `x`: the SIMD row
+/// kernel on NEON and simd128 builds, four scalar row dots elsewhere.
+#[cfg(any(all(target_arch = "aarch64", not(feature = "force_scalar")), all(target_arch = "wasm32", target_feature = "simd128")))]
+#[inline(always)]
+fn dot4<const Q4: bool>(rows: [&[u8]; 4], x: &[f32]) -> [f32; 4] {
+    dot_rows::<4, Q4>(rows, x)
+}
+
+#[cfg(not(any(all(target_arch = "aarch64", not(feature = "force_scalar")), all(target_arch = "wasm32", target_feature = "simd128"))))]
+#[inline(always)]
+fn dot4<const Q4: bool>(rows: [&[u8]; 4], x: &[f32]) -> [f32; 4] {
+    rows.map(|r| if Q4 { dot_q4_0_scalar(r, x) } else { dot_q8_0_scalar(r, x) })
+}
+
 /// One row's Q4_0 block bytes dotted against `x` (`x.len()` must equal
-/// `blocks_per_row * 32`). Dispatches to the NEON path on aarch64, simd128
-/// on a wasm32 build compiled with `+simd128`, scalar everywhere else -
-/// selected at compile time (see this module's doc comment), never at
-/// runtime.
+/// `blocks_per_row * 32`). NEON on aarch64, simd128 on a wasm32 build
+/// compiled with `+simd128`, scalar everywhere else, selected at compile
+/// time (see this module's doc comment), never at runtime. The SIMD paths
+/// give the same bits as that row inside `matvec_q`.
 #[inline]
 pub fn dot_q4_0(bytes: &[u8], x: &[f32]) -> f32 {
-    #[cfg(all(target_arch = "aarch64", not(feature = "force_scalar")))]
-    {
-        neon::dot_q4_0(bytes, x)
-    }
-    #[cfg(all(target_arch = "aarch64", feature = "force_scalar"))]
-    {
-        dot_q4_0_scalar(bytes, x)
-    }
-    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
-    {
-        simd128::dot_q4_0(bytes, x)
-    }
-    #[cfg(not(any(target_arch = "aarch64", all(target_arch = "wasm32", target_feature = "simd128"))))]
-    {
-        dot_q4_0_scalar(bytes, x)
-    }
+    #[cfg(any(all(target_arch = "aarch64", not(feature = "force_scalar")), all(target_arch = "wasm32", target_feature = "simd128")))]
+    return dot_rows::<1, true>([bytes], x)[0];
+    #[cfg(not(any(all(target_arch = "aarch64", not(feature = "force_scalar")), all(target_arch = "wasm32", target_feature = "simd128"))))]
+    return dot_q4_0_scalar(bytes, x);
 }
 
 /// One row's Q8_0 block bytes dotted against `x` (`x.len()` must equal
 /// `blocks_per_row * 32`). Same dispatch rule as `dot_q4_0`.
 #[inline]
 pub fn dot_q8_0(bytes: &[u8], x: &[f32]) -> f32 {
-    #[cfg(all(target_arch = "aarch64", not(feature = "force_scalar")))]
-    {
-        neon::dot_q8_0(bytes, x)
+    #[cfg(any(all(target_arch = "aarch64", not(feature = "force_scalar")), all(target_arch = "wasm32", target_feature = "simd128")))]
+    return dot_rows::<1, false>([bytes], x)[0];
+    #[cfg(not(any(all(target_arch = "aarch64", not(feature = "force_scalar")), all(target_arch = "wasm32", target_feature = "simd128"))))]
+    return dot_q8_0_scalar(bytes, x);
+}
+
+/// Rows `cols` of a Q4_0 (`Q4 = true`) or Q8_0 matrix (`bytes`, row-major,
+/// `row_bytes` bytes per row) dotted against `x`: `out[i]` is row
+/// `cols.start + i`. Four rows per pass share the activation loads; the
+/// remaining one to three rows go one at a time through the same per-row
+/// operations, so every element equals `dot_q4_0`/`dot_q8_0` of its row bit
+/// for bit, whatever `cols` is (the threaded and single-thread paths split
+/// the columns differently and still agree exactly).
+#[inline]
+pub fn matvec_q<const Q4: bool>(bytes: &[u8], row_bytes: usize, x: &[f32], cols: std::ops::Range<usize>, out: &mut [f32]) {
+    assert_eq!(out.len(), cols.len());
+    let row = |c: usize| &bytes[c * row_bytes..(c + 1) * row_bytes];
+    let mut c = cols.start;
+    let (quads, tail) = out.as_chunks_mut::<4>();
+    for o in quads {
+        *o = dot4::<Q4>([row(c), row(c + 1), row(c + 2), row(c + 3)], x);
+        c += 4;
     }
-    #[cfg(all(target_arch = "aarch64", feature = "force_scalar"))]
-    {
-        dot_q8_0_scalar(bytes, x)
-    }
-    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
-    {
-        simd128::dot_q8_0(bytes, x)
-    }
-    #[cfg(not(any(target_arch = "aarch64", all(target_arch = "wasm32", target_feature = "simd128"))))]
-    {
-        dot_q8_0_scalar(bytes, x)
+    for o in tail {
+        *o = if Q4 { dot_q4_0(row(c), x) } else { dot_q8_0(row(c), x) };
+        c += 1;
     }
 }
 
@@ -559,6 +515,83 @@ pub fn dot_q6_k(bytes: &[u8], x: &[f32]) -> f32 {
     {
         dot_q6_k_scalar(bytes, x)
     }
+}
+
+/// One row's Q5_0 block bytes (22 bytes per 32 values) dotted against `x`
+/// (`x.len()` must equal `blocks_per_row * 32`). Plain Rust on every target:
+/// the block is widened to integers in a fixed-size array the compiler
+/// vectorizes (NEON, simd128) without a hand-written kernel.
+#[inline]
+pub fn dot_q5_0(bytes: &[u8], x: &[f32]) -> f32 {
+    let mut acc = 0f32;
+    for (block, xb) in bytes.as_chunks::<22>().0.iter().zip(x.as_chunks::<32>().0) {
+        let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+        let qh = u32::from_le_bytes([block[2], block[3], block[4], block[5]]);
+        let mut s = 0f32;
+        for j in 0..16 {
+            let byte = block[6 + j];
+            let lo = ((byte & 0x0F) as u32 | (((qh >> j) & 1) << 4)) as i32 - 16;
+            let hi = ((byte >> 4) as u32 | (((qh >> (j + 16)) & 1) << 4)) as i32 - 16;
+            s += lo as f32 * xb[j] + hi as f32 * xb[j + 16];
+        }
+        acc += s * d;
+    }
+    acc
+}
+
+/// One row's Q4_K block bytes (144 bytes per 256 values) dotted against `x`
+/// (`x.len()` must equal the row's value count). Per sub-block of 32 values
+/// the sums of `nibble * x` and of `x` are formed, then
+/// `d * sc * sum(nibble * x) - dmin * m * sum(x)`. Plain Rust on every target.
+#[inline]
+pub fn dot_q4_k(bytes: &[u8], x: &[f32]) -> f32 {
+    let mut acc = 0f32;
+    for (block, xb) in bytes.as_chunks::<144>().0.iter().zip(x.as_chunks::<256>().0) {
+        let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+        let dmin = f16_to_f32(u16::from_le_bytes([block[2], block[3]]));
+        let scales = &block[4..16];
+        let qs = &block[16..144];
+        for g in 0..4 {
+            let (sc1, m1) = crate::gguf::q4_k_scale_min(2 * g, scales);
+            let (sc2, m2) = crate::gguf::q4_k_scale_min(2 * g + 1, scales);
+            let (mut qx1, mut sx1, mut qx2, mut sx2) = (0f32, 0f32, 0f32, 0f32);
+            for l in 0..32 {
+                let q = qs[g * 32 + l];
+                let (x1, x2) = (xb[g * 64 + l], xb[g * 64 + 32 + l]);
+                qx1 += (q & 0xF) as f32 * x1;
+                sx1 += x1;
+                qx2 += (q >> 4) as f32 * x2;
+                sx2 += x2;
+            }
+            acc += d * sc1 as f32 * qx1 - dmin * m1 as f32 * sx1;
+            acc += d * sc2 as f32 * qx2 - dmin * m2 as f32 * sx2;
+        }
+    }
+    acc
+}
+
+/// One row of F16 values (2 bytes each, little-endian) dotted against `x`.
+#[inline]
+pub fn dot_f16(bytes: &[u8], x: &[f32]) -> f32 {
+    let mut acc = [0f32; 4];
+    for (b, xc) in bytes.as_chunks::<8>().0.iter().zip(x.as_chunks::<4>().0) {
+        for l in 0..4 {
+            acc[l] += f16_to_f32(u16::from_le_bytes([b[2 * l], b[2 * l + 1]])) * xc[l];
+        }
+    }
+    (acc[0] + acc[1]) + (acc[2] + acc[3])
+}
+
+/// One row of BF16 values (the top 16 bits of an f32, little-endian) dotted against `x`.
+#[inline]
+pub fn dot_bf16(bytes: &[u8], x: &[f32]) -> f32 {
+    let mut acc = [0f32; 4];
+    for (b, xc) in bytes.as_chunks::<8>().0.iter().zip(x.as_chunks::<4>().0) {
+        for l in 0..4 {
+            acc[l] += f32::from_bits((u16::from_le_bytes([b[2 * l], b[2 * l + 1]]) as u32) << 16) * xc[l];
+        }
+    }
+    (acc[0] + acc[1]) + (acc[2] + acc[3])
 }
 
 #[cfg(test)]
@@ -611,6 +644,30 @@ mod tests {
         assert!((scalar - dispatched).abs() < 1e-3, "scalar={scalar} dispatched={dispatched}");
     }
 
+    #[test]
+    fn matvec_rows_equal_single_row_dots_bit_for_bit() {
+        let nb = 7;
+        let n = 45;
+        let x: Vec<f32> = (0..nb * 32).map(|i| ((i * 37 % 211) as f32) * 0.01 - 1.0).collect();
+        let q4: Vec<u8> = (0..n * nb).flat_map(|i| synth_q4_block(i as u32)).collect();
+        let q8: Vec<u8> = (0..n * nb).flat_map(|i| synth_q8_block(i as u32)).collect();
+        for cols in [0..n, 3..42, 5..6, 8..11] {
+            let mut out = vec![0f32; cols.len()];
+            matvec_q::<true>(&q4, nb * 18, &x, cols.clone(), &mut out);
+            for (o, c) in out.iter().zip(cols.clone()) {
+                let row = &q4[c * nb * 18..(c + 1) * nb * 18];
+                assert_eq!(o.to_bits(), dot_q4_0(row, &x).to_bits(), "Q4_0 row {c} of {cols:?}");
+                assert!(close(*o, dot_q4_0_scalar(row, &x)), "Q4_0 row {c} vs scalar");
+            }
+            matvec_q::<false>(&q8, nb * 34, &x, cols.clone(), &mut out);
+            for (o, c) in out.iter().zip(cols.clone()) {
+                let row = &q8[c * nb * 34..(c + 1) * nb * 34];
+                assert_eq!(o.to_bits(), dot_q8_0(row, &x).to_bits(), "Q8_0 row {c} of {cols:?}");
+                assert!(close(*o, dot_q8_0_scalar(row, &x)), "Q8_0 row {c} vs scalar");
+            }
+        }
+    }
+
     fn synth_q6k_block(seed: u32) -> Vec<u8> {
         let mut block = vec![0u8; 210];
         for (i, b) in block[0..192].iter_mut().enumerate() {
@@ -635,5 +692,45 @@ mod tests {
         let scalar = dot_q6_k_scalar(&bytes, &x);
         let dispatched = dot_q6_k(&bytes, &x);
         assert!((scalar - dispatched).abs() < 1e-2, "scalar={scalar} dispatched={dispatched}");
+    }
+
+    fn lcg(seed: &mut u32) -> u32 {
+        *seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+        *seed >> 8
+    }
+
+    fn close(a: f32, b: f32) -> bool {
+        (a - b).abs() <= 1e-3 * (1.0 + b.abs())
+    }
+
+    #[test]
+    fn q5_0_dot_matches_dequantized_dot() {
+        let mut seed = 7;
+        let bytes: Vec<u8> = (0..22 * 6).map(|i| if i % 22 < 2 { if i % 22 == 0 { 0x66 } else { 0x2c } } else { lcg(&mut seed) as u8 }).collect();
+        let x: Vec<f32> = (0..6 * 32).map(|i| (i as f32) * 0.013 - 1.2).collect();
+        let want: f32 = crate::gguf::dequantize_q5_0(&bytes, x.len()).iter().zip(&x).map(|(w, v)| w * v).sum();
+        assert!(close(dot_q5_0(&bytes, &x), want), "{} vs {want}", dot_q5_0(&bytes, &x));
+    }
+
+    #[test]
+    fn q4_k_dot_matches_dequantized_dot() {
+        let mut seed = 11;
+        let bytes: Vec<u8> = (0..144 * 3).map(|i| if i % 144 < 4 { [0x66, 0x2c, 0x1a, 0x24][i % 144] } else { lcg(&mut seed) as u8 }).collect();
+        let x: Vec<f32> = (0..3 * 256).map(|i| ((i * 7 % 101) as f32) * 0.02 - 1.0).collect();
+        let want: f32 = crate::gguf::dequantize_q4_k(&bytes, x.len()).iter().zip(&x).map(|(w, v)| w * v).sum();
+        assert!(close(dot_q4_k(&bytes, &x), want), "{} vs {want}", dot_q4_k(&bytes, &x));
+    }
+
+    #[test]
+    fn half_dots_match_dequantized_dot() {
+        let mut seed = 3;
+        let vals: Vec<f32> = (0..64).map(|_| (lcg(&mut seed) % 2000) as f32 * 0.001 - 1.0).collect();
+        let x: Vec<f32> = (0..64).map(|i| (i as f32) * 0.03 - 1.0).collect();
+        let f16: Vec<u8> = vals.iter().flat_map(|v| half::f16::from_f32(*v).to_le_bytes()).collect();
+        let bf16: Vec<u8> = vals.iter().flat_map(|v| ((v.to_bits() >> 16) as u16).to_le_bytes()).collect();
+        let want16: f32 = crate::gguf::dequantize_f16(&f16, 64).iter().zip(&x).map(|(w, v)| w * v).sum();
+        let wantb: f32 = crate::gguf::dequantize_bf16(&bf16, 64).iter().zip(&x).map(|(w, v)| w * v).sum();
+        assert!(close(dot_f16(&f16, &x), want16));
+        assert!(close(dot_bf16(&bf16, &x), wantb));
     }
 }

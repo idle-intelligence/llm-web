@@ -28,7 +28,7 @@
 // other and the repeated weight reads (one per row group) can hit in cache.
 // Rows past M read zeros and are never written.
 //
-// Q8 (pipeline override, `linear_q8_small_m` in engine.rs): the same
+// Q8 (build constant, `linear_q8_small_m` in engine.rs): the same
 // kernel over Q8_0 blocks, two vec4<u32> per column per block (8 words of
 // 4 signed bytes, word s = k4 slot s) instead of one (4 words of 8
 // nibbles, low nibbles of word s = slot s, high nibbles = slot s + 4).
@@ -56,7 +56,17 @@ struct Dims {
 @group(0) @binding(4) var<storage, read_write> out: array<f32>;
 @group(0) @binding(5) var<uniform> dims: Dims;
 
-override Q8: bool = false;
+const Q8: bool = false;
+// Q41 (build constant, `linear_q41_small_m` in engine.rs): Q4_1 blocks,
+// value = nibble * d + m; `scales` holds [d, m] f32 pairs.
+const Q41: bool = false;
+// Q50 and K4 (build constants, `linear_q50_small_m`, `linear_k4_small_m` in
+// engine.rs): Q5_0 and Q4_K blocks; see aux_common.wgsl. K4 runs the Q4_1
+// arithmetic with the block's (d * sc, -dmin * m) in place of its (d, m).
+const Q50: bool = false;
+const K4: bool = false;
+
+//@AUX
 
 const ROWS: u32 = 8u;
 const KS: u32 = 4u;
@@ -74,6 +84,10 @@ var<workgroup> xs: array<vec4<f32>, 512>;
 
 fn nib4(w: u32, s: f32) -> vec4<f32> {
     return (vec4<f32>(vec4<u32>(w, w >> 8u, w >> 16u, w >> 24u) & vec4<u32>(0xFu)) - vec4<f32>(8.0)) * s;
+}
+
+fn nib4_1(w: u32, s: f32, m: f32) -> vec4<f32> {
+    return vec4<f32>(vec4<u32>(w, w >> 8u, w >> 16u, w >> 24u) & vec4<u32>(0xFu)) * s + vec4<f32>(m);
 }
 
 fn i8x4(w: u32, s: f32) -> vec4<f32> {
@@ -129,7 +143,27 @@ fn main(
 
         let blk = blk0 + ks;
         if (blk < bpr) {
-            let s = vec4<f32>(scales[sb.x + blk], scales[sb.y + blk], scales[sb.z + blk], scales[sb.w + blk]);
+            var s = vec4<f32>(0.0);
+            var mn = vec4<f32>(0.0);
+            var qh = vec4<u32>(0u);
+            if (K4) {
+                let bi = sb + vec4<u32>(blk);
+                let c0 = k4_dm(bi.x >> 3u, blk & 7u);
+                let c1 = k4_dm(bi.y >> 3u, blk & 7u);
+                let c2 = k4_dm(bi.z >> 3u, blk & 7u);
+                let c3 = k4_dm(bi.w >> 3u, blk & 7u);
+                s = vec4<f32>(c0.x, c1.x, c2.x, c3.x);
+                mn = vec4<f32>(c0.y, c1.y, c2.y, c3.y);
+            } else if (Q41) {
+                let si = (sb + vec4<u32>(blk)) * 2u;
+                s = vec4<f32>(scales[si.x], scales[si.y], scales[si.z], scales[si.w]);
+                mn = vec4<f32>(scales[si.x + 1u], scales[si.y + 1u], scales[si.z + 1u], scales[si.w + 1u]);
+            } else {
+                s = vec4<f32>(scales[sb.x + blk], scales[sb.y + blk], scales[sb.z + blk], scales[sb.w + blk]);
+                if (Q50) {
+                    qh = vec4<u32>(aux_at(sb.x + blk), aux_at(sb.y + blk), aux_at(sb.z + blk), aux_at(sb.w + blk));
+                }
+            }
             let qi = select(sb + vec4<u32>(blk), (sb + vec4<u32>(blk)) * 2u, Q8);
             // 8 k4 slots; Q4_0: slot p < 4 is the low nibbles of word p, slot
             // p + 4 the high nibbles; Q8_0: slot p is word p (second vec4 from 4).
@@ -155,6 +189,18 @@ fn main(
                     w1 = i8x4(wd.y, s.y);
                     w2 = i8x4(wd.z, s.z);
                     w3 = i8x4(wd.w, s.w);
+                } else if (Q50) {
+                    let hi = p >= 4u;
+                    w0 = q5_vals(wd.x, hi, pw, qh.x) * s.x;
+                    w1 = q5_vals(wd.y, hi, pw, qh.y) * s.y;
+                    w2 = q5_vals(wd.z, hi, pw, qh.z) * s.z;
+                    w3 = q5_vals(wd.w, hi, pw, qh.w) * s.w;
+                } else if (Q41 || K4) {
+                    let sh = select(0u, 4u, p >= 4u);
+                    w0 = nib4_1(wd.x >> sh, s.x, mn.x);
+                    w1 = nib4_1(wd.y >> sh, s.y, mn.y);
+                    w2 = nib4_1(wd.z >> sh, s.z, mn.z);
+                    w3 = nib4_1(wd.w >> sh, s.w, mn.w);
                 } else {
                     let sh = select(0u, 4u, p >= 4u);
                     w0 = nib4(wd.x >> sh, s.x);

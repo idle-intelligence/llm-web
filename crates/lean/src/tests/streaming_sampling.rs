@@ -12,8 +12,9 @@
 
 use lean_core::engine::Engine;
 use crate::generate::decode_loop;
-use lean_core::model::{argmax, build_rope_tables, decode_greedy_pipelined, forward_decode_step_argmax, forward_prefill, forward_prefill_suffix, GpuModel, KvCache};
-use crate::sampling::SamplingParams;
+use lean_core::model::{argmax, build_rope_tables, decode_greedy_pipelined, forward_decode_step, forward_decode_step_argmax, forward_prefill, forward_prefill_suffix, GpuModel, KvCache};
+use crate::sampling::{id_counts, SamplingParams};
+use lean_core::resident_sampling::sample_reference;
 use lean_chat::{read_chat_template, render, Message};
 use tokenizers::Tokenizer;
 
@@ -97,7 +98,7 @@ fn pipelined_greedy_matches_step_loop() {
         expected.push(next);
     }
 
-    for stop_after in [steps, 7] {
+    for stop_after in [steps, 1, 7, 8, 9, 16, 17] {
         let mut cache_b = KvCache::new(&engine, &model.config, max_ctx);
         let logits = pollster::block_on(forward_prefill(&engine, &model, &mut cache_b, &prompt_ids, &cos_buf, &sin_buf, None));
         assert_eq!(argmax(&logits), first);
@@ -139,9 +140,87 @@ fn seeded_sampling_is_reproducible_across_runs() {
     assert_eq!(out_a, out_b, "same seed + same params must reproduce the exact same generated token ids");
 }
 
+/// `decode_loop` with the resident sampler (top_k 40, on the GPU) gives the
+/// tokens of the CPU reference run over the full logits of a step-by-step
+/// decode, for the same seed: the kernels agree with `sample_reference` on
+/// real model logits.
+#[test]
+#[ignore = "needs LEAN_GGUF and LEAN_TOKENIZER_DIR on disk; never committed to this repo"]
+fn resident_sampling_matches_cpu_reference() {
+    let (engine, model, tokenizer, chat_template) = setup();
+    let steps = 96u32;
+    let mut total = 0;
+    for (prompt, seed, top_p, penalty) in [
+        ("Write a long story about a lighthouse keeper.", 0u64, 0.9f32, 1.1f32),
+        ("Tell me a short story about a fox.", 12345, 0.95, 1.1),
+        ("List ten animals, one per line.", 7, 1.0, 1.3),
+        ("Say hello.", 99, 0.5, 1.0),
+    ] {
+        let prompt_ids = tokenize(&tokenizer, &chat_template, prompt);
+        let max_ctx = prompt_ids.len() as u32 + steps + 4;
+        let (cos, sin) = build_rope_tables(&model.config, max_ctx as usize);
+        let cos_buf = engine.buf_f32(&cos, "rope_cos");
+        let sin_buf = engine.buf_f32(&sin, "rope_sin");
+        let params = SamplingParams { temperature: 0.7, top_k: 40, top_p, repetition_penalty: penalty, seed };
+        let vocab = model.config.vocab_size;
+        let resident = params.resident(vocab).expect("top_k 40 qualifies");
+
+        let mut cache = KvCache::new(&engine, &model.config, max_ctx);
+        let logits = pollster::block_on(forward_prefill(&engine, &model, &mut cache, &prompt_ids, &cos_buf, &sin_buf, None));
+        let mut history = prompt_ids.clone();
+        let got = pollster::block_on(decode_loop(&engine, &model, &mut cache, logits, &cos_buf, &sin_buf, None, steps, &params, &mut history, |_| {}, || false));
+
+        let mut cache = KvCache::new(&engine, &model.config, max_ctx);
+        let logits = pollster::block_on(forward_prefill(&engine, &model, &mut cache, &prompt_ids, &cos_buf, &sin_buf, None));
+        let mut counts = id_counts(vocab, &prompt_ids);
+        let mut next = sample_reference(&logits, &counts, &resident, 0);
+        let mut want = Vec::new();
+        for step in 0..steps {
+            if model.config.eos_token_ids.contains(&next) {
+                break;
+            }
+            want.push(next);
+            counts[next as usize] += 1;
+            let l = pollster::block_on(forward_decode_step(&engine, &model, &mut cache, next, &cos_buf, &sin_buf, None));
+            next = sample_reference(&l, &counts, &resident, step + 1);
+        }
+        assert_eq!(got, want, "prompt {prompt:?} seed {seed}");
+        total += got.len();
+    }
+    assert!(total > 150, "the comparison needs real replies, got {total} tokens");
+}
+
+/// Settings outside the resident sampler (top_k 0 and 64) still sample
+/// through the full-logits path and reproduce for the same seed.
+#[test]
+#[ignore = "needs LEAN_GGUF and LEAN_TOKENIZER_DIR on disk; never committed to this repo"]
+fn full_logits_sampling_is_reproducible() {
+    let (engine, model, tokenizer, chat_template) = setup();
+    let prompt_ids = tokenize(&tokenizer, &chat_template, "Tell me a short story about a fox.");
+    let max_ctx = prompt_ids.len() as u32 + 40;
+    let (cos, sin) = build_rope_tables(&model.config, max_ctx as usize);
+    let cos_buf = engine.buf_f32(&cos, "rope_cos");
+    let sin_buf = engine.buf_f32(&sin, "rope_sin");
+    for top_k in [0u32, 64] {
+        let params = SamplingParams { temperature: 0.8, top_k, top_p: 0.95, repetition_penalty: 1.1, seed: 5 };
+        assert!(params.resident(model.config.vocab_size).is_none());
+        let run = || {
+            let mut cache = KvCache::new(&engine, &model.config, max_ctx);
+            let logits = pollster::block_on(forward_prefill(&engine, &model, &mut cache, &prompt_ids, &cos_buf, &sin_buf, None));
+            let mut history = prompt_ids.clone();
+            pollster::block_on(decode_loop(&engine, &model, &mut cache, logits, &cos_buf, &sin_buf, None, 24, &params, &mut history, |_| {}, || false))
+        };
+        assert_eq!(run(), run(), "top_k {top_k}");
+    }
+}
+
 #[test]
 #[ignore = "needs LEAN_GGUF and LEAN_TOKENIZER_DIR on disk; never committed to this repo"]
 fn multi_turn_append_matches_full_reprefill() {
+    // F32 kernels on both paths: the 1e-2 gate compares a short append
+    // against a long re-prefill, which differ by the f16 tile's rounding on
+    // an f16 adapter.
+    std::env::set_var("LEAN_F16", "0");
     let (engine, model, tokenizer, chat_template) = setup();
     let p1 = "What is the capital of France?";
     let p2 = "And what is its population?";

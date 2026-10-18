@@ -5,11 +5,15 @@
 //!
 //! `LEAN_GGUF=... cargo run --release -p lean --example prefill_sweep -- [--lens 8,16,36] [--reps 5] [--decode 32] [--split]`
 //!
+//! `--suffix` also times the suffix prefill (the second half of the prompt after
+//! the first half, or `--suffix-after N` tokens, is resident) and prints its largest logit difference from
+//! the full prefill.
+//!
 //! `--split` adds the per-op-group GPU time of one prefill per length and of
 //! the decode steps (pass timestamps, needs `TIMESTAMP_QUERY`).
 
 use lean_core::engine::Engine;
-use lean_core::model::{build_rope_tables, decode_greedy_pipelined, forward_decode_step_argmax, forward_prefill, GpuModel, KvCache};
+use lean_core::model::{build_rope_tables, decode_greedy_pipelined, forward_decode_step_argmax, forward_prefill, forward_prefill_suffix, GpuModel, KvCache};
 
 const PROMPT: [u32; 36] = [
     151644, 8948, 198, 2610, 525, 1207, 16948, 11, 3465, 553, 54364, 14817, 13, 1446, 525, 264, 10950, 17847, 13, 151645, 198, 151644, 872, 198, 3838, 374, 279, 6722, 315, 9625, 30, 151645, 198, 151644, 77091, 198,
@@ -38,6 +42,8 @@ fn main() -> anyhow::Result<()> {
     let reps: usize = arg(&args, "--reps").map(|s| s.parse().unwrap()).unwrap_or(5);
     let n_decode: usize = arg(&args, "--decode").map(|s| s.parse().unwrap()).unwrap_or(32);
     let split = args.iter().any(|a| a == "--split");
+    let suffix = args.iter().any(|a| a == "--suffix");
+    let suffix_after: Option<usize> = arg(&args, "--suffix-after").map(|s| s.parse().unwrap());
     let gguf = std::env::var("LEAN_GGUF").expect("set LEAN_GGUF");
 
     let engine = pollster::block_on(Engine::new_async_with(split))?;
@@ -64,6 +70,26 @@ fn main() -> anyhow::Result<()> {
         }
         let (mn, mx) = (times.iter().cloned().fold(f64::MAX, f64::min), times.iter().cloned().fold(0.0, f64::max));
         println!("{len:4} {:8.2} {mn:8.2} {mx:8.2}", median(&mut times));
+        if suffix {
+            model.pool.reset();
+            cache.kv_len = 0;
+            let full = pollster::block_on(forward_prefill(&engine, &model, &mut cache, &ids, &cos_buf, &sin_buf, None));
+            let half = suffix_after.map_or(ids.len() / 2, |n| n.min(ids.len() - 1));
+            let mut st = Vec::new();
+            let mut diff = 0f32;
+            for _ in 0..=reps {
+                model.pool.reset();
+                cache.kv_len = 0;
+                let _ = pollster::block_on(forward_prefill(&engine, &model, &mut cache, &ids[..half], &cos_buf, &sin_buf, None));
+                let t = std::time::Instant::now();
+                let l = pollster::block_on(forward_prefill_suffix(&engine, &model, &mut cache, &ids[half..], &cos_buf, &sin_buf, None));
+                st.push(t.elapsed().as_secs_f64() * 1e3);
+                diff = l.iter().zip(&full).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
+                assert_eq!(lean_core::model::argmax(&l), lean_core::model::argmax(&full));
+            }
+            st.remove(0);
+            println!("     suffix of {} after {half}: {:.2} ms median, max |dlogit| {diff:.2e}, argmax equal", ids.len() - half, median(&mut st));
+        }
         if split {
             engine.set_diag(true, true);
             model.pool.reset();
