@@ -4,14 +4,14 @@ Change: lean applied the repetition penalty once per occurrence of an id in the 
 
 ## Parameters
 
-- Before: `browser-perf` at 2f381ca. After: branch `rep-penalty-hf`, fix at f150fb5 (fixture d70bff4, test knob 3b1644f).
+- Before: `browser-perf` at 2f381ca. After: the fix at f150fb5 (fixture d70bff4, test knob 3b1644f).
 - Reference: transformers 5.17.0, torch 2.14.0, CPU, f32. `RepetitionPenaltyLogitsProcessor.__call__` in `transformers/generation/logits_process.py`: `torch.gather(scores, 1, input_ids)` (line 409), `torch.where(score < 0, score * self.penalty, score / self.penalty)` (line 411), `scores.scatter(1, input_ids, score)` (line 412). `generate` builds it with the penalty only (`generation/utils.py` lines 1303-1304), so `prompt_ignore_length` is unset and `input_ids` is the whole sequence, prompt plus generated ids.
 - llama.cpp (checkout 38a5b42, 2026-09-15): `llama_sampler_penalties_apply` in `src/llama-sampler.cpp` (lines 2950-2979) looks each candidate up in `token_count` and applies `penalty_repeat` once (`logit <= 0` multiplies, otherwise divides); the count only scales the frequency and presence penalties. The window is the last `penalty_last_n` accepted ids (default 64, `common/common.h` line 239; ring kept in lines 2921-2935), and prompt ids are accepted into it (`tools/server/server-context.cpp` lines 419-424, `tools/completion/completion.cpp` lines 693-695).
 - Fixture: `crates/lean-core/reference/gen_fixture_rep_penalty.py` writes `fixture_rep_penalty.json`. Models: SmolLM2-360M-Instruct and Qwen2.5-0.5B-Instruct, the Q4_0 GGUFs lean reads, loaded and dequantized by transformers. Two prompts per model (a five-fruit list, "repeat after me three times"), chat template, plus a 48-token greedy continuation, so the history repeats ids (90 to 96 ids, 35 to 60 distinct, an id occurring up to 10 times). Next-token logits from one f32 forward over the whole sequence; processor applied at penalties 1.1 and 1.3. The fixture stores the raw and processed logit of each distinct history id as f32 bits; the script asserts every other logit is unchanged.
 - Parity tests: `cpu_penalty_matches_transformers` (lean, `src/tests/rep_penalty_parity.rs`) runs `sample` at temperature 1, no top-k, no top-p, which leaves the penalized logits in place; `gpu_penalty_matches_transformers` (lean-core, `src/tests/resident_sampling.rs`) runs `sample_gpu` with the counts buffer as `decode_sampled_pipelined` fills it and reads the logits buffer back. Ids outside the history get fixed filler logits. Max abs diff over the whole vocabulary.
 - Native sampled: `sampled_native` (chat page sampler: temperature 0.7, top-k 40, top-p 0.9, seed 0; prompt "Write a long story about a lighthouse keeper."), penalty 1.1 and, through `LEAN_PENALTY`, 1.0; 128 and 256 new tokens, three runs each (asserted equal); md5 of the written replies. Backends WebGPU (Metal) and CPU.
 - Browsers: `scripts/bench` (bench.html, bench_worker.js) served by `serve.mjs`, phases `exact,decode,sampled`, `decode=128`, `sampledN=128,256`, one load per cell. Hashes: first 8 bytes of the SHA-256 of the reply text. Exactness = greedy replies to three fixed questions (48 tokens each); greedy 128 = the decode phase's reply; sampled = the chat page's sampler with penalty 1.1, seed 0. Playwright 1.63.0 bundled Chromium (headless) and WebKit (headless), Firefox Developer Edition 159.0b1 (headed, throwaway profile, `dom.webgpu.enabled`).
-- Builds: `scripts/build.sh`, single-thread package, ENGINE_BUILD `2026-10-16-rp-base` and `2026-10-16-rp-fix` (local tags, not committed; the committed loading URLs are not changed by this branch). Served wasm fetched back from each server, md5: base 649569c777ec820eb906947495b2e27d, fix 7b772b0d856fcab8c8095b8f8c3a5132; both keep `+simd128`.
+- Builds: `scripts/build.sh`, single-thread package, ENGINE_BUILD `2026-10-16-rp-base` and `2026-10-16-rp-fix` (local tags; the committed loading URLs carry a different tag). Served wasm fetched back from each server, md5: base 649569c777ec820eb906947495b2e27d, fix 7b772b0d856fcab8c8095b8f8c3a5132; both keep `+simd128`.
 - Machine: the M2 laptop (16 GB), Rust 1.99.0 (pinned toolchain), release builds. 1-minute load average at the start of the browser cells 2.29 to 4.43; the tok/s figures below are not timing claims.
 
 ## Results
@@ -131,29 +131,29 @@ Change: lean applied the repetition penalty once per occurrence of an id in the 
 - After, the follow-ups are one short sentence (5 and 7 tokens) naming Nepal. SmolLM2-360M still states a wrong height in meters (8,816); this is the model's own error at this sampling, not a format problem.
 - One seed per model and question (the page's fixed seed 0): this is a sample of two conversations per build, not a quality measurement.
 
-## Archivist format with the page's sampling
+## Tagging format with the page's sampling
 
 ### Parameters
 
-- Task: the Hive archivist turns one question and its answer into two tags (F-tags, max 10 tokens) or into two tags and a one-line summary (F-both, max 80 tokens); variant F puts one worked example before the pair. 20 fixed question/answer pairs, seeds 1, 2 and 3 (60 calls per variant), the page's sampling (temperature 0.7, top-k 40, top-p 0.9, repetition penalty 1.1). SmolLM2-1.7B-Instruct Q4_0 (and SmolLM2-360M-Instruct Q4_0 for F-tags), native lean, WebGPU on Metal, one engine per variant, calls in sequence.
+- Task: a tagging task with a fixed two-line format turns one question and its answer into two tags (F-tags, max 10 tokens) or into two tags and a one-line summary (F-both, max 80 tokens); variant F puts one worked example before the pair. 20 fixed question/answer pairs, seeds 1, 2 and 3 (60 calls per variant), the page's sampling (temperature 0.7, top-k 40, top-p 0.9, repetition penalty 1.1). SmolLM2-1.7B-Instruct Q4_0 (and SmolLM2-360M-Instruct Q4_0 for F-tags), native lean, WebGPU on Metal, one engine per variant, calls in sequence.
 - Strict format: F-both, two tags and an explicit `summary:` line; F-tags, one line of exactly two comma-separated items of one or two words. Tag hit: at least one tag whose words all appear in the pair's fixed follow-up question.
-- Before: 2f381ca. Scratch: 2f381ca with the penalty applied once per id in a scratch copy (an earlier experiment). After: this branch at 6c00854. Same prompts, pairs, seeds and scorer for all three.
+- Before: 2f381ca. Variant: 2f381ca with the penalty applied once per id (a variant of the old code). After: this branch at 6c00854. Same prompts, pairs, seeds and scorer for all three.
 
 ### Results
 
 | Model | Variant | Engine | Strict format | Usable | Tag hit (follow-up) | Out tokens (median) |
 |---|---|---|---|---|---|---|
 | SmolLM2-1.7B | F-both | before | 1/60 | 1/60 | 1/60 | 60 |
-| SmolLM2-1.7B | F-both | scratch, once per id | 54/60 | 54/60 | 32/60 | 39.5 |
+| SmolLM2-1.7B | F-both | variant, once per id | 54/60 | 54/60 | 32/60 | 39.5 |
 | SmolLM2-1.7B | F-both | after | 57/60 | 57/60 | 36/60 | 35.5 |
 | SmolLM2-1.7B | F-tags | before | 18/60 | 25/60 | 19/60 | 5 |
-| SmolLM2-1.7B | F-tags | scratch, once per id | 51/60 | 51/60 | 35/60 | 4 |
+| SmolLM2-1.7B | F-tags | variant, once per id | 51/60 | 51/60 | 35/60 | 4 |
 | SmolLM2-1.7B | F-tags | after | 51/60 | 51/60 | 35/60 | 4 |
 | SmolLM2-360M | F-tags | before | 6/60 | 7/60 | 14/60 | 6 |
-| SmolLM2-360M | F-tags | scratch, once per id | 34/60 | 35/60 | 32/60 | 3 |
+| SmolLM2-360M | F-tags | variant, once per id | 34/60 | 35/60 | 32/60 | 3 |
 | SmolLM2-360M | F-tags | after | 34/60 | 35/60 | 32/60 | 3 |
 
 ### Observations
 
 - With the page's sampling, format compliance goes from 1/60 to 57/60 (F-both) and from 18/60 to 51/60 (F-tags) on SmolLM2-1.7B, and from 6/60 to 34/60 on SmolLM2-360M F-tags.
-- The F-tags replies on this branch are the same text as the scratch experiment's in all 60 calls for SmolLM2-1.7B. F-both matches it in 21 of 60 calls and differs in the rest; the WGSL penalty is the same arithmetic in both, and the cause of the difference in the longer replies was not investigated.
+- The F-tags replies on this branch are the same text as the variant's in all 60 calls for SmolLM2-1.7B. F-both matches it in 21 of 60 calls and differs in the rest; the WGSL penalty is the same arithmetic in both, and the cause of the difference in the longer replies was not investigated.

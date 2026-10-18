@@ -52,7 +52,7 @@ Branch work on prefill and decode submission. Data first, observations after.
 
 ## Results: Firefox on the M2 (earlier runs, installed Firefox 157, headed; not repeated)
 
-These come from the previous session on intermediate builds, same model and prompts, one page load each, 2 repetitions. The final build was not re-measured here (see observations).
+These come from intermediate builds, same model and prompts, one page load each, 2 repetitions. The final build was not re-measured here (see observations).
 
 | Build | Cold 100 ttft | Cold 500 ttft | Suffix 100+24 ttft | Suffix 500+124 ttft | Decode tok/s |
 |---|---|---|---|---|---|
@@ -158,7 +158,7 @@ First loads of each cell, before the machine slowed: Chromium 48.2 and 47.9 (128
 - Before: tree at the logit_dump commit (no kernel change). After: this branch. The 3 Q4_1 tensors were dequantized to F32 at load (201.3 MB, read in full every step); the Q6_K head ran the scalar byte-by-byte matvec.
 - Q4_1: the nibbles repack as for Q4_0, `d` and `m` are stored as interleaved f32 pairs in the scales buffer, and the Q4_0 matvec and matmul kernels gain a `Q41` override (value = nibble * d + m): decode with one and with four rows per lane, short and long prefill, and the naive reference kernel. The dequantized values are the same as the F32 load.
 - Q6_K: units of 64 weights read as vec4<u32>, 8 lanes per row with consecutive lanes on consecutive units, four 6-bit values assembled per u32 and converted with the exponent trick.
-- Native decode: `crates/lean/examples/profile_roofline` (decode, 32 steps after 2 warm-up steps; group times from pass timestamps in a split run, wall from unsplit steps), release build, interleaved before/after (ABAB), 5 pairs per context on the M2, median with min and max. Prefill: len 100 and 500, 3 pairs. M2 load average 1.4 to 2.5 at the runs (run script waits for below 2.5), under the shared GPU lock. RTX 3080: 3 pairs at context 128 under the shared GPU lock, 1-minute load 0.8 to 1.5; context 512 and the box test suites were not run (the box stopped answering over SSH for the last hours of this work).
+- Native decode: `crates/lean/examples/profile_roofline` (decode, 32 steps after 2 warm-up steps; group times from pass timestamps in a split run, wall from unsplit steps), release build, interleaved before/after (ABAB), 5 pairs per context on the M2, median with min and max. Prefill: len 100 and 500, 3 pairs. M2 load average 1.4 to 2.5 at the runs (run script waits for below 2.5). RTX 3080: 3 pairs at context 128, 1-minute load 0.8 to 1.5; context 512 and the box test suites were not run (the box stopped answering over SSH for the last hours of this work).
 - Browsers (M2): Chromium 153 (`--use-angle=metal`), WebKit (Playwright build), Firefox Developer Edition 159 headed with a throwaway profile; harness `scripts/bench`, phases `decode,exact` at 128 tokens (3 loads per variant on Chromium, 2 on WebKit and Firefox) and `decode` at 512 tokens (1 load each), before and after interleaved. Served bytes checked by fetching `lean_bg.wasm` back from each server: before 5cf5941146783dc429f9a9f06c0343c6, after 62bf3b6f8cfe82925e6fd87841ebd840 (ENGINE_BUILD 2026-10-14-quant-01 on all four loading URLs).
 - Ceilings (from the profile run doc): M2 read 91.4 GB/s, RTX 3080 read 711 GB/s.
 
@@ -285,7 +285,7 @@ Change: the split-K pass 1 kernel (`attn_decode_split.wgsl`) read each key row w
 
 - Model SmolLM2-1.7B-Instruct Q4_0 (32 query heads, 32 KV heads, head_dim 64, F32 KV cache), greedy. Native harness: `crates/lean/examples/decode_ctx.rs` (prefill N tokens of a repeated prompt, then 64 pipelined greedy steps, median of 3 loads of the loop per cell; 5 interleaved process runs, before then after). Browser harness: `scripts/bench` phase decode, 128 / 512 / 1900 new tokens (the story ends by itself at 963 tokens, so the 1900 row is a 963-token run), 5 page loads per cell (3 for 1900), before then after interleaved.
 - Before: shader of the previous commit. After: this branch. wasm md5 before 120efbdcac048db0523e3a0053c52a01, after 9d1dae68c4b92487ff03dbf701dd6ba0 (built once on the Linux test machine, copied to the M2 with matching md5, served under distinct tags and fetched back).
-- M2 laptop: 1-minute load average 0.8 to 2.7 for the native runs; 1.0 to 6.7 for the browser runs (other workers built and ran on it). Linux test machine (RTX 3080): load under 1 for native, GPU behind a lock. Chromium 153 (Metal, headless) and WebKit via Playwright; Firefox Developer Edition 159 headed with a throwaway profile on the M2; Chromium 152 headed on Vulkan on the Linux machine.
+- M2 laptop: 1-minute load average 0.8 to 2.7 for the native runs; 1.0 to 6.7 for the browser runs (other jobs ran on the machine). Linux test machine (RTX 3080): load under 1 for native. Chromium 153 (Metal, headless) and WebKit via Playwright; Firefox Developer Edition 159 headed with a throwaway profile on the M2; Chromium 152 headed on Vulkan on the Linux machine.
 
 ### Results: native decode, ms per token (median, min-max)
 
@@ -296,7 +296,7 @@ Change: the split-K pass 1 kernel (`attn_decode_split.wgsl`) read each key row w
 | 1024 | 28.8 (28.6-28.8) | 25.3 (25.2-25.4) | 5.26 (5.23-5.29) | 4.78 (4.73-4.78) |
 | 2048 | 38.2 (37.9-38.3) | 33.3 (33.2-33.4) | 11.45 (11.41-11.46) | 5.59 (5.56-5.60) |
 
-M2 before has 4 runs (the first one timed out waiting for the GPU lock), after has 5. A quieter earlier M2 session gave before 19.3 / 23.5 / 27.7 / 36.8 ms and after 18.9 / 21.3 / 24.6 / 32.5 ms at the same four contexts (single run each).
+M2 before has 4 runs (the first one timed out), after has 5. A quieter earlier M2 session gave before 19.3 / 23.5 / 27.7 / 36.8 ms and after 18.9 / 21.3 / 24.6 / 32.5 ms at the same four contexts (single run each).
 
 RTX 3080, finer contexts, ms per token:
 
@@ -435,7 +435,7 @@ On the Linux test machine the F32 path was re-measured with the same wasm pair (
 - Q4_K layout on the device: nibbles repacked into 32-value blocks with Q4_0's layout (16 bytes), plus 20 bytes per 256 values of metadata (d and dmin as f16 in one word, eight 6-bit scales and eight 6-bit mins one per byte): 148 bytes per 256 values, 4.625 bits per value. Q5_0: Q4_0 layout plus a 4-byte word of fifth bits and an f32 scale per block, 6 bits per value.
 - A "Q4_K_M" file is a mix. Tensor types measured from the files: Qwen3-0.6B Q4_K_M (unsloth) Q4_K and Q6_K (token_embd, 14 attn_v, 14 ffn_down); SmolLM2-360M Q4_K_M 176 Q5_0, 16 Q4_K, 16 Q6_K, 17 Q8_0; Qwen2.5-0.5B-Instruct Q4_K_M (Qwen) mostly Q5_0 with Q8_0, Q6_K and 12 Q4_K.
 - Files: Qwen3-0.6B Q4_K_M from unsloth/Qwen3-0.6B-GGUF, Q4_0, F16 and BF16 from ggml-org/Qwen3-0.6B-GGUF, Q8_0 from Qwen/Qwen3-0.6B-GGUF (all Apache 2.0); Qwen2.5-0.5B-Instruct Q4_K_M and Q4_0 from Qwen/Qwen2.5-0.5B-Instruct-GGUF (Apache 2.0); SmolLM2-360M-Instruct Q4_K_M, Q4_0 and Q8_0 are the GGUF files of the SmolLM2 runs above (Apache 2.0 model).
-- Machine: M2 laptop, 16 GB, read ceiling 91.4 GB/s. Native numbers are from `decode_ctx` (pipelined greedy decode, 5 repetitions per context, median) and `profile_roofline prefill` (3 repetitions, median), each model measured in 3 rounds with the model order reversed between rounds; the table shows the median of the 3 round medians. The 1-minute load average was 1.1 to 1.9 during the rounds and no rustc ran at their start. Other workers' GPU jobs were serialized with this one by the lock.
+- Machine: M2 laptop, 16 GB, read ceiling 91.4 GB/s. Native numbers are from `decode_ctx` (pipelined greedy decode, 5 repetitions per context, median) and `profile_roofline prefill` (3 repetitions, median), each model measured in 3 rounds with the model order reversed between rounds; the table shows the median of the 3 round medians. The 1-minute load average was 1.1 to 1.9 during the rounds and no rustc ran at their start.
 - Browsers: Chromium 153 (`--use-angle=metal`), WebKit (Playwright build), Firefox Developer Edition 159 headed with a throwaway profile, harness `scripts/bench` (phases cold with 500-token prompts and 3 repetitions, decode 128 and 512 tokens, exact), one load per cell. wasm md5 51c3bb5fe8d85f28d9d63bf219ed51fe, equal for the file in `crates/lean/pkg`, the copy in the bench root and the bytes fetched from the bench server; build tag 2026-10-15-quant-formats-01 on every loading URL.
 
 ### Results: matvec read bandwidth (`matvec_bandwidth`, 16 distinct weights per format, decode rows == 1, M2)
@@ -518,7 +518,7 @@ The chat page samples with temperature 0.7, top-k 40, top-p 0.9, repetition pena
 - Bench: `scripts/bench/bench.html` with `phases=decode,sampled` (new `sampled` phase: GEN_PARAMS of `web/lean-chat-worker.js`, seed 0, prompt "Write a long story about a lighthouse keeper.", 128 and 256 new tokens, 3 repetitions per load, rate over the whole run from the first to the last token, sha256 of the reply). Loads: 5 per cell for Qwen2.5-0.5B Q4_0 and SmolLM2-1.7B Q4_0, 3 for Qwen3-0.6B Q8_0 and SmolLM2-360M Q4_0. The base, step 2 and final builds alternate load by load (ABAB order). Values are the median over all repetitions, with min to max in brackets.
 - Browsers on the M2: Playwright Chromium 153 (`--use-angle=metal`, headless), Playwright WebKit (headless), Firefox Developer Edition 159 (headed, throwaway profile). Native: the ignored test `crates/lean/tests/sampled_native.rs` on wgpu Metal.
 - Builds compared: base is browser-perf at the reuse fix plus the bench phase; step 2 is the GPU top-k with a 64-candidate readback (sampling still finished on the CPU); final is the whole step on the GPU (this section's last commit). Served wasm bytes were checked against the built files by sha256 before each series.
-- The machine was shared with another worker's GPU runs through the lock script; one-minute load average between 1 and 4 during the runs. SmolLM2-1.7B runs in WebKit and Firefox show dips that hit all builds; read the medians with the spread.
+- The machine ran other jobs during the runs; one-minute load average between 1 and 4 during the runs. SmolLM2-1.7B runs in WebKit and Firefox show dips that hit all builds; read the medians with the spread.
 
 ### Change
 

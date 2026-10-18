@@ -1,7 +1,7 @@
 # GGUF quant formats in the wild: what small models actually ship, and what lean needs
 
 Date: 2026-10-14. Scope: GGUF models up to about 8B parameters (LLM text models), plus what the browser engines load.
-All Hub numbers were pulled from the Hugging Face API on 2026-10-14; "downloads" is the API's 30-day figure unless stated. Throwaway data and header-parsing scripts are in /tmp/gg (not part of the repo).
+All Hub numbers were pulled from the Hugging Face API on 2026-10-14; "downloads" is the API's 30-day figure unless stated.
 
 ## Summary
 
