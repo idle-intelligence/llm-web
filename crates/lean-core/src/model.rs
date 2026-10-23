@@ -414,6 +414,9 @@ struct LayerWeights {
 
 pub struct GpuModel {
     pub config: Qwen2Config,
+    /// Length of the GGUF header (metadata and tensor table, aligned): the
+    /// byte offset where the tensor data starts.
+    pub gguf_header_len: u64,
     embed: EmbeddingTable,
     layers: Vec<LayerWeights>,
     out_norm: wgpu::Buffer,
@@ -885,10 +888,12 @@ impl GpuModel {
         // `reader` (and its underlying `File`) drops here - two-phase
         // loading: no raw GGUF bytes remain in memory past this point,
         // only the GPU-resident buffers built above.
+        let gguf_header_len = reader.data_section_offset();
         drop(reader);
 
         Ok(GpuModel {
             config,
+            gguf_header_len,
             embed,
             layers,
             out_norm,

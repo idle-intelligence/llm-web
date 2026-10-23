@@ -144,9 +144,9 @@ impl TokenizerSource {
 /// A fingerprint of the GGUF file: its length and every header byte
 /// (metadata, tokenizer tables, tensor names, types, shapes and offsets).
 /// Two files that differ only in tensor data under identical metadata share
-/// it; read only the header, never the weights.
-fn model_fingerprint(gguf: &mut GgufSource) -> anyhow::Result<[u8; 16]> {
-    let header_len = lean_core::gguf_header_len(gguf.open()?)?;
+/// it; read only the header, never the weights. `header_len` is the one
+/// the loader found.
+fn model_fingerprint(gguf: &mut GgufSource, header_len: u64) -> anyhow::Result<[u8; 16]> {
     let mut r = gguf.open()?;
     let len = r.seek(SeekFrom::End(0))?;
     r.seek(SeekFrom::Start(0))?;
@@ -228,7 +228,6 @@ impl Lean {
     pub async fn load(opts: LoadOptions) -> Result<Lean, LeanError> {
         let LoadOptions { mut gguf, tokenizer, max_ctx, backend } = opts;
         let (tokenizer, tokenizer_fp) = tokenizer.load()?;
-        let model_fp = model_fingerprint(&mut gguf)?;
         let parts = match backend {
             Backend::WebGpu => gpu_parts(webgpu_engine().await?, &mut gguf, max_ctx)?,
             Backend::Cpu => cpu_parts(&mut gguf, max_ctx)?,
@@ -240,10 +239,11 @@ impl Lean {
                 Err(_) => cpu_parts(&mut gguf, max_ctx)?,
             },
         };
-        let (config, backend) = match &parts {
-            Parts::Gpu { model, .. } => (&model.config, 0),
-            Parts::Cpu { model, .. } => (&model.config, 1),
+        let (config, backend, header_len) = match &parts {
+            Parts::Gpu { model, .. } => (&model.config, 0, model.gguf_header_len),
+            Parts::Cpu { model, .. } => (&model.config, 1, model.gguf_header_len),
         };
+        let model_fp = model_fingerprint(&mut gguf, header_len)?;
         let image_env = ImageEnv { num_layers: config.num_layers as u32, num_kv_heads: config.num_kv_heads as u32, head_dim: config.head_dim as u32, backend, model: model_fp, tokenizer: tokenizer_fp };
         Ok(Lean { parts, tokenizer, prefix: PrefixCache::default(), max_ctx: max_ctx as usize, image_env })
     }

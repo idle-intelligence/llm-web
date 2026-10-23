@@ -541,6 +541,9 @@ struct CpuLora {
 
 pub struct CpuModel {
     pub config: Qwen2Config,
+    /// Length of the GGUF header (metadata and tensor table, aligned): the
+    /// byte offset where the tensor data starts.
+    pub gguf_header_len: u64,
     embed: CpuEmbed,
     layers: Vec<CpuLayer>,
     out_norm: Vec<f32>,
@@ -680,9 +683,10 @@ impl CpuModel {
             None => gguf_weight(&mut reader, "output.weight")?,
         };
 
+        let gguf_header_len = reader.data_section_offset();
         drop(reader);
 
-        Ok(CpuModel { config, embed, layers, out_norm, lm_head, lora: None })
+        Ok(CpuModel { config, gguf_header_len, embed, layers, out_norm, lm_head, lora: None })
     }
 
     /// Parse an LLMLIFE2 adapter (q/k/v/o, see `lora.rs`) and apply it,
