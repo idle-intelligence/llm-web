@@ -10,6 +10,15 @@
 //   generated once or more with short replies (the repeat finds all of the
 //   prompt cached but its last token), then a different question; the reply
 //   to the question must equal the reply of a freshly loaded engine.
+// phases=prefix: prefix KV images. The prefix is the system prompt and tools of
+//   tools.json (next to the page, an input of fixtures/reference/inputs) rendered
+//   with the model's template, cut where the user turn starts. A fresh engine
+//   answers the full prompt; a second one prefills the prefix, saves its image
+//   to OPFS and answers; a third restores the image from OPFS and answers. The
+//   three greedy replies must be equal, and the KV cache after the reply must
+//   be the same bytes on the second and third engines. Then images for another
+//   engine build (header field changed), another prefix and a cut-short file
+//   must be refused, and the engine must still give the fresh reply.
 // phases=loads: `reps` loads and frees of the engine, `decode` ms pause after each (see run()).
 // Expects ../lean/pkg (built wasm), model.gguf, tokenizer.json and
 // tokenizer_config.json next to the page.
@@ -105,6 +114,82 @@ async function run({ backend, build, prompts, reps, decode, mini, phases, sampli
       out[name] = { hash: await sha(replies.join("\n")), equalsFresh: replies.every((r, i) => r === fresh[i]), first: replies[0].slice(0, 60) };
     }
     self.postMessage({ type: "result", result: { build, freshHash: await sha(fresh.join("\n")), reuse: out, reuseOk: Object.values(out).every((o) => o.equalsFresh) } });
+    return;
+  }
+  if (phases === "prefix") {
+    const input = await fetch("./tools.json").then((r) => r.json());
+    const tpl = mod.ChatTemplate.fromTokenizerConfig(tokenizerCfg);
+    const full = mod.chatRender(tpl, input.messages, input.tools, true);
+    const user = input.messages.filter((m) => m.role === "user").pop().content;
+    const prefix = full.slice(0, full.lastIndexOf("<|im_start|>", full.lastIndexOf(user)));
+    const opts = { gguf, tokenizer, maxCtx: 4096, backend: backend === "webgpu" ? "webgpu" : "cpu" };
+    const kvHashes = async (l, text) => {
+      const parts = [];
+      await l.savePrefix(text, (c) => parts.push(crypto.subtle.digest("SHA-256", c)));
+      return sha((await Promise.all(parts)).map((d) => [...new Uint8Array(d)].map((b) => b.toString(16).padStart(2, "0")).join("")).join(","));
+    };
+    const r = { build, requested: backend };
+    status("prefix: fresh");
+    let l = await mod.Lean.load(opts);
+    r.backend = l.backend;
+    r.prefixTokens = l.tokenCount(prefix);
+    r.fullTokens = l.tokenCount(full);
+    const fresh = await timeFirstToken(l, full, 64);
+    r.coldTtftMs = fresh.ttft;
+    l.free();
+
+    status("prefix: save");
+    l = await mod.Lean.load(opts);
+    const key = l.prefixKey(prefix);
+    r.key = key;
+    const dir = await navigator.storage.getDirectory();
+    const file = await dir.getFileHandle(`lean-kv-${key}.bin`, { create: true });
+    let h = await file.createSyncAccessHandle();
+    h.truncate(0);
+    let at = 0;
+    let t = performance.now();
+    r.prefill = await l.prefill(prefix);
+    r.prefillMs = performance.now() - t;
+    t = performance.now();
+    r.imageBytes = await l.savePrefix(prefix, (c) => { at += h.write(c, { at }); });
+    h.flush();
+    h.close();
+    r.saveMs = performance.now() - t;
+    r.fileBytes = (await file.getFile()).size;
+    const writerReply = (await timeFirstToken(l, full, 64)).reply;
+    const kvWriter = await kvHashes(l, full);
+    l.free();
+
+    status("prefix: restore");
+    l = await mod.Lean.load(opts);
+    const opfsReader = (handle, edit) => { let pos = 0; return (n) => { const b = new Uint8Array(n); const got = handle.read(b, { at: pos }); if (edit) edit(b, pos, got); pos += got; return b.subarray(0, got); }; };
+    h = await file.createSyncAccessHandle();
+    t = performance.now();
+    l.restorePrefix(prefix, opfsReader(h));
+    r.restoreMs = performance.now() - t;
+    const restored = await timeFirstToken(l, full, 64);
+    r.restoredTtftMs = restored.ttft;
+    const kvRestored = await kvHashes(l, full);
+    l.free();
+    r.replyHash = await sha(fresh.reply);
+    r.restoredEqualsFresh = restored.reply === fresh.reply;
+    r.writerEqualsFresh = writerReply === fresh.reply;
+    r.kvBitIdentical = kvRestored === kvWriter;
+
+    status("prefix: refusals");
+    l = await mod.Lean.load(opts);
+    const refused = async (text, read) => { try { l.restorePrefix(text, read); return "accepted"; } catch (e) { return `${e.name}:${e.code}${e.field ? ":" + e.field : ""}`; } };
+    r.otherEngine = await refused(prefix, opfsReader(h, (b, pos) => { if (pos === 0) b[72] ^= 1; }));
+    r.otherPrefix = await refused(prefix + " ", opfsReader(h));
+    r.otherPrefixKeyDiffers = l.prefixKey(prefix + " ") !== key;
+    const cut = r.imageBytes - 4;
+    r.truncated = await refused(prefix, (() => { const rd = opfsReader(h); let pos = 0; return (n) => { const b = rd(Math.min(n, cut - pos)); pos += b.length; return b; }; })());
+    r.afterRefusalsEqualsFresh = (await timeFirstToken(l, full, 64)).reply === fresh.reply;
+    l.free();
+    h.close();
+    await dir.removeEntry(file.name);
+    r.ok = r.restoredEqualsFresh && r.writerEqualsFresh && r.kvBitIdentical && r.otherEngine === "PrefixImage:STALE:engine" && r.otherPrefix === "PrefixImage:STALE:prefix" && r.otherPrefixKeyDiffers && r.truncated === "PrefixImage:TRUNCATED" && r.afterRefusalsEqualsFresh;
+    self.postMessage({ type: "result", result: r });
     return;
   }
   if (phases === "loads") {
