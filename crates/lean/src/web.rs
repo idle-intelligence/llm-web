@@ -345,13 +345,9 @@ impl LeanJs {
 
     /// Makes `text` resident without generating (see the Rust
     /// `Lean::prefill`): a later `generate` whose text starts with `text`
-    /// prefills only the rest. Resolves to `{ promptTokens }`, `text`'s
-    /// token count.
-    pub async fn prefill(&mut self, text: String) -> Result<JsValue, JsValue> {
-        let n = self.inner.prefill(&text).await.map_err(lean_error_to_js)?;
-        let out = js_sys::Object::new();
-        let _ = js_sys::Reflect::set(&out, &JsValue::from_str("promptTokens"), &JsValue::from_f64(n as f64));
-        Ok(out.into())
+    /// prefills only the rest. Resolves to `text`'s token count.
+    pub async fn prefill(&mut self, text: String) -> Result<f64, JsValue> {
+        self.inner.prefill(&text).await.map(|n| n as f64).map_err(lean_error_to_js)
     }
 
     /// The storage key of `prefix`'s KV image on this engine (32 hex
