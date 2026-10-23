@@ -1192,6 +1192,37 @@ impl Engine {
         result
     }
 
+    /// Reads the byte ranges `(offset, len)` of `buf`, concatenated in
+    /// order, with one staging buffer and one submit. Offsets and lengths
+    /// must be multiples of 4. Async like `read_buffer`.
+    pub async fn read_ranges(&self, buf: &wgpu::Buffer, ranges: &[(u64, u64)]) -> Vec<u8> {
+        let size: u64 = ranges.iter().map(|r| r.1).sum();
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("readback_ranges"),
+            size: size.max(4),
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("readback_ranges") });
+        let mut dst = 0;
+        for &(offset, len) in ranges {
+            encoder.copy_buffer_to_buffer(buf, offset, &staging, dst, len);
+            dst += len;
+        }
+        self.queue.submit(Some(encoder.finish()));
+        let slice = staging.slice(..);
+        let (tx, rx) = futures_channel::oneshot::channel();
+        slice.map_async(wgpu::MapMode::Read, move |res| {
+            let _ = tx.send(res);
+        });
+        self.map_done(rx).await;
+        let data = slice.get_mapped_range();
+        let result = data[..size as usize].to_vec();
+        drop(data);
+        staging.unmap();
+        result
+    }
+
     /// Same shape as `read_buffer` but for a single `u32` (the argmax
     /// kernel's output) - a 4-byte readback instead of a `vocab_size * 4`
     /// one for every decode step.

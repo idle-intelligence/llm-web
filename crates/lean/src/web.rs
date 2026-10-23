@@ -3,7 +3,9 @@
 //! - `Lean`: the engine, the same surface as the Rust [`crate::Lean`]:
 //!   `await Lean.load({gguf, tokenizer, maxCtx, backend})`, then
 //!   `await lean.generate(text, params, onToken, abort)` once per turn and
-//!   `lean.tokenCount(text)`. Text in, text out: no chat template, no
+//!   `lean.tokenCount(text)`; `await lean.prefill(text)`,
+//!   `lean.prefixKey(prefix)`, `await lean.savePrefix(prefix, onChunk)`,
+//!   `lean.restorePrefix(prefix, source)` for prefix KV images. Text in, text out: no chat template, no
 //!   conversation state. One client per engine (see `lean.rs`).
 //! - `AbortFlag`: the Rust [`crate::AbortFlag`] itself.
 //! - lean-chat's `ChatTemplate`, `chatRender` and `chatTrimOldestExchange`.
@@ -20,6 +22,7 @@ use std::cell::RefCell;
 use std::io::{Read, Seek, SeekFrom};
 
 use crate::error::LeanError;
+use crate::prefix_image::PrefixImageError;
 use crate::lean::{AbortFlag, Backend, GgufSource, Lean, LoadOptions, TokenizerSource};
 use crate::turn::GenParams;
 
@@ -114,6 +117,42 @@ fn gen_params_from_js(params: &JsValue) -> GenParams {
     }
 }
 
+/// `std::io::Write` over a JS `onChunk(Uint8Array)` callback; a throw
+/// becomes a write error.
+struct JsChunkWriter(js_sys::Function);
+
+impl std::io::Write for JsChunkWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.call1(&JsValue::NULL, &js_sys::Uint8Array::from(buf)).map_err(|e| std::io::Error::other(format!("onChunk threw: {}", js_message(&e))))?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// `std::io::Read` over a JS `read(n)` callback that returns the next at
+/// most `n` bytes of the image as a `Uint8Array` (an empty one at the end).
+struct JsFnReader(js_sys::Function);
+
+impl Read for JsFnReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let got = self.0.call1(&JsValue::NULL, &JsValue::from_f64(buf.len() as f64)).map_err(|e| std::io::Error::other(format!("read threw: {}", js_message(&e))))?;
+        let bytes: js_sys::Uint8Array = got.dyn_into().map_err(|_| std::io::Error::other("read(n) must return a Uint8Array"))?;
+        let n = bytes.length() as usize;
+        if n > buf.len() {
+            return Err(std::io::Error::other("read(n) returned more than n bytes"));
+        }
+        bytes.copy_to(&mut buf[..n]);
+        Ok(n)
+    }
+}
+
+fn js_message(e: &JsValue) -> String {
+    e.dyn_ref::<js_sys::Error>().map(|e| String::from(e.message())).or_else(|| e.as_string()).unwrap_or_else(|| format!("{e:?}"))
+}
+
 /// Converts a `LeanError` into the JS exception `Lean`'s calls throw:
 /// `ContextOverflow` becomes an `Error` with `name === "ContextOverflow"`,
 /// `code === "CONTEXT_OVERFLOW"` and numeric `needed`/`available`
@@ -127,6 +166,20 @@ fn lean_error_to_js(e: LeanError) -> JsValue {
             let _ = js_sys::Reflect::set(&err, &JsValue::from_str("code"), &JsValue::from_str("CONTEXT_OVERFLOW"));
             let _ = js_sys::Reflect::set(&err, &JsValue::from_str("needed"), &JsValue::from_f64(needed as f64));
             let _ = js_sys::Reflect::set(&err, &JsValue::from_str("available"), &JsValue::from_f64(available as f64));
+            err.into()
+        }
+        LeanError::PrefixImage(ref kind) => {
+            let err = js_sys::Error::new(&e.to_string());
+            err.set_name("PrefixImage");
+            let (code, field) = match kind {
+                PrefixImageError::NotAnImage => ("NOT_AN_IMAGE", None),
+                PrefixImageError::Stale(field) => ("STALE", Some(*field)),
+                PrefixImageError::Truncated => ("TRUNCATED", None),
+            };
+            let _ = js_sys::Reflect::set(&err, &JsValue::from_str("code"), &JsValue::from_str(code));
+            if let Some(field) = field {
+                let _ = js_sys::Reflect::set(&err, &JsValue::from_str("field"), &JsValue::from_str(field));
+            }
             err.into()
         }
         LeanError::Other(e) => JsValue::from(JsError::new(&format!("{e}"))),
@@ -288,6 +341,55 @@ impl LeanJs {
     #[wasm_bindgen(js_name = tokenCount)]
     pub fn token_count(&self, text: &str) -> Result<u32, JsValue> {
         self.inner.token_count(text).map(|n| n as u32).map_err(lean_error_to_js)
+    }
+
+    /// Makes `text` resident without generating (see the Rust
+    /// `Lean::prefill`): a later `generate` whose text starts with `text`
+    /// prefills only the rest. Resolves to `text`'s token count.
+    pub async fn prefill(&mut self, text: String) -> Result<f64, JsValue> {
+        self.inner.prefill(&text).await.map(|n| n as f64).map_err(lean_error_to_js)
+    }
+
+    /// The storage key of `prefix`'s KV image on this engine (32 hex
+    /// characters). It changes whenever the image would: another engine
+    /// build, model file, tokenizer, backend or prefix text.
+    #[wasm_bindgen(js_name = prefixKey)]
+    pub fn prefix_key(&self, prefix: &str) -> Result<String, JsValue> {
+        self.inner.prefix_key(prefix).map_err(lean_error_to_js)
+    }
+
+    /// Writes the KV image of `prefix` through `onChunk(bytes)`, called
+    /// once for the 128-byte header and once per K or V tensor of each
+    /// layer, in order; write each chunk at the running offset (an OPFS
+    /// `FileSystemSyncAccessHandle.write(bytes, {at})` in a worker). Each
+    /// chunk is a fresh `Uint8Array` the callback may keep. Prefills the
+    /// part of `prefix` not already resident. Resolves to the total byte
+    /// count. A throw from `onChunk` rejects the call; the engine stays
+    /// usable.
+    #[wasm_bindgen(js_name = savePrefix)]
+    pub async fn save_prefix(&mut self, prefix: String, on_chunk: js_sys::Function) -> Result<f64, JsValue> {
+        let mut out = JsChunkWriter(on_chunk);
+        self.inner.save_prefix(&prefix, &mut out).await.map(|n| n as f64).map_err(lean_error_to_js)
+    }
+
+    /// Restores an image written by `savePrefix` for the same `prefix`.
+    /// `source` is the whole image as a `Uint8Array` (read one tensor at a
+    /// time, never copied whole into wasm memory), or a function
+    /// `read(n)` returning the next at most `n` bytes as a `Uint8Array`.
+    /// Throws an `Error` with `name === "PrefixImage"` and `code`
+    /// `"STALE"` (with `field`: what differs), `"NOT_AN_IMAGE"` or
+    /// `"TRUNCATED"` when the image cannot be used: prefill again with
+    /// `savePrefix` and overwrite it.
+    #[wasm_bindgen(js_name = restorePrefix)]
+    pub fn restore_prefix(&mut self, prefix: &str, source: JsValue) -> Result<(), JsValue> {
+        let result = if let Some(bytes) = source.dyn_ref::<js_sys::Uint8Array>() {
+            self.inner.restore_prefix(prefix, &mut JsBytesReader::new(bytes.clone()))
+        } else if let Ok(f) = source.dyn_into::<js_sys::Function>() {
+            self.inner.restore_prefix(prefix, &mut JsFnReader(f))
+        } else {
+            return Err(JsValue::from(JsError::new("restorePrefix: source must be a Uint8Array or a read(n) function")));
+        };
+        result.map_err(lean_error_to_js)
     }
 
     /// `"webgpu"`, `"threads"` or `"single"`.
