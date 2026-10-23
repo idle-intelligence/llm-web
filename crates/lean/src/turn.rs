@@ -74,15 +74,26 @@ impl PrefixCache {
     /// the longest common prefix of the cached ids and `ids`, capped so at
     /// least one id is left to prefill (a turn always needs the logits of
     /// its last prompt position).
-    fn reuse(&self, ids: &[u32], kv_len: usize) -> usize {
+    pub(crate) fn reuse(&self, ids: &[u32], kv_len: usize) -> usize {
         let usable = self.cached_ids.len().min(kv_len);
         let lcp = self.cached_ids[..usable].iter().zip(ids).take_while(|(a, b)| a == b).count();
         lcp.min(ids.len().saturating_sub(1))
     }
 
+    /// Whether all of `ids` is already resident at `kv_len`.
+    pub(crate) fn holds(&self, ids: &[u32], kv_len: usize) -> bool {
+        ids.len() <= self.cached_ids.len().min(kv_len) && self.cached_ids[..ids.len()] == *ids
+    }
+
+    /// Replaces what the cache is known to hold (after a restore, or
+    /// nothing after a failed one).
+    pub(crate) fn set(&mut self, ids: Vec<u32>) {
+        self.cached_ids = ids;
+    }
+
     /// Records what a turn left resident: `ids` plus `generated`, truncated
     /// to `kv_len` (the last generated id is never fed back into the cache).
-    fn commit(&mut self, ids: Vec<u32>, generated: &[u32], kv_len: usize) {
+    pub(crate) fn commit(&mut self, ids: Vec<u32>, generated: &[u32], kv_len: usize) {
         let mut cached = ids;
         cached.extend_from_slice(generated);
         cached.truncate(kv_len);

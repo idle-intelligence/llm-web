@@ -28,7 +28,10 @@ use lean_core::cpu::{CpuKvCache, CpuModel};
 use lean_core::engine::Engine;
 use crate::error::LeanError;
 use lean_core::model::{build_rope_tables, GpuModel, KvCache};
+use crate::prefix_image::{self, Hash128, ImageEnv, PrefixImageError, HEADER_LEN};
 use crate::turn::{check_fits, cpu_turn, encode, gpu_turn, GenParams, PrefixCache};
+use lean_core::cpu::forward_prefill as cpu_forward_prefill;
+use lean_core::model::{forward_prefill, forward_prefill_suffix};
 
 #[cfg(feature = "web")]
 use wasm_bindgen::prelude::wasm_bindgen;
@@ -124,15 +127,40 @@ pub enum TokenizerSource {
 }
 
 impl TokenizerSource {
-    fn load(self) -> anyhow::Result<Tokenizer> {
-        match self {
+    /// The tokenizer and a fingerprint of the file's bytes.
+    fn load(self) -> anyhow::Result<(Tokenizer, [u8; 16])> {
+        let json = match self {
             #[cfg(not(target_arch = "wasm32"))]
-            TokenizerSource::Path(path) => Tokenizer::from_file(&path).map_err(|e| anyhow::anyhow!("loading {path}: {e}")),
+            TokenizerSource::Path(path) => std::fs::read(&path).map_err(|e| anyhow::anyhow!("loading {path}: {e}"))?,
             #[cfg(target_arch = "wasm32")]
             TokenizerSource::Path(_) => anyhow::bail!("TokenizerSource::Path needs a filesystem; use Json here"),
-            TokenizerSource::Json(json) => Tokenizer::from_bytes(json.as_bytes()).map_err(|e| anyhow::anyhow!("loading tokenizer.json: {e}")),
-        }
+            TokenizerSource::Json(json) => json.into_bytes(),
+        };
+        let tokenizer = Tokenizer::from_bytes(&json).map_err(|e| anyhow::anyhow!("loading tokenizer.json: {e}"))?;
+        Ok((tokenizer, prefix_image::hash(&json)))
     }
+}
+
+/// A fingerprint of the GGUF file: its length and every header byte
+/// (metadata, tokenizer tables, tensor names, types, shapes and offsets).
+/// Two files that differ only in tensor data under identical metadata share
+/// it; read only the header, never the weights.
+fn model_fingerprint(gguf: &mut GgufSource) -> anyhow::Result<[u8; 16]> {
+    let header_len = lean_core::gguf_header_len(gguf.open()?)?;
+    let mut r = gguf.open()?;
+    let len = r.seek(SeekFrom::End(0))?;
+    r.seek(SeekFrom::Start(0))?;
+    let mut h = Hash128::new();
+    h.update(&len.to_le_bytes());
+    let mut buf = vec![0u8; 1 << 20];
+    let mut left = header_len;
+    while left > 0 {
+        let n = left.min(buf.len() as u64) as usize;
+        r.read_exact(&mut buf[..n])?;
+        h.update(&buf[..n]);
+        left -= n as u64;
+    }
+    Ok(h.finish())
 }
 
 /// Everything [`Lean::load`] needs. `max_ctx` sizes the KV cache: a call's
@@ -158,6 +186,7 @@ pub struct Lean {
     tokenizer: Tokenizer,
     prefix: PrefixCache,
     max_ctx: usize,
+    image_env: ImageEnv,
 }
 
 /// A WebGPU device, if this client has one. In a browser, `navigator.gpu`
@@ -198,7 +227,8 @@ impl Lean {
     /// picks (see [`Backend`]).
     pub async fn load(opts: LoadOptions) -> Result<Lean, LeanError> {
         let LoadOptions { mut gguf, tokenizer, max_ctx, backend } = opts;
-        let tokenizer = tokenizer.load()?;
+        let (tokenizer, tokenizer_fp) = tokenizer.load()?;
+        let model_fp = model_fingerprint(&mut gguf)?;
         let parts = match backend {
             Backend::WebGpu => gpu_parts(webgpu_engine().await?, &mut gguf, max_ctx)?,
             Backend::Cpu => cpu_parts(&mut gguf, max_ctx)?,
@@ -210,7 +240,12 @@ impl Lean {
                 Err(_) => cpu_parts(&mut gguf, max_ctx)?,
             },
         };
-        Ok(Lean { parts, tokenizer, prefix: PrefixCache::default(), max_ctx: max_ctx as usize })
+        let (config, backend) = match &parts {
+            Parts::Gpu { model, .. } => (&model.config, 0),
+            Parts::Cpu { model, .. } => (&model.config, 1),
+        };
+        let image_env = ImageEnv { num_layers: config.num_layers as u32, num_kv_heads: config.num_kv_heads as u32, head_dim: config.head_dim as u32, backend, model: model_fp, tokenizer: tokenizer_fp };
+        Ok(Lean { parts, tokenizer, prefix: PrefixCache::default(), max_ctx: max_ctx as usize, image_env })
     }
 
     /// One inference turn: tokenizes `text` as-is, prefills what the KV
@@ -239,6 +274,138 @@ impl Lean {
     /// forward pass.
     pub fn token_count(&self, text: &str) -> Result<usize, LeanError> {
         Ok(encode(&self.tokenizer, text)?.len())
+    }
+
+    /// The storage key of `prefix`'s KV image on this engine: 32 hex
+    /// characters, a hash of everything the image depends on (format
+    /// version, dtype, engine build, model file, tokenizer, backend, and
+    /// the prefix's token ids). Any change to one of them gives a new key.
+    /// Tokenizes only, no forward pass.
+    pub fn prefix_key(&self, prefix: &str) -> Result<String, LeanError> {
+        let ids = encode(&self.tokenizer, prefix)?;
+        Ok(prefix_image::key(&prefix_image::header(&self.image_env, &ids)))
+    }
+
+    /// Makes `text` resident in the KV cache without generating: prefills
+    /// the part the cache does not already hold, so a following `generate`
+    /// whose text starts with `text` prefills only what comes after it
+    /// (a fixed system prompt or tools block warmed up before the first
+    /// request). Returns `text`'s token count.
+    pub async fn prefill(&mut self, text: &str) -> Result<usize, LeanError> {
+        Ok(self.prefill_ids(text).await?.len())
+    }
+
+    async fn prefill_ids(&mut self, text: &str) -> Result<Vec<u32>, LeanError> {
+        let ids = encode(&self.tokenizer, text)?;
+        check_fits(&ids, 0, self.max_ctx)?;
+        let Lean { parts, prefix: cached, .. } = self;
+        match parts {
+            Parts::Gpu { engine, model, cache, cos, sin } => {
+                if !cached.holds(&ids, cache.kv_len as usize) {
+                    let reuse = cached.reuse(&ids, cache.kv_len as usize);
+                    if reuse == 0 {
+                        forward_prefill(engine, model, cache, &ids, cos, sin, None).await;
+                    } else {
+                        cache.kv_len = reuse as u32;
+                        forward_prefill_suffix(engine, model, cache, &ids[reuse..], cos, sin, None).await;
+                    }
+                    cached.commit(ids.clone(), &[], cache.kv_len as usize);
+                }
+            }
+            Parts::Cpu { model, cache } => {
+                if !cached.holds(&ids, cache.kv_len) {
+                    cache.kv_len = cached.reuse(&ids, cache.kv_len);
+                    let start = cache.kv_len;
+                    cpu_forward_prefill(model, cache, &ids[start..]);
+                    cached.commit(ids.clone(), &[], cache.kv_len);
+                }
+            }
+        }
+        Ok(ids)
+    }
+
+    /// Writes the KV image of `prefix` to `out`: a 128-byte header, then
+    /// each layer's K and V for the prefix's positions, one tensor per
+    /// `write_all` call (at most `num_kv_heads * positions * head_dim * 4`
+    /// bytes, so the whole image is never in memory at once). Calls
+    /// `prefill(prefix)` first, so after a `prefill` or a `generate` whose
+    /// text started with `prefix` this is only a readback.
+    /// Returns the number of bytes written. The engine keeps `prefix`
+    /// resident, as after a `generate`.
+    pub async fn save_prefix(&mut self, prefix: &str, out: &mut impl std::io::Write) -> Result<u64, LeanError> {
+        let ids = self.prefill_ids(prefix).await?;
+        let header = prefix_image::header(&self.image_env, &ids);
+        let n = ids.len();
+        let io = |e: std::io::Error| LeanError::Other(anyhow::anyhow!("writing the prefix image: {e}"));
+        match &mut self.parts {
+            Parts::Gpu { engine, cache, .. } => {
+                out.write_all(&header).map_err(io)?;
+                for layer in 0..cache.num_layers() {
+                    for value in [false, true] {
+                        out.write_all(&cache.read_prefix(engine, layer, value, n as u32).await).map_err(io)?;
+                    }
+                }
+            }
+            Parts::Cpu { cache, .. } => {
+                out.write_all(&header).map_err(io)?;
+                for layer in 0..cache.num_layers() {
+                    for value in [false, true] {
+                        out.write_all(&cache.read_prefix(layer, value, n)).map_err(io)?;
+                    }
+                }
+            }
+        }
+        Ok((HEADER_LEN + 2 * self.image_env.num_layers as usize * prefix_image::tensor_bytes(&self.image_env, n)) as u64)
+    }
+
+    /// Reads a KV image written by `save_prefix` for the same `prefix` and
+    /// makes it resident, so the next `generate` whose text starts with
+    /// `prefix` prefills only what follows it, with the same output as
+    /// without the image. Reads one tensor at a time from `input`.
+    ///
+    /// The header is checked before anything is touched: an image written
+    /// by another engine build, model file, tokenizer, backend, dtype or
+    /// format, or for another prefix, is refused with
+    /// [`LeanError::PrefixImage`] and the engine is unchanged. A source that
+    /// ends early gives `PrefixImageError::Truncated`; the engine then holds
+    /// no prefix and stays usable. `prefix` longer than `max_ctx` gives
+    /// [`LeanError::ContextOverflow`].
+    pub fn restore_prefix(&mut self, prefix: &str, input: &mut impl std::io::Read) -> Result<(), LeanError> {
+        let ids = encode(&self.tokenizer, prefix)?;
+        check_fits(&ids, 0, self.max_ctx)?;
+        let expected = prefix_image::header(&self.image_env, &ids);
+        let mut found = [0u8; HEADER_LEN];
+        input.read_exact(&mut found).map_err(|_| LeanError::PrefixImage(PrefixImageError::NotAnImage))?;
+        prefix_image::check(&found, &expected).map_err(LeanError::PrefixImage)?;
+        let n = ids.len();
+        let mut buf = vec![0u8; prefix_image::tensor_bytes(&self.image_env, n)];
+        let truncated = |_| LeanError::PrefixImage(PrefixImageError::Truncated);
+        let Lean { parts, prefix: cached, .. } = self;
+        cached.set(Vec::new());
+        match parts {
+            Parts::Gpu { engine, cache, .. } => {
+                cache.kv_len = 0;
+                for layer in 0..cache.num_layers() {
+                    for value in [false, true] {
+                        input.read_exact(&mut buf).map_err(truncated)?;
+                        cache.write_prefix(engine, layer, value, n as u32, &buf);
+                    }
+                }
+                cache.kv_len = n as u32;
+            }
+            Parts::Cpu { cache, .. } => {
+                cache.kv_len = 0;
+                for layer in 0..cache.num_layers() {
+                    for value in [false, true] {
+                        input.read_exact(&mut buf).map_err(truncated)?;
+                        cache.write_prefix(layer, value, n, &buf);
+                    }
+                }
+                cache.kv_len = n;
+            }
+        }
+        cached.set(ids);
+        Ok(())
     }
 
     /// The backend this engine runs on: `"webgpu"`, `"threads"` (the CPU

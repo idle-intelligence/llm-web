@@ -4,7 +4,10 @@
 //! The engine is [`Lean`]: text in, text out. [`Lean::load`] picks a
 //! backend by capability (WebGPU, then CPU threads, then one CPU thread),
 //! [`Lean::generate`] runs one inference turn over the given text, and
-//! [`Lean::token_count`] tokenizes without running anything. The engine
+//! [`Lean::token_count`] tokenizes without running anything,
+//! [`Lean::prefill`] makes a prefix resident without generating, and
+//! [`Lean::save_prefix`] / [`Lean::restore_prefix`] move a prefix's KV cache
+//! to and from bytes (see `prefix_image.rs` for the format). The engine
 //! applies no chat template and keeps no conversation. It reuses the KV
 //! cache of its previous call for the longest matching token prefix, which
 //! serves one client per engine: give each client its own `Lean`.
@@ -16,6 +19,7 @@
 mod error;
 mod generate;
 mod lean;
+mod prefix_image;
 mod sampling;
 mod turn;
 #[cfg(feature = "web")]
@@ -31,6 +35,7 @@ mod tests;
 
 pub use error::LeanError;
 pub use lean::{AbortFlag, Backend, GgufSource, Lean, LoadOptions, ReadSeek, TokenizerSource};
+pub use prefix_image::PrefixImageError;
 pub use turn::GenParams;
 
 /// wasm-bindgen-rayon's worker-pool bootstrap, re-exported so the page can

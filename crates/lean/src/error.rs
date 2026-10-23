@@ -7,6 +7,8 @@
 
 use std::fmt;
 
+use crate::prefix_image::PrefixImageError;
+
 #[derive(Debug)]
 pub enum LeanError {
     /// The prompt's token count plus `max_new_tokens` exceeds `max_ctx`. `needed` is that sum; `available` is `max_ctx`.
@@ -14,6 +16,9 @@ pub enum LeanError {
     /// is checked before anything is prefilled, so the next call still
     /// works normally.
     ContextOverflow { needed: usize, available: usize },
+    /// `restore_prefix` refused the image (see [`PrefixImageError`]): prefill
+    /// the prefix again with `save_prefix` and overwrite the stored image.
+    PrefixImage(PrefixImageError),
     /// Anything else (loading, tokenizer, the forward pass).
     Other(anyhow::Error),
 }
@@ -24,6 +29,7 @@ impl fmt::Display for LeanError {
             LeanError::ContextOverflow { needed, available } => {
                 write!(f, "context overflow: needed {needed} tokens, {available} available")
             }
+            LeanError::PrefixImage(e) => write!(f, "{e}"),
             LeanError::Other(e) => write!(f, "{e}"),
         }
     }
@@ -32,7 +38,7 @@ impl fmt::Display for LeanError {
 impl std::error::Error for LeanError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            LeanError::ContextOverflow { .. } => None,
+            LeanError::ContextOverflow { .. } | LeanError::PrefixImage(_) => None,
             LeanError::Other(e) => e.source(),
         }
     }
