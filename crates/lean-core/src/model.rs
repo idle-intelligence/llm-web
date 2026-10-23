@@ -473,14 +473,14 @@ impl KvCache {
     /// compacted (no `max_ctx` padding) into a max_ctx-independent snapshot
     /// that can be restored into a cache with a *different* `max_ctx` (e.g.
     /// a resident prefix snapshot restored into a fresh, longer-context
-    /// cache for a new turn). Async readback only (`Engine::read_buffer`) -
+    /// cache for a new turn). Async readback only (`Engine::read_ranges`) -
     /// safe to call from the browser.
     pub async fn snapshot(&self, engine: &Engine) -> KvSnapshot {
         let mut k_out = Vec::with_capacity(self.k.len());
         let mut v_out = Vec::with_capacity(self.v.len());
         for i in 0..self.k.len() {
-            k_out.push(compact_kv_prefix(engine, &self.k[i], self.num_kv_heads, self.head_dim, self.kv_len, self.max_ctx).await);
-            v_out.push(compact_kv_prefix(engine, &self.v[i], self.num_kv_heads, self.head_dim, self.kv_len, self.max_ctx).await);
+            k_out.push(read_f32_le(&self.read_prefix(engine, i, false, self.kv_len).await));
+            v_out.push(read_f32_le(&self.read_prefix(engine, i, true, self.kv_len).await));
         }
         KvSnapshot { kv_len: self.kv_len, num_kv_heads: self.num_kv_heads, head_dim: self.head_dim, num_layers: self.k.len() as u32, k: k_out, v: v_out }
     }
@@ -499,8 +499,8 @@ impl KvCache {
         assert_eq!(snapshot.head_dim, self.head_dim, "kv snapshot head_dim mismatch");
         assert!(snapshot.kv_len <= self.max_ctx, "kv snapshot kv_len {} exceeds max_ctx {}", snapshot.kv_len, self.max_ctx);
         for i in 0..self.k.len() {
-            write_kv_prefix(engine, &self.k[i], &snapshot.k[i], self.num_kv_heads, self.head_dim, snapshot.kv_len, self.max_ctx);
-            write_kv_prefix(engine, &self.v[i], &snapshot.v[i], self.num_kv_heads, self.head_dim, snapshot.kv_len, self.max_ctx);
+            self.write_prefix(engine, i, false, snapshot.kv_len, bytemuck::cast_slice(&snapshot.k[i]));
+            self.write_prefix(engine, i, true, snapshot.kv_len, bytemuck::cast_slice(&snapshot.v[i]));
         }
         self.kv_len = snapshot.kv_len;
     }
@@ -600,33 +600,6 @@ impl KvSnapshot {
 
 fn read_f32_le(bytes: &[u8]) -> Vec<f32> {
     bytes.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect()
-}
-
-/// Reads a KV buffer's full `[kv_heads, max_ctx, head_dim]` contents back
-/// and compacts it to `[kv_heads, kv_len, head_dim]` (dropping the unused
-/// `[kv_len, max_ctx)` padding per head).
-async fn compact_kv_prefix(engine: &Engine, buf: &wgpu::Buffer, kv_heads: u32, head_dim: u32, kv_len: u32, max_ctx: u32) -> Vec<f32> {
-    let full = engine.read_buffer(buf, (kv_heads * max_ctx * head_dim) as usize).await;
-    let mut out = Vec::with_capacity((kv_heads * kv_len * head_dim) as usize);
-    for h in 0..kv_heads {
-        let base = (h * max_ctx * head_dim) as usize;
-        let len = (kv_len * head_dim) as usize;
-        out.extend_from_slice(&full[base..base + len]);
-    }
-    out
-}
-
-/// Inverse of `compact_kv_prefix`: writes a compacted `[kv_heads, kv_len,
-/// head_dim]` snapshot back into a `[kv_heads, max_ctx, head_dim]` cache
-/// buffer's `[0, kv_len)` prefix, one `queue.write_buffer` per head (queued
-/// CPU->GPU writes, no mapping/readback - safe in the browser).
-fn write_kv_prefix(engine: &Engine, buf: &wgpu::Buffer, compact: &[f32], kv_heads: u32, head_dim: u32, kv_len: u32, max_ctx: u32) {
-    for h in 0..kv_heads {
-        let src_base = (h * kv_len * head_dim) as usize;
-        let src_len = (kv_len * head_dim) as usize;
-        let dst_offset = ((h * max_ctx * head_dim) as u64) * 4;
-        engine.queue.write_buffer(buf, dst_offset, bytemuck::cast_slice(&compact[src_base..src_base + src_len]));
-    }
 }
 
 /// CPU argmax over a full logits vector, ties broken toward the lower index -
