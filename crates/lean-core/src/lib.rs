@@ -38,7 +38,7 @@ pub mod profile_report;
 /// Length of a GGUF file's header (metadata and tensor table): the byte
 /// offset where its tensor data starts.
 pub fn gguf_header_len<R: std::io::Read + std::io::Seek>(reader: R) -> anyhow::Result<u64> {
-    Ok(gguf::GgufReader::open(reader)?.data_section_offset())
+    gguf::header_len(reader)
 }
 mod quant;
 

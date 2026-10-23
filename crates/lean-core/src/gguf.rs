@@ -135,6 +135,72 @@ fn skip_gguf_value<R: Read + Seek>(reader: &mut R, value_type: u32) -> Result<()
     Ok(())
 }
 
+/// Byte offset where a GGUF file's tensor data starts (the end of its
+/// metadata and tensor table, aligned), found by skipping every value
+/// through one large buffer instead of parsing it: a header with a 150k-entry
+/// vocabulary is scanned in milliseconds.
+pub(crate) fn header_len<R: Read + Seek>(reader: R) -> Result<u64> {
+    let mut r = std::io::BufReader::with_capacity(1 << 20, reader);
+    r.seek(SeekFrom::Start(0))?;
+    let magic = r.read_u32::<LittleEndian>()?;
+    ensure!(magic == GGUF_MAGIC, "invalid GGUF magic: 0x{magic:08X}");
+    let version = r.read_u32::<LittleEndian>()?;
+    ensure!(version == 2 || version == 3, "unsupported GGUF version: {version}");
+    let tensor_count = r.read_u64::<LittleEndian>()?;
+    let kv_count = r.read_u64::<LittleEndian>()?;
+    fn skip_str<R: Read + Seek>(r: &mut std::io::BufReader<R>) -> Result<()> {
+        let len = r.read_u64::<LittleEndian>()?;
+        r.seek_relative(i64::try_from(len)?)?;
+        Ok(())
+    }
+    fn skip_value<R: Read + Seek>(r: &mut std::io::BufReader<R>, t: u32) -> Result<()> {
+        let size = match t {
+            0 | 1 | 7 => 1,
+            2 | 3 => 2,
+            4..=6 => 4,
+            10..=12 => 8,
+            8 => return skip_str(r),
+            9 => {
+                let elem = r.read_u32::<LittleEndian>()?;
+                let count = r.read_u64::<LittleEndian>()?;
+                match elem {
+                    8 | 9 => {
+                        for _ in 0..count {
+                            skip_value(r, elem)?;
+                        }
+                    }
+                    _ => {
+                        let one = match elem {
+                            0 | 1 | 7 => 1u64,
+                            2 | 3 => 2,
+                            4..=6 => 4,
+                            10..=12 => 8,
+                            other => bail!("unknown GGUF metadata value type: {other}"),
+                        };
+                        r.seek_relative(i64::try_from(count.checked_mul(one).context("GGUF array size overflow")?)?)?;
+                    }
+                }
+                return Ok(());
+            }
+            other => bail!("unknown GGUF metadata value type: {other}"),
+        };
+        r.seek_relative(size)?;
+        Ok(())
+    }
+    for _ in 0..kv_count {
+        skip_str(&mut r)?;
+        let t = r.read_u32::<LittleEndian>()?;
+        skip_value(&mut r, t)?;
+    }
+    for _ in 0..tensor_count {
+        skip_str(&mut r)?;
+        let ndims = r.read_u32::<LittleEndian>()?;
+        ensure!(ndims <= 4, "tensor ndims={ndims} exceeds supported maximum of 4");
+        r.seek_relative(8 * ndims as i64 + 4 + 8)?;
+    }
+    Ok(align_up(r.stream_position()?, ALIGNMENT))
+}
+
 /// Token texts that end a generation. Llama 3's `<|eot_id|>` (end of
 /// turn), `<|eom_id|>` (end of message, after a tool call) and
 /// `<|end_of_text|>` are the ids its `generation_config.json` lists as
@@ -385,12 +451,6 @@ impl<R: Read + Seek> GgufReader<R> {
         Ok(Self { reader, tensors, metadata, end_of_generation_ids, data_section_offset })
     }
 
-    /// Byte offset where tensor data starts: everything before it is the
-    /// header (metadata and the tensor table).
-    pub fn data_section_offset(&self) -> u64 {
-        self.data_section_offset
-    }
-
     pub fn tensor_info(&self, name: &str) -> Option<&GgufTensorInfo> {
         self.tensors.get(name)
     }
@@ -628,5 +688,22 @@ pub fn dequantize_for(dtype: GgmlDtype, bytes: &[u8], n_elements: usize) -> Vec<
         GgmlDtype::Q4_K => dequantize_q4_k(bytes, n_elements),
         GgmlDtype::Q6_K => dequantize_q6_k(bytes, n_elements),
         GgmlDtype::BF16 => dequantize_bf16(bytes, n_elements),
+    }
+}
+
+#[cfg(test)]
+mod header_len_tests {
+    /// `header_len`'s scan ends where the full parse puts the data section,
+    /// for every GGUF named in `LEAN_GGUF*` variables.
+    #[test]
+    #[ignore = "needs LEAN_GGUF* files on disk; never committed to this repo"]
+    fn header_len_matches_the_parse() {
+        let paths: Vec<String> = std::env::vars().filter(|(k, _)| k.starts_with("LEAN_GGUF")).map(|(_, v)| v).collect();
+        assert!(!paths.is_empty(), "set LEAN_GGUF to run this test");
+        for path in paths {
+            let open = || std::io::BufReader::new(std::fs::File::open(&path).unwrap());
+            let parsed = super::GgufReader::open(open()).unwrap().data_section_offset;
+            assert_eq!(super::header_len(open()).unwrap(), parsed, "{path}");
+        }
     }
 }
