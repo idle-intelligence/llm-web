@@ -503,6 +503,37 @@ impl KvCache {
     }
 }
 
+impl KvCache {
+    pub fn num_layers(&self) -> usize {
+        self.k.len()
+    }
+
+    /// Layer `layer`'s K (`value == false`) or V for positions `[0,
+    /// positions)`, compacted to `[kv_heads, positions, head_dim]` f32
+    /// little-endian bytes. One readback per call, awaited.
+    pub async fn read_prefix(&self, engine: &Engine, layer: usize, value: bool, positions: u32) -> Vec<u8> {
+        let buf = if value { &self.v[layer] } else { &self.k[layer] };
+        let row = self.head_dim as u64 * 4;
+        let ranges: Vec<(u64, u64)> = (0..self.num_kv_heads as u64).map(|h| (h * self.max_ctx as u64 * row, positions as u64 * row)).collect();
+        engine.read_ranges(buf, &ranges).await
+    }
+
+    /// Inverse of `read_prefix`: writes `[kv_heads, positions, head_dim]`
+    /// f32 bytes into layer `layer`'s K or V at positions `[0, positions)`
+    /// with `queue.write_buffer` (no mapping), then submits so the queued
+    /// copies do not pile up across layers. Does not touch `kv_len`.
+    pub fn write_prefix(&self, engine: &Engine, layer: usize, value: bool, positions: u32, bytes: &[u8]) {
+        let buf = if value { &self.v[layer] } else { &self.k[layer] };
+        let row = self.head_dim as usize * 4;
+        let per_head = positions as usize * row;
+        assert_eq!(bytes.len(), per_head * self.num_kv_heads as usize, "kv prefix bytes do not match the cache shape");
+        for h in 0..self.num_kv_heads as usize {
+            engine.queue.write_buffer(buf, (h * self.max_ctx as usize * row) as u64, &bytes[h * per_head..(h + 1) * per_head]);
+        }
+        engine.queue.submit(std::iter::empty());
+    }
+}
+
 /// A resident-prefix KV image: every layer's K/V for positions `[0,
 /// kv_len)`, compacted (`[kv_heads, kv_len, head_dim]`, no `max_ctx`
 /// padding) so it can be exported/imported as bytes and stored by a

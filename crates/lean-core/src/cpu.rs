@@ -771,6 +771,39 @@ impl CpuKvCache {
         self.max_ctx
     }
 
+    pub fn num_layers(&self) -> usize {
+        self.k.len()
+    }
+
+    /// Layer `layer`'s K (`value == false`) or V for positions `[0,
+    /// positions)`, as `[kv_heads, positions, head_dim]` f32 little-endian
+    /// bytes: the same bytes as the GPU cache's `KvCache::read_prefix`.
+    pub fn read_prefix(&self, layer: usize, value: bool, positions: usize) -> Vec<u8> {
+        let buf = if value { &self.v[layer] } else { &self.k[layer] };
+        let mut out = Vec::with_capacity(self.num_kv_heads * positions * self.head_dim * 4);
+        for h in 0..self.num_kv_heads {
+            let base = h * self.max_ctx * self.head_dim;
+            for x in &buf[base..base + positions * self.head_dim] {
+                out.extend_from_slice(&x.to_le_bytes());
+            }
+        }
+        out
+    }
+
+    /// Inverse of `read_prefix`. Does not touch `kv_len`.
+    pub fn write_prefix(&mut self, layer: usize, value: bool, positions: usize, bytes: &[u8]) {
+        let (heads, head_dim, max_ctx) = (self.num_kv_heads, self.head_dim, self.max_ctx);
+        assert_eq!(bytes.len(), heads * positions * head_dim * 4, "kv prefix bytes do not match the cache shape");
+        let buf = if value { &mut self.v[layer] } else { &mut self.k[layer] };
+        for h in 0..heads {
+            let dst = &mut buf[h * max_ctx * head_dim..][..positions * head_dim];
+            let src = &bytes[h * positions * head_dim * 4..][..positions * head_dim * 4];
+            for (d, c) in dst.iter_mut().zip(src.as_chunks::<4>().0) {
+                *d = f32::from_le_bytes(*c);
+            }
+        }
+    }
+
     pub fn remaining_capacity(&self) -> usize {
         self.max_ctx.saturating_sub(self.kv_len)
     }

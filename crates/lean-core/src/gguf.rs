@@ -385,6 +385,12 @@ impl<R: Read + Seek> GgufReader<R> {
         Ok(Self { reader, tensors, metadata, end_of_generation_ids, data_section_offset })
     }
 
+    /// Byte offset where tensor data starts: everything before it is the
+    /// header (metadata and the tensor table).
+    pub fn data_section_offset(&self) -> u64 {
+        self.data_section_offset
+    }
+
     pub fn tensor_info(&self, name: &str) -> Option<&GgufTensorInfo> {
         self.tensors.get(name)
     }
