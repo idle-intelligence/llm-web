@@ -37,6 +37,8 @@ pub use error::LeanError;
 pub use lean::{AbortFlag, Backend, GgufSource, Lean, LoadOptions, ReadSeek, TokenizerSource};
 pub use prefix_image::PrefixImageError;
 pub use turn::GenParams;
+#[cfg(feature = "web")]
+pub use web::OpfsReader;
 
 /// wasm-bindgen-rayon's worker-pool bootstrap, re-exported so the page can
 /// call `await initThreadPool(navigator.hardwareConcurrency)` once (after
