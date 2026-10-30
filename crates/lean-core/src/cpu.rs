@@ -913,10 +913,10 @@ fn embed_gather(model: &CpuModel, token_ids: &[u32]) -> Vec<f32> {
     out
 }
 
-/// Every layer plus `output_norm` over `token_ids` written at cache slots
-/// `[kv_len, kv_len + t)`; returns the normed hidden states `[t, hidden]`
-/// and leaves `cache.kv_len` at `kv_len + t`.
-fn forward_hidden(model: &CpuModel, cache: &mut CpuKvCache, token_ids: &[u32], positions: &[u32], allowed: Option<&[u32]>) -> Vec<f32> {
+/// Every layer over `token_ids` written at cache slots `[kv_len, kv_len +
+/// t)`; returns the hidden states `[t, hidden]` before `output_norm` and
+/// leaves `cache.kv_len` at `kv_len + t`.
+fn forward_layers(model: &CpuModel, cache: &mut CpuKvCache, token_ids: &[u32], positions: &[u32], allowed: Option<&[u32]>) -> Vec<f32> {
     let cfg = &model.config;
     cache.assert_matches(cfg);
     let rows = token_ids.len();
@@ -928,15 +928,40 @@ fn forward_hidden(model: &CpuModel, cache: &mut CpuKvCache, token_ids: &[u32], p
         x = layer_forward(layer, &x, rows, cfg, &mut cache.k[i], &mut cache.v[i], kv_base, positions, allowed, lora);
     }
     cache.kv_len = kv_base + rows;
-    rmsnorm(&x, &model.out_norm, rows, cfg.hidden_size, cfg.rms_norm_eps)
+    x
 }
 
-fn forward_layers(model: &CpuModel, cache: &mut CpuKvCache, token_ids: &[u32]) -> Vec<f32> {
+/// [`forward_layers`] plus `output_norm` on every row: the normed hidden
+/// states `[t, hidden]`.
+fn forward_hidden(model: &CpuModel, cache: &mut CpuKvCache, token_ids: &[u32], positions: &[u32], allowed: Option<&[u32]>) -> Vec<f32> {
     let cfg = &model.config;
-    let rows = token_ids.len();
+    let x = forward_layers(model, cache, token_ids, positions, allowed);
+    rmsnorm(&x, &model.out_norm, token_ids.len(), cfg.hidden_size, cfg.rms_norm_eps)
+}
+
+/// The last position's logits (`[vocab]`) after every layer over
+/// `token_ids`: `output_norm` and the head run on the last row only, as in
+/// `model.rs::forward_prefill`. The other rows' logits would never be read,
+/// and the head is the widest matrix of the model (`vocab` outputs): over
+/// every row, its output alone is `rows * vocab` floats, held twice by
+/// `linear_multi_row`.
+///
+/// A prompt of two or more rows runs the head through `linear_multi_row`,
+/// the kernel `linear` picks for its rows, so these logits are bit for bit
+/// the last row of the head over every row; one row (a decode step, a
+/// one-token prefill) takes `linear`'s one-row kernel.
+fn forward_last(model: &CpuModel, cache: &mut CpuKvCache, token_ids: &[u32]) -> Vec<f32> {
+    let cfg = &model.config;
+    let (rows, hidden, vocab) = (token_ids.len(), cfg.hidden_size, cfg.vocab_size);
     let positions: Vec<u32> = (0..rows).map(|r| (cache.kv_len + r) as u32).collect();
-    let normed = forward_hidden(model, cache, token_ids, &positions, None);
-    linear(&normed, rows, cfg.hidden_size, model.head(), &vec![0f32; cfg.vocab_size], cfg.vocab_size)
+    let x = forward_layers(model, cache, token_ids, &positions, None);
+    let last = rmsnorm(&x[(rows - 1) * hidden..], &model.out_norm, 1, hidden, cfg.rms_norm_eps);
+    let zero = vec![0f32; vocab];
+    if rows >= 2 && hidden.is_multiple_of(4) {
+        linear_multi_row(&last, 1, hidden, model.head(), &zero, vocab)
+    } else {
+        linear(&last, 1, hidden, model.head(), &zero, vocab)
+    }
 }
 
 /// CPU mirror of `model.rs::forward_chunk_spec`: one chunk of `token_ids`
@@ -978,22 +1003,19 @@ fn argmax(logits: &[f32]) -> u32 {
 /// the GPU path needs and this one doesn't (RoPE angles are computed
 /// on the fly per call, no precomputed table - see `rope_inplace`).
 pub fn forward_prefill(model: &CpuModel, cache: &mut CpuKvCache, token_ids: &[u32]) -> Vec<f32> {
-    let vocab = model.config.vocab_size;
-    let rows = token_ids.len();
     #[cfg(feature = "threads")]
-    let all_logits = crate::cpu_team::with_team(|| forward_layers(model, cache, token_ids));
+    return crate::cpu_team::with_team(|| forward_last(model, cache, token_ids));
     #[cfg(not(feature = "threads"))]
-    let all_logits = forward_layers(model, cache, token_ids);
-    all_logits[(rows - 1) * vocab..].to_vec()
+    forward_last(model, cache, token_ids)
 }
 
 /// Decode one token against the cache; returns full-vocab logits - CPU
 /// mirror of `model.rs::forward_decode_step`.
 pub fn forward_decode_step(model: &CpuModel, cache: &mut CpuKvCache, token_id: u32) -> Vec<f32> {
     #[cfg(feature = "threads")]
-    return crate::cpu_team::with_team(|| forward_layers(model, cache, &[token_id]));
+    return crate::cpu_team::with_team(|| forward_last(model, cache, &[token_id]));
     #[cfg(not(feature = "threads"))]
-    forward_layers(model, cache, &[token_id])
+    forward_last(model, cache, &[token_id])
 }
 
 /// Decode one token, returning only the argmax id - CPU mirror of
@@ -1157,5 +1179,16 @@ mod multi_row_tests {
                 assert!((got[r * out_dim + c] - reference[r * out_dim + c]).abs() < 1e-4, "row {r} col {c} vs per-row kernel");
             }
         }
+    }
+
+    #[test]
+    fn multi_row_one_row_equals_last_row_of_many() {
+        let (out_dim, in_dim, rows) = (37usize, 64usize, 9usize);
+        let w = CpuWeight::F32 { data: (0..out_dim * in_dim).map(|i| ((i * 3) % 251) as f32 * 0.005 - 0.6).collect(), out_dim, in_dim };
+        let b = vec![0f32; out_dim];
+        let x: Vec<f32> = (0..rows * in_dim).map(|i| ((i * 7) % 251) as f32 * 0.01 - 1.0).collect();
+        let all = linear_multi_row(&x, rows, in_dim, &w, &b, out_dim);
+        let last = linear_multi_row(&x[(rows - 1) * in_dim..], 1, in_dim, &w, &b, out_dim);
+        assert_eq!(last.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), all[(rows - 1) * out_dim..].iter().map(|v| v.to_bits()).collect::<Vec<_>>());
     }
 }
