@@ -1,0 +1,5 @@
+{"step":"init","ms":0,"wasmMiB":2,"maxCtx":8192,"systemPromptChars":1076,"verbs":7,"heapLiveMiB":0,"heapPeakMiB":0,"largestAllocMiB":0,"failedAllocMiB":0,"liveAtFailureMiB":0}
+{"step":"load","ms":1739,"wasmMiB":3571.7,"backend":"single","heapLiveMiB":3554.1,"heapPeakMiB":3555.1,"largestAllocMiB":315.3,"failedAllocMiB":0,"liveAtFailureMiB":0}
+{"step":"warm 0 tools","ms":32565,"wasmMiB":3604.3,"imageBytes":58720384,"positions":256,"heapLiveMiB":3554.3,"heapPeakMiB":3592.3,"largestAllocMiB":6,"failedAllocMiB":0,"liveAtFailureMiB":0}
+{"step":"warm 7 tools","ms":119996,"wasmMiB":3670.9,"imageBytes":207356032,"positions":904,"heapLiveMiB":3554.4,"heapPeakMiB":3651.5,"largestAllocMiB":15.3,"failedAllocMiB":0,"liveAtFailureMiB":0}
+{"step":"turn","ms":194868,"wasmMiB":3670.9,"outcome":{"type":"needTools","calls":[{"callId":"call_0","name":"find","arguments":{"words":"jazz"}}],"timing":{"promptTokens":915,"thinkTokens":177,"answerTokens":20}},"heapLiveMiB":3554.4,"heapPeakMiB":3556.3,"largestAllocMiB":0.6,"failedAllocMiB":0,"liveAtFailureMiB":0}

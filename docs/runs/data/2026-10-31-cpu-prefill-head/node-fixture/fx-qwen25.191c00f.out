@@ -1,0 +1,8 @@
+[lean-cpu] model loaded: layers=24 hidden=896 vocab=151936
+{"step":"load","wasmMiB":535.6}
+{"case":"short","seq":36,"top1":true,"top20MaxDiff":0.00006839,"tokens":32,"tokensMatch":true,"prefillMs":1281,"wasmMiB":535.6}
+{"case":"long","seq":86,"top1":true,"top20MaxDiff":0.00004341,"tokens":32,"tokensMatch":true,"prefillMs":2612,"wasmMiB":535.6}
+{"case":"non_english","seq":54,"top1":true,"top20MaxDiff":0.00003542,"tokens":32,"tokensMatch":true,"prefillMs":1745,"wasmMiB":535.6}
+{"case":"long_tools_single","seq":2225,"top1":true,"top20MaxDiff":0.00008757,"tokens":9,"tokensMatch":true,"prefillMs":108888,"wasmMiB":705.3}
+{"case":"long_tools_multiturn","seq":2354,"top1":true,"top20MaxDiff":0.00006709,"tokens":32,"tokensMatch":true,"prefillMs":119708,"wasmMiB":713.3}
+{"allOk":true}

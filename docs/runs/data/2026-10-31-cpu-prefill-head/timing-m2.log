@@ -1,0 +1,42 @@
+start load { 2.72 4.90 5.79 }
+== qwen25-1t before run 1 load 2.72 rustc        0
+len 256 prefill_ms 5663.7 tokens [68, 198, 220, 220, 16]
+== qwen3-1.7b-1t before run 1 load 2.58 rustc        0
+len 256 prefill_ms 20009.4 tokens [198, 2132, 4977, 1075, 498]
+== qwen25-1t after run 1 load 2.49 rustc        0
+len 256 prefill_ms 4396.9 tokens [68, 198, 220, 220, 16]
+== qwen3-1.7b-1t after run 1 load 2.61 rustc        0
+len 256 prefill_ms 17512.8 tokens [198, 2132, 4977, 1075, 498]
+== qwen25-1t before run 2 load 2.93 rustc        0
+len 256 prefill_ms 5979.7 tokens [68, 198, 220, 220, 16]
+== qwen3-1.7b-1t before run 2 load 2.94 rustc        0
+len 256 prefill_ms 22546.8 tokens [198, 2132, 4977, 1075, 498]
+== qwen25-1t after run 2 load 3.03 rustc        0
+len 256 prefill_ms 5574.5 tokens [68, 198, 220, 220, 16]
+== qwen3-1.7b-1t after run 2 load 3.11 rustc        0
+len 256 prefill_ms 22638.4 tokens [198, 2132, 4977, 1075, 498]
+== qwen25-1t before run 3 load 3.90 rustc        0
+len 256 prefill_ms 7947.8 tokens [68, 198, 220, 220, 16]
+== qwen3-1.7b-1t before run 3 load 4.30 rustc        0
+len 256 prefill_ms 28002.2 tokens [198, 2132, 4977, 1075, 498]
+== qwen25-1t after run 3 load 4.29 rustc        0
+len 256 prefill_ms 5943.9 tokens [68, 198, 220, 220, 16]
+== qwen3-1.7b-1t after run 3 load 4.27 rustc        0
+len 256 prefill_ms 23927.4 tokens [198, 2132, 4977, 1075, 498]
+== qwen25-1t before run 4 load 4.40 rustc        0
+len 256 prefill_ms 8054.8 tokens [68, 198, 220, 220, 16]
+== qwen3-1.7b-1t before run 4 load 4.34 rustc        0
+len 256 prefill_ms 28159.9 tokens [198, 2132, 4977, 1075, 498]
+== qwen25-1t after run 4 load 4.16 rustc        0
+len 256 prefill_ms 5137.8 tokens [68, 198, 220, 220, 16]
+== qwen3-1.7b-1t after run 4 load 4.06 rustc        0
+len 256 prefill_ms 18607.2 tokens [198, 2132, 4977, 1075, 498]
+== qwen25-1t before run 5 load 3.74 rustc        0
+len 256 prefill_ms 5701.2 tokens [68, 198, 220, 220, 16]
+== qwen3-1.7b-1t before run 5 load 3.60 rustc        0
+len 256 prefill_ms 19709.5 tokens [198, 2132, 4977, 1075, 498]
+== qwen25-1t after run 5 load 3.06 rustc        0
+len 256 prefill_ms 4284.5 tokens [68, 198, 220, 220, 16]
+== qwen3-1.7b-1t after run 5 load 3.05 rustc        0
+len 256 prefill_ms 16630.3 tokens [198, 2132, 4977, 1075, 498]
+MAC_TIMING_DONE

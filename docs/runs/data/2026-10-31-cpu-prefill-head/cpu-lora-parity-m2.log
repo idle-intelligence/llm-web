@@ -1,0 +1,19 @@
+== cpu_lora_parity (threads) 20:50:39
+    Finished `release` profile [optimized] target(s) in 0.08s
+     Running tests/cpu_lora_parity.rs (target/release/deps/cpu_lora_parity-58a4ed2419a96f91)
+
+running 1 test
+test cpu_lora_matches_gpu_and_hf_peft has been running for over 60 seconds
+[cpu_lora] CPU 64/forward vs HF+PEFT         512 cases: 0 answers differ, max |logit diff| 3.242e-4
+[cpu_lora] CPU 1/forward  vs HF+PEFT          64 cases: 0 answers differ, max |logit diff| 1.583e-4
+[cpu_lora] GPU 64/forward vs HF+PEFT         512 cases: 0 answers differ, max |logit diff| 2.060e-4
+[cpu_lora] CPU 64/forward vs GPU             512 cases: 0 answers differ, max |logit diff| 1.183e-4
+[cpu_lora] CPU 1/forward  vs CPU 64/forward   64 cases: 0 answers differ, max |logit diff| 0.000e0
+[cpu_lora] CPU correct vs the rule: 512/512 (64/forward), 64/64 (1/forward)
+[cpu_lora] CPU time (not a benchmark: shared machine): 64/forward 103.5 s (202.2 ms/cell), 1/forward 19.1 s (299.0 ms/cell), prefix 13 tokens
+[cpu_lora] after clear_lora, CPU vs GPU base model, 64 cases: 0 answers differ, max |logit diff| 3.433e-5 (adapter moved logits by up to 10.697)
+test cpu_lora_matches_gpu_and_hf_peft ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 163.64s
+
+LORA_DONE 20:53:23

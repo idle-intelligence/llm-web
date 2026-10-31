@@ -1,0 +1,71 @@
+== native-1t qwen25 ee92a41 run 1 load 1.07
+len 256 prefill_ms 15328.7 tokens [68, 198, 220, 220, 16]
+== native-mt qwen3-1.7b ee92a41 run 1 load 1.12
+len 256 prefill_ms 7627.8 tokens [198, 2132, 4977, 1075, 498]
+== native-1t qwen25 191c00f run 1 load 1.11
+len 256 prefill_ms 11197.5 tokens [68, 198, 220, 220, 16]
+== native-mt qwen3-1.7b 191c00f run 1 load 1.25
+len 256 prefill_ms 6832.6 tokens [198, 2132, 4977, 1075, 498]
+== native-1t qwen25 ee92a41 run 2 load 3.12
+len 256 prefill_ms 15249.8 tokens [68, 198, 220, 220, 16]
+== native-mt qwen3-1.7b ee92a41 run 2 load 2.73
+len 256 prefill_ms 7683.1 tokens [198, 2132, 4977, 1075, 498]
+== native-1t qwen25 191c00f run 2 load 2.46
+len 256 prefill_ms 11291.1 tokens [68, 198, 220, 220, 16]
+== native-mt qwen3-1.7b 191c00f run 2 load 2.14
+len 256 prefill_ms 6873.3 tokens [198, 2132, 4977, 1075, 498]
+== native-1t qwen25 ee92a41 run 3 load 3.80
+len 256 prefill_ms 14934.2 tokens [68, 198, 220, 220, 16]
+== native-mt qwen3-1.7b ee92a41 run 3 load 3.18
+len 256 prefill_ms 7660.2 tokens [198, 2132, 4977, 1075, 498]
+== native-1t qwen25 191c00f run 3 load 4.54
+len 256 prefill_ms 11367.4 tokens [68, 198, 220, 220, 16]
+== native-mt qwen3-1.7b 191c00f run 3 load 3.82
+len 256 prefill_ms 6891.4 tokens [198, 2132, 4977, 1075, 498]
+== native-1t qwen25 ee92a41 run 4 load 3.60
+len 256 prefill_ms 15265.0 tokens [68, 198, 220, 220, 16]
+== native-mt qwen3-1.7b ee92a41 run 4 load 2.93
+len 256 prefill_ms 7653.3 tokens [198, 2132, 4977, 1075, 498]
+== native-1t qwen25 191c00f run 4 load 6.41
+len 256 prefill_ms 11545.0 tokens [68, 198, 220, 220, 16]
+== native-mt qwen3-1.7b 191c00f run 4 load 5.57
+len 256 prefill_ms 6845.2 tokens [198, 2132, 4977, 1075, 498]
+== native-1t qwen25 ee92a41 run 5 load 6.79
+len 256 prefill_ms 15245.9 tokens [68, 198, 220, 220, 16]
+== native-mt qwen3-1.7b ee92a41 run 5 load 5.23
+len 256 prefill_ms 7647.6 tokens [198, 2132, 4977, 1075, 498]
+== native-1t qwen25 191c00f run 5 load 5.29
+len 256 prefill_ms 11503.2 tokens [68, 198, 220, 220, 16]
+== native-mt qwen3-1.7b 191c00f run 5 load 4.34
+len 256 prefill_ms 6910.7 tokens [198, 2132, 4977, 1075, 498]
+== wasm pkg-ee92a41 run 1 load 5.81
+{"step":"init","ms":0,"wasmMiB":2,"maxCtx":2048,"systemPromptChars":1076,"verbs":7}
+{"step":"load","ms":1702,"wasmMiB":2543,"backend":"single"}
+{"step":"warm 0 tools","ms":37578,"wasmMiB":2872.5,"imageBytes":58720384,"positions":256}
+{"step":"warm 7 tools","ms":137836,"wasmMiB":3630.6,"imageBytes":207356032,"positions":904}
+== wasm pkg-191c00f run 1 load 1.63
+{"step":"init","ms":0,"wasmMiB":2,"maxCtx":2048,"systemPromptChars":1076,"verbs":7}
+{"step":"load","ms":1554,"wasmMiB":2227.7,"backend":"single"}
+{"step":"warm 0 tools","ms":32083,"wasmMiB":2260.3,"imageBytes":58720384,"positions":256}
+{"step":"warm 7 tools","ms":117786,"wasmMiB":2326.9,"imageBytes":207356032,"positions":904}
+== wasm pkg-ee92a41 run 2 load 1.24
+{"step":"init","ms":0,"wasmMiB":2,"maxCtx":2048,"systemPromptChars":1076,"verbs":7}
+{"step":"load","ms":1669,"wasmMiB":2543,"backend":"single"}
+{"step":"warm 0 tools","ms":37635,"wasmMiB":2872.5,"imageBytes":58720384,"positions":256}
+{"step":"warm 7 tools","ms":138497,"wasmMiB":3630.6,"imageBytes":207356032,"positions":904}
+== wasm pkg-191c00f run 2 load 1.20
+{"step":"init","ms":0,"wasmMiB":2,"maxCtx":2048,"systemPromptChars":1076,"verbs":7}
+{"step":"load","ms":1607,"wasmMiB":2227.7,"backend":"single"}
+{"step":"warm 0 tools","ms":32236,"wasmMiB":2260.3,"imageBytes":58720384,"positions":256}
+{"step":"warm 7 tools","ms":118786,"wasmMiB":2326.9,"imageBytes":207356032,"positions":904}
+== wasm pkg-ee92a41 run 3 load 1.10
+{"step":"init","ms":0,"wasmMiB":2,"maxCtx":2048,"systemPromptChars":1076,"verbs":7}
+{"step":"load","ms":1698,"wasmMiB":2543,"backend":"single"}
+{"step":"warm 0 tools","ms":38182,"wasmMiB":2872.5,"imageBytes":58720384,"positions":256}
+{"step":"warm 7 tools","ms":138722,"wasmMiB":3630.6,"imageBytes":207356032,"positions":904}
+== wasm pkg-191c00f run 3 load 1.38
+{"step":"init","ms":0,"wasmMiB":2,"maxCtx":2048,"systemPromptChars":1076,"verbs":7}
+{"step":"load","ms":1557,"wasmMiB":2227.7,"backend":"single"}
+{"step":"warm 0 tools","ms":32794,"wasmMiB":2260.3,"imageBytes":58720384,"positions":256}
+{"step":"warm 7 tools","ms":119121,"wasmMiB":2326.9,"imageBytes":207356032,"positions":904}
+TIMING_DONE

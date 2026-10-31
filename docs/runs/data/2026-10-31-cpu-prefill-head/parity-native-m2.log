@@ -1,0 +1,64 @@
+== cli qwen25 0.5b q4_0 fixture.json long (1 thread)
+loaded CPU model in 659.49375ms
+engine=cpu  case            seq  tok_match  top1_match  top20_maxdiff  prefill_ms/tok  decode_ms/tok
+engine=cpu  short          36  ids=true   tok=true   top1=true   top20_maxdiff=0.000061  prefill=23.59  decode=47.97
+engine=cpu  long           86  ids=true   tok=true   top1=true   top20_maxdiff=0.000050  prefill=22.59  decode=50.04
+engine=cpu  non_english    54  ids=true   tok=true   top1=true   top20_maxdiff=0.000034  prefill=24.72  decode=49.46
+engine=cpu  long_tools_single 2225  ids=true   tok=false  top1=true   top20_maxdiff=0.000081  prefill=44.66  decode=159.89
+[long_tools_single] got tokens:      [785, 9780, 374, 5023, 5619, 264, 26791, 13, 151645, 151645, 151643, 33975, 25, 358, 1184, 311, 1477, 279, 5535, 3669, 4549, 389, 279, 8544, 315, 9977, 2297, 13, 151645, 151645, 151645, 151645]
+[long_tools_single] fixture tokens:  [785, 9780, 374, 5023, 5619, 264, 26791, 13, 151645]
+engine=cpu  long_tools_multiturn 2354  ids=true   tok=true   top1=true   top20_maxdiff=0.000089  prefill=41.96  decode=113.50
+Error: one or more fixture cases failed (see stderr above)
+== cli qwen3 0.6b q8_0 fixture_qwen3.json long (threads)
+loaded CPU model in 1.059029833s
+engine=cpu  case            seq  tok_match  top1_match  top20_maxdiff  prefill_ms/tok  decode_ms/tok
+engine=cpu  short          15  ids=true   tok=true   top1=true   top20_maxdiff=0.000057  prefill=28.24  decode=80.00
+engine=cpu  long           65  ids=true   tok=true   top1=true   top20_maxdiff=0.000086  prefill=38.00  decode=101.79
+engine=cpu  non_english    33  ids=true   tok=true   top1=true   top20_maxdiff=0.000061  prefill=51.37  decode=118.40
+engine=cpu  long_tools_single 2225  ids=true   tok=true   top1=true   top20_maxdiff=0.000116  prefill=46.14  decode=101.22
+all fixture cases passed (engine=cpu)
+== cli qwen3 1.7b q8_0 fixture_qwen3_1_7b.json long (threads)
+loaded CPU model in 655.56175ms
+engine=cpu  case            seq  tok_match  top1_match  top20_maxdiff  prefill_ms/tok  decode_ms/tok
+engine=cpu  short          15  ids=true   tok=true   top1=true   top20_maxdiff=0.000053  prefill=40.06  decode=50.67
+engine=cpu  long           65  ids=true   tok=true   top1=true   top20_maxdiff=0.000062  prefill=23.45  decode=55.40
+engine=cpu  non_english    33  ids=true   tok=true   top1=true   top20_maxdiff=0.000068  prefill=27.96  decode=53.90
+engine=cpu  long_tools_single 2225  ids=true   tok=true   top1=true   top20_maxdiff=0.000099  prefill=56.59  decode=165.12
+all fixture cases passed (engine=cpu)
+== test fixture_parity_llama_360m_cpu 
+    Finished `release` profile [optimized] target(s) in 0.07s
+     Running tests/fixture_parity_llama_360m_cpu.rs (target/release/deps/fixture_parity_llama_360m_cpu-c180c29161661bbb)
+
+running 1 test
+test fixture_parity_llama_360m_cpu ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 13.81s
+
+== test fixture_parity_gguf_cpu SmolLM2-360M Q4_K_M 
+running 1 test
+[cpu short] seq 37 max |top20 diff| 6.10e-5, 8 greedy tokens equal
+[cpu long] seq 86 max |top20 diff| 3.81e-5, 32 greedy tokens equal
+[cpu non_english] seq 63 max |top20 diff| 1.62e-5, 32 greedy tokens equal
+test fixture_parity_gguf_cpu ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 11.71s
+
+== test fixture_parity_llama_360m_cpu --features threads
+    Finished `release` profile [optimized] target(s) in 0.07s
+     Running tests/fixture_parity_llama_360m_cpu.rs (target/release/deps/fixture_parity_llama_360m_cpu-91a250b7ac61c240)
+
+running 1 test
+test fixture_parity_llama_360m_cpu ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.89s
+
+== test fixture_parity_gguf_cpu SmolLM2-360M Q4_K_M --features threads
+running 1 test
+[cpu short] seq 37 max |top20 diff| 6.10e-5, 8 greedy tokens equal
+[cpu long] seq 86 max |top20 diff| 3.81e-5, 32 greedy tokens equal
+[cpu non_english] seq 63 max |top20 diff| 1.62e-5, 32 greedy tokens equal
+test fixture_parity_gguf_cpu ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 6.61s
+
+PARITY_DONE

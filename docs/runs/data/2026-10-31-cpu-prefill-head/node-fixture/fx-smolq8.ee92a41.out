@@ -1,0 +1,6 @@
+[lean-cpu] model loaded: layers=32 hidden=960 vocab=49152
+{"step":"load","wasmMiB":463.7}
+{"case":"short","seq":37,"top1":true,"top20MaxDiff":0.00002475,"tokens":8,"tokensMatch":true,"prefillMs":1275,"wasmMiB":470.7}
+{"case":"long","seq":86,"top1":true,"top20MaxDiff":0.00004344,"tokens":32,"tokensMatch":true,"prefillMs":2733,"wasmMiB":486.9}
+{"case":"non_english","seq":63,"top1":true,"top20MaxDiff":0.00002471,"tokens":32,"tokensMatch":true,"prefillMs":2072,"wasmMiB":486.9}
+{"allOk":true}
