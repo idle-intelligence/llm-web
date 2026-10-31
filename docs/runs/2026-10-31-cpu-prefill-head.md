@@ -6,7 +6,8 @@ Change (two commits on top of ee92a41):
 
 ## Parameters
 
-- Before: ee92a41. After: 191c00f (and e95db1d alone, for the bit-identity table).
+- Before: ee92a41. After: 191c00f (and e95db1d alone, for the bit-identity table). In `native-dumps/` and `timing-m2.log`, `before` is ee92a41, `fix2` is e95db1d (its dump binary is byte-identical to one rebuilt at e95db1d) and `after` is 191c00f; in `node-agent/`, `f2d*` and `f2r8192` are the 191c00f diagnostic and release agent packages; the other files name the commit.
+- Follow-up commits 0ac8b91 (one function for `linear`'s multi-row rule, used by `forward_last` too) and 473e45d (the unit test's last row taken from a full 4x4 tile): the native dump comparison was repeated at 473e45d (`native-dumps-473e45d/`).
 - Machines: the M2 laptop (macOS, aarch64, NEON kernels) and the Linux test machine (RTX 3080, Ryzen 9 3900X, x86-64: native CPU kernels are the scalar `F4` fallback there; wasm runs use simd128). Rust 1.99.0 (pinned toolchain), release builds, no `RUSTFLAGS`.
 - Models (GGUF): SmolLM2-360M-Instruct Q4_0, Q8_0 and Q4_K_M; Qwen2.5-0.5B-Instruct Q4_0 (separate `output.weight`); Qwen3-0.6B Q8_0; Qwen3-1.7B Q8_0 (hidden 2048, 28 layers, 16 heads, 8 KV heads, head dim 128, FFN 6144, vocab 151,936, tied embeddings).
 - Native bit-identity: `data/.../native-dumps/cpu_last_logits.rs` (an example program against `lean_core::cpu`, not committed to the crate) writes the prefill logits and four greedy decode steps' logits as raw f32 for synthetic prompts of 1, 2, 3, 5, 36 and 256 tokens. Built at ee92a41, e95db1d and 191c00f, default features and `threads`; run on the M2 laptop.
@@ -89,9 +90,9 @@ Source: `timing-linux.log`, `timing-m2.log` (`len 256 prefill_ms`).
 | Step | Rows prefilled | ee92a41 median (runs) | 191c00f median (runs) |
 |---|---:|---|---|
 | warm, no tools | 256 | 35,966 (35,876, 35,966, 36,484) | 30,629 (30,529, 30,629, 31,237) |
-| warm, seven tools | 648 | 100,540 (100,258, 100,540, 100,862) | 86,327 (85,703, 86,327, 86,550) |
+| warm, seven tools | 654 | 100,540 (100,258, 100,540, 100,862) | 86,327 (85,703, 86,327, 86,550) |
 
-Source: `timing-linux.log` (step `ms` differences). Load at the start of the six runs: 5.81, 1.63, 1.24, 1.20, 1.10, 1.38.
+Source: `timing-linux.log` (step `ms` differences). The seven-tools step prefills 654 rows: its 904 positions minus the 250 it shares with the no-tools prompt, the row count that a 379.1 MiB `[rows, 151,936]` f32 buffer gives (654 x 151,936 x 4 B = 379.05 MiB). Load at the start of the six runs: 5.81, 1.63, 1.24, 1.20, 1.10, 1.38.
 
 ### CI commands on 191c00f (M2 laptop)
 
@@ -101,10 +102,10 @@ Source: `timing-linux.log` (step `ms` differences). Load at the start of the six
 
 - The last-row logits and the four decode steps after them have the same SHA-256 before and after on all five models, at 1 to 256 prompt tokens, with and without `threads`; in wasm the prefill logits of every case both builds ran are the same bits.
 - The wasm memory after load drops by 315.3 MiB at every max_ctx (3,887.0 to 3,571.7 at 8192), the size of the second `token_embd` copy.
-- The largest request during a prefill drops from 148.4 MiB (256 rows) and 379.1 MiB (648 rows) to 6.0 and 15.3 MiB, and wasm memory grows by 99.2 MiB over load and both prefills at 8192, against 1,087.6 MiB at 2048 before.
+- The largest request during a prefill drops from 148.4 MiB (256 rows) and 379.1 MiB (654 rows, measured at ee92a41 in the 2026-10-30 run) to 6.0 and 15.3 MiB, and wasm memory grows by 99.2 MiB over load and both prefills at 8192, against 1,087.6 MiB at 2048 before.
 - At max_ctx 8192 the agent sequence completes after the change and returns the same tool call and token counts as the earlier builds at 2048 and 4096; before, it failed in the first prefill.
-- Qwen3-1.7B's 2,225-token prefill traps in wasm before the change (at 2,961.8 MiB, about 2.6 GB of logits needed) and passes after it, token-exact.
-- The 256-token prefill is 25.5% faster natively on one thread for Qwen2.5-0.5B on the Linux machine, 10.2% with 24 threads on Qwen3-1.7B, and 14.8% (256 rows) and 14.1% (648 rows) faster in wasm on Qwen3-1.7B. The M2 numbers ran at load averages above 3 for most runs and spread by up to 43% within a build.
-- `lean-cli` counts `long_tools_single` on Qwen2.5-0.5B as a token mismatch: it generates 32 tokens while the fixture stops at 9 (an end-of-turn token); the first 9 are equal. The comparison takes `got_tokens` whole against the fixture's shorter list, the same at ee92a41.
+- Qwen3-1.7B's 2,225-token prefill traps in wasm before the change (at 2,961.8 MiB, 2,579.2 MiB of logits needed: two `[2225, 151,936]` f32 buffers) and passes after it, token-exact.
+- The 256-token prefill is 25.5% faster natively on one thread for Qwen2.5-0.5B on the Linux machine, 10.2% with 24 threads on Qwen3-1.7B, and 14.8% (256 rows) and 14.1% (654 rows) faster in wasm on Qwen3-1.7B. The M2 numbers ran at load averages above 3 for most runs and spread by up to 43% within a build.
+- `lean-cli` counts `long_tools_single` on Qwen2.5-0.5B as a token mismatch: it generates 32 tokens while the fixture stops at 9 (an end-of-turn token); the first 9 are equal. The comparison takes `got_tokens` whole against the fixture's shorter list; `lean_cli.rs` is not changed by these commits, and this case was not rerun at ee92a41.
 </content>
 </invoke>

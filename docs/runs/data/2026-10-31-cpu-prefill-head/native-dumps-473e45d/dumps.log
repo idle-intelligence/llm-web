@@ -1,0 +1,40 @@
+== SmolLM2-360M-Instruct-Q4_0 ee92a41
+len 1 prefill_ms 112.3 tokens [18829, 28, 346, 1124, 1643]
+len 2 prefill_ms 424.7 tokens [28, 339, 3543, 719, 1891]
+len 36 prefill_ms 951.1 tokens [12960, 235, 162, 236, 162]
+len 256 prefill_ms 5189.3 tokens [741, 253, 33, 33, 33]
+== SmolLM2-360M-Instruct-Q4_0 ee92a41-threads
+len 1 prefill_ms 24.7 tokens [18829, 28, 346, 1124, 1643]
+len 2 prefill_ms 151.6 tokens [28, 339, 3543, 719, 1891]
+len 36 prefill_ms 389.4 tokens [12960, 235, 162, 236, 162]
+len 256 prefill_ms 2577.1 tokens [741, 253, 33, 33, 33]
+== SmolLM2-360M-Instruct-Q4_0 473e45d
+len 1 prefill_ms 47.7 tokens [18829, 28, 346, 1124, 1643]
+len 2 prefill_ms 273.4 tokens [28, 339, 3543, 719, 1891]
+len 36 prefill_ms 836.4 tokens [12960, 235, 162, 236, 162]
+len 256 prefill_ms 4695.4 tokens [741, 253, 33, 33, 33]
+== SmolLM2-360M-Instruct-Q4_0 473e45d-threads
+len 1 prefill_ms 31.8 tokens [18829, 28, 346, 1124, 1643]
+len 2 prefill_ms 316.5 tokens [28, 339, 3543, 719, 1891]
+len 36 prefill_ms 453.5 tokens [12960, 235, 162, 236, 162]
+len 256 prefill_ms 2181.6 tokens [741, 253, 33, 33, 33]
+== Qwen3-1.7B-Q8_0 ee92a41
+len 1 prefill_ms 532.7 tokens [25, 220, 16, 13, 220]
+len 2 prefill_ms 1433.8 tokens [198, 16, 13, 220, 16]
+len 36 prefill_ms 3549.2 tokens [82, 1, 220, 16, 24]
+len 256 prefill_ms 23969.2 tokens [198, 2132, 4977, 1075, 498]
+== Qwen3-1.7B-Q8_0 ee92a41-threads
+len 1 prefill_ms 1236.9 tokens [25, 220, 16, 13, 220]
+len 2 prefill_ms 1169.1 tokens [198, 16, 13, 220, 16]
+len 36 prefill_ms 1556.2 tokens [82, 1, 220, 16, 24]
+len 256 prefill_ms 9182.5 tokens [198, 2132, 4977, 1075, 498]
+== Qwen3-1.7B-Q8_0 473e45d
+len 1 prefill_ms 642.0 tokens [25, 220, 16, 13, 220]
+len 2 prefill_ms 1514.4 tokens [198, 16, 13, 220, 16]
+len 36 prefill_ms 3384.5 tokens [82, 1, 220, 16, 24]
+len 256 prefill_ms 21341.2 tokens [198, 2132, 4977, 1075, 498]
+== Qwen3-1.7B-Q8_0 473e45d-threads
+len 1 prefill_ms 819.9 tokens [25, 220, 16, 13, 220]
+len 2 prefill_ms 537.3 tokens [198, 16, 13, 220, 16]
+len 36 prefill_ms 1590.2 tokens [82, 1, 220, 16, 24]
+len 256 prefill_ms 8275.4 tokens [198, 2132, 4977, 1075, 498]
