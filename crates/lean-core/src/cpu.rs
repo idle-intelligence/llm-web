@@ -1190,7 +1190,7 @@ mod multi_row_tests {
 
     #[test]
     fn multi_row_one_row_equals_last_row_of_many() {
-        let (out_dim, in_dim, rows) = (37usize, 64usize, 9usize);
+        let (out_dim, in_dim, rows) = (37usize, 64usize, 12usize);
         let w = CpuWeight::F32 { data: (0..out_dim * in_dim).map(|i| ((i * 3) % 251) as f32 * 0.005 - 0.6).collect(), out_dim, in_dim };
         let b = vec![0f32; out_dim];
         let x: Vec<f32> = (0..rows * in_dim).map(|i| ((i * 7) % 251) as f32 * 0.01 - 1.0).collect();
