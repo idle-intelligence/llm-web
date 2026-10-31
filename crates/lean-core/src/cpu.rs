@@ -286,6 +286,12 @@ fn linear_multi_row(x: &[f32], rows: usize, in_dim: usize, w: &CpuWeight, b: &[f
     out
 }
 
+/// Whether `linear` runs `rows` rows of width `in_dim` through
+/// `linear_multi_row` rather than the one-row kernels.
+fn takes_multi_row(rows: usize, in_dim: usize) -> bool {
+    rows >= 2 && in_dim.is_multiple_of(4)
+}
+
 /// `x`: `[rows, in_dim]` row-major. Returns `[rows, out_dim]` row-major, `+
 /// bias` per output column - same shape/semantics as `model.rs::linear`'s
 /// GPU kernel, computed as `rows * out_dim` independent dot products (no
@@ -302,7 +308,7 @@ fn linear_multi_row(x: &[f32], rows: usize, in_dim: usize, w: &CpuWeight, b: &[f
 /// float summation order; a one-row decode step keeps the per-row dot
 /// kernels the fixtures were gated on).
 fn linear(x: &[f32], rows: usize, in_dim: usize, w: &CpuWeight, b: &[f32], out_dim: usize) -> Vec<f32> {
-    if rows >= 2 && in_dim.is_multiple_of(4) {
+    if takes_multi_row(rows, in_dim) {
         return linear_multi_row(x, rows, in_dim, w, b, out_dim);
     }
     #[cfg(feature = "threads")]
@@ -946,10 +952,11 @@ fn forward_hidden(model: &CpuModel, cache: &mut CpuKvCache, token_ids: &[u32], p
 /// every row, its output alone is `rows * vocab` floats, held twice by
 /// `linear_multi_row`.
 ///
-/// A prompt of two or more rows runs the head through `linear_multi_row`,
-/// the kernel `linear` picks for its rows, so these logits are bit for bit
-/// the last row of the head over every row; one row (a decode step, a
-/// one-token prefill) takes `linear`'s one-row kernel.
+/// The head runs the kernel `linear` would pick for all the rows
+/// (`takes_multi_row`), here on the last row alone, so these logits are bit
+/// for bit the last row of the head over every row: `linear_multi_row` for
+/// a prompt of several rows, `linear`'s one-row kernel for a decode step or
+/// a one-token prefill.
 fn forward_last(model: &CpuModel, cache: &mut CpuKvCache, token_ids: &[u32]) -> Vec<f32> {
     let cfg = &model.config;
     let (rows, hidden, vocab) = (token_ids.len(), cfg.hidden_size, cfg.vocab_size);
@@ -957,7 +964,7 @@ fn forward_last(model: &CpuModel, cache: &mut CpuKvCache, token_ids: &[u32]) -> 
     let x = forward_layers(model, cache, token_ids, &positions, None);
     let last = rmsnorm(&x[(rows - 1) * hidden..], &model.out_norm, 1, hidden, cfg.rms_norm_eps);
     let zero = vec![0f32; vocab];
-    if rows >= 2 && hidden.is_multiple_of(4) {
+    if takes_multi_row(rows, hidden) {
         linear_multi_row(&last, 1, hidden, model.head(), &zero, vocab)
     } else {
         linear(&last, 1, hidden, model.head(), &zero, vocab)
