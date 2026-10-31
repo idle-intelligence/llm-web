@@ -8,6 +8,10 @@
 //!   `lean.restorePrefix(prefix, source)` for prefix KV images. Text in, text out: no chat template, no
 //!   conversation state. One client per engine (see `lean.rs`).
 //! - `AbortFlag`: the Rust [`crate::AbortFlag`] itself.
+//! - [`OpfsReader`]: a GGUF file in the origin private file system, read at
+//!   offsets through a `FileSystemSyncAccessHandle`; `Lean.load` takes the
+//!   handle as `gguf`, and a Rust caller passes the reader as
+//!   [`crate::GgufSource::Reader`].
 //! - lean-chat's `ChatTemplate`, `chatRender` and `chatTrimOldestExchange`.
 //! - With the `diag` feature, `LeanEngine` and `LeanEngineCpu`
 //!   (`web_diag.rs`): token-level and diagnostics calls.
@@ -23,7 +27,7 @@ use std::io::{Read, Seek, SeekFrom};
 
 use crate::error::LeanError;
 use crate::prefix_image::PrefixImageError;
-use crate::lean::{AbortFlag, Backend, GgufSource, Lean, LoadOptions, TokenizerSource};
+use crate::lean::{AbortFlag, Backend, GgufSource, Lean, LoadOptions, ReadSeek, TokenizerSource};
 use crate::turn::GenParams;
 
 /// `Read + Seek` adapter over a JS-owned `js_sys::Uint8Array`, so the whole
@@ -81,6 +85,83 @@ impl Seek for JsBytesReader {
         };
         if new_pos < 0 {
             return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "JsBytesReader: seek before byte 0"));
+        }
+        self.pos = new_pos as u64;
+        Ok(self.pos)
+    }
+}
+
+/// `Read + Seek` over a GGUF file in the origin private file system,
+/// through a `FileSystemSyncAccessHandle` (dedicated workers only). A
+/// tensor-sized read is one `handle.read(buf, {at})` straight into the wasm
+/// buffer the loader asks for, so neither JS nor wasm memory ever holds
+/// more of the file than the tensor being read. Reads smaller than
+/// `OPFS_WINDOW` (the header's many short strings and numbers) are served
+/// from one window of the file, so they cost one handle read per window
+/// instead of one each. The page opens the handle and closes it once the
+/// load has resolved; the file must not change in between.
+pub struct OpfsReader {
+    handle: web_sys::FileSystemSyncAccessHandle,
+    pos: u64,
+    len: u64,
+    window: Vec<u8>,
+    window_start: u64,
+}
+
+const OPFS_WINDOW: usize = 64 * 1024;
+
+impl OpfsReader {
+    /// Reads the file's size once; fails if the handle is closed.
+    pub fn new(handle: web_sys::FileSystemSyncAccessHandle) -> std::io::Result<Self> {
+        let len = handle.get_size().map_err(|e| std::io::Error::other(format!("getSize threw: {}", js_message(&e))))? as u64;
+        Ok(Self { handle, pos: 0, len, window: Vec::new(), window_start: 0 })
+    }
+
+    fn read_at(&self, buf: &mut [u8], at: u64) -> std::io::Result<usize> {
+        let opts = web_sys::FileSystemReadWriteOptions::new();
+        opts.set_at(at as f64);
+        Ok(self.handle.read_with_u8_array_and_options(buf, &opts).map_err(|e| std::io::Error::other(format!("read threw: {}", js_message(&e))))? as usize)
+    }
+}
+
+impl Read for OpfsReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = (buf.len() as u64).min(self.len.saturating_sub(self.pos)) as usize;
+        if n == 0 {
+            return Ok(0);
+        }
+        if n >= OPFS_WINDOW {
+            let got = self.read_at(&mut buf[..n], self.pos)?;
+            self.pos += got as u64;
+            return Ok(got);
+        }
+        let in_window = self.pos >= self.window_start && self.pos < self.window_start + self.window.len() as u64;
+        if !in_window {
+            let want = (OPFS_WINDOW as u64).min(self.len - self.pos) as usize;
+            self.window.resize(want, 0);
+            let mut window = std::mem::take(&mut self.window);
+            let got = self.read_at(&mut window, self.pos);
+            self.window = window;
+            self.window.truncate(got?);
+            self.window_start = self.pos;
+        }
+        let off = (self.pos - self.window_start) as usize;
+        let got = n.min(self.window.len() - off);
+        buf[..got].copy_from_slice(&self.window[off..off + got]);
+        self.pos += got as u64;
+        Ok(got)
+    }
+}
+
+impl Seek for OpfsReader {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        let new_pos = match pos {
+            SeekFrom::Start(p) => p as i64,
+            SeekFrom::End(p) => self.len as i64 + p,
+            SeekFrom::Current(p) => self.pos as i64 + p,
+        };
+        if new_pos < 0 {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "OpfsReader: seek before byte 0"));
         }
         self.pos = new_pos as u64;
         Ok(self.pos)
@@ -287,14 +368,24 @@ impl LeanJs {
     /// `opts`: `{ gguf, tokenizer, maxCtx, backend }`. `gguf` is the GGUF
     /// file as a `Uint8Array` (read one tensor at a time, never copied
     /// whole into wasm memory; drop your reference after the call so the
-    /// JS heap can reclaim it), `tokenizer` the text of `tokenizer.json`,
+    /// JS heap can reclaim it), or, in a worker, a
+    /// `FileSystemSyncAccessHandle` on the file in the origin private file
+    /// system (read at offsets, one tensor at a time, so the file never
+    /// sits in memory; close it after the call), `tokenizer` the text of `tokenizer.json`,
     /// `maxCtx` the KV cache size in tokens, `backend` `"auto"` (default:
     /// WebGPU, else the CPU forward pass), `"webgpu"` or `"cpu"`. The CPU
     /// forward pass runs on a thread pool in the threads build after
     /// `initThreadPool(n)`, and on one thread otherwise.
     pub async fn load(opts: JsValue) -> Result<LeanJs, JsValue> {
         console_error_panic_hook::set_once();
-        let gguf: js_sys::Uint8Array = get_field(&opts, "gguf").dyn_into().map_err(|_| JsValue::from(JsError::new("opts.gguf must be a Uint8Array")))?;
+        let gguf = get_field(&opts, "gguf");
+        let gguf: Box<dyn ReadSeek> = if let Some(bytes) = gguf.dyn_ref::<js_sys::Uint8Array>() {
+            Box::new(JsBytesReader::new(bytes.clone()))
+        } else if let Ok(handle) = gguf.dyn_into::<web_sys::FileSystemSyncAccessHandle>() {
+            Box::new(OpfsReader::new(handle).map_err(|e| JsValue::from(JsError::new(&format!("opts.gguf: {e}"))))?)
+        } else {
+            return Err(JsValue::from(JsError::new("opts.gguf must be a Uint8Array or a FileSystemSyncAccessHandle")));
+        };
         let tokenizer = get_field(&opts, "tokenizer").as_string().ok_or_else(|| JsValue::from(JsError::new("opts.tokenizer must be the text of tokenizer.json")))?;
         let max_ctx = get_field(&opts, "maxCtx").as_f64().ok_or_else(|| JsValue::from(JsError::new("opts.maxCtx must be a number")))? as u32;
         let backend = match get_field(&opts, "backend").as_string().as_deref() {
@@ -303,7 +394,7 @@ impl LeanJs {
             Some("cpu") => Backend::Cpu,
             Some(other) => return Err(JsValue::from(JsError::new(&format!("unknown backend {other:?} (expected \"auto\", \"webgpu\" or \"cpu\")")))),
         };
-        let opts = LoadOptions { gguf: GgufSource::Reader(Box::new(JsBytesReader::new(gguf))), tokenizer: TokenizerSource::Json(tokenizer), max_ctx, backend };
+        let opts = LoadOptions { gguf: GgufSource::Reader(gguf), tokenizer: TokenizerSource::Json(tokenizer), max_ctx, backend };
         let inner = Lean::load(opts).await.map_err(lean_error_to_js)?;
         wasm_log(&format!("[lean] loaded on {}", inner.backend()));
         Ok(LeanJs { inner })

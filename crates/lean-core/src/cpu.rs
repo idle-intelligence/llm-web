@@ -286,6 +286,12 @@ fn linear_multi_row(x: &[f32], rows: usize, in_dim: usize, w: &CpuWeight, b: &[f
     out
 }
 
+/// Whether `linear` runs `rows` rows of width `in_dim` through
+/// `linear_multi_row` rather than the one-row kernels.
+fn takes_multi_row(rows: usize, in_dim: usize) -> bool {
+    rows >= 2 && in_dim.is_multiple_of(4)
+}
+
 /// `x`: `[rows, in_dim]` row-major. Returns `[rows, out_dim]` row-major, `+
 /// bias` per output column - same shape/semantics as `model.rs::linear`'s
 /// GPU kernel, computed as `rows * out_dim` independent dot products (no
@@ -302,7 +308,7 @@ fn linear_multi_row(x: &[f32], rows: usize, in_dim: usize, w: &CpuWeight, b: &[f
 /// float summation order; a one-row decode step keeps the per-row dot
 /// kernels the fixtures were gated on).
 fn linear(x: &[f32], rows: usize, in_dim: usize, w: &CpuWeight, b: &[f32], out_dim: usize) -> Vec<f32> {
-    if rows >= 2 && in_dim.is_multiple_of(4) {
+    if takes_multi_row(rows, in_dim) {
         return linear_multi_row(x, rows, in_dim, w, b, out_dim);
     }
     #[cfg(feature = "threads")]
@@ -468,60 +474,6 @@ struct CpuLayer {
     k_norm: Option<Vec<f32>>,
 }
 
-#[allow(non_camel_case_types)]
-enum CpuEmbed {
-    Q4_0 { bytes: Vec<u8>, blocks_per_row: usize, hidden: usize },
-    Q8_0 { bytes: Vec<u8>, blocks_per_row: usize, hidden: usize },
-    Q6_K { bytes: Vec<u8>, blocks_per_row: usize, hidden: usize },
-    Q5_0 { bytes: Vec<u8>, blocks_per_row: usize, hidden: usize },
-    Q4_K { bytes: Vec<u8>, blocks_per_row: usize, hidden: usize },
-    F16 { bytes: Vec<u8>, hidden: usize },
-    BF16 { bytes: Vec<u8>, hidden: usize },
-}
-
-impl CpuEmbed {
-    /// Dequantizes one vocab row (`token_id`) to a dense `[hidden]` f32
-    /// vector - the CPU op boundary matching `embed_gather_q4.wgsl`/
-    /// `embed_gather_q8.wgsl`/`embed_gather_q6k.wgsl`.
-    fn row(&self, token_id: u32) -> Vec<f32> {
-        match self {
-            CpuEmbed::Q4_0 { bytes, blocks_per_row, hidden } => {
-                let bytes_per_row = blocks_per_row * 18;
-                let start = token_id as usize * bytes_per_row;
-                crate::gguf::dequantize_q4_0(&bytes[start..start + bytes_per_row], *hidden)
-            }
-            CpuEmbed::Q8_0 { bytes, blocks_per_row, hidden } => {
-                let bytes_per_row = blocks_per_row * 34;
-                let start = token_id as usize * bytes_per_row;
-                crate::gguf::dequantize_q8_0(&bytes[start..start + bytes_per_row], *hidden)
-            }
-            CpuEmbed::Q6_K { bytes, blocks_per_row, hidden } => {
-                let bytes_per_row = blocks_per_row * 210;
-                let start = token_id as usize * bytes_per_row;
-                crate::gguf::dequantize_q6_k(&bytes[start..start + bytes_per_row], *hidden)
-            }
-            CpuEmbed::Q5_0 { bytes, blocks_per_row, hidden } => {
-                let bytes_per_row = blocks_per_row * 22;
-                let start = token_id as usize * bytes_per_row;
-                crate::gguf::dequantize_q5_0(&bytes[start..start + bytes_per_row], *hidden)
-            }
-            CpuEmbed::Q4_K { bytes, blocks_per_row, hidden } => {
-                let bytes_per_row = blocks_per_row * 144;
-                let start = token_id as usize * bytes_per_row;
-                crate::gguf::dequantize_q4_k(&bytes[start..start + bytes_per_row], *hidden)
-            }
-            CpuEmbed::F16 { bytes, hidden } => {
-                let start = token_id as usize * hidden * 2;
-                crate::gguf::dequantize_f16(&bytes[start..start + hidden * 2], *hidden)
-            }
-            CpuEmbed::BF16 { bytes, hidden } => {
-                let start = token_id as usize * hidden * 2;
-                crate::gguf::dequantize_bf16(&bytes[start..start + hidden * 2], *hidden)
-            }
-        }
-    }
-}
-
 /// One projection's runtime LoRA delta on the CPU backend: `a` is
 /// `[rank, in]`, `b` is `[out, rank]` with `alpha / rank` folded in, both
 /// plain F32 weights run through `linear()` - the same two-matmul-plus-add
@@ -544,10 +496,14 @@ pub struct CpuModel {
     /// Length of the GGUF header (metadata and tensor table, aligned): the
     /// byte offset where the tensor data starts.
     pub gguf_header_len: u64,
-    embed: CpuEmbed,
+    /// `token_embd`, `[vocab, hidden]`, in its GGUF bytes: the embedding
+    /// gather dequantizes one row per token (`CpuWeight::dequant_row`).
+    embed: CpuWeight,
     layers: Vec<CpuLayer>,
     out_norm: Vec<f32>,
-    lm_head: CpuWeight,
+    /// `output.weight`; `None` when the embeddings are tied, the head then
+    /// reads `embed` (one copy of the table, see `CpuModel::head`).
+    lm_head: Option<CpuWeight>,
     /// Runtime LoRA adapter (q/k/v/o), added to each projection's output on
     /// every forward; the base weights are never touched. See `lora.rs`.
     lora: Option<CpuLora>,
@@ -627,18 +583,7 @@ impl CpuModel {
             "token_embd.weight: {embed_dtype:?} is not supported as an embedding table (Q4_0, Q5_0, Q8_0, Q4_K, Q6_K, F16 and BF16 are)"
         );
         let hidden = embed_shape[1];
-        let embed_bytes = reader.tensor_data("token_embd.weight")?;
-        let tied_lm_head = config.tied_embeddings.then(|| weight_from_bytes(embed_bytes.clone(), embed_dtype, embed_shape[0], hidden));
-        let embed = match embed_dtype {
-            GgmlDtype::Q4_0 => CpuEmbed::Q4_0 { bytes: embed_bytes, blocks_per_row: hidden / 32, hidden },
-            GgmlDtype::Q5_0 => CpuEmbed::Q5_0 { bytes: embed_bytes, blocks_per_row: hidden / 32, hidden },
-            GgmlDtype::Q8_0 => CpuEmbed::Q8_0 { bytes: embed_bytes, blocks_per_row: hidden / 32, hidden },
-            GgmlDtype::Q4_K => CpuEmbed::Q4_K { bytes: embed_bytes, blocks_per_row: hidden / 256, hidden },
-            GgmlDtype::Q6_K => CpuEmbed::Q6_K { bytes: embed_bytes, blocks_per_row: hidden / 256, hidden },
-            GgmlDtype::F16 => CpuEmbed::F16 { bytes: embed_bytes, hidden },
-            GgmlDtype::BF16 => CpuEmbed::BF16 { bytes: embed_bytes, hidden },
-            _ => unreachable!(),
-        };
+        let embed = weight_from_bytes(reader.tensor_data("token_embd.weight")?, embed_dtype, embed_shape[0], hidden);
 
         let mut layers = Vec::with_capacity(config.num_layers);
         for i in 0..config.num_layers {
@@ -678,10 +623,7 @@ impl CpuModel {
         }
 
         let out_norm = gguf_f32_vec(&mut reader, "output_norm.weight")?;
-        let lm_head = match tied_lm_head {
-            Some(w) => w,
-            None => gguf_weight(&mut reader, "output.weight")?,
-        };
+        let lm_head = if config.tied_embeddings { None } else { Some(gguf_weight(&mut reader, "output.weight")?) };
 
         let gguf_header_len = reader.data_section_offset();
         drop(reader);
@@ -714,6 +656,12 @@ impl CpuModel {
         self.lora.is_some()
     }
 
+    /// The LM head: `output.weight`, or the embedding table itself when the
+    /// embeddings are tied.
+    fn head(&self) -> &CpuWeight {
+        self.lm_head.as_ref().unwrap_or(&self.embed)
+    }
+
     /// Logits for a few vocab ids at every row of `hidden` (`[rows,
     /// hidden]`, as `forward_chunk_spec` returns it), read through the token
     /// embedding rows: CPU mirror of `GpuModel::embed_head_sliced` (see its
@@ -721,7 +669,14 @@ impl CpuModel {
     /// Returns `[rows, token_ids.len()]`, row-major.
     pub fn embed_head_sliced(&self, hidden: &[f32], rows: usize, token_ids: &[u32]) -> Vec<f32> {
         let h = self.config.hidden_size;
-        let head: Vec<Vec<f32>> = token_ids.iter().map(|&id| self.embed.row(id)).collect();
+        let head: Vec<Vec<f32>> = token_ids
+            .iter()
+            .map(|&id| {
+                let mut w = vec![0f32; h];
+                self.embed.dequant_row(id as usize, &mut w);
+                w
+            })
+            .collect();
         let mut out = vec![0f32; rows * token_ids.len()];
         for r in 0..rows {
             let x = &hidden[r * h..(r + 1) * h];
@@ -959,15 +914,15 @@ fn embed_gather(model: &CpuModel, token_ids: &[u32]) -> Vec<f32> {
     let hidden = model.config.hidden_size;
     let mut out = vec![0f32; token_ids.len() * hidden];
     for (i, &id) in token_ids.iter().enumerate() {
-        out[i * hidden..(i + 1) * hidden].copy_from_slice(&model.embed.row(id));
+        model.embed.dequant_row(id as usize, &mut out[i * hidden..(i + 1) * hidden]);
     }
     out
 }
 
-/// Every layer plus `output_norm` over `token_ids` written at cache slots
-/// `[kv_len, kv_len + t)`; returns the normed hidden states `[t, hidden]`
-/// and leaves `cache.kv_len` at `kv_len + t`.
-fn forward_hidden(model: &CpuModel, cache: &mut CpuKvCache, token_ids: &[u32], positions: &[u32], allowed: Option<&[u32]>) -> Vec<f32> {
+/// Every layer over `token_ids` written at cache slots `[kv_len, kv_len +
+/// t)`; returns the hidden states `[t, hidden]` before `output_norm` and
+/// leaves `cache.kv_len` at `kv_len + t`.
+fn forward_layers(model: &CpuModel, cache: &mut CpuKvCache, token_ids: &[u32], positions: &[u32], allowed: Option<&[u32]>) -> Vec<f32> {
     let cfg = &model.config;
     cache.assert_matches(cfg);
     let rows = token_ids.len();
@@ -979,15 +934,41 @@ fn forward_hidden(model: &CpuModel, cache: &mut CpuKvCache, token_ids: &[u32], p
         x = layer_forward(layer, &x, rows, cfg, &mut cache.k[i], &mut cache.v[i], kv_base, positions, allowed, lora);
     }
     cache.kv_len = kv_base + rows;
-    rmsnorm(&x, &model.out_norm, rows, cfg.hidden_size, cfg.rms_norm_eps)
+    x
 }
 
-fn forward_layers(model: &CpuModel, cache: &mut CpuKvCache, token_ids: &[u32]) -> Vec<f32> {
+/// [`forward_layers`] plus `output_norm` on every row: the normed hidden
+/// states `[t, hidden]`.
+fn forward_hidden(model: &CpuModel, cache: &mut CpuKvCache, token_ids: &[u32], positions: &[u32], allowed: Option<&[u32]>) -> Vec<f32> {
     let cfg = &model.config;
-    let rows = token_ids.len();
+    let x = forward_layers(model, cache, token_ids, positions, allowed);
+    rmsnorm(&x, &model.out_norm, token_ids.len(), cfg.hidden_size, cfg.rms_norm_eps)
+}
+
+/// The last position's logits (`[vocab]`) after every layer over
+/// `token_ids`: `output_norm` and the head run on the last row only, as in
+/// `model.rs::forward_prefill`. The other rows' logits would never be read,
+/// and the head is the widest matrix of the model (`vocab` outputs): over
+/// every row, its output alone is `rows * vocab` floats, held twice by
+/// `linear_multi_row`.
+///
+/// The head runs the kernel `linear` would pick for all the rows
+/// (`takes_multi_row`), here on the last row alone, so these logits are bit
+/// for bit the last row of the head over every row: `linear_multi_row` for
+/// a prompt of several rows, `linear`'s one-row kernel for a decode step or
+/// a one-token prefill.
+fn forward_last(model: &CpuModel, cache: &mut CpuKvCache, token_ids: &[u32]) -> Vec<f32> {
+    let cfg = &model.config;
+    let (rows, hidden, vocab) = (token_ids.len(), cfg.hidden_size, cfg.vocab_size);
     let positions: Vec<u32> = (0..rows).map(|r| (cache.kv_len + r) as u32).collect();
-    let normed = forward_hidden(model, cache, token_ids, &positions, None);
-    linear(&normed, rows, cfg.hidden_size, &model.lm_head, &vec![0f32; cfg.vocab_size], cfg.vocab_size)
+    let x = forward_layers(model, cache, token_ids, &positions, None);
+    let last = rmsnorm(&x[(rows - 1) * hidden..], &model.out_norm, 1, hidden, cfg.rms_norm_eps);
+    let zero = vec![0f32; vocab];
+    if takes_multi_row(rows, hidden) {
+        linear_multi_row(&last, 1, hidden, model.head(), &zero, vocab)
+    } else {
+        linear(&last, 1, hidden, model.head(), &zero, vocab)
+    }
 }
 
 /// CPU mirror of `model.rs::forward_chunk_spec`: one chunk of `token_ids`
@@ -1029,22 +1010,19 @@ fn argmax(logits: &[f32]) -> u32 {
 /// the GPU path needs and this one doesn't (RoPE angles are computed
 /// on the fly per call, no precomputed table - see `rope_inplace`).
 pub fn forward_prefill(model: &CpuModel, cache: &mut CpuKvCache, token_ids: &[u32]) -> Vec<f32> {
-    let vocab = model.config.vocab_size;
-    let rows = token_ids.len();
     #[cfg(feature = "threads")]
-    let all_logits = crate::cpu_team::with_team(|| forward_layers(model, cache, token_ids));
+    return crate::cpu_team::with_team(|| forward_last(model, cache, token_ids));
     #[cfg(not(feature = "threads"))]
-    let all_logits = forward_layers(model, cache, token_ids);
-    all_logits[(rows - 1) * vocab..].to_vec()
+    forward_last(model, cache, token_ids)
 }
 
 /// Decode one token against the cache; returns full-vocab logits - CPU
 /// mirror of `model.rs::forward_decode_step`.
 pub fn forward_decode_step(model: &CpuModel, cache: &mut CpuKvCache, token_id: u32) -> Vec<f32> {
     #[cfg(feature = "threads")]
-    return crate::cpu_team::with_team(|| forward_layers(model, cache, &[token_id]));
+    return crate::cpu_team::with_team(|| forward_last(model, cache, &[token_id]));
     #[cfg(not(feature = "threads"))]
-    forward_layers(model, cache, &[token_id])
+    forward_last(model, cache, &[token_id])
 }
 
 /// Decode one token, returning only the argmax id - CPU mirror of
@@ -1208,5 +1186,16 @@ mod multi_row_tests {
                 assert!((got[r * out_dim + c] - reference[r * out_dim + c]).abs() < 1e-4, "row {r} col {c} vs per-row kernel");
             }
         }
+    }
+
+    #[test]
+    fn multi_row_one_row_equals_last_row_of_many() {
+        let (out_dim, in_dim, rows) = (37usize, 64usize, 12usize);
+        let w = CpuWeight::F32 { data: (0..out_dim * in_dim).map(|i| ((i * 3) % 251) as f32 * 0.005 - 0.6).collect(), out_dim, in_dim };
+        let b = vec![0f32; out_dim];
+        let x: Vec<f32> = (0..rows * in_dim).map(|i| ((i * 7) % 251) as f32 * 0.01 - 1.0).collect();
+        let all = linear_multi_row(&x, rows, in_dim, &w, &b, out_dim);
+        let last = linear_multi_row(&x[(rows - 1) * in_dim..], 1, in_dim, &w, &b, out_dim);
+        assert_eq!(last.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), all[(rows - 1) * out_dim..].iter().map(|v| v.to_bits()).collect::<Vec<_>>());
     }
 }

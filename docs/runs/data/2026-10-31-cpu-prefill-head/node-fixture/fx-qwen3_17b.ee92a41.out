@@ -1,0 +1,7 @@
+[lean-cpu] model loaded: layers=28 hidden=2048 vocab=151936
+{"step":"load","wasmMiB":2677.6}
+{"case":"short","seq":15,"top1":true,"top20MaxDiff":0.00006241,"tokens":32,"tokensMatch":true,"prefillMs":3030,"wasmMiB":2677.6}
+{"case":"long","seq":65,"top1":true,"top20MaxDiff":0.00004489,"tokens":32,"tokensMatch":true,"prefillMs":8831,"wasmMiB":2752.9}
+{"case":"non_english","seq":33,"top1":true,"top20MaxDiff":0.00006666,"tokens":32,"tokensMatch":true,"prefillMs":4914,"wasmMiB":2752.9}
+{"case":"long_tools_single","seq":2225,"error":"RuntimeError: unreachable","wasmMiB":2961.8}
+{"allOk":false}
