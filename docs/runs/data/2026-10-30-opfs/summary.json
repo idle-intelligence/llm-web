@@ -1,0 +1,827 @@
+{
+ "parity2": {
+  "url": "http://127.0.0.1:8891/parity.html?v=cf8b32a",
+  "adapter": {
+   "vendor": "nvidia",
+   "arch": "ampere"
+  },
+  "elapsedMs": 65610,
+  "result": {
+   "gpu": {
+    "n": 151936,
+    "bitIdentical": true,
+    "maxAbsDiff": 0,
+    "argmaxA": 785,
+    "argmaxB": 785,
+    "promptTokens": 27,
+    "loadMsBytes": 4064,
+    "loadPlusPrefillMsOpfs": 3955
+   },
+   "cpu": {
+    "n": 151936,
+    "bitIdentical": true,
+    "maxAbsDiff": 0,
+    "argmaxA": 785,
+    "argmaxB": 785
+   },
+   "lean_webgpu": {
+    "bytes": {
+     "backend": "webgpu",
+     "loadMs": 3865,
+     "text": "The capital of France is Paris. It is the political, cultural, and economic center of the country, home to iconic landmarks like the Eiffel Tower and the Louvre Museum.",
+     "prefixKey": "cd8ccd5416011f8c6ee141fce15a9339",
+     "imageBytes": 6193280,
+     "imageSha": "1b1c1d4f1629df1f6c6cc15219d78ff97e31dfc830338f33d84982d801585bc3"
+    },
+    "opfs": {
+     "backend": "webgpu",
+     "loadMs": 3998,
+     "text": "The capital of France is Paris. It is the political, cultural, and economic center of the country, home to iconic landmarks like the Eiffel Tower and the Louvre Museum.",
+     "prefixKey": "cd8ccd5416011f8c6ee141fce15a9339",
+     "imageBytes": 6193280,
+     "imageSha": "1b1c1d4f1629df1f6c6cc15219d78ff97e31dfc830338f33d84982d801585bc3"
+    },
+    "sameText": true,
+    "sameImage": true,
+    "sameKey": true
+   },
+   "lean_cpu": {
+    "bytes": {
+     "backend": "single",
+     "loadMs": 511,
+     "text": "The capital of France is Paris. It is the political, cultural, and economic center of the country, home to iconic landmarks like the Eiffel Tower and the Louvre Museum.",
+     "prefixKey": "6fd9d2886e20cd0ab15748b798c46b55",
+     "imageBytes": 6193280,
+     "imageSha": "cba7d9d11797a31f13c8837ce6f3fa014e7eba2c0fe102027f22fb1777d7a361"
+    },
+    "opfs": {
+     "backend": "single",
+     "loadMs": 519,
+     "text": "The capital of France is Paris. It is the political, cultural, and economic center of the country, home to iconic landmarks like the Eiffel Tower and the Louvre Museum.",
+     "prefixKey": "6fd9d2886e20cd0ab15748b798c46b55",
+     "imageBytes": 6193280,
+     "imageSha": "cba7d9d11797a31f13c8837ce6f3fa014e7eba2c0fe102027f22fb1777d7a361"
+    },
+    "sameText": true,
+    "sameImage": true,
+    "sameKey": true
+   }
+  },
+  "text": "running\nopfs file ready: 1834426016 bytes in 0.0 s\nbytes fetched: 1834426016 in 1.8 s\ngpu logits: {\"n\":151936,\"bitIdentical\":true,\"maxAbsDiff\":0,\"argmaxA\":785,\"argmaxB\":785,\"promptTokens\":27,\"loadMsBytes\":4064,\"loadPlusPrefillMsOpfs\":3955}\ncpu logits: {\"n\":151936,\"bitIdentical\":true,\"maxAbsDiff\":0,\"argmaxA\":785,\"argmaxB\":785}\nLean.load webgpu: {\"bytes\":{\"backend\":\"webgpu\",\"loadMs\":3865,\"text\":\"The capital of France is Paris. It is the political, cultural, and economic center of the country, home to iconic landmarks like the Eiffel Tower and the Louvre Museum.\",\"prefixKey\":\"cd8ccd5416011f8c6ee141fce15a9339\",\"imageBytes\":6193280,\"imageSha\":\"1b1c1d4f1629df1f6c6cc15219d78ff97e31dfc830338f33d84982d801585bc3\"},\"opfs\":{\"backend\":\"webgpu\",\"loadMs\":3998,\"text\":\"The capital of France is Paris. It is the political, cultural, and economic center of the country, home to iconic landmarks like the Eiffel Tower and the Louvre Museum.\",\"prefixKey\":\"cd8ccd5416011f8c6ee141fce15a9339\",\"imageBytes\":6193280,\"imageSha\":\"1b1c1d4f1629df1f6c6cc15219d78ff97e31dfc830338f33d84982d801585bc3\"},\"sameText\":true,\"sameImage\":true,\"sameKey\":true}\nLean.load cpu: {\"bytes\":{\"backend\":\"single\",\"loadMs\":511,\"text\":\"The capital of France is Paris. It is the political, cultural, and economic center of the country, home to iconic landmarks like the Eiffel Tower and the Louvre Museum.\",\"prefixKey\":\"6fd9d2886e20cd0ab15748b798c46b55\",\"imageBytes\":6193280,\"imageSha\":\"cba7d9d11797a31f13c8837ce6f3fa014e7eba2c0fe102027f22fb1777d7a361\"},\"opfs\":{\"backend\":\"single\",\"loadMs\":519,\"text\":\"The capital of France is Paris. It is the political, cultural, and economic center of the country, home to iconic landmarks like the Eiffel Tower and the Louvre Museum.\",\"prefixKey\":\"6fd9d2886e20cd0ab15748b798c46b55\",\"imageBytes\":6193280,\"imageSha\":\"cba7d9d11797a31f13c8837ce6f3fa014e7eba2c0fe102027f22fb1777d7a361\"},\"sameText\":true,\"sameImage\":true,\"sameKey\":true}\nDONE",
+  "peak": {
+   "rendererRss": 6566522880,
+   "rendererHwm": 6597517312,
+   "gpuRss": 538136576,
+   "gpuHwm": 545640448,
+   "jsHeapUsed": 2702956,
+   "jsHeapTotal": 6815744,
+   "backingStorage": 3312726446,
+   "embedderHeap": 1828208
+  },
+  "marks": {},
+  "console": [],
+  "servedSha256": [
+   "cf8b32ae40f8e83ba422a4da1556d38938f89768214f9d027d1ffefbcc90f0e6",
+   "76b29bc97d8701e1798a2e698dbd5c7f3cd18ae44fb9fd976b93775d8b0b22de",
+   "b22f7e9f8e34cc0b1dc488401ad35cd59cc1e2a7ccc8142c3a43855eca6fd1c4"
+  ]
+ },
+ "m17-old": {
+  "url": "http://127.0.0.1:8891/agent.html?v=cf8b32a&mode=old&model=17",
+  "adapter": {
+   "vendor": "nvidia",
+   "arch": "ampere"
+  },
+  "elapsedMs": 7040,
+  "result": {
+   "mode": "old",
+   "model": "17",
+   "fetchMs": 1825,
+   "loadMs": 4540,
+   "backend": "webgpu",
+   "wasmMemoryBytes": 2634088448,
+   "answerMs": 343,
+   "outcome": {
+    "type": "final",
+    "text": "The capital of France is Paris.",
+    "timing": {
+     "promptTokens": 36,
+     "thinkTokens": 0,
+     "answerTokens": 7
+    }
+   },
+   "wasmMemoryBytesAfter": 2634088448,
+   "persisted": false
+  },
+  "text": "running\ngguf ready (old) in 1825 ms\nMARK loading\nloaded on webgpu in 4540 ms, wasm memory 2634088448\nMARK loaded\noutcome {\"type\":\"final\",\"text\":\"The capital of France is Paris.\",\"timing\":{\"promptTokens\":36,\"thinkTokens\":0,\"answerTokens\":7}}\nDONE",
+  "peak": {
+   "rendererRss": 5646426112,
+   "rendererHwm": 5651722240,
+   "gpuRss": 480092160,
+   "gpuHwm": 480092160,
+   "jsHeapUsed": 1479684,
+   "jsHeapTotal": 3932160,
+   "backingStorage": 2697048503,
+   "embedderHeap": 1667544
+  },
+  "marks": {
+   "loading": {
+    "atMs": 2521,
+    "rendererRss": 3939733504,
+    "rendererHwm": 3939733504,
+    "gpuRss": 241934336,
+    "gpuHwm": 241934336,
+    "jsHeapUsed": 695232,
+    "jsHeapTotal": 3145728,
+    "backingStorage": 1845141465,
+    "embedderHeap": 773712
+   },
+   "loaded": {
+    "atMs": 7029,
+    "rendererRss": 5646426112,
+    "rendererHwm": 5651722240,
+    "gpuRss": 480092160,
+    "gpuHwm": 480092160,
+    "jsHeapUsed": 1479684,
+    "jsHeapTotal": 3932160,
+    "backingStorage": 2697048503,
+    "embedderHeap": 1667544
+   }
+  },
+  "console": [],
+  "servedSha256": [
+   "cf8b32ae40f8e83ba422a4da1556d38938f89768214f9d027d1ffefbcc90f0e6",
+   "76b29bc97d8701e1798a2e698dbd5c7f3cd18ae44fb9fd976b93775d8b0b22de",
+   "b22f7e9f8e34cc0b1dc488401ad35cd59cc1e2a7ccc8142c3a43855eca6fd1c4"
+  ]
+ },
+ "m17-bytes": {
+  "url": "http://127.0.0.1:8891/agent.html?v=cf8b32a&mode=bytes&model=17",
+  "adapter": {
+   "vendor": "nvidia",
+   "arch": "ampere"
+  },
+  "elapsedMs": 7031,
+  "result": {
+   "mode": "bytes",
+   "model": "17",
+   "fetchMs": 1936,
+   "loadMs": 4438,
+   "backend": "webgpu",
+   "wasmMemoryBytes": 799604736,
+   "answerMs": 324,
+   "outcome": {
+    "type": "final",
+    "text": "The capital of France is Paris.",
+    "timing": {
+     "promptTokens": 36,
+     "thinkTokens": 0,
+     "answerTokens": 7
+    }
+   },
+   "wasmMemoryBytesAfter": 799604736,
+   "persisted": false
+  },
+  "text": "running\ngguf ready (bytes) in 1936 ms\nMARK loading\nloaded on webgpu in 4438 ms, wasm memory 799604736\nMARK loaded\noutcome {\"type\":\"final\",\"text\":\"The capital of France is Paris.\",\"timing\":{\"promptTokens\":36,\"thinkTokens\":0,\"answerTokens\":7}}\nDONE",
+  "peak": {
+   "rendererRss": 3821133824,
+   "rendererHwm": 3870031872,
+   "gpuRss": 477368320,
+   "gpuHwm": 483995648,
+   "jsHeapUsed": 1799052,
+   "jsHeapTotal": 4980736,
+   "backingStorage": 2697540198,
+   "embedderHeap": 1667552
+  },
+  "marks": {
+   "loading": {
+    "atMs": 2520,
+    "rendererRss": 3084820480,
+    "rendererHwm": 3819659264,
+    "gpuRss": 244854784,
+    "gpuHwm": 244854784,
+    "jsHeapUsed": 762860,
+    "jsHeapTotal": 2359296,
+    "backingStorage": 1845144695,
+    "embedderHeap": 773712
+   },
+   "loaded": {
+    "atMs": 7020,
+    "rendererRss": 3821133824,
+    "rendererHwm": 3870031872,
+    "gpuRss": 477368320,
+    "gpuHwm": 483995648,
+    "jsHeapUsed": 1799052,
+    "jsHeapTotal": 4980736,
+    "backingStorage": 2697540198,
+    "embedderHeap": 1667552
+   }
+  },
+  "console": [],
+  "servedSha256": [
+   "cf8b32ae40f8e83ba422a4da1556d38938f89768214f9d027d1ffefbcc90f0e6",
+   "76b29bc97d8701e1798a2e698dbd5c7f3cd18ae44fb9fd976b93775d8b0b22de",
+   "b22f7e9f8e34cc0b1dc488401ad35cd59cc1e2a7ccc8142c3a43855eca6fd1c4"
+  ]
+ },
+ "m17-opfs-dl": {
+  "url": "http://127.0.0.1:8891/agent.html?v=cf8b32a&mode=opfs&model=17",
+  "adapter": {
+   "vendor": "nvidia",
+   "arch": "ampere"
+  },
+  "elapsedMs": 21535,
+  "result": {
+   "mode": "opfs",
+   "model": "17",
+   "opfsUnavailable": null,
+   "firstProgress": 659098,
+   "fetchMs": 16168,
+   "loadMs": 4469,
+   "backend": "webgpu",
+   "wasmMemoryBytes": 799604736,
+   "answerMs": 264,
+   "outcome": {
+    "type": "final",
+    "text": "The capital of France is Paris.",
+    "timing": {
+     "promptTokens": 36,
+     "thinkTokens": 0,
+     "answerTokens": 7
+    }
+   },
+   "wasmMemoryBytesAfter": 799604736,
+   "persisted": false
+  },
+  "text": "running\nfirst progress 659098/1834426016\ndownload 268435456/1834426016\ndownload 536870912/1834426016\ndownload 805306368/1834426016\nHALFWAY 918552576/1834426016\ndownload 1073741824/1834426016\ndownload 1342177280/1834426016\ndownload 1610612736/1834426016\ndownload 1834426016/1834426016\ngguf ready (opfs) in 16168 ms\nMARK loading\nloaded on webgpu in 4469 ms, wasm memory 799604736\nMARK loaded\noutcome {\"type\":\"final\",\"text\":\"The capital of France is Paris.\",\"timing\":{\"promptTokens\":36,\"thinkTokens\":0,\"answerTokens\":7}}\nDONE",
+  "peak": {
+   "rendererRss": 1606320128,
+   "rendererHwm": 1718603776,
+   "gpuRss": 477663232,
+   "gpuHwm": 484122624,
+   "jsHeapUsed": 1397632,
+   "jsHeapTotal": 5242880,
+   "backingStorage": 497838263,
+   "embedderHeap": 1471440
+  },
+  "marks": {
+   "loading": {
+    "atMs": 16524,
+    "rendererRss": 250609664,
+    "rendererHwm": 250609664,
+    "gpuRss": 242659328,
+    "gpuHwm": 242659328,
+    "jsHeapUsed": 1397632,
+    "jsHeapTotal": 3407872,
+    "backingStorage": 109297113,
+    "embedderHeap": 773712
+   },
+   "loaded": {
+    "atMs": 21023,
+    "rendererRss": 1606320128,
+    "rendererHwm": 1718603776,
+    "gpuRss": 477663232,
+    "gpuHwm": 484122624,
+    "jsHeapUsed": 1397632,
+    "jsHeapTotal": 5242880,
+    "backingStorage": 497838263,
+    "embedderHeap": 773712
+   }
+  },
+  "console": [],
+  "servedSha256": [
+   "cf8b32ae40f8e83ba422a4da1556d38938f89768214f9d027d1ffefbcc90f0e6",
+   "76b29bc97d8701e1798a2e698dbd5c7f3cd18ae44fb9fd976b93775d8b0b22de",
+   "b22f7e9f8e34cc0b1dc488401ad35cd59cc1e2a7ccc8142c3a43855eca6fd1c4"
+  ]
+ },
+ "m17-opfs": {
+  "url": "http://127.0.0.1:8891/agent.html?v=cf8b32a&mode=opfs&model=17",
+  "adapter": {
+   "vendor": "nvidia",
+   "arch": "ampere"
+  },
+  "elapsedMs": 5043,
+  "result": {
+   "mode": "opfs",
+   "model": "17",
+   "opfsUnavailable": null,
+   "firstProgress": 1834426016,
+   "fetchMs": 10,
+   "loadMs": 4327,
+   "backend": "webgpu",
+   "wasmMemoryBytes": 799604736,
+   "answerMs": 295,
+   "outcome": {
+    "type": "final",
+    "text": "The capital of France is Paris.",
+    "timing": {
+     "promptTokens": 36,
+     "thinkTokens": 0,
+     "answerTokens": 7
+    }
+   },
+   "wasmMemoryBytesAfter": 799604736,
+   "persisted": false
+  },
+  "text": "running\nfirst progress 1834426016/1834426016\ndownload 1834426016/1834426016\nHALFWAY 1834426016/1834426016\ngguf ready (opfs) in 10 ms\nMARK loading\nloaded on webgpu in 4327 ms, wasm memory 799604736\nMARK loaded\noutcome {\"type\":\"final\",\"text\":\"The capital of France is Paris.\",\"timing\":{\"promptTokens\":36,\"thinkTokens\":0,\"answerTokens\":7}}\nDONE",
+  "peak": {
+   "rendererRss": 1622319104,
+   "rendererHwm": 1704099840,
+   "gpuRss": 471113728,
+   "gpuHwm": 474939392,
+   "jsHeapUsed": 1398932,
+   "jsHeapTotal": 5242880,
+   "backingStorage": 562117984,
+   "embedderHeap": 1667688
+  },
+  "marks": {
+   "loading": {
+    "atMs": 522,
+    "rendererRss": 255197184,
+    "rendererHwm": 255197184,
+    "gpuRss": 213590016,
+    "gpuHwm": 213590016,
+    "jsHeapUsed": 717440,
+    "jsHeapTotal": 2883584,
+    "backingStorage": 10730048,
+    "embedderHeap": 407648
+   },
+   "loaded": {
+    "atMs": 4530,
+    "rendererRss": 1622319104,
+    "rendererHwm": 1704099840,
+    "gpuRss": 471113728,
+    "gpuHwm": 474939392,
+    "jsHeapUsed": 942724,
+    "jsHeapTotal": 5242880,
+    "backingStorage": 562117984,
+    "embedderHeap": 569968
+   }
+  },
+  "console": [],
+  "servedSha256": [
+   "cf8b32ae40f8e83ba422a4da1556d38938f89768214f9d027d1ffefbcc90f0e6",
+   "76b29bc97d8701e1798a2e698dbd5c7f3cd18ae44fb9fd976b93775d8b0b22de",
+   "b22f7e9f8e34cc0b1dc488401ad35cd59cc1e2a7ccc8142c3a43855eca6fd1c4"
+  ]
+ },
+ "m4b-old": {
+  "url": "http://127.0.0.1:8891/agent.html?v=cf8b32a&mode=old&model=4b",
+  "adapter": {
+   "vendor": "nvidia",
+   "arch": "ampere"
+  },
+  "elapsedMs": 2532,
+  "result": {
+   "error": "Failed to fetch",
+   "persisted": false
+  },
+  "text": "running\nERROR TypeError: Failed to fetch",
+  "peak": {
+   "rendererRss": 2520338432,
+   "rendererHwm": 2524467200,
+   "gpuRss": 242233344,
+   "gpuHwm": 242233344,
+   "jsHeapUsed": 695232,
+   "jsHeapTotal": 1572864,
+   "backingStorage": 10715462,
+   "embedderHeap": 773712
+  },
+  "marks": {},
+  "console": [],
+  "servedSha256": [
+   "cf8b32ae40f8e83ba422a4da1556d38938f89768214f9d027d1ffefbcc90f0e6",
+   "76b29bc97d8701e1798a2e698dbd5c7f3cd18ae44fb9fd976b93775d8b0b22de",
+   "b22f7e9f8e34cc0b1dc488401ad35cd59cc1e2a7ccc8142c3a43855eca6fd1c4"
+  ]
+ },
+ "m4b-opfs-cut": {
+  "url": "http://127.0.0.1:8891/agent.html?v=cf8b32a&mode=opfs&model=4b",
+  "adapter": {
+   "vendor": "nvidia",
+   "arch": "ampere"
+  },
+  "elapsedMs": 11046,
+  "killed": true,
+  "text": "running\nfirst progress 659098/2369547040\ndownload 268435456/2369547040\ndownload 536870912/2369547040\ndownload 805306368/2369547040\ndownload 1073741824/2369547040\nHALFWAY 1184890880/2369547040",
+  "peak": {
+   "rendererRss": 259727360,
+   "rendererHwm": 259776512,
+   "gpuRss": 244817920,
+   "gpuHwm": 244817920,
+   "jsHeapUsed": 835448,
+   "jsHeapTotal": 4456448,
+   "backingStorage": 115588558,
+   "embedderHeap": 773712
+  },
+  "marks": {},
+  "console": [],
+  "servedSha256": [
+   "cf8b32ae40f8e83ba422a4da1556d38938f89768214f9d027d1ffefbcc90f0e6",
+   "76b29bc97d8701e1798a2e698dbd5c7f3cd18ae44fb9fd976b93775d8b0b22de",
+   "b22f7e9f8e34cc0b1dc488401ad35cd59cc1e2a7ccc8142c3a43855eca6fd1c4"
+  ]
+ },
+ "m4b-opfs-resume": {
+  "url": "http://127.0.0.1:8891/agent.html?v=cf8b32a&mode=opfs&model=4b",
+  "adapter": {
+   "vendor": "nvidia",
+   "arch": "ampere"
+  },
+  "elapsedMs": 15047,
+  "result": {
+   "mode": "opfs",
+   "model": "4b",
+   "opfsUnavailable": null,
+   "firstProgress": 1208422031,
+   "fetchMs": 10263,
+   "loadMs": 3868,
+   "backend": "webgpu",
+   "wasmMemoryBytes": 729677824,
+   "answerMs": 409,
+   "outcome": {
+    "type": "final",
+    "text": "The capital of France is Paris.",
+    "timing": {
+     "promptTokens": 36,
+     "thinkTokens": 0,
+     "answerTokens": 7
+    }
+   },
+   "wasmMemoryBytesAfter": 729677824,
+   "persisted": false
+  },
+  "text": "running\nfirst progress 1208422031/2369547040\ndownload 1208422031/2369547040\nHALFWAY 1208422031/2369547040\ndownload 1478492160/2369547040\ndownload 1746927616/2369547040\ndownload 2015363072/2369547040\ndownload 2283798528/2369547040\ndownload 2369547040/2369547040\ngguf ready (opfs) in 10263 ms\nMARK loading\nloaded on webgpu in 3868 ms, wasm memory 729677824\nMARK loaded\noutcome {\"type\":\"final\",\"text\":\"The capital of France is Paris.\",\"timing\":{\"promptTokens\":36,\"thinkTokens\":0,\"answerTokens\":7}}\nDONE",
+  "peak": {
+   "rendererRss": 1704271872,
+   "rendererHwm": 1717743616,
+   "gpuRss": 401100800,
+   "gpuHwm": 405622784,
+   "jsHeapUsed": 1540876,
+   "jsHeapTotal": 4456448,
+   "backingStorage": 736603975,
+   "embedderHeap": 1710616
+  },
+  "marks": {
+   "loading": {
+    "atMs": 10530,
+    "rendererRss": 246616064,
+    "rendererHwm": 246616064,
+    "gpuRss": 242552832,
+    "gpuHwm": 242552832,
+    "jsHeapUsed": 800380,
+    "jsHeapTotal": 3932160,
+    "backingStorage": 103005650,
+    "embedderHeap": 773712
+   },
+   "loaded": {
+    "atMs": 14536,
+    "rendererRss": 1704271872,
+    "rendererHwm": 1717743616,
+    "gpuRss": 398680064,
+    "gpuHwm": 405622784,
+    "jsHeapUsed": 1540876,
+    "jsHeapTotal": 4456448,
+    "backingStorage": 736603975,
+    "embedderHeap": 1037392
+   }
+  },
+  "console": [],
+  "servedSha256": [
+   "cf8b32ae40f8e83ba422a4da1556d38938f89768214f9d027d1ffefbcc90f0e6",
+   "76b29bc97d8701e1798a2e698dbd5c7f3cd18ae44fb9fd976b93775d8b0b22de",
+   "b22f7e9f8e34cc0b1dc488401ad35cd59cc1e2a7ccc8142c3a43855eca6fd1c4"
+  ]
+ },
+ "m4b-opfs": {
+  "url": "http://127.0.0.1:8891/agent.html?v=cf8b32a&mode=opfs&model=4b",
+  "adapter": {
+   "vendor": "nvidia",
+   "arch": "ampere"
+  },
+  "elapsedMs": 4535,
+  "result": {
+   "mode": "opfs",
+   "model": "4b",
+   "opfsUnavailable": null,
+   "firstProgress": 2369547040,
+   "fetchMs": 10,
+   "loadMs": 3594,
+   "backend": "webgpu",
+   "wasmMemoryBytes": 729677824,
+   "answerMs": 375,
+   "outcome": {
+    "type": "final",
+    "text": "The capital of France is Paris.",
+    "timing": {
+     "promptTokens": 36,
+     "thinkTokens": 0,
+     "answerTokens": 7
+    }
+   },
+   "wasmMemoryBytesAfter": 729677824,
+   "persisted": false
+  },
+  "text": "running\nfirst progress 2369547040/2369547040\ndownload 2369547040/2369547040\nHALFWAY 2369547040/2369547040\ngguf ready (opfs) in 10 ms\nMARK loading\nloaded on webgpu in 3594 ms, wasm memory 729677824\nMARK loaded\noutcome {\"type\":\"final\",\"text\":\"The capital of France is Paris.\",\"timing\":{\"promptTokens\":36,\"thinkTokens\":0,\"answerTokens\":7}}\nDONE",
+  "peak": {
+   "rendererRss": 1488359424,
+   "rendererHwm": 1644699648,
+   "gpuRss": 405585920,
+   "gpuHwm": 407457792,
+   "jsHeapUsed": 1441072,
+   "jsHeapTotal": 5242880,
+   "backingStorage": 517691188,
+   "embedderHeap": 1773656
+  },
+  "marks": {
+   "loading": {
+    "atMs": 521,
+    "rendererRss": 262840320,
+    "rendererHwm": 262840320,
+    "gpuRss": 225329152,
+    "gpuHwm": 225329152,
+    "jsHeapUsed": 731580,
+    "jsHeapTotal": 2883584,
+    "backingStorage": 10730046,
+    "embedderHeap": 407632
+   },
+   "loaded": {
+    "atMs": 4022,
+    "rendererRss": 1488359424,
+    "rendererHwm": 1644699648,
+    "gpuRss": 402345984,
+    "gpuHwm": 407457792,
+    "jsHeapUsed": 1441072,
+    "jsHeapTotal": 5242880,
+    "backingStorage": 517691188,
+    "embedderHeap": 1148288
+   }
+  },
+  "console": [],
+  "servedSha256": [
+   "cf8b32ae40f8e83ba422a4da1556d38938f89768214f9d027d1ffefbcc90f0e6",
+   "76b29bc97d8701e1798a2e698dbd5c7f3cd18ae44fb9fd976b93775d8b0b22de",
+   "b22f7e9f8e34cc0b1dc488401ad35cd59cc1e2a7ccc8142c3a43855eca6fd1c4"
+  ]
+ },
+ "e2e-new": {
+  "browser": "chromium",
+  "base": "http://127.0.0.1:8893",
+  "device": "WebGPU\tyes\t69.4 ms\t2.6\t383.9\nCPU single-thread\tyes\t3065.2 ms\t102.4\t9.8",
+  "chat": [
+   {
+    "model": "qwen25-0.5b",
+    "backend": "webgpu",
+    "metric": "WebGPU \u00b7 Qwen2.5-0.5B-Instruct Q4_0",
+    "speed": "235.3",
+    "status": "Ready",
+    "reply": "YOU\nWhat is the capital of France? Answer in one sentence.\nLEAN\nThe capital of France is Paris.\n0.04 s to first token \u00b7 7 tokens at 235 tok/s \u00b7 34 prompt tokens \u00b7 WebGPU",
+    "shot": "chromium-qwen25-0.5b-webgpu.png"
+   },
+   {
+    "model": "qwen25-0.5b",
+    "backend": "single",
+    "metric": "CPU single-thread \u00b7 Qwen2.5-0.5B-Instruct Q4_0",
+    "speed": "6.9",
+    "status": "Ready",
+    "reply": "YOU\nWhat is the capital of France? Answer in one sentence.\nLEAN\nThe capital of France is Paris.\n1.65 s to first token \u00b7 7 tokens at 7 tok/s \u00b7 34 prompt tokens \u00b7 CPU single-thread",
+    "shot": "chromium-qwen25-0.5b-single.png"
+   },
+   {
+    "model": "smollm2-360m",
+    "backend": "webgpu",
+    "metric": "WebGPU \u00b7 SmolLM2-360M-Instruct Q4_0",
+    "speed": "207.8",
+    "status": "Ready",
+    "reply": "YOU\nWhat is the capital of France? Answer in one sentence.\nLEAN\nThe capital of France is Paris.\n0.07 s to first token \u00b7 7 tokens at 208 tok/s \u00b7 35 prompt tokens \u00b7 WebGPU",
+    "shot": "chromium-smollm2-360m-webgpu.png"
+   },
+   {
+    "model": "smollm2-360m",
+    "backend": "single",
+    "metric": "CPU single-thread \u00b7 SmolLM2-360M-Instruct Q4_0",
+    "speed": "8.3",
+    "status": "Ready",
+    "reply": "YOU\nWhat is the capital of France? Answer in one sentence.\nLEAN\nThe capital of France is Paris.\n1.47 s to first token \u00b7 7 tokens at 8 tok/s \u00b7 35 prompt tokens \u00b7 CPU single-thread",
+    "shot": "chromium-smollm2-360m-single.png"
+   }
+  ]
+ },
+ "e2e-base": {
+  "browser": "chromium",
+  "base": "http://127.0.0.1:8892",
+  "device": "WebGPU\tyes\t70.2 ms\t2.7\t366.7\nCPU single-thread\tyes\t3008.8 ms\t103.3\t9.7",
+  "chat": [
+   {
+    "model": "qwen25-0.5b",
+    "backend": "webgpu",
+    "metric": "WebGPU \u00b7 Qwen2.5-0.5B-Instruct Q4_0",
+    "speed": "223.7",
+    "status": "Ready",
+    "reply": "YOU\nWhat is the capital of France? Answer in one sentence.\nLEAN\nThe capital of France is Paris.\n0.04 s to first token \u00b7 7 tokens at 224 tok/s \u00b7 34 prompt tokens \u00b7 WebGPU",
+    "shot": "chromium-qwen25-0.5b-webgpu.png"
+   },
+   {
+    "model": "qwen25-0.5b",
+    "backend": "single",
+    "metric": "CPU single-thread \u00b7 Qwen2.5-0.5B-Instruct Q4_0",
+    "speed": "6.9",
+    "status": "Ready",
+    "reply": "YOU\nWhat is the capital of France? Answer in one sentence.\nLEAN\nThe capital of France is Paris.\n1.67 s to first token \u00b7 7 tokens at 7 tok/s \u00b7 34 prompt tokens \u00b7 CPU single-thread",
+    "shot": "chromium-qwen25-0.5b-single.png"
+   },
+   {
+    "model": "smollm2-360m",
+    "backend": "webgpu",
+    "metric": "WebGPU \u00b7 SmolLM2-360M-Instruct Q4_0",
+    "speed": "213.4",
+    "status": "Ready",
+    "reply": "YOU\nWhat is the capital of France? Answer in one sentence.\nLEAN\nThe capital of France is Paris.\n0.07 s to first token \u00b7 7 tokens at 213 tok/s \u00b7 35 prompt tokens \u00b7 WebGPU",
+    "shot": "chromium-smollm2-360m-webgpu.png"
+   },
+   {
+    "model": "smollm2-360m",
+    "backend": "single",
+    "metric": "CPU single-thread \u00b7 SmolLM2-360M-Instruct Q4_0",
+    "speed": "8.2",
+    "status": "Ready",
+    "reply": "YOU\nWhat is the capital of France? Answer in one sentence.\nLEAN\nThe capital of France is Paris.\n1.44 s to first token \u00b7 7 tokens at 8 tok/s \u00b7 35 prompt tokens \u00b7 CPU single-thread",
+    "shot": "chromium-smollm2-360m-single.png"
+   }
+  ]
+ },
+ "e2e-served": "4f60e0720e13b1edb3b54aed9601b28896470b31fae2ebdbded8d6afa5a32f26  llm-web-base/_site/web/lean/pkg/lean_bg.wasm\n1a88e9d1e7bb335a69b5939a022d8e7cb432740439340bf03f48053173c4d607  llm-web/_site/web/lean/pkg/lean_bg.wasm\n4f60e0720e13b1edb3b54aed9601b28896470b31fae2ebdbded8d6afa5a32f26  -\n1a88e9d1e7bb335a69b5939a022d8e7cb432740439340bf03f48053173c4d607  -\n",
+ "e2e-firefox-new": {
+  "browser": "firefox",
+  "base": "http://127.0.0.1:8893",
+  "device": "CPU single-thread\tyes\t3068.0 ms\t96.7\t10.3",
+  "chat": [
+   {
+    "model": "qwen25-0.5b",
+    "backend": "auto",
+    "metric": "CPU single-thread \u00b7 Qwen2.5-0.5B-Instruct Q4_0",
+    "speed": "7.0",
+    "status": "Ready",
+    "reply": "YOU\nWhat is the capital of France? Answer in one sentence.\nLEAN\nThe capital of France is Paris.\n1.65 s to first token \u00b7 7 tokens at 7 tok/s \u00b7 34 prompt tokens \u00b7 CPU single-thread",
+    "shot": "firefox-qwen25-0.5b-auto.png"
+   },
+   {
+    "model": "qwen25-0.5b",
+    "backend": "single",
+    "metric": "CPU single-thread \u00b7 Qwen2.5-0.5B-Instruct Q4_0",
+    "speed": "6.6",
+    "status": "Ready",
+    "reply": "YOU\nWhat is the capital of France? Answer in one sentence.\nLEAN\nThe capital of France is Paris.\n1.67 s to first token \u00b7 7 tokens at 7 tok/s \u00b7 34 prompt tokens \u00b7 CPU single-thread",
+    "shot": "firefox-qwen25-0.5b-single.png"
+   },
+   {
+    "model": "smollm2-360m",
+    "backend": "auto",
+    "metric": "CPU single-thread \u00b7 SmolLM2-360M-Instruct Q4_0",
+    "speed": "8.6",
+    "status": "Ready",
+    "reply": "YOU\nWhat is the capital of France? Answer in one sentence.\nLEAN\nThe capital of France is Paris.\n1.45 s to first token \u00b7 7 tokens at 9 tok/s \u00b7 35 prompt tokens \u00b7 CPU single-thread",
+    "shot": "firefox-smollm2-360m-auto.png"
+   },
+   {
+    "model": "smollm2-360m",
+    "backend": "single",
+    "metric": "CPU single-thread \u00b7 SmolLM2-360M-Instruct Q4_0",
+    "speed": "8.9",
+    "status": "Ready",
+    "reply": "YOU\nWhat is the capital of France? Answer in one sentence.\nLEAN\nThe capital of France is Paris.\n1.41 s to first token \u00b7 7 tokens at 9 tok/s \u00b7 35 prompt tokens \u00b7 CPU single-thread",
+    "shot": "firefox-smollm2-360m-single.png"
+   }
+  ]
+ },
+ "e2e-firefox-base": {
+  "browser": "firefox",
+  "base": "http://127.0.0.1:8892",
+  "device": "CPU single-thread\tyes\t3148.8 ms\t99.8\t10.0",
+  "chat": [
+   {
+    "model": "qwen25-0.5b",
+    "backend": "auto",
+    "metric": "CPU single-thread \u00b7 Qwen2.5-0.5B-Instruct Q4_0",
+    "speed": "6.8",
+    "status": "Ready",
+    "reply": "YOU\nWhat is the capital of France? Answer in one sentence.\nLEAN\nThe capital of France is Paris.\n1.64 s to first token \u00b7 7 tokens at 7 tok/s \u00b7 34 prompt tokens \u00b7 CPU single-thread",
+    "shot": "firefox-qwen25-0.5b-auto.png"
+   },
+   {
+    "model": "qwen25-0.5b",
+    "backend": "single",
+    "metric": "CPU single-thread \u00b7 Qwen2.5-0.5B-Instruct Q4_0",
+    "speed": "6.6",
+    "status": "Ready",
+    "reply": "YOU\nWhat is the capital of France? Answer in one sentence.\nLEAN\nThe capital of France is Paris.\n1.64 s to first token \u00b7 7 tokens at 7 tok/s \u00b7 34 prompt tokens \u00b7 CPU single-thread",
+    "shot": "firefox-qwen25-0.5b-single.png"
+   },
+   {
+    "model": "smollm2-360m",
+    "backend": "auto",
+    "metric": "CPU single-thread \u00b7 SmolLM2-360M-Instruct Q4_0",
+    "speed": "8.6",
+    "status": "Ready",
+    "reply": "YOU\nWhat is the capital of France? Answer in one sentence.\nLEAN\nThe capital of France is Paris.\n1.43 s to first token \u00b7 7 tokens at 9 tok/s \u00b7 35 prompt tokens \u00b7 CPU single-thread",
+    "shot": "firefox-smollm2-360m-auto.png"
+   },
+   {
+    "model": "smollm2-360m",
+    "backend": "single",
+    "metric": "CPU single-thread \u00b7 SmolLM2-360M-Instruct Q4_0",
+    "speed": "8.6",
+    "status": "Ready",
+    "reply": "YOU\nWhat is the capital of France? Answer in one sentence.\nLEAN\nThe capital of France is Paris.\n1.43 s to first token \u00b7 7 tokens at 9 tok/s \u00b7 35 prompt tokens \u00b7 CPU single-thread",
+    "shot": "firefox-smollm2-360m-single.png"
+   }
+  ]
+ },
+ "e2e-firefox-served": "4f60e0720e13b1edb3b54aed9601b28896470b31fae2ebdbded8d6afa5a32f26  -\n1a88e9d1e7bb335a69b5939a022d8e7cb432740439340bf03f48053173c4d607  -\n",
+ "ff-opfs17-dl": {
+  "browser": "firefox",
+  "version": "155.0",
+  "url": "http://127.0.0.1:8891/agent.html?v=cf8b32a&mode=opfs&model=17",
+  "elapsedMs": 38632,
+  "result": {
+   "mode": "opfs",
+   "model": "17",
+   "opfsUnavailable": null,
+   "firstProgress": 65536,
+   "fetchMs": 29019,
+   "loadMs": 887,
+   "backend": "single",
+   "wasmMemoryBytes": 2427387904,
+   "answerMs": 8229,
+   "outcome": {
+    "type": "final",
+    "text": "The capital of France is Paris.",
+    "timing": {
+     "promptTokens": 36,
+     "thinkTokens": 0,
+     "answerTokens": 7
+    }
+   },
+   "wasmMemoryBytesAfter": 2473918464,
+   "persisted": "pending"
+  },
+  "text": "running\nfirst progress 65536/1834426016\ndownload 268435456/1834426016\ndownload 536870912/1834426016\ndownload 805306368/1834426016\nHALFWAY 917241856/1834426016\ndownload 1073741824/1834426016\ndownload 1342177280/1834426016\ndownload 1610612736/1834426016\ndownload 1834426016/1834426016\ngguf ready (opfs) in 29019 ms\nMARK loading\nloaded on single in 887 ms, wasm memory 2427387904\nMARK loaded\noutcome {\"type\":\"final\",\"text\":\"The capital of France is Paris.\",\"timing\":{\"promptTokens\":36,\"thinkTokens\":0,\"answerTokens\":7}}\nDONE"
+ },
+ "ff-opfs17": {
+  "browser": "firefox",
+  "version": "155.0",
+  "url": "http://127.0.0.1:8891/agent.html?v=cf8b32a&mode=opfs&model=17",
+  "elapsedMs": 9692,
+  "result": {
+   "mode": "opfs",
+   "model": "17",
+   "opfsUnavailable": null,
+   "firstProgress": 1834426016,
+   "fetchMs": 25,
+   "loadMs": 884,
+   "backend": "single",
+   "wasmMemoryBytes": 2427387904,
+   "answerMs": 8520,
+   "outcome": {
+    "type": "final",
+    "text": "The capital of France is Paris.",
+    "timing": {
+     "promptTokens": 36,
+     "thinkTokens": 0,
+     "answerTokens": 7
+    }
+   },
+   "wasmMemoryBytesAfter": 2473918464,
+   "persisted": "pending"
+  },
+  "text": "running\nfirst progress 1834426016/1834426016\ndownload 1834426016/1834426016\nHALFWAY 1834426016/1834426016\ngguf ready (opfs) in 25 ms\nMARK loading\nloaded on single in 884 ms, wasm memory 2427387904\nMARK loaded\noutcome {\"type\":\"final\",\"text\":\"The capital of France is Paris.\",\"timing\":{\"promptTokens\":36,\"thinkTokens\":0,\"answerTokens\":7}}\nDONE"
+ },
+ "ff-bytes17": {
+  "browser": "firefox",
+  "version": "155.0",
+  "url": "http://127.0.0.1:8891/agent.html?v=cf8b32a&mode=bytes&model=17",
+  "elapsedMs": 13147,
+  "result": {
+   "mode": "bytes",
+   "model": "17",
+   "fetchMs": 3013,
+   "loadMs": 1197,
+   "backend": "single",
+   "wasmMemoryBytes": 2427387904,
+   "answerMs": 8509,
+   "outcome": {
+    "type": "final",
+    "text": "The capital of France is Paris.",
+    "timing": {
+     "promptTokens": 36,
+     "thinkTokens": 0,
+     "answerTokens": 7
+    }
+   },
+   "wasmMemoryBytesAfter": 2473918464,
+   "persisted": "pending"
+  },
+  "text": "running\ngguf ready (bytes) in 3013 ms\nMARK loading\nloaded on single in 1197 ms, wasm memory 2427387904\nMARK loaded\noutcome {\"type\":\"final\",\"text\":\"The capital of France is Paris.\",\"timing\":{\"promptTokens\":36,\"thinkTokens\":0,\"answerTokens\":7}}\nDONE"
+ }
+}
